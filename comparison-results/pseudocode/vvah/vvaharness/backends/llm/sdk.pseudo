@@ -1,55 +1,904 @@
 // file: vvaharness/backends/llm/sdk.py
 // via: sdk -- raw Anthropic Messages loop with read-only localtools; mutating/Bash tool requests are
-// delegated to the Claude Agent SDK. Hard turn cap, one prose re-ask, then a forced final answer.
+// delegated to the Claude Agent SDK. Streams to dodge HTTP timeouts, caches the prompt, retries 429/5xx.
+// Hard turn cap, one prose re-ask, then a forced final answer. Cache markers only where three gates agree:
+// the route accepts cache_control, the kill switch is on, and the prefix clears the model minimum.
 
 @executedBy(CODE) @role(backend)
 class LlmSdk {
 
-    void configure(String apiKey, String baseUrl, Object verifySsl, String caCert, Object clientCert, boolean allowApiKeyFallback) { }
-    void configureCache(Object markers, Integer minBlockTokens, String route) { }
+    // two retry layers, deliberately: the SDK's own (max_retries 2) and the wrapper ladder; worst case 3x3=9 sends per prompt()
+    int CLIENT_MAX_RETRIES = θ["code.backends.llm.sdk.client_max_retries"];                                 // src: vvaharness/backends/llm/sdk.py:222
+    // unauthorized / invalid api key / invalid ... token / token ... expired|invalid|revoked / authentication failed (bounded, not a wildcard)
+    Regex AUTH_STATUS_RX = θ["code.backends.llm.sdk.auth_status_rx"];                                       // src: vvaharness/backends/llm/sdk.py:109
+    int AUTH_MAX_RETRIES_SDK = θ["code.backends.llm.sdk.auth_max_retries"];                                 // src: vvaharness/backends/llm/sdk.py:118
+    List<Integer> AUTH_BACKOFF_SDK = θ["code.backends.llm.sdk.auth_backoff_s"];                             // src: vvaharness/backends/llm/sdk.py:119
+    // lazy thread-safe singleton client (s4 and s6 run in a thread pool)
+    Object client = null;                                                                                   // src: vvaharness/backends/llm/sdk.py:123
+    Lock clientLock = new Lock();                                                                           // src: vvaharness/backends/llm/sdk.py:124
+    // the anthropic-beta value baked into the live client's DEFAULT headers (OAuth mode only), or ""
+    String clientDefaultBetas = "";                                                                         // src: vvaharness/backends/llm/sdk.py:128
+    SdkConfig cfg = new SdkConfig();                                                                        // api_key, base_url, verify_ssl=true, ca_cert, client_cert, no_proxy, allow_api_key_fallback=false, cache_min_block_tokens=null (published per-model minimum), cache_route="auto", cache_markers="on" // src: vvaharness/backends/llm/sdk.py:129
 
-    @src("vvaharness/backends/llm/sdk.py:1202")
-    String agentic(Prompt userPrompt, String model, Prompt systemPrompt, List<String> allowedTools, Path cwd, Integer maxTurns, Integer timeout, Schema responseModel, Effort effort, Theta θ) {
-        int turnsCap = maxTurns != null ? maxTurns : _AGENTIC_MAX_TURNS;                                    // src: vvaharness/backends/llm/sdk.py:1243
-        if (allowedTools.contains("Bash")) throw new ValueError("Bash is forbidden on via: sdk");          // src: vvaharness/backends/llm/sdk.py:1250
-        List<String> missing = LocalTools.unsupported(allowedTools);                                        // src: vvaharness/backends/llm/sdk.py:1254
-        if (!missing.isEmpty()) return AgentSdk.agentic(userPrompt, model, systemPrompt, allowedTools, cwd, maxTurns, timeout, effort); // mutation tools -> cwd-confined Agent SDK // src: vvaharness/backends/llm/sdk.py:1268
-        Double sessionBudget = timeout != null ? LlmModels.effortScaledSeconds(timeout, effort, SESSION) : null; // src: vvaharness/backends/llm/sdk.py:1283
-        Prompt systemText = systemPrompt;
-        Map kw = Map.of("tools", LocalTools.schemas(allowedTools));
-        if (responseModel != null) {
-            if (!forcingBlocked(model, effort)) kw.put("tool_choice", "any");                               // src: vvaharness/backends/llm/sdk.py:1307
-            else systemText = StructuredOutputPrompts.withSubmitInstruction(systemPrompt, responseModel, LlmModels.RESPONSE_MODEL_TOOL_NAME, θ); // src: vvaharness/backends/llm/sdk.py:1310
-        }
-        boolean schemaNudged = false;
-        for (int turn = 1; turn <= turnsCap; turn++) {                                                      // src: vvaharness/backends/llm/sdk.py:1337
-            if (sessionBudget != null && elapsed() >= sessionBudget) throw new CallTimeoutError();          // src: vvaharness/backends/llm/sdk.py:1338
-            Message msg = send(systemText, kw);
-            raiseIfRefused(msg);                                                                            // src: vvaharness/backends/llm/sdk.py:1465
-            if (msg.stopReason != "tool_use") {
-                // prose where a submit was expected: ask once by name, never on the last turn
-                if (responseModel != null && !schemaNudged && turn < turnsCap) {                             // src: vvaharness/backends/llm/sdk.py:1470
-                    schemaNudged = true;
-                    append(StructuredOutputPrompts.proseReask(θ));                                          // src: vvaharness/backends/llm/sdk.py:1483
-                    continue;
+    String ROUTE_ANTHROPIC = "anthropic";                                                                   // cache_control // src: vvaharness/backends/llm/sdk.py:276
+    String ROUTE_VERTEX = "vertex";                                                                         // cache_control, same shape as Anthropic direct // src: vvaharness/backends/llm/sdk.py:277
+    String ROUTE_BEDROCK = "bedrock";                                                                       // no markers: unverified intermediary, usage names not parsed // src: vvaharness/backends/llm/sdk.py:278
+    String ROUTE_UNKNOWN = "unknown";                                                                       // no markers of any kind // src: vvaharness/backends/llm/sdk.py:279
+    // every marker this module places is gated on this ONE set
+    List<String> CACHE_CONTROL_ROUTES = θ["code.backends.llm.sdk.cache_control_routes"];                    // src: vvaharness/backends/llm/sdk.py:283
+    // anchored on the registrable domain: a bare substring test promoted any hostname containing vertex or bedrock
+    Regex BEDROCK_HOST_RX = θ["code.backends.llm.sdk.bedrock_host_rx"];                                     // src: vvaharness/backends/llm/sdk.py:288
+    Regex VERTEX_HOST_RX = θ["code.backends.llm.sdk.vertex_host_rx"];                                       // hyphen alternative admits the regional form // src: vvaharness/backends/llm/sdk.py:291
+    Regex ANTHROPIC_HOST_RX = θ["code.backends.llm.sdk.anthropic_host_rx"];                                 // src: vvaharness/backends/llm/sdk.py:293
+    // route classifications already noted as withholding markers (registered in warn_once registry sites)
+    Set<String> CACHE_ROUTE_NOTED = new Set();                                                              // src: vvaharness/backends/llm/sdk.py:298
+    // published per-model minimum cacheable prefix sizes in real tokens; first match wins; unseen model gets the fallback
+    List<Pair<Regex, Integer>> CACHE_MIN_TOKENS_TABLE = θ["code.backends.llm.sdk.cache_min_tokens_table"];  // src: vvaharness/backends/llm/sdk.py:361
+    int CACHE_MIN_TOKENS_FALLBACK = θ["code.backends.llm.sdk.cache_min_tokens_fallback"];                   // src: vvaharness/backends/llm/sdk.py:368
+    double CACHE_EST_MARGIN = Cache.CACHE_EST_MARGIN;                                                       // same value and rationale as the openai path // src: vvaharness/backends/llm/sdk.py:385
+    Set<String> PARSED_USAGE_CACHE_KEYS = Cache.ANTHROPIC_PARSED_CACHE_KEYS;                                // src: vvaharness/backends/llm/sdk.py:458
+
+    // ceiling on total attempts after bounded extra-send grants (param-drop and truncation retry)
+    int ATTEMPTS_CEILING = θ["code.backends.llm.sdk.attempts_ceiling"];                                     // src: vvaharness/backends/llm/sdk.py:477
+    Set<String> NO_TEMP_MODELS = new Set();                                                                 // src: vvaharness/backends/llm/sdk.py:479
+    Set<String> NO_THINK_MODELS = new Set();                                                                // src: vvaharness/backends/llm/sdk.py:480
+    // models that 400'd on a FORCED tool_choice, remembered for the run (structured tool advertised, not forced)
+    Set<String> NO_TOOL_CHOICE_MODELS = new Set();                                                          // src: vvaharness/backends/llm/sdk.py:484
+    Set<String> WARNED_DROPS = new Set();                                                                   // param drops already announced // src: vvaharness/backends/llm/sdk.py:486
+    // opus 4.7+, opus 5-9, sonnet 5-9, haiku 5-9 reject temperature
+    Regex NO_TEMP_RX = θ["code.backends.llm.sdk.no_temp_rx"];                                               // src: vvaharness/backends/llm/sdk.py:487
+    String RESPONSE_MODEL_TOOL_NAME = LlmModels.RESPONSE_MODEL_TOOL_NAME;                                   // one definition shared with openai.agentic // src: vvaharness/backends/llm/sdk.py:556
+    int AGENTIC_MAX_TOK = LlmModels.AGENTIC_MAX_TOKENS;                                                     // src: vvaharness/backends/llm/sdk.py:993
+    int AGENTIC_MAX_TURNS = θ["code.backends.llm.sdk.agentic_max_turns"];                                   // src: vvaharness/backends/llm/sdk.py:994
+    String EVICTED_MARK = "[evicted to fit context]";                                                       // marker on an evicted tool result so shrinkHistory advances instead of re-picking // src: vvaharness/backends/llm/sdk.py:1176
+    Regex CTX_OVERFLOW_RX = θ["code.backends.llm.sdk.ctx_overflow_rx"];                                     // src: vvaharness/backends/llm/sdk.py:1177
+
+    /** Called once by the orchestrator before any SDK step; prefers ANTHROPIC_SDK_API_KEY. */
+    @src("vvaharness/backends/llm/sdk.py:146")
+    void configure(String apiKey, String baseUrl, Object verifySsl, String caCert, Object clientCert, String noProxy, Boolean allowApiKeyFallback, Integer cacheMinBlockTokens, String cacheMarkers, Object cacheRoute) {
+        synchronized (clientLock) {
+            if (apiKey != null && !apiKey.isEmpty()) cfg.apiKey = apiKey;                                   // src: vvaharness/backends/llm/sdk.py:160
+            if (baseUrl != null && !baseUrl.isEmpty()) cfg.baseUrl = baseUrl;                               // src: vvaharness/backends/llm/sdk.py:162
+            if (allowApiKeyFallback != null) cfg.allowApiKeyFallback = allowApiKeyFallback;                 // src: vvaharness/backends/llm/sdk.py:164
+            if (verifySsl != null) cfg.verifySsl = Tls.coerceVerify(verifySsl);                             // src: vvaharness/backends/llm/sdk.py:166
+            if (caCert != null && !caCert.isEmpty()) cfg.caCert = caCert;                                   // src: vvaharness/backends/llm/sdk.py:168
+            if (clientCert != null) cfg.clientCert = clientCert;                                            // src: vvaharness/backends/llm/sdk.py:170
+            if (noProxy != null && !noProxy.isEmpty()) cfg.noProxy = noProxy;                               // src: vvaharness/backends/llm/sdk.py:172
+            if (cacheMinBlockTokens != null) cfg.cacheMinBlockTokens = cacheMinBlockTokens;                 // src: vvaharness/backends/llm/sdk.py:174
+            if (cacheMarkers != null) cfg.cacheMarkers = cacheMarkers;                                      // src: vvaharness/backends/llm/sdk.py:176
+            if (cacheRoute != null) {
+                // PyYAML parses an unquoted off/no as False, so accept it as the documented "none"
+                String v = cacheRoute == false ? "none" : cacheRoute.toString().strip().lower();            // src: vvaharness/backends/llm/sdk.py:181
+                if (!List.of("auto", "none", ROUTE_ANTHROPIC, ROUTE_VERTEX, ROUTE_BEDROCK).contains(v)) {   // src: vvaharness/backends/llm/sdk.py:182
+                    log.warning(Events.CACHE_ROUTE_UNKNOWN);                                               // unrecognised: warn and fall back; the field only gates an optimisation so it never fails the run // src: vvaharness/backends/llm/sdk.py:184
+                    v = "auto";                                                                             // src: vvaharness/backends/llm/sdk.py:185
                 }
-                return msg.text;                                                                            // src: vvaharness/backends/llm/sdk.py:1488
+                cfg.cacheRoute = v;                                                                         // src: vvaharness/backends/llm/sdk.py:186
             }
-            dispatchTools(msg);                                                                             // ungranted names never run // src: vvaharness/backends/llm/sdk.py:1540
+            client = null;                                                                                  // force rebuild on next call // src: vvaharness/backends/llm/sdk.py:187
         }
-        // Budget exhausted: force a final answer
-        Counters.bump("llm_turn_cap_exhausted");                                                            // src: vvaharness/backends/llm/sdk.py:1570
-        append(TurnCapPrompt.finalAnswer(responseModel != null, θ));                                        // src: vvaharness/backends/llm/sdk.py:1572
-        // forced tool (or tools forbidden) unless forcing is blocked
-        kw.put("tool_choice", responseModel == null ? "none" : (forcingBlocked(model, effort) ? null : LlmModels.RESPONSE_MODEL_TOOL_NAME)); // src: vvaharness/backends/llm/sdk.py:1594
-        return send(systemText, kw).text;
     }
 
-    boolean forcingBlocked(String model, Effort effort) { }
-    Message send(Prompt system, Map kw) { }
-    void append(Prompt p) { }
-    void dispatchTools(Message msg) { }
-    void raiseIfRefused(Message msg) { }
+    void configureCache(Object markers, Integer minBlockTokens, String route) {
+        configure(null, null, null, null, null, null, null, minBlockTokens, markers, route);                // the preflight entry point: cache_markers, cache_min_block_tokens, cache_route // src: vvaharness/backends/llm/sdk.py:146
+    }
+
+    /** verify upgraded to an SSL context carrying the configured client chain. */
+    @src("vvaharness/backends/llm/sdk.py:189")
+    Object mtlsVerify(Object verify) {
+        // never pass cert= to the httpx client (the httpx-0.28.1 trap); EVERY chain shape is pre-checked
+        Object clientCert = Tls.resolveClientChain(cfg.clientCert, "sdk", null);                            // src: vvaharness/backends/llm/sdk.py:196
+        if (clientCert == null) return verify;                                                              // src: vvaharness/backends/llm/sdk.py:197
+        SslContext context = Httpx.createSslContext(verify, true);                                          // trust_env=True // src: vvaharness/backends/llm/sdk.py:199
+        if (!Tls.loadClientChain(context, clientCert, "sdk")) return verify;                                // src: vvaharness/backends/llm/sdk.py:200
+        return context;                                                                                     // src: vvaharness/backends/llm/sdk.py:202
+    }
+
+    /** Lazy singleton Anthropic client: credential resolution, TLS, optional client cert, scoped NO_PROXY. */
+    @src("vvaharness/backends/llm/sdk.py:204")
+    Object getClient() {
+        if (client != null) return client;                                                                  // src: vvaharness/backends/llm/sdk.py:206
+        synchronized (clientLock) {
+            if (client == null) {                                                                           // src: vvaharness/backends/llm/sdk.py:209
+                Map kw = Map.of("max_retries", CLIENT_MAX_RETRIES);                                         // src: vvaharness/backends/llm/sdk.py:222
+                // dedicated env var so sdk can target a different gateway/key than the CLI backend
+                String key = cfg.apiKey != null ? cfg.apiKey : System.getenv("ANTHROPIC_SDK_API_KEY");            // src: vvaharness/backends/llm/sdk.py:224
+                if (key == null && cfg.allowApiKeyFallback) {
+                    // sole-sdk profile only: falls back to the shared ANTHROPIC key, not from via:cli
+                    key = firstNonEmpty(System.getenv("ANTHROPIC_API_KEY"), System.getenv("ANTHROPIC_AUTH_TOKEN"));     // src: vvaharness/backends/llm/sdk.py:227
+                    if (key != null) Console.write("no ANTHROPIC_SDK_API_KEY - falling back to ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN"); // src: vvaharness/backends/llm/sdk.py:230
+                }
+                if (key == null) {
+                    // constructing with NO auth kwarg does not fail: the SDK would read ANTHROPIC_API_KEY from the ambient env itself; fail closed on the harness's own rule instead
+                    throw new AuthenticationError("no sdk credential resolved: set ANTHROPIC_SDK_API_KEY or sdk.api_key; ANTHROPIC_API_KEY accepted only when sdk/deepagents are the sole backends", null, "sdk"); // src: vvaharness/backends/llm/sdk.py:238
+                }
+                Map authKw = Tls.anthropicAuthKwargs(key);                                                  // src: vvaharness/backends/llm/sdk.py:247
+                // read the beta header off what the auth helper produced, so the per-request merge sends exactly the client's value
+                clientDefaultBetas = authKw.get("default_headers") != null ? authKw.get("default_headers").getOrDefault("anthropic-beta", "") : ""; // src: vvaharness/backends/llm/sdk.py:252
+                kw.putAll(authKw);                                                                          // src: vvaharness/backends/llm/sdk.py:254
+                if (cfg.baseUrl != null) kw.put("base_url", cfg.baseUrl);                                   // src: vvaharness/backends/llm/sdk.py:255
+                String ca = cfg.caCert;                                                                     // ca_cert (path) wins over verify_ssl (bool) // src: vvaharness/backends/llm/sdk.py:257
+                if (ca != null && !Fs.exists(ca)) {
+                    log.warning(Events.TLS_CA_FALLBACK);                                                   // missing CA file: warn and ignore it // src: vvaharness/backends/llm/sdk.py:259
+                    ca = null;                                                                              // src: vvaharness/backends/llm/sdk.py:260
+                }
+                Object verify = ca != null ? ca : cfg.verifySsl;                                            // src: vvaharness/backends/llm/sdk.py:261
+                if (verify == false) Tls.warnVerifyDisabled(cfg.baseUrl, "sdk", "<default Anthropic endpoint>", "sdk.ca_cert"); // src: vvaharness/backends/llm/sdk.py:262
+                // httpx drops cert= whenever verify= is a str CA path or False, so a client cert is loaded onto an explicit context
+                verify = mtlsVerify(verify);                                                                // src: vvaharness/backends/llm/sdk.py:271
+                if (verify != true) kw.put("http_client", Anthropic.defaultHttpxClient(verify));            // src: vvaharness/backends/llm/sdk.py:272
+                synchronized (Tls.scopedNoProxyEnv(cfg.noProxy)) {
+                    client = Anthropic.client(kw);                                                          // src: vvaharness/backends/llm/sdk.py:275
+                }
+            }
+        }
+        return client;                                                                                      // src: vvaharness/backends/llm/sdk.py:276
+    }
+
+    /** Classify which cache-marker regime the client is talking to, from its own resolved base_url. */
+    @src("vvaharness/backends/llm/sdk.py:301")
+    String cacheRoute(Object client, Map config, boolean emitNote) {
+        // never from the model id or from via: at this transport those are indistinguishable
+        Map settings = config == null ? cfg : config;                                                       // src: vvaharness/backends/llm/sdk.py:307
+        Object forced = settings.getOrDefault("cache_route", "auto");                                       // src: vvaharness/backends/llm/sdk.py:308
+        if (forced == false) forced = "none";                                                               // a directly-poked cfg gets configure()'s YAML tolerance too // src: vvaharness/backends/llm/sdk.py:310
+        forced = (forced != null ? forced : "auto").toString().strip().lower();                             // src: vvaharness/backends/llm/sdk.py:311
+        if (forced == "none") return ROUTE_UNKNOWN;                                                         // src: vvaharness/backends/llm/sdk.py:313
+        if (List.of(ROUTE_ANTHROPIC, ROUTE_VERTEX, ROUTE_BEDROCK).contains(forced)) return forced;          // an explicit route beats detection // src: vvaharness/backends/llm/sdk.py:315
+        Object baseUrl = firstNonEmpty(client.baseUrl, settings.get("base_url"), "");                       // src: vvaharness/backends/llm/sdk.py:317
+        String host = (Url.split(baseUrl.toString()).hostname != null ? Url.split(baseUrl.toString()).hostname : baseUrl.toString()).lower(); // src: vvaharness/backends/llm/sdk.py:318
+        if (host.isEmpty()) return ROUTE_ANTHROPIC;                                                         // no host at all: treated as Anthropic direct // src: vvaharness/backends/llm/sdk.py:321
+        if (BEDROCK_HOST_RX.search(host)) return ROUTE_BEDROCK;                                             // src: vvaharness/backends/llm/sdk.py:323
+        if (VERTEX_HOST_RX.search(host)) return ROUTE_VERTEX;                                               // src: vvaharness/backends/llm/sdk.py:325
+        if (ANTHROPIC_HOST_RX.search(host)) return ROUTE_ANTHROPIC;                                         // src: vvaharness/backends/llm/sdk.py:327
+        // failing closed is correct but SILENT (prompt tokens billed uncached): the AUTO-DETECTED fallthrough notes it, an explicit cache_route none or cache_markers off does not
+        if (!emitNote) return ROUTE_UNKNOWN;                                                                // src: vvaharness/backends/llm/sdk.py:338
+        WarnOnce.warnOnce(CACHE_ROUTE_NOTED, ROUTE_UNKNOWN, "prompt caching enabled by default but the endpoint is not recognised as Anthropic, Vertex or Bedrock: cache markers withheld; set cache_route anthropic if the gateway is Messages-compatible"); // src: vvaharness/backends/llm/sdk.py:340
+        return ROUTE_UNKNOWN;                                                                               // src: vvaharness/backends/llm/sdk.py:348
+    }
+
+    /** The kill switch: cache_markers off suppresses every marker, on every route. */
+    @src("vvaharness/backends/llm/sdk.py:351")
+    boolean cacheMarkersEnabled() {
+        return Cache.markersEnabled(cfg, null);                                                             // src: vvaharness/backends/llm/sdk.py:353
+    }
+
+    /** Minimum cacheable prefix size (real tokens) for the model, or the operator's forced floor. */
+    @src("vvaharness/backends/llm/sdk.py:371")
+    int cacheMinTokensFor(String model) {
+        Integer override = cfg.cacheMinBlockTokens;                                                         // src: vvaharness/backends/llm/sdk.py:373
+        if (override != null) {
+            // 0 disables the size gate (every marker placed; the provider silently ignores below-minimum ones); negatives clamp to 0
+            return Math.max(0, override);                                                                   // src: vvaharness/backends/llm/sdk.py:377
+        }
+        for (Pair<Regex, Integer> row : CACHE_MIN_TOKENS_TABLE) {                                           // first match wins, specific minors before family catch-alls // src: vvaharness/backends/llm/sdk.py:378
+            if (row.first.search(model != null ? model : "")) return row.second;                            // src: vvaharness/backends/llm/sdk.py:379
+        }
+        return CACHE_MIN_TOKENS_FALLBACK;                                                                   // src: vvaharness/backends/llm/sdk.py:381
+    }
+
+    /** Whether a breakpoint after text is estimated to clear the model's minimum cacheable size (cumulative with preceding). */
+    @src("vvaharness/backends/llm/sdk.py:388")
+    boolean cachePrefixMeetsMinimum(String text, String model, String preceding) {
+        int floor = cacheMinTokensFor(model);                                                               // src: vvaharness/backends/llm/sdk.py:391
+        double est = Tokens.estimateTokens(preceding, null) + Tokens.estimateTokens(text, null);            // src: vvaharness/backends/llm/sdk.py:392
+        return est * CACHE_EST_MARGIN >= floor;                                                             // src: vvaharness/backends/llm/sdk.py:393
+    }
+
+    /** Decide how to deliver cache_prefix + user_prompt: marker block, plain prefix block, or one concatenated string. */
+    @src("vvaharness/backends/llm/sdk.py:396")
+    Object buildCachePrefixContent(Object client, String cachePrefix, Object userPrompt, String model, String preceding) {
+        // when a marker cannot be placed the prefix is still concatenated LEADING, so an implicit cache still benefits
+        if (cachePrefix == null || cachePrefix.isEmpty()) return userPrompt;                                // src: vvaharness/backends/llm/sdk.py:405
+        String route = null;
+        if (cacheMarkersEnabled()) {                                                                        // gate 2: kill switch // src: vvaharness/backends/llm/sdk.py:409
+            String candidate = cacheRoute(client, null, true);                                              // gate 1: route accepts cache_control // src: vvaharness/backends/llm/sdk.py:410
+            if (CACHE_CONTROL_ROUTES.contains(candidate) && cachePrefixMeetsMinimum(cachePrefix, model, preceding)) route = candidate; // gate 3: minimum size // src: vvaharness/backends/llm/sdk.py:411
+        }
+        if (userPrompt instanceof List) {
+            // blocks cannot be string-concatenated: the prefix becomes its own text block, with cache_control when the gate allows
+            Map prefixBlock = Map.of("type", "text", "text", cachePrefix);                                  // src: vvaharness/backends/llm/sdk.py:418
+            if (route != null && !userPrompt.isEmpty()) prefixBlock.put("cache_control", Map.of("type", "ephemeral")); // src: vvaharness/backends/llm/sdk.py:419
+            return List.of(prefixBlock) + userPrompt;                                                       // src: vvaharness/backends/llm/sdk.py:421
+        }
+        // an empty trailing text block is rejected by the API: no breakpoint when the prefix is the whole prompt
+        if (route != null && !userPrompt.isEmpty()) {                                                       // src: vvaharness/backends/llm/sdk.py:425
+            return List.of(Map.of("type", "text", "text", cachePrefix, "cache_control", Map.of("type", "ephemeral")), Map.of("type", "text", "text", userPrompt)); // src: vvaharness/backends/llm/sdk.py:426
+        }
+        // bedrock is withheld for a narrower reason: cannot sign SigV4, so the base_url is an unverified intermediary
+        return cachePrefix + userPrompt;                                                                    // src: vvaharness/backends/llm/sdk.py:434
+    }
+
+    /** System block for one call: one block carrying a marker when worth placing, else the plain string. */
+    @src("vvaharness/backends/llm/sdk.py:438")
+    Object buildSystemContent(Object client, String systemPrompt, String model, String toolsText) {
+        // every marker obeys CACHE_CONTROL_ROUTES; the minimum is CUMULATIVE and tool schemas render ahead of the system block
+        if (cacheMarkersEnabled() && CACHE_CONTROL_ROUTES.contains(cacheRoute(client, null, true)) && cachePrefixMeetsMinimum(systemPrompt, model, toolsText)) { // src: vvaharness/backends/llm/sdk.py:448
+            return List.of(Map.of("type", "text", "text", systemPrompt, "cache_control", Map.of("type", "ephemeral"))); // src: vvaharness/backends/llm/sdk.py:452
+        }
+        return systemPrompt;                                                                                // src: vvaharness/backends/llm/sdk.py:456
+    }
+
+    /** Flag cache accounting reported under key names this module does not parse. */
+    @src("vvaharness/backends/llm/sdk.py:461")
+    void noteUnparsedCacheKeys(Map usage) {
+        Cache.noteUnparsedCacheKeys(usage, "sdk");                                                          // src: vvaharness/backends/llm/sdk.py:463
+    }
+
+    /** Bank msg's usage into the token counter (a call with none still counts) and return it. */
+    @src("vvaharness/backends/llm/sdk.py:466")
+    Map bankUsage(Message msg) {
+        Map usage = msg.usage != null ? msg.usage.modelDump() : null;                                       // src: vvaharness/backends/llm/sdk.py:468
+        noteUnparsedCacheKeys(usage);                                                                       // src: vvaharness/backends/llm/sdk.py:469
+        TokenCounter.add(usage, null, null);                                                                // src: vvaharness/backends/llm/sdk.py:470
+        return usage;
+    }
+
+    /** One-time WARN that max_budget_usd is accepted but never enforced on this raw loop. */
+    @src("vvaharness/backends/llm/sdk.py:493")
+    void warnMaxBudgetUnenforced(String fn, Double maxBudgetUsd) {
+        // only the Claude-side transports (via cli, the Agent SDK, cli_mcp) enforce a spend cap; max_turns applies here instead
+        if (maxBudgetUsd == null) return;                                                                   // src: vvaharness/backends/llm/sdk.py:499
+        WarnOnce.warnOnce(WARNED_DROPS, "max_budget_usd:" + fn, "max_budget_usd accepted but not enforced on this route; route this role via cli for an enforced budget"); // src: vvaharness/backends/llm/sdk.py:501
+    }
+
+    @src("vvaharness/backends/llm/sdk.py:509")
+    boolean supportsTemperature(String model) {
+        if (NO_TEMP_MODELS.contains(model)) return false;                                                   // learned from a 400 // src: vvaharness/backends/llm/sdk.py:510
+        return !NO_TEMP_RX.search(model);                                                                   // src: vvaharness/backends/llm/sdk.py:512
+    }
+
+    /** The extra_headers for a request that asks for betas, or None; re-joins the client's own default beta first. */
+    @src("vvaharness/backends/llm/sdk.py:515")
+    Map betaHeaders(List<String> betas) {
+        // TRAP: a per-request extra_headers REPLACES a default header of the same name; on an OAuth client a role with betas would drop the OAuth beta and 401
+        if (betas == null || betas.isEmpty()) return null;                                                  // src: vvaharness/backends/llm/sdk.py:521
+        List<String> joined = clientDefaultBetas.split(",").filter(b -> !b.strip().isEmpty());              // src: vvaharness/backends/llm/sdk.py:522
+        for (String b : betas) if (!joined.contains(b.toString())) joined.add(b.toString());                // src: vvaharness/backends/llm/sdk.py:523
+        return Map.of("anthropic-beta", String.join(",", joined));                                          // src: vvaharness/backends/llm/sdk.py:526
+    }
+
+    /** True for a retryable status, or a transient a gateway reported in the message instead. */
+    @src("vvaharness/backends/llm/sdk.py:530")
+    boolean isTransientSdk(ApiStatusError error) {
+        // a gateway can report a transient as an APIStatusError with status_code 200; dropped sockets have their own branch
+        if (LlmModels.RETRYABLE_STATUS.contains(error.statusCode)) return true;                             // src: vvaharness/backends/llm/sdk.py:538
+        // prose may not PROMOTE an explicit auth status: a 401/403 does not heal on a retry (a DLP block page says Service Unavailable)
+        if (List.of(401, 403).contains(error.statusCode)) return false;                                     // src: vvaharness/backends/llm/sdk.py:545
+        // rejection_text drops a pydantic echo of the request: a PROMPT naming rate limit must not make a permanent 422 transient
+        String body = LlmModels.rejectionText(error);                                                       // src: vvaharness/backends/llm/sdk.py:548
+        return LlmModels.RATE_LIMIT_TRANSIENT_RX.search(body) || LlmModels.SERVER_ERROR_TRANSIENT_RX.search(body); // src: vvaharness/backends/llm/sdk.py:549
+    }
+
+    /** Validate the structured tool call in msg, or raise StructuredOutputRejected (both failure shapes are the same defect). */
+    @src("vvaharness/backends/llm/sdk.py:560")
+    Object extractResponseModel(Schema responseModel, Message msg, String model) {
+        String finish = msg.stopReason;                                                                     // the marker carries the final's stop_reason for the seam's finish label // src: vvaharness/backends/llm/sdk.py:568
+        for (Block b : msg.content) {                                                                       // src: vvaharness/backends/llm/sdk.py:569
+            if (b.type != "tool_use") continue;                                                             // src: vvaharness/backends/llm/sdk.py:570
+            if (b.name == RESPONSE_MODEL_TOOL_NAME) {                                                       // first matching tool_use wins // src: vvaharness/backends/llm/sdk.py:572
+                try {
+                    return responseModel.modelValidate(b.input);                                            // src: vvaharness/backends/llm/sdk.py:574
+                } catch (Exception e) {
+                    throw new StructuredOutputRejected("reply failed validation: " + e, finish);            // src: vvaharness/backends/llm/sdk.py:576
+                }
+            }
+        }
+        throw new StructuredOutputRejected("ended without calling the structured tool (stop_reason=" + finish + ")", finish); // src: vvaharness/backends/llm/sdk.py:580
+    }
+
+    /** The provider's label on a refused reply (stop_details.category), None when absent. */
+    @src("vvaharness/backends/llm/sdk.py:584")
+    String refusalCategory(Message msg) {
+        // stop_reason is this route's whole refusal seam; is_model_refusal_rejection is not used here
+        Object category = msg.stopDetails != null ? msg.stopDetails.category : null;                        // src: vvaharness/backends/llm/sdk.py:587
+        return category instanceof String ? category : null;                                                // src: vvaharness/backends/llm/sdk.py:588
+    }
+
+    /** Raise the typed refusal for a refused reply; callers bank its usage first. */
+    @src("vvaharness/backends/llm/sdk.py:591")
+    void raiseIfRefused(Message msg, String tag) {
+        if (msg.stopReason == LlmModels.ANTHROPIC_STOP_REFUSAL) throw LlmModels.modelRefusal("sdk", tag != null ? tag : "", refusalCategory(msg)); // src: vvaharness/backends/llm/sdk.py:594
+    }
+
+    /** Adaptive-thinking kwargs for effort on model, or empty (the shared effort mapping, same as deepagents). */
+    @src("vvaharness/backends/llm/sdk.py:597")
+    Map effortThinkingKwargs(String model, String effort) {
+        // ONE translation for both prompt() and agentic(); null effort yields empty without importing the mapping
+        if (effort == null || NO_THINK_MODELS.contains(model)) return Map.of();                             // a model already learned to reject thinking // src: vvaharness/backends/llm/sdk.py:605
+        return DeepagentsModelBuilding.anthropicThinkingKwargs(effort);                                     // src: vvaharness/backends/llm/sdk.py:608
+    }
+
+    /** Whether a forced tool_choice must be withheld: a memoised model, or manual thinking. */
+    @src("vvaharness/backends/llm/sdk.py:611")
+    boolean forcingBlocked(String model, Map thinking) {
+        // adaptive thinking accepts tool_choice tool/any; only manual enabled thinking is limited to auto/none
+        return NO_TOOL_CHOICE_MODELS.contains(model) || (thinking != null ? thinking : Map.of()).get("type") == "enabled"; // src: vvaharness/backends/llm/sdk.py:617
+    }
+
+    /** Name, once per model, that manual thinking cost a forced structured-output tool_choice. */
+    @src("vvaharness/backends/llm/sdk.py:620")
+    void warnToolChoiceDroppedForThinking(String model, String effort) {
+        WarnOnce.warnOnce(WARNED_DROPS, "tool_choice_dropped_for_thinking:" + model, "manual thinking allows only tool_choice auto/none: tool_choice left at auto; the tool is still advertised and validated; prose re-asked once"); // src: vvaharness/backends/llm/sdk.py:622
+        Counters.bump("sdk_tool_choice_dropped_for_thinking", 1);                                           // src: vvaharness/backends/llm/sdk.py:631
+    }
+
+    /** Memoise model and unforce kw when the rejection names the forced tool_choice. */
+    @src("vvaharness/backends/llm/sdk.py:634")
+    boolean unforceRejectedToolChoice(Map kw, ApiStatusError e, String low, Object client, String model, String systemPrompt, Schema responseModel, String toolsText) {
+        // a model rule, not a combination error: a model that rejects forcing does so on every request; the rejection can also arrive as a 200-status stream relaying it mid-stream
+        if (!(kw.containsKey("tool_choice") && low.contains("tool_choice") && (LlmModels.PARAM_REJECTION_STATUS.contains(e.statusCode) || LlmModels.isGatewayWrappedParamRejection(e)))) return false; // src: vvaharness/backends/llm/sdk.py:646
+        NO_TOOL_CHOICE_MODELS.add(model);                                                                   // memo holds for the run // src: vvaharness/backends/llm/sdk.py:650
+        WarnOnce.warnOnce(WARNED_DROPS, "tool_choice:" + model, "model rejected a forced tool_choice: retrying with the tool advertised but not forced; a reply that skips the tool fails loudly"); // src: vvaharness/backends/llm/sdk.py:651
+        kw.remove("tool_choice");                                                                           // src: vvaharness/backends/llm/sdk.py:656
+        if (responseModel != null) {                                                                        // always, when tool_choice was set // src: vvaharness/backends/llm/sdk.py:657
+            kw.put("system", buildSystemContent(client, StructuredOutputPrompts.withSubmitInstruction(systemPrompt, responseModel, RESPONSE_MODEL_TOOL_NAME, null), model, toolsText)); // the request that lost its forcing carries the ask instead // src: vvaharness/backends/llm/sdk.py:659
+        }
+        return true;                                                                                        // src: vvaharness/backends/llm/sdk.py:661
+    }
+
+    /** Force the structured tool again and restore the un-augmented system block. */
+    @src("vvaharness/backends/llm/sdk.py:663")
+    void reforceToolChoice(Map kw, Map toolChoice, Object client, String model, String systemPrompt, Schema responseModel, String toolsText) {
+        // byte-identical to a never-unforced request, so the system cache breakpoint still reads
+        if (responseModel == null || NO_TOOL_CHOICE_MODELS.contains(model)) return;                         // src: vvaharness/backends/llm/sdk.py:670
+        kw.put("tool_choice", toolChoice);                                                                  // src: vvaharness/backends/llm/sdk.py:672
+        if (systemPrompt != null && !systemPrompt.isEmpty()) kw.put("system", buildSystemContent(client, systemPrompt, model, toolsText)); // src: vvaharness/backends/llm/sdk.py:673
+        else kw.remove("system");                                                                           // src: vvaharness/backends/llm/sdk.py:675
+    }
+
+    /** Whether the error is an unhealable credential failure (VVAH-E001); a RETRYABLE status beats auth-looking prose. */
+    @src("vvaharness/backends/llm/sdk.py:1041")
+    boolean authFailureSdk(ApiStatusError error) {
+        return error.statusCode == 401 || (AUTH_STATUS_RX.search(LlmModels.rejectionText(error)) && !LlmModels.RETRYABLE_STATUS.contains(error.statusCode)); // src: vvaharness/backends/llm/sdk.py:1043
+    }
+
+    /** Iterate the stream to its final message, closing it once the wall-clock deadline passes (checks the clock between chunks). */
+    @src("vvaharness/backends/llm/sdk.py:1048")
+    Message drainWithinDeadline(Stream stream, double deadline, String stage, String effort, Double budgetS) {
+        // a per-request SDK timeout bounds each read, so a trickle of small chunks could otherwise run past the stage budget forever
+        if (stream.isIterable()) {                                                                          // duck-typed: a double exposing only get_final_message is unaffected // src: vvaharness/backends/llm/sdk.py:1058
+            for (Event ev : stream) {                                                                       // src: vvaharness/backends/llm/sdk.py:1059
+                if (Clock.monotonic() >= deadline) {
+                    stream.close();                                                                         // src: vvaharness/backends/llm/sdk.py:1061
+                    throw LlmModels.callTimeoutError(stage != null ? stage : "", "sdk", budgetS, effort, "sdk stream exceeded its wall-clock budget"); // src: vvaharness/backends/llm/sdk.py:1062
+                }
+            }
+        }
+        return stream.getFinalMessage();                                                                    // src: vvaharness/backends/llm/sdk.py:1066
+    }
+
+    /** Serialize SDK response blocks back into the dict shape the Messages API expects on the next turn. */
+    @src("vvaharness/backends/llm/sdk.py:997")
+    List<Map> assistantBlocks(List<Block> content) {
+        List<Map> out = new List();
+        for (Block b : content) {                                                                           // src: vvaharness/backends/llm/sdk.py:1000
+            if (b.type == "text") {
+                if (!b.text.strip().isEmpty()) out.add(Map.of("type", "text", "text", b.text));             // the API rejects an empty text block // src: vvaharness/backends/llm/sdk.py:1004
+            } else if (b.type == "tool_use") {
+                out.add(Map.of("type", "tool_use", "id", b.id, "name", b.name, "input", b.input));          // src: vvaharness/backends/llm/sdk.py:1006
+            } else {
+                try {
+                    Map d = b.modelDump();                                                                  // thinking and other blocks kept as dumped // src: vvaharness/backends/llm/sdk.py:1010
+                    d.remove("cache_control");                                                              // never persist markers in history // src: vvaharness/backends/llm/sdk.py:1011
+                    out.add(d);
+                } catch (Exception e) { }                                                                   // unserialisable block silently skipped // src: vvaharness/backends/llm/sdk.py:1013
+            }
+        }
+        return out;
+    }
+
+    /** Copy of msgs with cache_control stripped and one ephemeral marker on the last content block (route and kill switch permitting). */
+    @src("vvaharness/backends/llm/sdk.py:1019")
+    List<Map> withCacheMarker(Object client, List<Map> msgs) {
+        List<Map> out = new List();
+        Map lastBlock = null;
+        for (Map m : msgs) {                                                                                // src: vvaharness/backends/llm/sdk.py:1024
+            Object c = m.get("content");
+            if (c instanceof List) {
+                List cc = new List();
+                for (Object b : c) {
+                    if (b instanceof Map) { b = b.withoutKey("cache_control"); lastBlock = b; }             // src: vvaharness/backends/llm/sdk.py:1029
+                    cc.add(b);
+                }
+                out.add(m.with("content", cc));                                                             // src: vvaharness/backends/llm/sdk.py:1033
+            } else out.add(m);                                                                              // string content carries no marker // src: vvaharness/backends/llm/sdk.py:1035
+        }
+        if (lastBlock != null && cacheMarkersEnabled() && CACHE_CONTROL_ROUTES.contains(cacheRoute(client, null, true))) lastBlock.put("cache_control", Map.of("type", "ephemeral")); // src: vvaharness/backends/llm/sdk.py:1036
+        return out;
+    }
+
+    /** Evict the oldest not-yet-evicted oversized tool result, returning whether it shrank one. */
+    @src("vvaharness/backends/llm/sdk.py:1181")
+    boolean shrinkHistory(List<Map> messages) {
+        // the Anthropic-shape counterpart of openai shrink: a tool result is a tool_result block inside a user message
+        for (Map m : messages) {                                                                            // src: vvaharness/backends/llm/sdk.py:1187
+            Object blocks = m.get("content");
+            if (!(blocks instanceof List)) continue;                                                        // src: vvaharness/backends/llm/sdk.py:1189
+            for (Object b : blocks) {
+                if (!(b instanceof Map) || b.get("type") != "tool_result") continue;                        // src: vvaharness/backends/llm/sdk.py:1192
+                Object c = b.get("content");
+                if (c instanceof String && c.length() > θ["code.backends.llm.sdk.evict_min_chars"] && !c.endsWith(EVICTED_MARK)) { // src: vvaharness/backends/llm/sdk.py:1195
+                    b.put("content", c.substring(0, θ["code.backends.llm.sdk.evict_keep_chars"]) + "\n..." + EVICTED_MARK); // src: vvaharness/backends/llm/sdk.py:1197
+                    return true;                                                                            // src: vvaharness/backends/llm/sdk.py:1198
+                }
+            }
+        }
+        return false;                                                                                       // src: vvaharness/backends/llm/sdk.py:1199
+    }
+
+    /** Single-shot completion, no tools (response_model optional): streamed with the two-layer retry ladder. Same return contract as cli.prompt(). */
+    @src("vvaharness/backends/llm/sdk.py:678")
+    String prompt(Object userPrompt, String model, String cachePrefix, String systemPrompt, Integer maxTokens, Double temperature, Integer thinkingBudget, List<String> betas, Double maxBudgetUsd, Integer timeout, String tag, Schema responseModel, String effort, Theta θ) {
+        // json_schema, output_format and cwd are accepted-but-ignored so the dispatcher can pass cli.prompt() calls through
+        warnMaxBudgetUnenforced("prompt", maxBudgetUsd);                                                    // src: vvaharness/backends/llm/sdk.py:699
+        Object client = getClient();                                                                        // src: vvaharness/backends/llm/sdk.py:700
+        int maxTok = maxTokens != null && maxTokens != 0 ? maxTokens : θ["code.backends.llm.sdk.prompt_default_max_tokens"]; // src: vvaharness/backends/llm/sdk.py:701
+        Map effortKw = effortThinkingKwargs(model, effort);                                                 // src: vvaharness/backends/llm/sdk.py:705
+        boolean forced = responseModel != null && !forcingBlocked(model, effortKw.get("thinking"));         // forced under adaptive thinking too // src: vvaharness/backends/llm/sdk.py:706
+        String systemText = systemPrompt;                                                                   // stays un-augmented so a re-forced request restores it byte-identically // src: vvaharness/backends/llm/sdk.py:708
+        if (responseModel != null && !forced) {
+            systemText = StructuredOutputPrompts.withSubmitInstruction(systemPrompt, responseModel, RESPONSE_MODEL_TOOL_NAME, θ); // unforced: name the tool as the only accepted reply, before the system text is measured for the cache breakpoint // src: vvaharness/backends/llm/sdk.py:712
+        }
+        // the system prompt renders ahead of the user turn, so it counts toward the cumulative minimum for the prefix breakpoint
+        Object userContent = buildCachePrefixContent(client, cachePrefix, userPrompt, model, systemText != null ? systemText : ""); // src: vvaharness/backends/llm/sdk.py:717
+        Map kw = Map.of("model", model, "max_tokens", maxTok, "messages", List.of(Map.of("role", "user", "content", userContent))); // src: vvaharness/backends/llm/sdk.py:721
+        if (responseModel != null) {
+            kw.put("tools", List.of(LlmModels.responseModelTool(responseModel)));                           // src: vvaharness/backends/llm/sdk.py:729
+            if (forced) kw.put("tool_choice", Map.of("type", "tool", "name", RESPONSE_MODEL_TOOL_NAME));    // src: vvaharness/backends/llm/sdk.py:731
+            else if (!NO_TOOL_CHOICE_MODELS.contains(model)) warnToolChoiceDroppedForThinking(model, effort); // src: vvaharness/backends/llm/sdk.py:733
+        }
+        Map betaHeaders = betaHeaders(betas);                                                               // merged, never assigned: a bare assignment clobbers the OAuth default and 401s // src: vvaharness/backends/llm/sdk.py:737
+        if (betaHeaders != null) kw.put("extra_headers", betaHeaders);                                      // src: vvaharness/backends/llm/sdk.py:739
+        if (thinkingBudget != null && thinkingBudget != 0 && !NO_THINK_MODELS.contains(model)) {            // src: vvaharness/backends/llm/sdk.py:740
+            // legacy: thinking_budget never reaches the wire (adaptive has no budget_tokens); it only turns thinking on and sizes headroom
+            if (maxTok <= thinkingBudget) {
+                maxTok = thinkingBudget + θ["code.backends.llm.sdk.thinking_headroom_tokens"];              // src: vvaharness/backends/llm/sdk.py:745
+                kw.put("max_tokens", maxTok);                                                               // src: vvaharness/backends/llm/sdk.py:746
+            }
+            kw.put("thinking", Map.of("type", "adaptive"));                                                 // src: vvaharness/backends/llm/sdk.py:747
+            temperature = null;                                                                             // Anthropic rejects a temperature alongside thinking // src: vvaharness/backends/llm/sdk.py:748
+        }
+        if (!effortKw.isEmpty()) {
+            kw.putAll(effortKw);                                                                            // src: vvaharness/backends/llm/sdk.py:751
+            temperature = null;                                                                             // src: vvaharness/backends/llm/sdk.py:752
+        }
+        if (temperature != null) {                                                                          // src: vvaharness/backends/llm/sdk.py:753
+            if (supportsTemperature(model)) kw.setdefault("extra_body", new Map()).put("temperature", temperature); // src: vvaharness/backends/llm/sdk.py:755
+            else if (!NO_TEMP_MODELS.contains(model)) {
+                NO_TEMP_MODELS.add(model);                                                                  // dropped for this and subsequent calls // src: vvaharness/backends/llm/sdk.py:757
+                Console.write("model does not accept temperature; dropping it");                            // src: vvaharness/backends/llm/sdk.py:758
+            }
+        }
+        if (systemText != null && !systemText.isEmpty()) kw.put("system", buildSystemContent(client, systemText, model, "")); // placement gated identically to the prefix breakpoint // src: vvaharness/backends/llm/sdk.py:763
+        // a disabled SESSION ceiling (timeout 0 or None) must not disable this REQUEST hang-stop
+        double requestTimeout = LlmModels.effortScaledSeconds(timeout != null && timeout != 0 ? timeout : LlmModels.DEFAULT_REQUEST_TIMEOUT_SECONDS, effort, ClockKind.REQUEST); // src: vvaharness/backends/llm/sdk.py:767
+        double sessionT0 = Clock.monotonic();                                                               // src: vvaharness/backends/llm/sdk.py:782
+        double sessionBudget = requestTimeout;                                                              // prompt() session budget equals the request timeout // src: vvaharness/backends/llm/sdk.py:783
+        int attempts = θ["code.backends.llm.sdk.prompt_attempts"];                                          // src: vvaharness/backends/llm/sdk.py:785
+        int retryWait = θ["code.backends.llm.sdk.prompt_retry_wait_s"];                                     // flat: gateway-reported 200-body transients carry no retry-after // src: vvaharness/backends/llm/sdk.py:785
+        int authAttempt = 0;                                                                                // src: vvaharness/backends/llm/sdk.py:786
+        Message msg = null;
+        boolean truncRetried = false;                                                                       // VVAH-E005: one cap-bounded doubled-budget retry per call // src: vvaharness/backends/llm/sdk.py:789
+        int truncRetryAt = 0;                                                                               // src: vvaharness/backends/llm/sdk.py:790
+        int attempt = 0;                                                                                    // attempts is read live so a param-drop on the final attempt can grant one bounded extra send // src: vvaharness/backends/llm/sdk.py:792
+        while (attempt < attempts) {                                                                        // src: vvaharness/backends/llm/sdk.py:793
+            attempt += 1;
+            try {
+                // stream so large max_tokens (64k) does not trip the HTTP timeout
+                double t0 = Clock.monotonic();                                                              // src: vvaharness/backends/llm/sdk.py:798
+                Map send = LlmModels.turnOptions(sessionT0, sessionBudget, requestTimeout);                 // src: vvaharness/backends/llm/sdk.py:799
+                msg = drainWithinDeadline(client.withOptions(send).messages.stream(kw), t0 + send.get("timeout"), tag, effort, requestTimeout); // src: vvaharness/backends/llm/sdk.py:800
+                LlmModels.noteBudgetUse(Clock.monotonic() - t0, requestTimeout, effort);                    // src: vvaharness/backends/llm/sdk.py:804
+                if (LlmModels.finishTruncated(msg.stopReason)) {                                            // max_tokens, or the context window on 4.5+ models // src: vvaharness/backends/llm/sdk.py:805
+                    Map clippedUsage = bankUsage(msg);                                                      // the clipped attempt was paid for: bank it // src: vvaharness/backends/llm/sdk.py:809
+                    Integer produced = clippedUsage != null ? clippedUsage.get("output_tokens") : null;     // src: vvaharness/backends/llm/sdk.py:810
+                    int requestedNow = kw.get("max_tokens");                                                // src: vvaharness/backends/llm/sdk.py:811
+                    Integer retryAt = truncRetried ? null : LlmModels.truncationRetryMax(requestedNow, DeepagentsLimits.MODEL_MAX_OUTPUT_TOKENS); // one doubled retry bounded by the model cap // src: vvaharness/backends/llm/sdk.py:812
+                    if (retryAt != null) {
+                        if (attempt == attempts && attempts < ATTEMPTS_CEILING) attempts += 1;              // a final-attempt truncation still gets its retry, capped like param-drops // src: vvaharness/backends/llm/sdk.py:817
+                        if (attempt < attempts) {                                                           // src: vvaharness/backends/llm/sdk.py:819
+                            truncRetried = true; truncRetryAt = retryAt;                                    // src: vvaharness/backends/llm/sdk.py:820
+                            Counters.bump(LlmModels.TRUNCATED_RETRY_ATTEMPTED_COUNTER, 1);                  // src: vvaharness/backends/llm/sdk.py:821
+                            Errlog.log(tag != null ? tag : "sdk", tag != null ? tag : "truncation", "VVAH-E005 warning: reply truncated; retrying once at a doubled budget", true, Map.of("error_code", TruncatedResponseError.errorCode, "produced", produced)); // src: vvaharness/backends/llm/sdk.py:824
+                            kw.put("max_tokens", retryAt);                                                  // src: vvaharness/backends/llm/sdk.py:832
+                            msg = null;                                                                     // src: vvaharness/backends/llm/sdk.py:833
+                            continue;
+                        }
+                    }
+                    throw Retry.truncationError(maxTok, truncRetryAt, tag, retryAt);                        // E005 after the one retry (produced carried) // src: vvaharness/backends/llm/sdk.py:835
+                }
+                if (truncRetried) Counters.bump(LlmModels.TRUNCATED_RETRY_RECOVERED_COUNTER, 1);            // src: vvaharness/backends/llm/sdk.py:838
+                break;                                                                                      // src: vvaharness/backends/llm/sdk.py:839
+            } catch (ApiStatusError e) {
+                String body = e.message;                                                                    // src: vvaharness/backends/llm/sdk.py:841
+                String low = LlmModels.rejectionText(e).lower();                                            // src: vvaharness/backends/llm/sdk.py:842
+                if (kw.getOrDefault("extra_body", Map.of()).containsKey("temperature") && low.contains("temperature") && LlmModels.PARAM_REJECTION_STATUS.contains(e.statusCode)) { // src: vvaharness/backends/llm/sdk.py:843
+                    NO_TEMP_MODELS.add(model);                                                              // src: vvaharness/backends/llm/sdk.py:845
+                    kw.get("extra_body").remove("temperature");                                             // retry without it // src: vvaharness/backends/llm/sdk.py:848
+                    if (attempt == attempts && attempts < ATTEMPTS_CEILING) attempts += 1;                  // grant the cleaned request one more send (capped) // src: vvaharness/backends/llm/sdk.py:849
+                    continue;                                                                               // src: vvaharness/backends/llm/sdk.py:850
+                }
+                // tool_choice BEFORE thinking, deliberately: such a 400 routinely names BOTH parameters; the thinking arm first permanently memoised the model as thinking-incapable
+                if (unforceRejectedToolChoice(kw, e, low, client, model, systemPrompt, responseModel, "")) { // src: vvaharness/backends/llm/sdk.py:854
+                    if (attempt == attempts && attempts < ATTEMPTS_CEILING) attempts += 1;                  // src: vvaharness/backends/llm/sdk.py:858
+                    continue;
+                }
+                if (kw.containsKey("thinking") && low.contains("thinking") && LlmModels.PARAM_REJECTION_STATUS.contains(e.statusCode)) { // status-gated: a 5xx whose text names thinking is an outage // src: vvaharness/backends/llm/sdk.py:861
+                    // only memoise the model as thinking-incapable when the body says the FEATURE is unsupported; a bare 400 mentioning thinking drops it for THIS request only
+                    List<String> markers = θ["code.backends.llm.sdk.thinking_unsupported_markers"];
+                    boolean unsupported = markers.any(m -> low.contains(m));                                // src: vvaharness/backends/llm/sdk.py:869
+                    if (unsupported) NO_THINK_MODELS.add(model);                                            // src: vvaharness/backends/llm/sdk.py:873
+                    Console.write("model rejected extended thinking - retrying without it");                // src: vvaharness/backends/llm/sdk.py:874
+                    kw.remove("thinking");                                                                  // src: vvaharness/backends/llm/sdk.py:877
+                    if (!effortKw.isEmpty()) {
+                        kw.remove("output_config");                                                         // the effort tier rides with thinking // src: vvaharness/backends/llm/sdk.py:881
+                        reforceToolChoice(kw, Map.of("type", "tool", "name", RESPONSE_MODEL_TOOL_NAME), client, model, systemPrompt, responseModel, ""); // a forcing manual thinking had withheld comes back // src: vvaharness/backends/llm/sdk.py:882
+                    }
+                    if (attempt == attempts && attempts < ATTEMPTS_CEILING) attempts += 1;                  // src: vvaharness/backends/llm/sdk.py:887
+                    continue;
+                }
+                // VVAH-E001: auth cannot heal on a retry: a few fast retries then halt, and BEFORE the transient arm (a body carrying both auth and transient prose would otherwise take the 60s ladder twice and lose AuthenticationError)
+                if (authFailureSdk(e)) {                                                                    // a RETRYABLE status still beats prose: a 503 saying authentication_failed is an outage // src: vvaharness/backends/llm/sdk.py:897
+                    // attempt < attempts as well as the auth budget: with the two equal every send was spent on a continue and the raise was unreachable
+                    if (authAttempt < AUTH_MAX_RETRIES_SDK && attempt < attempts) {                         // src: vvaharness/backends/llm/sdk.py:902
+                        int wait = AUTH_BACKOFF_SDK.get(Math.min(authAttempt, AUTH_BACKOFF_SDK.size() - 1)); // src: vvaharness/backends/llm/sdk.py:903
+                        Exception overrun = LlmModels.waitOverrun(wait, sessionT0, sessionBudget, tag != null ? tag : "", "sdk", effort); // a backoff that would overrun the session budget raises instead of sleeping // src: vvaharness/backends/llm/sdk.py:905
+                        if (overrun != null) throw overrun;                                                 // src: vvaharness/backends/llm/sdk.py:907
+                        Thread.sleep(wait);                                                                 // src: vvaharness/backends/llm/sdk.py:913
+                        authAttempt += 1;                                                                   // src: vvaharness/backends/llm/sdk.py:914
+                        continue;                                                                           // src: vvaharness/backends/llm/sdk.py:915
+                    }
+                    // redact BEFORE truncating to 400: truncating first can cut a JWT segment so the pattern no longer matches
+                    throw new AuthenticationError(Redact.redact(body, false, null).substring(0, 400), e.statusCode, "sdk"); // src: vvaharness/backends/llm/sdk.py:918
+                }
+                if (isTransientSdk(e) && attempt < attempts) {                                              // src: vvaharness/backends/llm/sdk.py:920
+                    double wait = LlmModels.jitteredDelay(retryWait);                                       // src: vvaharness/backends/llm/sdk.py:921
+                    Exception overrun = LlmModels.waitOverrun(wait, sessionT0, sessionBudget, tag != null ? tag : "", "sdk", effort); // src: vvaharness/backends/llm/sdk.py:922
+                    if (overrun != null) throw overrun;                                                     // src: vvaharness/backends/llm/sdk.py:924
+                    Thread.sleep(wait);                                                                     // src: vvaharness/backends/llm/sdk.py:931
+                    continue;                                                                               // src: vvaharness/backends/llm/sdk.py:932
+                }
+                throw new RuntimeError("Anthropic SDK call failed (status=" + e.statusCode + "): " + Redact.redact(body, false, null)); // response body scrubbed (may reflect auth headers) // src: vvaharness/backends/llm/sdk.py:934
+            } catch (ApiConnectionError | TransportError e) {                                               // src: vvaharness/backends/llm/sdk.py:935
+                if (ResponseQuality.isTimeoutFailure(e, θ)) throw LlmModels.callTimeoutError(tag != null ? tag : "", "sdk", requestTimeout, effort, "Anthropic SDK request exceeded the request timeout"); // src: vvaharness/backends/llm/sdk.py:936
+                Exception proxy = LlmModels.proxyError(e, "sdk");                                           // src: vvaharness/backends/llm/sdk.py:940
+                if (proxy != null) throw proxy;                                                             // proxy/TLS fails fast (VVAH-E002) // src: vvaharness/backends/llm/sdk.py:941
+                if (attempt < attempts) {                                                                   // src: vvaharness/backends/llm/sdk.py:942
+                    double wait = LlmModels.jitteredDelay(retryWait);                                       // src: vvaharness/backends/llm/sdk.py:943
+                    Exception overrun = LlmModels.waitOverrun(wait, sessionT0, sessionBudget, tag != null ? tag : "", "sdk", effort); // src: vvaharness/backends/llm/sdk.py:944
+                    if (overrun != null) throw overrun;                                                     // src: vvaharness/backends/llm/sdk.py:946
+                    Thread.sleep(wait);                                                                     // src: vvaharness/backends/llm/sdk.py:952
+                    continue;                                                                               // src: vvaharness/backends/llm/sdk.py:953
+                }
+                throw new RuntimeError("Anthropic SDK connection error after " + attempts + " attempts: network/TLS/DNS/proxy failure, not an auth/model error"); // src: vvaharness/backends/llm/sdk.py:955
+            }
+        }
+        if (msg == null) throw new RuntimeError("Anthropic SDK call exhausted all retries without a successful response (every attempt hit a parameter-drop retry)"); // src: vvaharness/backends/llm/sdk.py:960
+        Map usage = bankUsage(msg);                                                                         // src: vvaharness/backends/llm/sdk.py:967
+        raiseIfRefused(msg, tag);                                                                           // after banking: a refusal mid-stream is billed // src: vvaharness/backends/llm/sdk.py:978
+        String text = responseModel != null ? extractResponseModel(responseModel, msg, model).modelDumpJson() : msg.content.filter(b -> b.type == "text").map(b -> b.text).join(""); // src: vvaharness/backends/llm/sdk.py:981
+        Integer outTokens = ResponseQuality.outputTokensForGate(usage);                                     // absent-vs-zero matters // src: vvaharness/backends/llm/sdk.py:985
+        ResponseQuality.checkResponseQuality(text.strip(), tag != null ? tag : "", null, outTokens, null, θ); // degenerate reply -> VVAH-E003 // src: vvaharness/backends/llm/sdk.py:986
+        return text.strip();                                                                                // src: vvaharness/backends/llm/sdk.py:988
+    }
+
+    /** One truncation check for an agentic reply: a doubled-budget retry bounded by the model cap, else E005. Returns (msg, override text). */
+    @src("vvaharness/backends/llm/sdk.py:1068")
+    Pair checkAgenticStop(Message msg, Object client, List<Map> messages, Map callKw, String model, String tag, int requested, Schema responseModel, boolean dispatchable, String effort, Double requestTimeout, Double sessionT0, Double sessionBudget) {
+        if (!LlmModels.finishTruncated(msg.stopReason)) return Pair.of(msg, null);                          // src: vvaharness/backends/llm/sdk.py:1077
+        Integer retryAt = LlmModels.truncationRetryMax(requested, DeepagentsLimits.MODEL_MAX_OUTPUT_TOKENS); // src: vvaharness/backends/llm/sdk.py:1079
+        if (retryAt != null) {                                                                              // src: vvaharness/backends/llm/sdk.py:1080
+            Counters.bump(LlmModels.TRUNCATED_RETRY_ATTEMPTED_COUNTER, 1);                                  // src: vvaharness/backends/llm/sdk.py:1081
+            Errlog.log(tag != null ? tag : "sdk", tag != null ? tag : "truncation", "VVAH-E005 warning: agentic reply truncated; retrying once at a doubled budget", true, Map.of("error_code", TruncatedResponseError.errorCode)); // src: vvaharness/backends/llm/sdk.py:1085
+            Map retryKw = callKw.with("max_tokens", retryAt);                                               // src: vvaharness/backends/llm/sdk.py:1090
+            Message retried;
+            try {
+                double t0 = Clock.monotonic();                                                              // src: vvaharness/backends/llm/sdk.py:1092
+                Map send = LlmModels.turnOptions(sessionT0 != null ? sessionT0 : t0, sessionBudget, requestTimeout); // src: vvaharness/backends/llm/sdk.py:1093
+                retried = drainWithinDeadline(client.withOptions(send).messages.stream(withCacheMarker(client, messages), retryKw), t0 + send.get("timeout"), tag, effort, requestTimeout); // src: vvaharness/backends/llm/sdk.py:1095
+                LlmModels.noteBudgetUse(Clock.monotonic() - t0, requestTimeout, effort);                    // src: vvaharness/backends/llm/sdk.py:1100
+            } catch (ApiStatusError e) {
+                if (authFailureSdk(e)) throw new AuthenticationError(Redact.redact(e.message, false, null).substring(0, 400), e.statusCode, "sdk"); // auth-first: VVAH-E001, not a raw SDK exception // src: vvaharness/backends/llm/sdk.py:1104
+                String low = LlmModels.rejectionText(e).lower();                                            // src: vvaharness/backends/llm/sdk.py:1109
+                if (LlmModels.PARAM_REJECTION_STATUS.contains(e.statusCode) && CTX_OVERFLOW_RX.search(low)) { // the doubled budget pushed input+output over the context window // src: vvaharness/backends/llm/sdk.py:1110
+                    Counters.bump(LlmModels.TRUNCATED_REPLIES_COUNTER, 1);                                  // src: vvaharness/backends/llm/sdk.py:1115
+                    throw new TruncatedResponseError("agentic reply hit the output-token budget, and the doubled-budget retry would overflow the context window; no useful retry", tag != null ? tag : "", requested, 0, null, null, null); // not useful to retry a retry // src: vvaharness/backends/llm/sdk.py:1116
+                }
+                throw new RuntimeError(Redact.redact("Anthropic SDK agentic truncation-retry failed (status=" + e.statusCode + ")", false, null)); // src: vvaharness/backends/llm/sdk.py:1121
+            } catch (ApiConnectionError | TransportError e) {                                               // src: vvaharness/backends/llm/sdk.py:1125
+                if (ResponseQuality.isTimeoutFailure(e, null)) throw LlmModels.callTimeoutError(tag != null ? tag : "", "sdk", requestTimeout, effort, "Anthropic SDK agentic truncation-retry exceeded the request timeout"); // src: vvaharness/backends/llm/sdk.py:1126
+                Exception proxy = LlmModels.proxyError(e, "sdk");                                           // src: vvaharness/backends/llm/sdk.py:1131
+                if (proxy != null) throw proxy;                                                             // src: vvaharness/backends/llm/sdk.py:1133
+                throw new RuntimeError(Redact.redact("Anthropic SDK agentic truncation-retry connection error", false, null)); // src: vvaharness/backends/llm/sdk.py:1135
+            }
+            if (retried.usage != null) {                                                                    // src: vvaharness/backends/llm/sdk.py:1139
+                Map retriedUsage = retried.usage.modelDump();
+                noteUnparsedCacheKeys(retriedUsage);                                                        // src: vvaharness/backends/llm/sdk.py:1141
+                TokenCounter.add(retriedUsage, null, null);                                                 // src: vvaharness/backends/llm/sdk.py:1142
+            }
+            if (LlmModels.finishTruncated(retried.stopReason)) {                                            // src: vvaharness/backends/llm/sdk.py:1144
+                Counters.bump(LlmModels.TRUNCATED_REPLIES_COUNTER, 1);                                      // src: vvaharness/backends/llm/sdk.py:1145
+                throw new TruncatedResponseError("agentic reply still hit the output-token budget after the doubled retry", tag != null ? tag : "", requested, retryAt, null, null, null); // src: vvaharness/backends/llm/sdk.py:1146
+            }
+            // a dispatchable tool call (submit included) goes to the turn loop; no check belongs here
+            boolean undispatchedCall = retried.stopReason == "tool_use" && !dispatchable;                   // src: vvaharness/backends/llm/sdk.py:1151
+            if (undispatchedCall && responseModel == null) {
+                // no tool_choice forced anything here, so a tool call at the doubled budget IS an anomaly at the forced-final site with no turn loop left to dispatch it
+                throw new TruncatedResponseError("agentic reply's doubled-budget retry unexpectedly requested a tool call; refusing to guess at dispatching it", tag != null ? tag : "", requested, retryAt, null, null, null); // src: vvaharness/backends/llm/sdk.py:1155
+            }
+            Counters.bump(LlmModels.TRUNCATED_RETRY_RECOVERED_COUNTER, 1);                                  // src: vvaharness/backends/llm/sdk.py:1160
+            if (undispatchedCall && responseModel != null) {
+                // the forced call the clipped attempt was making completed on retry: extract it as the caller would on a first-try success
+                return Pair.of(retried, extractResponseModel(responseModel, retried, model).modelDumpJson()); // src: vvaharness/backends/llm/sdk.py:1164
+            }
+            return Pair.of(retried, null);                                                                  // src: vvaharness/backends/llm/sdk.py:1167
+        }
+        Counters.bump(LlmModels.TRUNCATED_REPLIES_COUNTER, 1);                                              // src: vvaharness/backends/llm/sdk.py:1168
+        throw new TruncatedResponseError("agentic reply hit the output-token budget; already at the model output cap; no useful retry", tag != null ? tag : "", requested, 0, null, null, null); // src: vvaharness/backends/llm/sdk.py:1169
+    }
+
+    /** Read-only tool loop (Read/Glob/Grep); mutation or Bash delegates to the Agent SDK sandbox; hard turn cap, one prose re-ask, then a forced final answer. */
+    @src("vvaharness/backends/llm/sdk.py:1202")
+    String agentic(Prompt userPrompt, String model, Prompt systemPrompt, List<String> allowedTools, Path cwd, Double maxBudgetUsd, String permissionMode, Integer maxTurns, Integer timeout, String tag, List<Map> extraTools, Function extraDispatch, Schema responseModel, Integer maxOutputTokens, Supplier<String> submitGuard, Supplier<Set<String>> exhaustedTools, String effort, Theta θ) {
+        int turnsCap = maxTurns != null && maxTurns != 0 ? maxTurns : AGENTIC_MAX_TURNS;                    // src: vvaharness/backends/llm/sdk.py:1243
+        int outCap = maxOutputTokens != null && maxOutputTokens != 0 ? maxOutputTokens : AGENTIC_MAX_TOK;   // per-turn output ceiling // src: vvaharness/backends/llm/sdk.py:1244
+        // None means unspecified (read-only default); an EMPTY list means no localtools at all (folding the two with or made that inexpressible)
+        List<String> allowed = allowedTools == null ? List.copyOf(LlmModels.DEFAULT_READ_TOOLS) : List.copyOf(allowedTools); // src: vvaharness/backends/llm/sdk.py:1249
+        if (allowed.contains("Bash")) throw new ValueError("sdk.agentic: Bash is forbidden on via: sdk; remove it from allowed_tools or switch that role to via: cli"); // src: vvaharness/backends/llm/sdk.py:1250
+        Pair<List<String>, List<String>> split = LlmTools.supported(allowed);                               // (ok, missing) // src: vvaharness/backends/llm/sdk.py:1254
+        List<String> ok = split.first; List<String> missing = split.second;
+        if (!missing.isEmpty()) {
+            // the raw loop is read-only: a role needing file-MUTATION tools or Bash goes to the Claude Agent SDK's cwd-confined permission sandbox
+            if (extraTools != null && !extraTools.isEmpty()) throw new ValueError("sdk.agentic: extra_tools cannot be combined with mutating/Bash tools that route to the Claude Agent SDK"); // src: vvaharness/backends/llm/sdk.py:1259
+            Console.write("agentic requests mutating/Bash tools - delegating to the Claude Agent SDK backend"); // src: vvaharness/backends/llm/sdk.py:1268
+            return AgentSdk.agentic(userPrompt, model, systemPrompt, allowed, cwd, maxTurns, timeout != null ? timeout.doubleValue() : null, effort); // max_budget_usd, permission_mode and tag forwarded; both knobs enforced there // src: vvaharness/backends/llm/sdk.py:1272
+        }
+        // below this point the raw Anthropic loop drives the call: only this path drops max_budget_usd
+        warnMaxBudgetUnenforced("agentic", maxBudgetUsd);                                                   // src: vvaharness/backends/llm/sdk.py:1283
+        Object client = getClient();                                                                        // src: vvaharness/backends/llm/sdk.py:1284
+        // two clocks compose: request_timeout bounds a call in flight; the session clock stops the loop STARTING a turn past its budget
+        double requestTimeout = LlmModels.effortScaledSeconds(LlmModels.DEFAULT_REQUEST_TIMEOUT_SECONDS, effort, ClockKind.REQUEST); // src: vvaharness/backends/llm/sdk.py:1285
+        Double sessionBudget = (timeout != null && timeout != 0) ? LlmModels.effortScaledSeconds(timeout, effort, ClockKind.SESSION) : null; // src: vvaharness/backends/llm/sdk.py:1287
+        double sessionT0 = Clock.monotonic();                                                               // src: vvaharness/backends/llm/sdk.py:1289
+        List<Map> tools = LlmTools.anthropicSchemasFor(ok) + (extraTools != null ? extraTools : List.of()); // src: vvaharness/backends/llm/sdk.py:1290
+        List<String> advertised = ok + extraTools.map(t -> t.get("name"));                                  // src: vvaharness/backends/llm/sdk.py:1291
+        if (responseModel != null) {
+            tools = tools + List.of(LlmModels.responseModelTool(responseModel));                            // src: vvaharness/backends/llm/sdk.py:1293
+            advertised = advertised + List.of(RESPONSE_MODEL_TOOL_NAME);                                    // src: vvaharness/backends/llm/sdk.py:1294
+        }
+        Map baseKw = Map.of("model", model, "max_tokens", outCap, "tools", tools);                          // src: vvaharness/backends/llm/sdk.py:1296
+        Map thinkingKwargs = effortThinkingKwargs(model, effort);                                           // src: vvaharness/backends/llm/sdk.py:1298
+        baseKw.putAll(thinkingKwargs);                                                                      // src: vvaharness/backends/llm/sdk.py:1299
+        Prompt systemText = systemPrompt;                                                                   // un-augmented so a re-forced request can restore it byte-identically // src: vvaharness/backends/llm/sdk.py:1301
+        if (responseModel != null) {
+            if (!forcingBlocked(model, thinkingKwargs.get("thinking"))) {
+                baseKw.put("tool_choice", Map.of("type", "any"));                                           // sent under adaptive thinking too; only advisory on some 5.x models // src: vvaharness/backends/llm/sdk.py:1305
+            } else {
+                // unforced (memoised model, or manual thinking): ask for the tool by name
+                if (!NO_TOOL_CHOICE_MODELS.contains(model)) warnToolChoiceDroppedForThinking(model, effort); // src: vvaharness/backends/llm/sdk.py:1309
+                systemText = StructuredOutputPrompts.withSubmitInstruction(systemPrompt, responseModel, RESPONSE_MODEL_TOOL_NAME, θ); // src: vvaharness/backends/llm/sdk.py:1310
+            }
+        }
+        String toolsText = Json.dumps(tools);                                                               // src: vvaharness/backends/llm/sdk.py:1311
+        if (systemText != null) baseKw.put("system", buildSystemContent(client, systemText, model, toolsText)); // tool schemas render ahead of the system block and count toward the cumulative minimum // src: vvaharness/backends/llm/sdk.py:1315
+        // as a block, not a bare string, so withCacheMarker can land the history breakpoint on turn 1
+        List<Map> messages = new List(List.of(Map.of("role", "user", "content", List.of(Map.of("type", "text", "text", userPrompt))))); // src: vvaharness/backends/llm/sdk.py:1319
+        int toolCallsTotal = 0;                                                                             // src: vvaharness/backends/llm/sdk.py:1326
+        // bounds the submit-validation re-ask ladder independently of the turn budget (shared with openai.py's identical ladder)
+        int submitRejects = 0;                                                                              // src: vvaharness/backends/llm/sdk.py:1331
+        boolean schemaNudged = false;                                                                       // one in-session re-ask per call when a structured session ends on prose // src: vvaharness/backends/llm/sdk.py:1334
+        Set<String> withdrawn = Set.of();                                                                   // names already dropped from the tools list // src: vvaharness/backends/llm/sdk.py:1336
+        for (int turn = 1; turn <= turnsCap; turn++) {                                                      // src: vvaharness/backends/llm/sdk.py:1337
+            if (sessionBudget != null && sessionBudget != 0 && Clock.monotonic() - sessionT0 >= sessionBudget) {
+                throw LlmModels.callTimeoutError(tag != null ? tag : "", "sdk", sessionBudget, effort, "session clock exceeded before the turn"); // the orphaned turn is discarded anyway: stopping here stops its billing // src: vvaharness/backends/llm/sdk.py:1340
+            }
+            if (exhaustedTools != null) {                                                                   // out-of-loop tool WITHDRAWAL, mirrors ToolCallBudget.wrap_model_call on deepagents // src: vvaharness/backends/llm/sdk.py:1343
+                Set<String> newlyExhausted = exhaustedTools.get() - withdrawn;                              // src: vvaharness/backends/llm/sdk.py:1344
+                if (!newlyExhausted.isEmpty()) {
+                    withdrawn = withdrawn + newlyExhausted;                                                 // src: vvaharness/backends/llm/sdk.py:1346
+                    baseKw.put("tools", baseKw.get("tools").filter(t -> !withdrawn.contains(t.get("name")))); // src: vvaharness/backends/llm/sdk.py:1347
+                }
+            }
+            Message msg = sendAgenticTurn(client, messages, baseKw, model, systemPrompt, responseModel, toolsText, turn, tag, effort, requestTimeout, sessionT0, sessionBudget); // inner retry ladder // src: vvaharness/backends/llm/sdk.py:1352
+            if (msg.usage != null) {
+                Map turnUsage = msg.usage.modelDump();                                                      // src: vvaharness/backends/llm/sdk.py:1447
+                noteUnparsedCacheKeys(turnUsage);                                                           // src: vvaharness/backends/llm/sdk.py:1449
+                TokenCounter.add(turnUsage, null, null);                                                    // src: vvaharness/backends/llm/sdk.py:1450
+            }
+            if (LlmModels.finishTruncated(msg.stopReason)) {                                                // src: vvaharness/backends/llm/sdk.py:1452
+                Pair r = checkAgenticStop(msg, client, messages, baseKw, model, tag, outCap, responseModel, true, effort, requestTimeout, sessionT0, sessionBudget); // dispatchable: a tool call goes to the turn loop // src: vvaharness/backends/llm/sdk.py:1453
+                msg = r.first;
+                if (r.second != null) return r.second;                                                      // src: vvaharness/backends/llm/sdk.py:1459
+                // msg may now have stop_reason tool_use (the retry finished a call the clipped attempt was mid-way through): fall through to dispatch
+            }
+            raiseIfRefused(msg, tag);                                                                       // after the truncation check, so a refusal on its doubled retry is caught too // src: vvaharness/backends/llm/sdk.py:1466
+            if (msg.stopReason != "tool_use") {                                                             // src: vvaharness/backends/llm/sdk.py:1467
+                String text = msg.content.filter(b -> b.type == "text").map(b -> b.text).join("").strip();  // src: vvaharness/backends/llm/sdk.py:1468
+                // prose where a submit was expected: ask once by name, never on the last turn (the forced-final cannot force under thinking and raises on prose)
+                if (responseModel != null && !schemaNudged && turn < turnsCap) {                            // src: vvaharness/backends/llm/sdk.py:1472
+                    schemaNudged = true;                                                                    // src: vvaharness/backends/llm/sdk.py:1473
+                    Counters.bump("llm_structured_prose_reask", 1);                                         // src: vvaharness/backends/llm/sdk.py:1474
+                    log.warning(Events.STRUCTURED_PROSE_REASK);                                            // src: vvaharness/backends/llm/sdk.py:1475
+                    List<Map> blocks = assistantBlocks(msg.content);                                        // src: vvaharness/backends/llm/sdk.py:1478
+                    // an assistant turn needs text or tool_use (thinking-only is empty once thinking is stripped); consecutive user turns merge
+                    if (blocks.any(b -> List.of("text", "tool_use").contains(b.get("type")))) messages.add(Map.of("role", "assistant", "content", blocks)); // src: vvaharness/backends/llm/sdk.py:1481
+                    messages.add(Map.of("role", "user", "content", List.of(Map.of("type", "text", "text", StructuredOutputPrompts.proseReask(θ))))); // src: vvaharness/backends/llm/sdk.py:1483
+                    continue;                                                                               // src: vvaharness/backends/llm/sdk.py:1485
+                }
+                return text;                                                                                // src: vvaharness/backends/llm/sdk.py:1488
+            }
+            messages.add(Map.of("role", "assistant", "content", assistantBlocks(msg.content)));             // src: vvaharness/backends/llm/sdk.py:1490
+            List<Map> results = new List();
+            for (Block b : msg.content) {                                                                   // src: vvaharness/backends/llm/sdk.py:1493
+                if (b.type != "tool_use") continue;
+                if (responseModel != null && b.name == RESPONSE_MODEL_TOOL_NAME) {                          // src: vvaharness/backends/llm/sdk.py:1496
+                    Object validated;
+                    try {
+                        validated = responseModel.modelValidate(b.input);                                   // src: vvaharness/backends/llm/sdk.py:1498
+                    } catch (Exception exc) {
+                        // bounded by STRUCTURED_REASK_MAX independently of the overall turn budget, so one malformed submit cannot spend the whole ladder
+                        submitRejects += 1;                                                                 // src: vvaharness/backends/llm/sdk.py:1502
+                        Counters.bump("llm_structured_submit_rejected", 1);                                 // src: vvaharness/backends/llm/sdk.py:1503
+                        if (submitRejects >= LlmModels.STRUCTURED_REASK_MAX) {                              // src: vvaharness/backends/llm/sdk.py:1504
+                            log.warning(Events.STRUCTURED_SUBMIT_REJECTED);                                // src: vvaharness/backends/llm/sdk.py:1505
+                            Pair detail = ResponseQuality.structuredFailureDetail(exc, θ);                  // src: vvaharness/backends/llm/sdk.py:1509
+                            Errlog.log(tag != null ? tag : "sdk", tag != null ? tag : "structured", "structured submit rejected repeatedly; raw submit returned", true, Map.of("detail", detail.first, "reason", "llm_structured_reask_gave_up")); // recovered=True: the stage's own parser decides // src: vvaharness/backends/llm/sdk.py:1511
+                            return Json.dumps(b.input != null ? b.input : Map.of());                        // raw submit returned unvalidated // src: vvaharness/backends/llm/sdk.py:1517
+                        }
+                        Console.write("structured tool rejected - re-asking");                              // src: vvaharness/backends/llm/sdk.py:1518
+                        results.add(Map.of("type", "tool_result", "tool_use_id", b.id, "content", "Rejected: " + exc.toString().substring(0, θ["code.backends.llm.sdk.submit_reject_detail_chars"]) + ". Fix the named fields and call the tool again.")); // the validation error goes back to the model // src: vvaharness/backends/llm/sdk.py:1521
+                        continue;                                                                           // src: vvaharness/backends/llm/sdk.py:1524
+                    }
+                    if (submitGuard != null) {                                                              // out-of-loop EvidenceGate: bounded by the gate's own max_rejections, NOT STRUCTURED_REASK_MAX // src: vvaharness/backends/llm/sdk.py:1525
+                        String holdText = submitGuard.get();                                                // src: vvaharness/backends/llm/sdk.py:1526
+                        if (holdText != null) {
+                            Console.write("structured tool accepted but evidence-gated - re-asking");       // src: vvaharness/backends/llm/sdk.py:1528
+                            results.add(Map.of("type", "tool_result", "tool_use_id", b.id, "content", holdText)); // src: vvaharness/backends/llm/sdk.py:1530
+                            continue;                                                                       // src: vvaharness/backends/llm/sdk.py:1534
+                        }
+                    }
+                    return validated.modelDumpJson();                                                       // accepted as the final answer // src: vvaharness/backends/llm/sdk.py:1538
+                }
+                toolCallsTotal += 1;                                                                        // src: vvaharness/backends/llm/sdk.py:1540
+                Map args = b.input != null ? b.input : Map.of();                                            // src: vvaharness/backends/llm/sdk.py:1541
+                // a caller-supplied tool goes to extra_dispatch (the caller logs and caps it); a localtools name returns None from it and is executed and logged here
+                String out = extraDispatch != null ? extraDispatch.apply(b.name, args) : null;              // src: vvaharness/backends/llm/sdk.py:1546
+                if (out == null && !ok.contains(b.name)) out = LlmTools.UNGRANTED_TOOL_ERROR;               // an ungranted localtool never runs, whatever name the model emits // src: vvaharness/backends/llm/sdk.py:1547
+                if (out == null) {
+                    out = LlmTools.capToolResult(LlmTools.execute(b.name, args, cwd));                      // capped like the openai loop: one whole-file Read otherwise consumed the window // src: vvaharness/backends/llm/sdk.py:1554
+                    if (!ScanProgress.isStageOnly()) Console.write("tool " + b.name + "(" + LlmTools.summarizeArgs(b.input) + ") -> " + out.length() + " chars"); // src: vvaharness/backends/llm/sdk.py:1557
+                }
+                results.add(Map.of("type", "tool_result", "tool_use_id", b.id, "content", out));            // src: vvaharness/backends/llm/sdk.py:1560
+            }
+            messages.add(Map.of("role", "user", "content", results));                                       // cache_control is applied at request time; history stays marker-free under the 4-block cap // src: vvaharness/backends/llm/sdk.py:1564
+        }
+        return forceFinalAnswer(client, messages, baseKw, tools, model, systemPrompt, responseModel, turnsCap, outCap, tag, effort, requestTimeout, sessionT0, sessionBudget, θ); // budget exhausted // src: vvaharness/backends/llm/sdk.py:1566
+    }
+
+    /** One agentic turn's request with its inner retry ladder (context eviction, tool_choice and thinking param-drops, bounded transients). */
+    @src("vvaharness/backends/llm/sdk.py:1352")
+    Message sendAgenticTurn(Object client, List<Map> messages, Map baseKw, String model, String systemPrompt, Schema responseModel, String toolsText, int turn, String tag, String effort, double requestTimeout, double sessionT0, Double sessionBudget) {
+        Message msg = null;
+        int transients = 0;                                                                                 // src: vvaharness/backends/llm/sdk.py:1352
+        int shrinks = 0;                                                                                    // src: vvaharness/backends/llm/sdk.py:1353
+        while (msg == null) {                                                                               // src: vvaharness/backends/llm/sdk.py:1354
+            try {
+                double t0 = Clock.monotonic();                                                              // src: vvaharness/backends/llm/sdk.py:1356
+                Map send = LlmModels.turnOptions(sessionT0, sessionBudget, requestTimeout);                 // src: vvaharness/backends/llm/sdk.py:1357
+                msg = drainWithinDeadline(client.withOptions(send).messages.stream(withCacheMarker(client, messages), baseKw), t0 + send.get("timeout"), tag, effort, requestTimeout); // src: vvaharness/backends/llm/sdk.py:1359
+                LlmModels.noteBudgetUse(Clock.monotonic() - t0, requestTimeout, effort);                    // src: vvaharness/backends/llm/sdk.py:1366
+            } catch (ApiStatusError e) {
+                // auth FIRST, same rule as prompt(): a mid-scan expired credential is unhealable and must not spend the transient ladder
+                if (authFailureSdk(e)) throw new AuthenticationError(Redact.redact(e.message, false, null).substring(0, 400), e.statusCode, "sdk"); // src: vvaharness/backends/llm/sdk.py:1370
+                String low = LlmModels.rejectionText(e).lower();                                            // src: vvaharness/backends/llm/sdk.py:1374
+                // context-window overflow: evict the oldest oversized tool result and retry, as the openai loop always did; bounded at 16 evictions
+                if (LlmModels.PARAM_REJECTION_STATUS.contains(e.statusCode) && CTX_OVERFLOW_RX.search(low) && shrinks < θ["code.backends.llm.sdk.max_history_evictions"] && shrinkHistory(messages)) { // src: vvaharness/backends/llm/sdk.py:1377
+                    shrinks += 1;                                                                           // src: vvaharness/backends/llm/sdk.py:1379
+                    continue;                                                                               // src: vvaharness/backends/llm/sdk.py:1382
+                }
+                // tool_choice BEFORE thinking, as in prompt(): bounded, since the memo unforces
+                if (unforceRejectedToolChoice(baseKw, e, low, client, model, systemPrompt, responseModel, toolsText)) continue; // src: vvaharness/backends/llm/sdk.py:1384
+                // only memoise the model as thinking-incapable when the body names the FEATURE
+                if (LlmModels.PARAM_REJECTION_STATUS.contains(e.statusCode) && baseKw.containsKey("thinking") && low.contains("thinking")) { // src: vvaharness/backends/llm/sdk.py:1391
+                    List<String> markers = θ["code.backends.llm.sdk.thinking_unsupported_markers"];
+                    boolean unsupported = markers.any(m -> low.contains(m));                                // src: vvaharness/backends/llm/sdk.py:1394
+                    if (unsupported) NO_THINK_MODELS.add(model);                                            // src: vvaharness/backends/llm/sdk.py:1398
+                    baseKw.remove("thinking");                                                              // src: vvaharness/backends/llm/sdk.py:1399
+                    baseKw.remove("output_config");                                                         // src: vvaharness/backends/llm/sdk.py:1400
+                    reforceToolChoice(baseKw, Map.of("type", "any"), client, model, systemPrompt, responseModel, toolsText); // src: vvaharness/backends/llm/sdk.py:1401
+                    continue;                                                                               // src: vvaharness/backends/llm/sdk.py:1406
+                }
+                if (isTransientSdk(e) && transients < θ["code.backends.llm.sdk.agentic_transient_retries"]) { // src: vvaharness/backends/llm/sdk.py:1408
+                    transients += 1;                                                                        // src: vvaharness/backends/llm/sdk.py:1409
+                    double wait = LlmModels.jitteredDelay(Math.min(θ["code.backends.llm.sdk.agentic_backoff_cap_s"], θ["code.backends.llm.sdk.agentic_backoff_step_s"] * transients)); // src: vvaharness/backends/llm/sdk.py:1410
+                    Exception overrun = LlmModels.waitOverrun(wait, sessionT0, sessionBudget, tag != null ? tag : "", "sdk", effort); // src: vvaharness/backends/llm/sdk.py:1411
+                    if (overrun != null) throw overrun;                                                     // src: vvaharness/backends/llm/sdk.py:1413
+                    Thread.sleep(wait);                                                                     // src: vvaharness/backends/llm/sdk.py:1419
+                    continue;                                                                               // src: vvaharness/backends/llm/sdk.py:1420
+                }
+                throw new RuntimeError(Redact.redact("Anthropic SDK agentic call failed (status=" + e.statusCode + ", turn=" + turn + ")", false, null)); // src: vvaharness/backends/llm/sdk.py:1421
+            } catch (ApiConnectionError | TransportError e) {                                               // src: vvaharness/backends/llm/sdk.py:1423
+                if (ResponseQuality.isTimeoutFailure(e, null)) throw LlmModels.callTimeoutError(tag != null ? tag : "", "sdk", requestTimeout, effort, "Anthropic SDK agentic call exceeded the request timeout"); // src: vvaharness/backends/llm/sdk.py:1424
+                Exception proxy = LlmModels.proxyError(e, "sdk");                                           // src: vvaharness/backends/llm/sdk.py:1429
+                if (proxy != null) throw proxy;                                                             // src: vvaharness/backends/llm/sdk.py:1430
+                if (transients < θ["code.backends.llm.sdk.agentic_transient_retries"]) {                    // src: vvaharness/backends/llm/sdk.py:1431
+                    transients += 1;                                                                        // src: vvaharness/backends/llm/sdk.py:1432
+                    double wait = LlmModels.jitteredDelay(Math.min(θ["code.backends.llm.sdk.agentic_backoff_cap_s"], θ["code.backends.llm.sdk.agentic_backoff_step_s"] * transients)); // src: vvaharness/backends/llm/sdk.py:1433
+                    Exception overrun = LlmModels.waitOverrun(wait, sessionT0, sessionBudget, tag != null ? tag : "", "sdk", effort); // src: vvaharness/backends/llm/sdk.py:1434
+                    if (overrun != null) throw overrun;                                                     // src: vvaharness/backends/llm/sdk.py:1436
+                    Thread.sleep(wait);                                                                     // src: vvaharness/backends/llm/sdk.py:1441
+                    continue;                                                                               // src: vvaharness/backends/llm/sdk.py:1442
+                }
+                throw new RuntimeError(Redact.redact("Anthropic SDK agentic connection error (turn=" + turn + ")", false, null)); // src: vvaharness/backends/llm/sdk.py:1443
+            }
+        }
+        return msg;
+    }
+
+    /** Turn budget exhausted: append the forcing instruction and make one last request (forced tool, tools forbidden, or unforced). */
+    @src("vvaharness/backends/llm/sdk.py:1566")
+    String forceFinalAnswer(Object client, List<Map> messages, Map baseKw, List<Map> tools, String model, String systemPrompt, Schema responseModel, int turnsCap, int outCap, String tag, String effort, double requestTimeout, double sessionT0, Double sessionBudget, Theta θ) {
+        // unlike oai.agentic() the full tools list stays: the memo arm only catches a rejection naming tool_choice, not one of a rewritten list
+        log.warning(Events.LLM_TURN_CAP_EXHAUSTED);                                                        // src: vvaharness/backends/llm/sdk.py:1568
+        Counters.bump("llm_turn_cap_exhausted", 1);                                                         // src: vvaharness/backends/llm/sdk.py:1569
+        // block-shaped, not a bare string, so the tail marker can land on it
+        messages.add(Map.of("role", "user", "content", List.of(Map.of("type", "text", "text", TurnCapPrompt.finalAnswer(responseModel != null, θ))))); // src: vvaharness/backends/llm/sdk.py:1572
+        Map finalKw = baseKw.withoutKey("tools");                                                           // src: vvaharness/backends/llm/sdk.py:1587
+        // forced (or tools forbidden) unless the model rejects forcing or thinking is manual; none is never withheld (every model accepts it)
+        if (responseModel == null) finalKw.put("tool_choice", Map.of("type", "none"));                      // src: vvaharness/backends/llm/sdk.py:1594
+        else if (forcingBlocked(model, finalKw.get("thinking"))) finalKw.remove("tool_choice");             // src: vvaharness/backends/llm/sdk.py:1595
+        else finalKw.put("tool_choice", Map.of("type", "tool", "name", RESPONSE_MODEL_TOOL_NAME));          // src: vvaharness/backends/llm/sdk.py:1598
+        finalKw.put("tools", tools);                                                                        // API requires tools when tool_choice is set // src: vvaharness/backends/llm/sdk.py:1599
+        int finalTransients = 0;                                                                            // src: vvaharness/backends/llm/sdk.py:1603
+        Message msg;
+        while (true) {                                                                                      // src: vvaharness/backends/llm/sdk.py:1604
+            try {
+                double t0 = Clock.monotonic();                                                              // src: vvaharness/backends/llm/sdk.py:1606
+                Map send = LlmModels.turnOptions(sessionT0, sessionBudget, requestTimeout);                 // src: vvaharness/backends/llm/sdk.py:1607
+                msg = drainWithinDeadline(client.withOptions(send).messages.stream(withCacheMarker(client, messages), finalKw), t0 + send.get("timeout"), tag, effort, requestTimeout); // src: vvaharness/backends/llm/sdk.py:1609
+                LlmModels.noteBudgetUse(Clock.monotonic() - t0, requestTimeout, effort);                    // src: vvaharness/backends/llm/sdk.py:1614
+                break;                                                                                      // src: vvaharness/backends/llm/sdk.py:1615
+            } catch (ApiStatusError e) {
+                if (authFailureSdk(e)) throw new AuthenticationError(Redact.redact(e.message, false, null).substring(0, 400), e.statusCode, "sdk"); // auth-first, same rule as the turn loop // src: vvaharness/backends/llm/sdk.py:1617
+                // bounded: the memo pops tool_choice, so the resend cannot fail the same way
+                if (unforceRejectedToolChoice(finalKw, e, LlmModels.rejectionText(e).lower(), client, model, systemPrompt, responseModel, Json.dumps(finalKw.get("tools")))) continue; // src: vvaharness/backends/llm/sdk.py:1622
+                if (isTransientSdk(e) && finalTransients < θ["code.backends.llm.sdk.agentic_transient_retries"]) { // src: vvaharness/backends/llm/sdk.py:1629
+                    finalTransients += 1;                                                                   // src: vvaharness/backends/llm/sdk.py:1630
+                    double wait = LlmModels.jitteredDelay(Math.min(θ["code.backends.llm.sdk.agentic_backoff_cap_s"], θ["code.backends.llm.sdk.agentic_backoff_step_s"] * finalTransients)); // src: vvaharness/backends/llm/sdk.py:1631
+                    Exception overrun = LlmModels.waitOverrun(wait, sessionT0, sessionBudget, tag != null ? tag : "", "sdk", effort); // src: vvaharness/backends/llm/sdk.py:1632
+                    if (overrun != null) throw overrun;                                                     // src: vvaharness/backends/llm/sdk.py:1634
+                    Thread.sleep(wait);                                                                     // src: vvaharness/backends/llm/sdk.py:1639
+                    continue;                                                                               // src: vvaharness/backends/llm/sdk.py:1640
+                }
+                throw new RuntimeError(Redact.redact("Anthropic SDK agentic forced-final failed (status=" + e.statusCode + ")", false, null)); // src: vvaharness/backends/llm/sdk.py:1641
+            } catch (ApiConnectionError | TransportError e) {                                               // src: vvaharness/backends/llm/sdk.py:1645
+                if (ResponseQuality.isTimeoutFailure(e, θ)) throw LlmModels.callTimeoutError(tag != null ? tag : "", "sdk", requestTimeout, effort, "Anthropic SDK agentic forced-final exceeded the request timeout"); // src: vvaharness/backends/llm/sdk.py:1646
+                Exception proxy = LlmModels.proxyError(e, "sdk");                                           // src: vvaharness/backends/llm/sdk.py:1651
+                if (proxy != null) throw proxy;                                                             // src: vvaharness/backends/llm/sdk.py:1652
+                if (finalTransients < θ["code.backends.llm.sdk.agentic_transient_retries"]) {               // src: vvaharness/backends/llm/sdk.py:1653
+                    finalTransients += 1;                                                                   // src: vvaharness/backends/llm/sdk.py:1654
+                    double wait = LlmModels.jitteredDelay(Math.min(θ["code.backends.llm.sdk.agentic_backoff_cap_s"], θ["code.backends.llm.sdk.agentic_backoff_step_s"] * finalTransients)); // src: vvaharness/backends/llm/sdk.py:1655
+                    Exception overrun = LlmModels.waitOverrun(wait, sessionT0, sessionBudget, tag != null ? tag : "", "sdk", effort); // src: vvaharness/backends/llm/sdk.py:1656
+                    if (overrun != null) throw overrun;                                                     // src: vvaharness/backends/llm/sdk.py:1658
+                    Thread.sleep(wait);                                                                     // src: vvaharness/backends/llm/sdk.py:1662
+                    continue;                                                                               // src: vvaharness/backends/llm/sdk.py:1663
+                }
+                throw new RuntimeError(Redact.redact("Anthropic SDK agentic forced-final connection error", false, null)); // src: vvaharness/backends/llm/sdk.py:1664
+            }
+        }
+        if (msg.usage != null) {                                                                            // src: vvaharness/backends/llm/sdk.py:1668
+            Map finalUsage = msg.usage.modelDump();                                                         // src: vvaharness/backends/llm/sdk.py:1669
+            noteUnparsedCacheKeys(finalUsage);                                                              // src: vvaharness/backends/llm/sdk.py:1670
+            TokenCounter.add(finalUsage, null, null);                                                       // src: vvaharness/backends/llm/sdk.py:1671
+        }
+        Pair r = checkAgenticStop(msg, client, messages, finalKw, model, tag, outCap, responseModel, false, effort, requestTimeout, sessionT0, sessionBudget); // dispatchable false: no turn loop left // src: vvaharness/backends/llm/sdk.py:1672
+        msg = r.first;
+        if (r.second != null) return r.second;                                                              // src: vvaharness/backends/llm/sdk.py:1677
+        raiseIfRefused(msg, tag);                                                                           // before the response_model branch, so the text-mode final is covered too // src: vvaharness/backends/llm/sdk.py:1680
+        if (responseModel != null) return extractResponseModel(responseModel, msg, model).modelDumpJson();  // src: vvaharness/backends/llm/sdk.py:1682
+        return msg.content.filter(b -> b.type == "text").map(b -> b.text).join("").strip();                 // src: vvaharness/backends/llm/sdk.py:1683
+    }
 }
 
 @executedBy(MODEL) @role(prompt)

@@ -161,9 +161,18 @@ class S6Verify {
         return captive.filter(f -> !f.done());                                                  // src: vvaharness/pipeline/stages/s6_verify.py:542
     }
 
+    /** Nested _submit(idx, batch, refusal_child): one pool task per batch; a refused batch splits rather than resends, its singletons are the resend. */
     Future submit(DaemonPool ex, Batch batch, ContextPackage ctx, Theta θ, List<Tool> tools, boolean resendRefusal) {
-        // Thread start, not submit time, starts the batch's own wall clock.
-        return ex.submit(() -> { started.put(batch.idx, now()); return S6Session.verifyBatch(batch, ctx, θ, tools, abandoned.get(batch.idx), resendRefusal); }); // src: vvaharness/pipeline/stages/s6_verify.py:303
+        Event flag = abandoned.setdefault(batch.idx, new Event());                              // src: vvaharness/pipeline/stages/s6_verify.py:298
+        boolean resend = refusalResend && batch.size() == 1 && !refusalChild;                   // src: vvaharness/pipeline/stages/s6_verify.py:300
+        return ex.submit(() -> timed(batch, flag, resend, ctx, θ, tools));                      // src: vvaharness/pipeline/stages/s6_verify.py:308
+    }
+
+    /** Nested timed(): thread start, not submit time, starts the batch's own wall clock; a queued batch has spent none of it. */
+    @src("vvaharness/pipeline/stages/s6_verify.py:303")
+    Map timed(Batch batch, Event flag, boolean resend, ContextPackage ctx, Theta θ, List<Tool> tools) {
+        started.put(batch.idx, now());                                                          // src: vvaharness/pipeline/stages/s6_verify.py:305
+        return S6Session.verifyBatch(batch, ctx, θ, tools, flag.isSet(), resend);               // src: vvaharness/pipeline/stages/s6_verify.py:306
     }
 
     List<Integer> splitAndResubmit(List<Item> batch, Exception e) {
@@ -210,6 +219,23 @@ class S6Progress {
 
 @executedBy(CODE) @role(rule_set) @stage("S6")
 class Sink {
+
+    /** A checked-and-reserve callback over file's filed lines (atomic under the sink lock). */
+    @src("vvaharness/pipeline/stages/s6_verify.py:711")
+    Function<Integer, Boolean> reserver(String file) {
+        return line -> reserve(file, line);                                                     // src: vvaharness/pipeline/stages/s6_verify.py:720
+    }
+
+    /** Nested reserve(line): false when another session already filed this line, else claim it. */
+    @src("vvaharness/pipeline/stages/s6_verify.py:713")
+    boolean reserve(String file, int line) {
+        synchronized (lock) {                                                                   // src: vvaharness/pipeline/stages/s6_verify.py:714
+            Set<Integer> lines = filed.setdefault(file, new Set());                             // src: vvaharness/pipeline/stages/s6_verify.py:715
+            if (lines.contains(line)) return false;                                             // src: vvaharness/pipeline/stages/s6_verify.py:716
+            lines.add(line);                                                                    // src: vvaharness/pipeline/stages/s6_verify.py:718
+            return true;
+        }
+    }
 
     void fail(List<Item> batch, String reason, Exception exc) {
         // Drop every member of a batch whose session raised; one errlog row each.
@@ -297,5 +323,56 @@ class Sink {
         // "X is not imported" is refuted by import X or from X; "X is not defined" only by import X.
         Regex stmt = found.allowFrom ? "^import X|^from X" : "^import X";                     // src: vvaharness/pipeline/stages/s6_verify.py:675
         return lines.any(stmt::matches) ? found.module : null;                                 // src: vvaharness/pipeline/stages/s6_verify.py:678
+    }
+}
+
+/** The stage's pool: up to max_workers daemon threads on a FIFO queue, so a stalled batch never holds interpreter exit (ThreadPoolExecutor's atexit hook joins every worker whatever the daemon flag). The bound is load-bearing: a captive batch keeps its slot, which runWave's sweep counts. */
+@executedBy(CODE) @role(io) @stage("S6")
+class DaemonPool {
+    int maxWorkers; String prefix; Queue queue; List<Thread> threads; Lock lock; boolean shutdownFlag;
+
+    /** Constructor: max_workers must be positive. */
+    @src("vvaharness/pipeline/stages/s6_verify.py:92")
+    DaemonPool(int maxWorkers, String threadNamePrefix) {
+        if (maxWorkers <= 0) throw new ValueError("max_workers must be greater than 0");        // src: vvaharness/pipeline/stages/s6_verify.py:93
+        // prefix defaults to s6-verify
+    }
+
+    /** Queue the call and start a worker thread if fewer than max_workers exist. */
+    @src("vvaharness/pipeline/stages/s6_verify.py:102")
+    Future submit(Callable fn) {
+        synchronized (lock) {                                                                   // src: vvaharness/pipeline/stages/s6_verify.py:103
+            if (shutdownFlag) throw new RuntimeError("cannot schedule new futures after shutdown"); // src: vvaharness/pipeline/stages/s6_verify.py:105
+            Future fut = new Future();
+            queue.put(Pair.of(fut, fn));                                                        // src: vvaharness/pipeline/stages/s6_verify.py:108
+            // limitation: a thread per submit up to the bound, no idle reuse
+            if (threads.size() < maxWorkers) { Thread t = new DaemonThread(this::work, prefix + "_" + threads.size()); t.start(); threads.add(t); } // src: vvaharness/pipeline/stages/s6_verify.py:110
+            return fut;
+        }
+    }
+
+    /** Worker loop: take items until the None sentinel; settle each future through Replay.settleFuture; drop the item reference so an idle worker pins nothing. */
+    @src("vvaharness/pipeline/stages/s6_verify.py:121")
+    void work() {
+        Object item;
+        while ((item = queue.get()) != null) {                                                  // src: vvaharness/pipeline/stages/s6_verify.py:122
+            Replay.settleFuture(item.first, item.second);                                       // src: vvaharness/pipeline/stages/s6_verify.py:123
+            item = null;                                                                        // src: vvaharness/pipeline/stages/s6_verify.py:125
+        }
+    }
+
+    /** Mark shut down; with cancel_futures, drain and cancel queued items; then one None sentinel per thread; wait joins every thread. */
+    @src("vvaharness/pipeline/stages/s6_verify.py:127")
+    void shutdown(boolean wait, boolean cancelFutures) {
+        synchronized (lock) {                                                                   // src: vvaharness/pipeline/stages/s6_verify.py:128
+            shutdownFlag = true;
+            while (cancelFutures) {                                                             // src: vvaharness/pipeline/stages/s6_verify.py:130
+                Object item = queue.getNowait();
+                if (item == EMPTY) break;                                                       // src: vvaharness/pipeline/stages/s6_verify.py:134
+                if (item != null) item.first.cancel();                                          // src: vvaharness/pipeline/stages/s6_verify.py:136
+            }
+            for (Thread t : threads) queue.put(null);                                           // src: vvaharness/pipeline/stages/s6_verify.py:138
+        }
+        if (wait) for (Thread t : threads) t.join();                                            // src: vvaharness/pipeline/stages/s6_verify.py:140
     }
 }

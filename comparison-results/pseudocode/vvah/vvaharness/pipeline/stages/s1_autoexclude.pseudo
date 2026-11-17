@@ -6,8 +6,8 @@
 class S1Autoexclude {
 
     double AGGRESSIVE_KEEP_RATIO = 0.10;   // literal: reporting threshold only, no knob  // src: vvaharness/pipeline/stages/s1_autoexclude.py:122
-    int MIN_RESPONSE_CHARS = 40;           // literal: stage quality floor  // src: vvaharness/pipeline/stages/s1_autoexclude.py:117
-    int MIN_RESPONSE_TOKENS = 10;          // literal  // src: vvaharness/pipeline/stages/s1_autoexclude.py:118
+    // 40/10 rather than the global 150/30: a valid overlay can be a few dozen tokens and three false trips drop it; a degenerate reply is under 10 tokens
+    // min chars: θ["code.s1.autoexclude.min_response_chars"], min tokens: θ["code.s1.autoexclude.min_response_tokens"]  // src: vvaharness/pipeline/stages/s1_autoexclude.py:117
 
     /** Survey repoRoot, always write a step1 overlay YAML (possibly empty) to outPath, and return it. */
     Path run(String repoRoot, Config cfg, Path outPath, Theta θ) {
@@ -16,15 +16,15 @@ class S1Autoexclude {
         Triple<Set, Set, List> base = S1Preprocess.exclusionSets(cfg, θ);                    // src: vvaharness/pipeline/stages/s1_autoexclude.py:589
         int curMaxKb = θ["step1.max_file_kb"];                                               // src: vvaharness/pipeline/stages/s1_autoexclude.py:590
         Map curDedup = mergeDedupDefaults(cfg);                                              // src: vvaharness/pipeline/stages/s1_autoexclude.py:591
-        Pair<String, Integer> survey = survey(repoRoot, base);                               // src: vvaharness/pipeline/stages/s1_autoexclude.py:599
+        Pair<String, Integer> survey = survey(repoRoot, base.dirs, base.exts, base.globs, θ);                               // src: vvaharness/pipeline/stages/s1_autoexclude.py:599
         ModelSpec model = cfg.models.autoexclude != null ? cfg.models.autoexclude : cfg.models.preprocess; // src: vvaharness/pipeline/stages/s1_autoexclude.py:600
         int maxTok = θ["step1.auto_exclude_max_tokens"];                                     // src: vvaharness/pipeline/stages/s1_autoexclude.py:601
         Prompt user = S1AutoexcludePrompts.user(base, curMaxKb, curDedup, survey.first, θ);  // src: vvaharness/pipeline/stages/s1_autoexclude.py:603
         Effort effort = θ["step1.auto_exclude_effort"];                                      // src: vvaharness/pipeline/stages/s1_autoexclude.py:640
         // one model call; resent once without the effort tier if a clipped reply on a route that drops the tier
         String raw = ResponseQuality.dispatchOrRetryUnforced(
-            drop -> Runtime.llm(new ModelSpec(model, drop ? null : effort, maxTok), S1AutoexcludePrompts.system(θ), user, null),
-            MIN_RESPONSE_CHARS, MIN_RESPONSE_TOKENS);                                         // src: vvaharness/pipeline/stages/s1_autoexclude.py:660
+            drop -> dispatch(drop, model, effort, maxTok, user, repoRoot, cfg, θ),
+            θ["code.s1.autoexclude.min_response_chars"], θ["code.s1.autoexclude.min_response_tokens"]);                                         // src: vvaharness/pipeline/stages/s1_autoexclude.py:660
 
         Map data = extractYaml(raw);                                                         // src: vvaharness/pipeline/stages/s1_autoexclude.py:665
         // drop entries that repeat the baseline
@@ -58,7 +58,7 @@ class S1Autoexclude {
         Object ddIn = data.get("config_dedup");                                              // src: vvaharness/pipeline/stages/s1_autoexclude.py:719
         if (ddIn is Map) {
             Map ddOut = typeCheckDedupKeys(ddIn);                                            // keeps only well-typed _DEDUP_KEYS  // src: vvaharness/pipeline/stages/s1_autoexclude.py:722
-            ddOut = vetConfigDedup(ddOut);                                                   // read-site veto  // src: vvaharness/pipeline/stages/s1_autoexclude.py:736
+            ddOut = vetConfigDedup(ddOut, θ);                                                   // read-site veto  // src: vvaharness/pipeline/stages/s1_autoexclude.py:736
             if (!ddOut.isEmpty()) overlay.put("config_dedup", ddOut);                        // src: vvaharness/pipeline/stages/s1_autoexclude.py:737
         }
         // writer-site veto: re-checked before serialisation
@@ -70,18 +70,96 @@ class S1Autoexclude {
         return outPath;                                                                      // src: vvaharness/pipeline/stages/s1_autoexclude.py:759
     }
 
-    /** Deterministic survey: depth<=2 tree, top-40 extension histogram, largest 15 files, up to 12 README/build excerpts of 1500 chars. */
-    Pair<String, Integer> survey(String repoRoot, Triple<Set, Set, List> base) {
-        // already-excluded dirs/exts/globs are hidden; off-repo symlinked excerpts are skipped
-        for (Dir d : osWalk(repoRoot)) {                                                     // src: vvaharness/pipeline/stages/s1_autoexclude.py:140
-            d.children = d.children.filter(c -> !base.dirs.contains(c.lower()) && !globHit(c, base.globs)); // src: vvaharness/pipeline/stages/s1_autoexclude.py:144
-            for (String fn : d.files) {
-                if (extExcluded(fn, base.exts) || globHit(fn, base.globs)) continue;         // src: vvaharness/pipeline/stages/s1_autoexclude.py:157
-                countFile(fn);                                                               // ext hist, largest, tree counts
-                if (d.depth <= 2 && excerpts.size() < 12 && EXCERPT_NAMES.matches(fn) && !symlinkEscapes(fn)) excerpts.add(head(fn, 1500)); // src: vvaharness/pipeline/stages/s1_autoexclude.py:177
+    /** Deterministic survey: returns the rendered survey blocks and the count of files that survive the current exclusions. */
+    @src("vvaharness/pipeline/stages/s1_autoexclude.py:125")
+    Pair<String, Integer> survey(String repoRoot, Set<String> baseDirs, Set<String> baseExts, List<String> baseGlobs, Theta θ) {
+        // tree: relative posix dir -> (subdirs, file count, depth); starts with the root entry
+        Map<String, S1SurveyNode> tree = Map.of("", new S1SurveyNode(new Set(), 0, 0));                      // src: vvaharness/pipeline/stages/s1_autoexclude.py:134
+        Counter<String> extHist = new Counter();
+        List<Pair<String, String>> excerpts = new List();
+        List<Pair<Integer, String>> largest = new List();
+        int nFiles = 0;
+        Path rootResolved = Path.of(repoRoot).resolve();                                     // src: vvaharness/pipeline/stages/s1_autoexclude.py:139
+        for (Dir d : Files.walk(repoRoot)) {                                                 // src: vvaharness/pipeline/stages/s1_autoexclude.py:141
+            String relDir = d.relativePosix().equals(".") ? "" : d.relativePosix();          // src: vvaharness/pipeline/stages/s1_autoexclude.py:142
+            int depth = relDir.isEmpty() ? 0 : relDir.count("/") + 1;                        // src: vvaharness/pipeline/stages/s1_autoexclude.py:144
+            // in-place prune of the walk: sorted, drop baseline dirs (case-insensitive) and globbed dirs
+            d.children = d.children.filter(c -> !baseDirs.contains(c.lower()) && !globbed(relDir.isEmpty() ? c : relDir + "/" + c, baseGlobs)).sorted(); // src: vvaharness/pipeline/stages/s1_autoexclude.py:145
+            if (depth <= θ["code.s1.autoexclude.survey_tree_depth"]) {                       // src: vvaharness/pipeline/stages/s1_autoexclude.py:149
+                tree.computeIfAbsent(relDir, k -> new S1SurveyNode(new Set(), 0, depth)).subdirs.addAll(d.children); // src: vvaharness/pipeline/stages/s1_autoexclude.py:150
+            }
+            for (String fn : d.files) {                                                      // src: vvaharness/pipeline/stages/s1_autoexclude.py:152
+                String rel = relDir.isEmpty() ? fn : relDir + "/" + fn;
+                // mirror the repo walk exactly: suffix OR full-name endswith, so counts match
+                String name = fn.lower(); String suffix = suffixOf(fn).lower();
+                if (baseExts.anyMatch(e -> suffix.equals(e) || name.endsWith(e)) || globbed(rel, baseGlobs)) continue; // src: vvaharness/pipeline/stages/s1_autoexclude.py:157
+                String ext = suffix.isEmpty() ? "(none)" : suffix;                           // src: vvaharness/pipeline/stages/s1_autoexclude.py:159
+                nFiles += 1; extHist.add(ext);                                               // src: vvaharness/pipeline/stages/s1_autoexclude.py:160
+                int sz;
+                try { sz = stat(d.path, fn).size; } catch (OSError e) { sz = 0; }            // unreadable -> 0 // src: vvaharness/pipeline/stages/s1_autoexclude.py:163
+                if (largest.size() < θ["code.s1.autoexclude.survey_largest_n"] || sz > largest.last().first) { // src: vvaharness/pipeline/stages/s1_autoexclude.py:166
+                    largest.add(Pair.of(sz, rel));
+                    largest.sortDescending();                                                // by size, then by path on ties
+                    largest.truncate(θ["code.s1.autoexclude.survey_largest_n"]);             // src: vvaharness/pipeline/stages/s1_autoexclude.py:169
+                }
+                String anc = relDir;                                                         // count the file in every ancestor dir that is in the tree
+                while (true) {                                                               // src: vvaharness/pipeline/stages/s1_autoexclude.py:171
+                    if (tree.containsKey(anc)) tree.get(anc).fileCount += 1;
+                    if (anc.isEmpty()) break;
+                    anc = beforeLastSlash(anc);                                              // rpartition on "/"
+                }
+                // size cap first: no multi-GB README in memory; the int compare short-circuits the regex
+                if (depth <= θ["code.s1.autoexclude.survey_tree_depth"] && excerpts.size() < θ["code.s1.autoexclude.survey_excerpt_max"]
+                        && sz <= θ["code.s1.autoexclude.survey_excerpt_max_bytes"] && θ["code.s1.autoexclude.survey_excerpt_names"].matches(fn)) { // src: vvaharness/pipeline/stages/s1_autoexclude.py:177
+                    Path fp = Path.of(d.path, fn);
+                    if (fp.isSymlink()) {                                                    // a symlink out of the repo would embed off-host content in the prompt // src: vvaharness/pipeline/stages/s1_autoexclude.py:182
+                        try { if (!fp.resolve(false).isRelativeTo(rootResolved)) continue; } // src: vvaharness/pipeline/stages/s1_autoexclude.py:184
+                        catch (OSError e) { continue; }                                      // src: vvaharness/pipeline/stages/s1_autoexclude.py:187
+                    }
+                    try {
+                        String txt = fp.readText("utf-8", "replace").substring(0, θ["code.s1.autoexclude.survey_excerpt_chars"]); // src: vvaharness/pipeline/stages/s1_autoexclude.py:190
+                        excerpts.add(Pair.of(rel, txt.rstrip()));                            // src: vvaharness/pipeline/stages/s1_autoexclude.py:192
+                    } catch (OSError e) { }                                                  // unreadable excerpt skipped // src: vvaharness/pipeline/stages/s1_autoexclude.py:193
+                }
             }
         }
-        return new Pair(renderSurvey(), nFiles);                                             // src: vvaharness/pipeline/stages/s1_autoexclude.py:225
+        String extBlock = extHist.mostCommon(θ["code.s1.autoexclude.survey_ext_top_n"]).map(x -> pad(x.ext, 16) + " " + padLeft(x.n, 7)).join("\n"); // src: vvaharness/pipeline/stages/s1_autoexclude.py:211
+        if (extBlock.isEmpty()) extBlock = "  (none)";                                       // src: vvaharness/pipeline/stages/s1_autoexclude.py:213
+        if (extHist.size() > θ["code.s1.autoexclude.survey_ext_top_n"]) extBlock += "\n  ... (+N more extensions)"; // src: vvaharness/pipeline/stages/s1_autoexclude.py:214
+        String excBlock = excerpts.isEmpty() ? "(no README/build files found at depth <=2)" : excerpts.map(x -> "### " + x.first + fenced(x.second)).join("\n\n"); // src: vvaharness/pipeline/stages/s1_autoexclude.py:217
+        String largeBlock = largest.isEmpty() ? "  (none)" : largest.map(x -> sizeKb(x.first) + " KB  " + x.second).join("\n"); // src: vvaharness/pipeline/stages/s1_autoexclude.py:221
+        String survey = "## Directory tree" + fenced(renderTree(tree, θ)) + "## Extension histogram" + fenced(extBlock) + "## Largest files" + fenced(largeBlock) + "## Key build/README excerpts" + excBlock; // src: vvaharness/pipeline/stages/s1_autoexclude.py:225
+        return new Pair(survey, nFiles);                                                     // src: vvaharness/pipeline/stages/s1_autoexclude.py:236
+    }
+
+    /** Nested in survey: whether a repo-relative path matches a baseline glob. Shares glob_hit with s1 so the survey cannot disagree with what s1 excludes. */
+    @src("vvaharness/pipeline/stages/s1_autoexclude.py:128")
+    boolean globbed(String rel, List<String> baseGlobs) {
+        return ScopeWalk.globHit(rel, baseGlobs) != null;                                    // src: vvaharness/pipeline/stages/s1_autoexclude.py:130
+    }
+
+    /** Nested in survey (tree and θ passed explicitly): the indented directory tree. Depth-limited dirs list at most 60 children. */
+    @src("vvaharness/pipeline/stages/s1_autoexclude.py:196")
+    String renderTree(Map<String, S1SurveyNode> tree, Theta θ) {
+        List<String> lines = new List();
+        lines.add("./    (" + tree.get("").fileCount + " files)");                           // src: vvaharness/pipeline/stages/s1_autoexclude.py:197
+        for (Entry<String, S1SurveyNode> e : tree.sortedByKey()) {                                   // src: vvaharness/pipeline/stages/s1_autoexclude.py:198
+            if (e.key.isEmpty()) continue;                                                   // root already printed
+            String indent = "  ".repeat(e.value.depth);                                      // src: vvaharness/pipeline/stages/s1_autoexclude.py:201
+            lines.add(indent + baseName(e.key) + "/    (" + e.value.fileCount + " files)"); // src: vvaharness/pipeline/stages/s1_autoexclude.py:202
+            if (e.value.depth == θ["code.s1.autoexclude.survey_tree_depth"] && !e.value.subdirs.isEmpty()) { // only the deepest listed level shows children // src: vvaharness/pipeline/stages/s1_autoexclude.py:203
+                List<String> kids = e.value.subdirs.sorted();
+                for (String k : kids.subList(0, θ["code.s1.autoexclude.survey_tree_max_children"])) lines.add(indent + "  " + k + "/"); // src: vvaharness/pipeline/stages/s1_autoexclude.py:206
+                if (kids.size() > θ["code.s1.autoexclude.survey_tree_max_children"]) lines.add(indent + "  ... (+N more)"); // src: vvaharness/pipeline/stages/s1_autoexclude.py:207
+            }
+        }
+        return lines.join("\n");                                                            // src: vvaharness/pipeline/stages/s1_autoexclude.py:209
+    }
+
+    /** Nested in run (drop_thinking is its parameter, the rest captured): one prompt dispatch with no response model (fenced YAML), so thinking costs no tool_choice; effort is dropped only on the resend path. */
+    @src("vvaharness/pipeline/stages/s1_autoexclude.py:642")
+    String dispatch(boolean dropThinking, ModelSpec model, Effort effort, int maxTok, Prompt userPrompt, String repoRoot, Config cfg, Theta θ) {
+        return Runtime.llm(new ModelSpec(model, dropThinking ? null : effort, maxTok), S1AutoexcludePrompts.system(θ), userPrompt, null); // graph name s1-autoexclude, cwd repoRoot // src: vvaharness/pipeline/stages/s1_autoexclude.py:643
     }
 
     /** The step1 overlay mapping a reply proposes, or empty; picks yaml-labelled fences first, then unlabelled, other, whole reply. */
@@ -104,44 +182,74 @@ class S1Autoexclude {
         return EXT_TO_LANG.containsKey(ext) ? ext : null;                                    // src: vvaharness/pipeline/stages/s1_autoexclude.py:300
     }
 
-    boolean isVendorOrBuildEntry(String entry) {
+    boolean isVendorOrBuildEntry(String entry, Theta θ) {
         if (entry.lower().contains(".min.")) return true;                                    // src: vvaharness/pipeline/stages/s1_autoexclude.py:316
-        return pathParts(entry).anyMatch(p -> VENDOR_PATH_SEGMENTS.contains(p));             // dist build out target vendor third_party node_modules ...  // src: vvaharness/pipeline/stages/s1_autoexclude.py:319
+        return pathParts(entry).anyMatch(p -> θ["code.s1.autoexclude.vendor_path_segments"].contains(p));             // dist build out target vendor third_party node_modules ...  // src: vvaharness/pipeline/stages/s1_autoexclude.py:319
     }
 
-    /** Model-only vetoes: operator overlays bypass these. Returns surviving (dirs, exts, globs). */
+    /** Model-only vetoes: operator overlays bypass these; --resume re-vets; max_file_kb is gated by run(). Returns surviving (dirs, exts, globs). */
+    @src("vvaharness/pipeline/stages/s1_autoexclude.py:480")
     Triple<List, List, List> vetOverlay(String repoRoot, Config cfg, List<String> dirs, List<String> exts, List<String> globs, List<String> inv, Theta θ) {
         // language-erasure veto is unconditional
-        exts = exts.filter(e -> erasesLanguage(e) == null);                                  // src: vvaharness/pipeline/stages/s1_autoexclude.py:486
-        globs = globs.filter(g -> erasesLanguage(g) == null);                                // src: vvaharness/pipeline/stages/s1_autoexclude.py:487
+        List<String> vetoed = (exts.concat(globs)).filter(x -> erasesLanguage(x) != null);   // src: vvaharness/pipeline/stages/s1_autoexclude.py:484
+        if (!vetoed.isEmpty()) {
+            exts = exts.filter(e -> erasesLanguage(e) == null);                              // src: vvaharness/pipeline/stages/s1_autoexclude.py:486
+            globs = globs.filter(g -> erasesLanguage(g) == null);                            // src: vvaharness/pipeline/stages/s1_autoexclude.py:487
+            Log.warn("S1_OVERLAY_VETOED_LANGUAGE", vetoed.sorted());                         // src: vvaharness/pipeline/stages/s1_autoexclude.py:488
+            Errlog.log(TAG, "language-erasure veto", true);                                  // recovered=True: the veto KEEPS files in scope // src: vvaharness/pipeline/stages/s1_autoexclude.py:491
+            Counters.bump("s1_autoexclude_language_veto", vetoed.size());                    // src: vvaharness/pipeline/stages/s1_autoexclude.py:498
+        }
+        // one walk, reused as run()'s scope-gate baseline and by every protected-file classification
+        List<String> invWalk = inv != null ? inv : ScopeWalk.scopeAfter(repoRoot, cfg);      // src: vvaharness/pipeline/stages/s1_autoexclude.py:501
+        // a wider "veto any known-language file" variant was measured out: it re-included vendored JS
+        S1OverlayLists lists = new S1OverlayLists(dirs, exts, globs);                                          // dirs/exts/globs are rebound by each veto (nonlocal in the source)
         if (θ["step1.auto_exclude_protect_templates"]) {                                     // src: vvaharness/pipeline/stages/s1_autoexclude.py:536
-            List<String> templates = inv.filter(r -> LangDetect.isWebTemplate(r));          // src: vvaharness/pipeline/stages/s1_autoexclude.py:324
-            containmentVeto(templates, dirs, exts, globs);                                   // src: vvaharness/pipeline/stages/s1_autoexclude.py:537
+            runContainmentVeto(lists, templateFiles(invWalk), "server-side template file(s)", "template-containment", "s1_autoexclude_template_veto",
+                "s1_autoexclude_template_veto", "s1_autoexclude_template_files_protected", "n_template_files", "s1_autoexclude_template_veto_vendor_exempt", θ); // src: vvaharness/pipeline/stages/s1_autoexclude.py:537
         }
         if (θ["step1.auto_exclude_protect_key_material"]) {                                  // src: vvaharness/pipeline/stages/s1_autoexclude.py:547
-            List<String> keys = inv.filter(r -> isKeyMaterial(r));                           // src: vvaharness/pipeline/stages/s1_autoexclude.py:348
-            containmentVeto(keys, dirs, exts, globs);                                        // src: vvaharness/pipeline/stages/s1_autoexclude.py:548
+            runContainmentVeto(lists, keyMaterialFiles(invWalk, θ), "key-material file(s)", "key-material-containment", "s1_autoexclude_key_material_veto",
+                "s1_autoexclude_key_material_veto", "s1_autoexclude_key_material_files_protected", "n_key_material_files", "s1_autoexclude_key_material_veto_vendor_exempt", θ); // src: vvaharness/pipeline/stages/s1_autoexclude.py:548
         }
         if (θ["step1.auto_exclude_protect_secrets"]) {                                       // src: vvaharness/pipeline/stages/s1_autoexclude.py:558
-            List<String> secrets = inv.filter(r -> !Redact.redactCounts(head(r, 1500)).isEmpty()); // src: vvaharness/pipeline/stages/s1_autoexclude.py:362
-            containmentVeto(secrets, dirs, exts, globs);                                     // src: vvaharness/pipeline/stages/s1_autoexclude.py:559
+            runContainmentVeto(lists, secretBearingFiles(invWalk, repoRoot, θ), "secret-bearing file(s)", "secret-bearing-containment", "s1_autoexclude_secret_bearing_veto",
+                "s1_autoexclude_secret_bearing_veto", "s1_autoexclude_secret_bearing_files_protected", "n_secret_bearing_files", "s1_autoexclude_secret_bearing_veto_vendor_exempt", θ); // src: vvaharness/pipeline/stages/s1_autoexclude.py:559
         }
         if (θ["step1.auto_exclude_protect_client_sinks"]) {                                  // src: vvaharness/pipeline/stages/s1_autoexclude.py:569
-            List<String> sinks = clientSinkFiles(inv, θ);                                    // src: vvaharness/pipeline/stages/s1_autoexclude.py:571
-            containmentVeto(sinks, dirs, exts, globs);                                       // src: vvaharness/pipeline/stages/s1_autoexclude.py:570
+            runContainmentVeto(lists, clientSinkFiles(invWalk, repoRoot, cfg, θ), "first-party client file(s) with a DOM sink", "client-sink-containment", "s1_autoexclude_client_sink_veto",
+                "s1_autoexclude_client_sink_veto", "s1_autoexclude_client_sink_files_protected", "n_client_sink_files", "s1_autoexclude_client_sink_veto_vendor_exempt", θ); // src: vvaharness/pipeline/stages/s1_autoexclude.py:570
         }
-        return new Triple(dirs, exts, globs);                                                // src: vvaharness/pipeline/stages/s1_autoexclude.py:580
+        return new Triple(lists.dirs, lists.exts, lists.globs);                              // src: vvaharness/pipeline/stages/s1_autoexclude.py:580
     }
 
-    /** Drop every proposed entry that would remove a protected file, unless the entry names vendored/build output. */
-    void containmentVeto(List<String> protectedFiles, List<String> dirs, List<String> exts, List<String> globs) {
-        for (String kind : List.of("dir", "ext", "glob")) {                                  // src: vvaharness/pipeline/stages/s1_autoexclude.py:532
-            for (String entry : entriesOf(kind, dirs, exts, globs)) {                        // src: vvaharness/pipeline/stages/s1_autoexclude.py:510
-                if (isVendorOrBuildEntry(entry)) continue;                                   // exempt: kept  // src: vvaharness/pipeline/stages/s1_autoexclude.py:511
-                List<String> hits = removesProtectedFiles(protectedFiles, kind, entry);      // src: vvaharness/pipeline/stages/s1_autoexclude.py:515
-                if (!hits.isEmpty()) { remove(entry); Log.warn("S1_OVERLAY_VETOED"); }       // src: vvaharness/pipeline/stages/s1_autoexclude.py:516
+    /** Nested in vet_overlay: drop every proposed entry that would remove a protected file, unless it names vendored/build output.
+     *  Order: dirs, then exts, then globs. lists holds the captured dirs/exts/globs that the source rebinds. */
+    @src("vvaharness/pipeline/stages/s1_autoexclude.py:502")
+    void runContainmentVeto(S1OverlayLists lists, List<String> protectedFiles, String noun, String label, String reason, String counter, String counterFiles, String errlogFilesKey, String counterVendor, Theta θ) {
+        // inner function _veto(entries, kind) is a loop over one list
+        lists.dirs = veto(lists.dirs, "dir", protectedFiles, noun, label, reason, counter, counterFiles, errlogFilesKey, counterVendor, θ);   // src: vvaharness/pipeline/stages/s1_autoexclude.py:529
+        lists.exts = veto(lists.exts, "ext", protectedFiles, noun, label, reason, counter, counterFiles, errlogFilesKey, counterVendor, θ);    // src: vvaharness/pipeline/stages/s1_autoexclude.py:529
+        lists.globs = veto(lists.globs, "glob", protectedFiles, noun, label, reason, counter, counterFiles, errlogFilesKey, counterVendor, θ);  // src: vvaharness/pipeline/stages/s1_autoexclude.py:530
+    }
+
+    /** Nested _veto of runContainmentVeto: the surviving entries of one kind. */
+    @src("vvaharness/pipeline/stages/s1_autoexclude.py:508")
+    List<String> veto(List<String> entries, String kind, List<String> protectedFiles, String noun, String label, String reason, String counter, String counterFiles, String errlogFilesKey, String counterVendor, Theta θ) {
+        List<String> kept = new List();
+        for (String entry : entries) {                                                       // src: vvaharness/pipeline/stages/s1_autoexclude.py:510
+            if (isVendorOrBuildEntry(entry, θ)) {                                            // exempt: otherwise one bundled index.html makes frontend/dist unexcludable // src: vvaharness/pipeline/stages/s1_autoexclude.py:511
+                kept.add(entry);
+                Counters.bump(counterVendor);                                                // src: vvaharness/pipeline/stages/s1_autoexclude.py:513
+                continue;
             }
+            List<String> hits = removesProtectedFiles(protectedFiles, kind, entry);          // src: vvaharness/pipeline/stages/s1_autoexclude.py:515
+            if (hits.isEmpty()) { kept.add(entry); continue; }                               // src: vvaharness/pipeline/stages/s1_autoexclude.py:516
+            Log.warn("S1_OVERLAY_VETOED", entry, hits.size(), noun, hits.get(0));            // src: vvaharness/pipeline/stages/s1_autoexclude.py:519
+            Errlog.log(TAG, label + " veto: entry dropped from the overlay", reason, true, entry, errlogFilesKey, hits.size()); // recovered=True: the veto KEEPS files in scope // src: vvaharness/pipeline/stages/s1_autoexclude.py:522
+            Counters.bump(counter);                                                          // src: vvaharness/pipeline/stages/s1_autoexclude.py:526
+            Counters.bump(counterFiles, hits.size());                                        // src: vvaharness/pipeline/stages/s1_autoexclude.py:527
         }
+        return kept;
     }
 
     List<String> removesProtectedFiles(List<String> protectedFiles, String kind, String entry) {
@@ -151,31 +259,63 @@ class S1Autoexclude {
         return protectedFiles.filter(r -> globHit(r, List.of(entry)));                      // src: vvaharness/pipeline/stages/s1_autoexclude.py:408
     }
 
-    boolean isKeyMaterial(String rel) {
-        // naming convention: .htpasswd .git-credentials .npmrc .pypirc .netrc, id_rsa*, .pem .key .p12 .pfx .jks ...
-        return KEY_MATERIAL_NAMES.contains(name(rel)) || name(rel).startsWithAny(KEY_PREFIXES) || KEY_MATERIAL_EXTS.contains(suffix(rel)); // src: vvaharness/pipeline/stages/s1_autoexclude.py:341
+    /** Whether rel names key/credential material by filename convention (content scanning is elsewhere). */
+    @src("vvaharness/pipeline/stages/s1_autoexclude.py:337")
+    boolean isKeyMaterial(String rel, Theta θ) {
+        String name = lastSegment(rel).lower();                                              // src: vvaharness/pipeline/stages/s1_autoexclude.py:339
+        // naming convention: .htpasswd .git-credentials .npmrc .pypirc .netrc, id_rsa* id_dsa* id_ecdsa* id_ed25519*, .pem .key .ppk .p12 .pfx .jks .keystore .p8 .pkcs12 .asc .gpg .ovpn
+        if (θ["code.s1.autoexclude.key_material_names"].contains(name) || name.startsWithAny(θ["code.s1.autoexclude.key_material_name_prefixes"])) return true; // src: vvaharness/pipeline/stages/s1_autoexclude.py:341
+        return θ["code.s1.autoexclude.key_material_exts"].contains(suffixOf(name));          // src: vvaharness/pipeline/stages/s1_autoexclude.py:343
     }
 
-    /** First-party JS/TS files where S5's detector-docwrite-location rule fires (shared with S5 so they cannot disagree). */
-    List<String> clientSinkFiles(List<String> inv, Theta θ) {
-        FileCache cache = new FileCache(θ["step1.max_file_kb"]);                             // src: vvaharness/pipeline/stages/s1_autoexclude.py:379
+    /** Server-side templates in inventory, classified once rather than per vetoed entry. */
+    @src("vvaharness/pipeline/stages/s1_autoexclude.py:322")
+    List<String> templateFiles(List<String> inventory) {
+        return inventory.filter(rel -> LangDetect.isWebTemplate(rel));                       // src: vvaharness/pipeline/stages/s1_autoexclude.py:324
+    }
+
+    /** Key/credential-material files in inventory, classified once rather than per vetoed entry. */
+    @src("vvaharness/pipeline/stages/s1_autoexclude.py:346")
+    List<String> keyMaterialFiles(List<String> inventory, Theta θ) {
+        return inventory.filter(rel -> isKeyMaterial(rel, θ));                               // src: vvaharness/pipeline/stages/s1_autoexclude.py:348
+    }
+
+    /** Files whose head (first 1500 chars, so a large dump is sampled) redact_counts flags as carrying credential material; unreadable files are skipped. */
+    @src("vvaharness/pipeline/stages/s1_autoexclude.py:351")
+    List<String> secretBearingFiles(List<String> inventory, String repoRoot, Theta θ) {
         List<String> hits = new List();
-        for (String rel : inv) {
-            if (!List.of("javascript", "typescript").contains(EXT_TO_LANG.get(suffix(rel)))) continue; // src: vvaharness/pipeline/stages/s1_autoexclude.py:382
-            if (isVendorOrBuildEntry(rel)) continue;                                         // src: vvaharness/pipeline/stages/s1_autoexclude.py:384
-            if (DetectMatcher.detectorHits(rel, cache.lines(rel), DetectPatterns.detector("detector-docwrite-location"))) hits.add(rel); // src: vvaharness/pipeline/stages/s1_autoexclude.py:387
+        for (String rel : inventory) {                                                       // src: vvaharness/pipeline/stages/s1_autoexclude.py:355
+            String head;
+            try { head = Path.of(repoRoot, rel).read("utf-8", "replace", θ["code.s1.autoexclude.survey_excerpt_chars"]); } // src: vvaharness/pipeline/stages/s1_autoexclude.py:359
+            catch (OSError e) { continue; }                                                  // src: vvaharness/pipeline/stages/s1_autoexclude.py:360
+            Map counts = Redact.redactCounts(head).second;                                   // src: vvaharness/pipeline/stages/s1_autoexclude.py:362
+            if (!counts.isEmpty()) hits.add(rel);                                            // src: vvaharness/pipeline/stages/s1_autoexclude.py:363
         }
         return hits;
     }
 
+    /** First-party JS/TS files where S5's detector-docwrite-location rule (and its proximity gate) fires; shared with S5 so they cannot disagree. */
+    @src("vvaharness/pipeline/stages/s1_autoexclude.py:371")
+    List<String> clientSinkFiles(List<String> inv, String repoRoot, Config cfg, Theta θ) {
+        FileCache cache = new FileCache(repoRoot, θ["step1.max_file_kb"]);                   // src: vvaharness/pipeline/stages/s1_autoexclude.py:379
+        List<String> hits = new List();
+        for (String rel : inv) {
+            if (!θ["code.s1.autoexclude.client_sink_languages"].contains(EXT_TO_LANG.get(suffixOf(rel).lower()))) continue; // src: vvaharness/pipeline/stages/s1_autoexclude.py:382
+            if (isVendorOrBuildEntry(rel, θ)) continue;                                      // src: vvaharness/pipeline/stages/s1_autoexclude.py:384
+            List<String> lines = cache.lines(rel);                                           // src: vvaharness/pipeline/stages/s1_autoexclude.py:386
+            if (!lines.isEmpty() && DetectMatcher.detectorHits(rel, lines, List.of(DetectPatterns.detector("detector-docwrite-location", θ)))) hits.add(rel); // src: vvaharness/pipeline/stages/s1_autoexclude.py:387
+        }
+        return hits;                                                                         // src: vvaharness/pipeline/stages/s1_autoexclude.py:389
+    }
+
     /** Copy of dd without model-proposed dedup widenings that could silently drop a protected file. */
-    Map vetConfigDedup(Map dd) {
+    Map vetConfigDedup(Map dd, Theta θ) {
         for (String flag : List.of("promote_on_secret_hit", "promote_on_insecure_value")) {  // src: vvaharness/pipeline/stages/s1_autoexclude.py:442
             if (dd.get(flag) == false) dd.remove(flag);                                      // flag stays enabled  // src: vvaharness/pipeline/stages/s1_autoexclude.py:443
         }
         List<String> xs = dd.get("exts");                                                    // src: vvaharness/pipeline/stages/s1_autoexclude.py:453
         if (xs != null) {
-            List<String> bad = xs.filter(e -> KEY_MATERIAL_EXTS.contains(e) || erasesLanguage(e) != null); // src: vvaharness/pipeline/stages/s1_autoexclude.py:455
+            List<String> bad = xs.filter(e -> θ["code.s1.autoexclude.key_material_exts"].contains(e) || erasesLanguage(e) != null); // src: vvaharness/pipeline/stages/s1_autoexclude.py:455
             if (!bad.isEmpty()) {
                 List<String> kept = xs.minus(bad);                                           // src: vvaharness/pipeline/stages/s1_autoexclude.py:458
                 if (kept.isEmpty()) dd.remove("exts"); else dd.put("exts", kept);            // src: vvaharness/pipeline/stages/s1_autoexclude.py:469
@@ -184,6 +324,14 @@ class S1Autoexclude {
         return dd;
     }
 }
+
+/** Mutable holder for the dirs/exts/globs lists that nested functions rebind in the source. */
+@executedBy(CODE) @role(types)
+record S1OverlayLists(List<String> dirs, List<String> exts, List<String> globs) { }
+
+/** One surveyed directory: subdirectory names, files under it, depth. */
+@executedBy(CODE) @role(types)
+record S1SurveyNode(Set<String> subdirs, int fileCount, int depth) { }
 
 @executedBy(MODEL) @role(prompt) @stage("S1")
 class S1AutoexcludePrompts {

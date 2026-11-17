@@ -1,0 +1,474 @@
+// file: vulnhunt/phases/phase2_hunt.md
+// Phase 2 (orchestrator): forms hunt jobs = production partitions x class groups (INJ, NAV, LOG) plus one
+// sink-driven audit agent, dispatches them in waves, then aggregates dispositions into VULN-NNN candidates.
+// Prompt-only logic: the orchestrator model follows this procedure; nothing here is enforced by code.
+
+@executedBy(MODEL) @role(types)
+enum ClassGroup { INJ, NAV, LOG }
+
+@executedBy(MODEL) @role(types)
+enum HuntDisposition { CANDIDATE, SAFE, NO_MATCH, CROSS_CLASS, DESIGN_INTENT }
+
+@executedBy(MODEL) @role(types)
+record HuntJob(String sgId, ClassGroup cls, List<Input> inputs, boolean sinkDriven) { }
+
+@executedBy(MODEL) @role(stage) @stage("P2")
+class Phase2Hunt {
+
+    // Entry point: the orchestrator runs Phase 2 after Phase 1 recon produced the inventory and partitions.
+    List<Candidate> run(ReconOutput recon, Theta θ) {
+        List<Partition> partitions = readPartitions(recon, θ);                                          // src: vulnhunt/phases/phase2_hunt.md:35
+        List<HuntJob> jobs = formJobs(partitions, θ);                                                    // src: vulnhunt/phases/phase2_hunt.md:19
+        List<HuntResult> results = dispatchInWaves(jobs, θ);                                             // src: vulnhunt/phases/phase2_hunt.md:54
+        for (Partition sg : partitions) {
+            if (sg.markers.contains("SEQUENTIAL-FALLBACK")) results.addAll(sequentialFallback(sg, θ));  // src: vulnhunt/phases/phase2_hunt.md:67
+        }
+        dispatchChecklist(jobs, results, θ);                                                             // src: vulnhunt/phases/phase2_hunt.md:73
+        return aggregate(recon, jobs, results, θ);                                                       // src: vulnhunt/phases/phase2_hunt.md:70
+    }
+
+    // Step 1: each partition carries SG-N id, input numbers, entry points, app files, shared infra nodes, markers.
+    List<Partition> readPartitions(ReconOutput recon, Theta θ) {
+        return recon.partitions;                                                                         // src: vulnhunt/phases/phase2_hunt.md:35
+    }
+
+    // DISPATCH PROCEDURE: one agent per (production partition, class group) + sink-driven agent(s).
+    List<HuntJob> formJobs(List<Partition> partitions, Theta θ) {
+        List<HuntJob> jobs = new List();
+        List<ClassGroup> groups = θ["prompt.hunt.class_groups"];                                         // src: vulnhunt/phases/phase2_hunt.md:46
+        for (Partition sg : partitions) {
+            if (θ["p.phase2_hunt.skip_dev_only_partitions"] && sg.isDevOnly) continue;                   // src: vulnhunt/phases/phase2_hunt.md:24
+            if (sg.markers.contains("SEQUENTIAL-FALLBACK")) continue;                                    // src: vulnhunt/phases/phase2_hunt.md:67
+            // θ["p.phase2_hunt.no_inline_partition_analysis"]: every production partition gets agents.   // src: vulnhunt/phases/phase2_hunt.md:29
+            if (θ["p.phase2_hunt.no_inline_partition_analysis"]) assert !analysedInline(sg);             // src: vulnhunt/phases/phase2_hunt.md:29
+            for (ClassGroup cls : groups) {                                                              // src: vulnhunt/phases/phase2_hunt.md:40
+                // θ["p.phase2_hunt.no_skipping_class_groups"] and θ["p.phase2_hunt.no_combining_class_groups"]:
+                // one job per group, never merged, never skipped.                                        // src: vulnhunt/phases/phase2_hunt.md:28
+                if (θ["p.phase2_hunt.no_combining_class_groups"] && θ["p.phase2_hunt.no_skipping_class_groups"]) {
+                    // Each agent traces ALL partition inputs; evaluates only its own class group's sinks.
+                    jobs.add(new HuntJob(sg.id, cls, sg.inputs, false));                                 // src: vulnhunt/phases/phase2_hunt.md:11
+                }
+            }
+            assert jobsFor(jobs, sg).size() == θ["p.phase2_hunt.agents_per_production_partition"];       // src: vulnhunt/phases/phase2_hunt.md:19
+        }
+        // θ["p.phase2_hunt.no_per_candidate_agents"]: never per-candidate / per-hypothesis / per-finding agents.
+        if (θ["p.phase2_hunt.no_per_candidate_agents"]) assert jobs.allPerPartition();                   // src: vulnhunt/phases/phase2_hunt.md:27
+        for (int i = 0; i < θ["prompt.hunt.sink_driven_agents"]; i++) {                                 // src: vulnhunt/phases/phase2_hunt.md:25
+            jobs.add(new HuntJob(null, null, null, true));                                               // src: vulnhunt/phases/phase2_hunt.md:25
+        }
+        // Minimum agent count = (3 x production_partition_count) + 1 sink-driven; fewer = violation.
+        assert jobs.size() >= minAgentCount(partitions, θ);                                              // src: vulnhunt/phases/phase2_hunt.md:30
+        return jobs;
+    }
+
+    int minAgentCount(List<Partition> partitions, Theta θ) {
+        // formula text: θ["prompt.hunt.min_agent_count"]                                                 // src: vulnhunt/phases/phase2_hunt.md:30
+        int prod = partitions.count(sg -> !sg.isDevOnly);
+        return θ["p.phase2_hunt.agents_per_production_partition"] * prod + θ["prompt.hunt.sink_driven_agents"]; // src: vulnhunt/phases/phase2_hunt.md:30
+    }
+
+    // Waves of at most 6 agents per message; wait for all results files; sink-driven agent alone as final wave.
+    List<HuntResult> dispatchInWaves(List<HuntJob> jobs, Theta θ) {
+        int size = min(θ["prompt.hunt.wave_size"], θ["p.phase2_hunt.wave_size_cap"]);                    // src: vulnhunt/phases/phase2_hunt.md:54
+        if (θ["p.phase2_hunt.no_single_message_dispatch"]) assert size < jobs.size() || jobs.size() <= size; // src: vulnhunt/phases/phase2_hunt.md:56
+        List<HuntJob> traceJobs = jobs.filter(j -> !j.sinkDriven);
+        List<HuntJob> sinkJobs = jobs.filter(j -> j.sinkDriven);
+        List<HuntResult> out = new List();
+        for (List<HuntJob> wave : chunk(traceJobs, size)) {                                              // src: vulnhunt/phases/phase2_hunt.md:54
+            List<HuntResult> waveOut = Runtime.parallel(wave.size(), wave, j -> runTraceAgent(j, θ));    // src: vulnhunt/phases/phase2_hunt.md:54
+            if (θ["p.phase2_hunt.wait_for_wave_results"]) waitUntilAllResultsFilesExist(wave);          // src: vulnhunt/phases/phase2_hunt.md:55
+            out.addAll(waveOut);
+        }
+        // Conflict in source: line 63 says own final wave, line 134 says in parallel with trace agents.
+        if (θ["p.phase2_hunt.sink_driven_final_wave"] == "own final wave") {                             // src: vulnhunt/phases/phase2_hunt.md:63
+            out.addAll(Runtime.parallel(sinkJobs.size(), sinkJobs, j -> SinkDrivenAuditAgent.run(θ)));  // src: vulnhunt/phases/phase2_hunt.md:63
+        } else {
+            // θ["p.phase2_hunt.sink_driven_parallel_with_trace"] = "in parallel"                         // src: vulnhunt/phases/phase2_hunt.md:134
+            out.addAll(Runtime.parallel(sinkJobs.size(), sinkJobs, j -> SinkDrivenAuditAgent.run(θ)));  // src: vulnhunt/phases/phase2_hunt.md:134
+        }
+        return out;
+    }
+
+    // One class-group trace agent: short prompt, reads phase2_shared.md then its class file, then its partition data.
+    HuntResult runTraceAgent(HuntJob job, Theta θ) {
+        Prompt p = TraceAgentPrompt.build(job, θ);                                                       // src: vulnhunt/phases/phase2_hunt.md:89
+        Transcript t = Runtime.subagent(p, job);                                                         // src: vulnhunt/phases/phase2_hunt.md:83
+        // Inside the subagent: shared rules first, class file second (θ["prompt.trace_agent_reading_list"]).
+        List<Disposition> ds;
+        if (job.cls == ClassGroup.INJ) ds = Phase2ClassInj.run(job.sgId, job.inputs, θ);                 // src: vulnhunt/phases/phase2_hunt.md:20
+        else if (job.cls == ClassGroup.NAV) ds = Phase2ClassNav.run(job.sgId, job.inputs, θ);            // src: vulnhunt/phases/phase2_hunt.md:21
+        else ds = Phase2ClassLog.run(job.sgId, job.inputs, θ);                                           // src: vulnhunt/phases/phase2_hunt.md:22
+        for (Disposition d : ds) {
+            if (d.kind == HuntDisposition.CANDIDATE) d.candidate = Phase2Shared.applyHardGates(d.candidate, job.cls, null, θ); // src: vulnhunt/phases/phase2_shared.md:111
+        }
+        writeFile(resultsPath(job, θ), ds);                                                              // src: vulnhunt/phases/phase2_hunt.md:109
+        return new HuntResult(job, ds, shortReturn(θ["p.phase2_hunt.trace_agent_return_words"]));        // src: vulnhunt/phases/phase2_hunt.md:111
+    }
+
+    String resultsPath(HuntJob job, Theta θ) {
+        return "$VULNHUNT_DIR/" + θ["p.phase2_hunt.trace_results_path"].replace("<SG_ID>", job.sgId).replace("<class>", job.cls); // src: vulnhunt/phases/phase2_hunt.md:109
+    }
+
+    // MANDATORY dispatch checklist before Phase 2b; failed/stalled/no-results agents are re-dispatched.
+    void dispatchChecklist(List<HuntJob> jobs, List<HuntResult> results, Theta θ) {
+        List<String> checklist = θ["p.phase2_hunt.dispatch_checklist"];                                  // src: vulnhunt/phases/phase2_hunt.md:73
+        for (HuntJob j : jobs) {
+            HuntResult r = results.find(j);
+            if (r == null || r.failed || r.stalled || !exists(r.resultsFile)) {                          // src: vulnhunt/phases/phase2_hunt.md:77
+                // θ["p.phase2_hunt.failed_agent_is_unknown_coverage"]: a failed agent is not "no findings".
+                if (θ["p.phase2_hunt.failed_agent_is_unknown_coverage"]) r = null;                       // src: vulnhunt/phases/phase2_hunt.md:78
+                if (θ["prompt.redispatch_on_failure"] != null) results.replace(j, j.sinkDriven ? SinkDrivenAuditAgent.run(θ) : runTraceAgent(j, θ)); // src: vulnhunt/phases/phase2_hunt.md:77
+            }
+        }
+        if (θ["p.phase2_hunt.no_proceeding_with_gaps"]) assert results.coverAll(jobs);                   // src: vulnhunt/phases/phase2_hunt.md:79
+    }
+
+    // Results Aggregation (orchestrator only).
+    List<Candidate> aggregate(ReconOutput recon, List<HuntJob> jobs, List<HuntResult> results, Theta θ) {
+        if (θ["p.phase2_hunt.merge_sink_driven_candidates"]) results = results.withSinkDrivenMerged();   // src: vulnhunt/phases/phase2_hunt.md:205
+        Map<Input, HuntDisposition> finalDisp = mergeDispositions(recon, results, θ);                    // src: vulnhunt/phases/phase2_hunt.md:213
+        List<Candidate> cands = assignVulnIds(results, θ);                                               // src: vulnhunt/phases/phase2_hunt.md:223
+        cands = dedup(cands, θ);                                                                         // src: vulnhunt/phases/phase2_hunt.md:227
+        completenessCheck(recon, finalDisp, θ);                                                          // src: vulnhunt/phases/phase2_hunt.md:232
+        if (θ["p.phase2_hunt.present_candidates_to_user"]) present(cands, finalDisp);                   // src: vulnhunt/phases/phase2_hunt.md:236
+        cands.addAll(absentInputCheckpoint(recon, θ));                                                   // src: vulnhunt/phases/phase2_hunt.md:239
+        return cands;
+    }
+
+    // Step 1: merge per-input dispositions across the 3 class-group agents.
+    Map<Input, HuntDisposition> mergeDispositions(ReconOutput recon, List<HuntResult> results, Theta θ) {
+        Map<Input, HuntDisposition> out = new Map();
+        for (Input in : recon.inventory) {
+            List<Disposition> ds = results.dispositionsFor(in);
+            if (ds.isEmpty() && θ["p.phase2_hunt.missing_disposition_redispatch"]) {                     // src: vulnhunt/phases/phase2_hunt.md:221
+                ds = redispatch(in, θ);                                                                  // src: vulnhunt/phases/phase2_hunt.md:221
+            }
+            for (Disposition d : ds.filter(x -> x.kind == HuntDisposition.CROSS_CLASS)) {
+                if (θ["p.phase2_hunt.cross_class_resolution"]) {                                         // src: vulnhunt/phases/phase2_hunt.md:217
+                    Disposition target = results.forPartitionClass(d.sgId, d.suspectedClass).forSink(d.sink);
+                    if (target != null) d.kind = target.kind;                                            // src: vulnhunt/phases/phase2_hunt.md:218
+                    else if (θ["p.phase2_hunt.cross_class_redispatch_condition"]) ds.addAll(redispatch(in, θ)); // src: vulnhunt/phases/phase2_hunt.md:219
+                }
+            }
+            if (θ["prompt.aggregate.any_candidate_wins"] && ds.any(x -> x.kind == HuntDisposition.CANDIDATE)) { // src: vulnhunt/phases/phase2_hunt.md:215
+                out.put(in, HuntDisposition.CANDIDATE);
+            } else if (θ["p.phase2_hunt.safe_requires_all_agents"] && ds.all(x -> x.kind == HuntDisposition.SAFE || x.kind == HuntDisposition.NO_MATCH)) { // src: vulnhunt/phases/phase2_hunt.md:216
+                out.put(in, HuntDisposition.SAFE);
+            } else {
+                out.put(in, ds.first().kind);  // unclear: DESIGN-INTENT merge rule is not stated
+            }
+        }
+        return out;
+    }
+
+    // Step 2: VULN-NNN numbering across all subgraphs.
+    List<Candidate> assignVulnIds(List<HuntResult> results, Theta θ) {
+        List<Candidate> cs = results.candidates();
+        if (θ["p.phase2_hunt.vuln_ids_assigned_at_aggregation"]) {                                       // src: vulnhunt/phases/phase2_hunt.md:223
+            cs.sortBy(θ["p.phase2_hunt.vuln_id_ordering"]);  // subgraph dispatch order, then input number // src: vulnhunt/phases/phase2_hunt.md:224
+            for (int i = 0; i < cs.size(); i++) cs.get(i).id = "VULN-" + pad3(i + 1);                    // src: vulnhunt/phases/phase2_hunt.md:224
+        }
+        return cs;
+    }
+
+    // Step 3: dedup by identical sink file:line; keep worst severity and union of data flows.
+    List<Candidate> dedup(List<Candidate> cs, Theta θ) {
+        // key: θ["prompt.aggregate.same_sink_dedup"] / θ["p.phase2_hunt.dedup_same_sink_file_line"]
+        Map<Location, List<Candidate>> bySink = cs.groupBy(c -> c.sink);                                 // src: vulnhunt/phases/phase2_hunt.md:227
+        if (!(θ["prompt.aggregate.same_sink_dedup"] != null && θ["p.phase2_hunt.dedup_same_sink_file_line"] != null)) return cs; // src: vulnhunt/phases/phase2_hunt.md:227
+        List<Candidate> out = new List();
+        for (List<Candidate> grp : bySink.values()) {
+            Candidate m = grp.first();
+            if (θ["p.phase2_hunt.dedup_keep_pessimistic_union"]) {                                       // src: vulnhunt/phases/phase2_hunt.md:229
+                m.severity = grp.maxSeverity();
+                m.dataFlow = grp.unionDataFlows();
+            }
+            out.add(m);
+        }
+        return out;
+    }
+
+    // Step 4: disposition count must equal Phase 1 inventory count.
+    void completenessCheck(ReconOutput recon, Map<Input, HuntDisposition> disp, Theta θ) {
+        if (θ["p.phase2_hunt.disposition_count_check"] && disp.size() != recon.inventory.size()) {      // src: vulnhunt/phases/phase2_hunt.md:232
+            if (θ["p.phase2_hunt.unresolved_inputs_redispatch"]) {                                       // src: vulnhunt/phases/phase2_hunt.md:233
+                for (Input in : recon.inventory.minus(disp.keys())) redispatch(in, θ);
+            }
+        }
+    }
+
+    // Step 6: orchestrator-level absent-input checkpoint (cross-input reasoning agents cannot do).
+    List<Candidate> absentInputCheckpoint(ReconOutput recon, Theta θ) {
+        List<Candidate> out = new List();
+        if (!θ["p.phase2_hunt.orchestrator_absent_input_checkpoint"]) return out;                       // src: vulnhunt/phases/phase2_hunt.md:239
+        for (Input in : recon.inventory.filter(i -> i.kind in List.of("cookie", "header", "parameter"))) {
+            if (!in.gatesBlockIn(θ["p.phase2_hunt.absent_input_security_blocks"])) continue;             // src: vulnhunt/phases/phase2_hunt.md:241
+            // "If omitted, does the security check fail closed or fail open?"
+            if (failsOpenWhenOmitted(in)) out.add(Candidate.cvb(in, θ["p.phase2_hunt.fail_open_is_cvb_cwe306"])); // src: vulnhunt/phases/phase2_hunt.md:243
+        }
+        return out;
+    }
+
+    // Fallback: SEQUENTIAL-FALLBACK partitions processed in the orchestrator's own context with checkpoints.
+    List<HuntResult> sequentialFallback(Partition sg, Theta θ) {
+        // strategy: θ["prompt.hunt.sequential_fallback"]                                               // src: vulnhunt/phases/phase2_hunt.md:246
+        if (θ["prompt.hunt.sequential_fallback"] == null) return List.of();
+        List<HuntResult> out = new List();
+        Map<EntryPoint, List<Input>> groups = θ["p.phase2_hunt.fallback_group_by_entry_point"] ? sg.inputs.groupBy(i -> i.entryPoint) : Map.of(null, sg.inputs); // src: vulnhunt/phases/phase2_hunt.md:251
+        for (EntryPoint ep : groups.keys()) {
+            if (θ["p.phase2_hunt.sequential_fallback_class_iteration"]) {                                // src: vulnhunt/phases/phase2_hunt.md:68
+                for (ClassGroup cls : θ["p.phase2_hunt.fallback_class_group_order"]) {                   // src: vulnhunt/phases/phase2_hunt.md:252
+                    HuntResult r = runTraceAgentInline(new HuntJob(sg.id, cls, groups.get(ep), false), θ);
+                    writeFile(θ["p.phase2_hunt.fallback_checkpoint_files"], r);                          // src: vulnhunt/phases/phase2_hunt.md:254
+                    out.add(r);
+                }
+            }
+        }
+        if (θ["p.phase2_hunt.fallback_merge_into_aggregation"]) return out;                              // src: vulnhunt/phases/phase2_hunt.md:258
+        return List.of();
+    }
+
+    HuntResult runTraceAgentInline(HuntJob job, Theta θ) {
+        // Same as runTraceAgent but in the orchestrator's context; one class group's gates active at a time. // src: vulnhunt/phases/phase2_hunt.md:256
+        return runTraceAgent(job, θ);
+    }
+}
+
+@executedBy(MODEL) @role(prompt) @stage("P2")
+class Phase2HuntPrompt {
+
+    Prompt run(Theta θ) {
+        Prompt p = new Prompt();
+        p.include(context(θ));
+        p.include(dispatchProcedure(θ));
+        p.include(classGroups(θ));
+        p.include(waves(θ));
+        p.include(checklist(θ));
+        p.include(orchestratorOnly(θ));
+        p.include(aggregation(θ));
+        p.include(fallback(θ));
+        return p;
+    }
+
+    Prompt context(Theta θ) {
+        Prompt p = new Prompt();
+        p.context("Phase 1 recon output: input inventory and subgraph partitions");                      // src: vulnhunt/phases/phase2_hunt.md:3
+        p.rule(θ["p.phase2_hunt.agent_traces_all_inputs_own_sinks"]);                                    // src: vulnhunt/phases/phase2_hunt.md:11
+        return p;
+    }
+
+    Prompt dispatchProcedure(Theta θ) {
+        Prompt p = new Prompt();
+        p.must(θ["p.phase2_hunt.agents_per_production_partition"]);                                      // src: vulnhunt/phases/phase2_hunt.md:19
+        p.rule(θ["p.phase2_hunt.skip_dev_only_partitions"]);                                             // src: vulnhunt/phases/phase2_hunt.md:24
+        p.rule(θ["prompt.hunt.sink_driven_agents"]);                                                     // src: vulnhunt/phases/phase2_hunt.md:25
+        p.forbid(θ["p.phase2_hunt.no_per_candidate_agents"]);                                            // src: vulnhunt/phases/phase2_hunt.md:27
+        p.forbid(θ["p.phase2_hunt.no_combining_class_groups"]);                                          // src: vulnhunt/phases/phase2_hunt.md:28
+        p.forbid(θ["p.phase2_hunt.no_skipping_class_groups"]);                                           // src: vulnhunt/phases/phase2_hunt.md:28
+        p.forbid(θ["p.phase2_hunt.no_inline_partition_analysis"]);                                       // src: vulnhunt/phases/phase2_hunt.md:29
+        p.threshold(θ["prompt.hunt.min_agent_count"]);                                                   // src: vulnhunt/phases/phase2_hunt.md:30
+        return p;
+    }
+
+    Prompt classGroups(Theta θ) {
+        Prompt p = new Prompt();
+        p.choose(θ["prompt.hunt.class_groups"]);                                                         // src: vulnhunt/phases/phase2_hunt.md:46
+        p.context(θ["p.phase2_hunt.class_group_inj_contents"]);                                          // src: vulnhunt/phases/phase2_hunt.md:50
+        p.context(θ["p.phase2_hunt.class_group_nav_contents"]);                                          // src: vulnhunt/phases/phase2_hunt.md:51
+        p.context(θ["p.phase2_hunt.class_group_log_contents"]);                                          // src: vulnhunt/phases/phase2_hunt.md:52
+        return p;
+    }
+
+    Prompt waves(Theta θ) {
+        Prompt p = new Prompt();
+        p.threshold(θ["prompt.hunt.wave_size"]);                                                         // src: vulnhunt/phases/phase2_hunt.md:54
+        p.threshold(θ["p.phase2_hunt.wave_size_cap"]);                                                   // src: vulnhunt/phases/phase2_hunt.md:54
+        p.must(θ["p.phase2_hunt.wait_for_wave_results"]);                                                // src: vulnhunt/phases/phase2_hunt.md:55
+        p.forbid(θ["p.phase2_hunt.no_single_message_dispatch"]);                                         // src: vulnhunt/phases/phase2_hunt.md:56
+        p.rule(θ["p.phase2_hunt.sink_driven_final_wave"]);                                               // src: vulnhunt/phases/phase2_hunt.md:63
+        p.rule(θ["p.phase2_hunt.sequential_fallback_class_iteration"]);                                  // src: vulnhunt/phases/phase2_hunt.md:67
+        return p;
+    }
+
+    Prompt checklist(Theta θ) {
+        Prompt p = new Prompt();
+        p.checklist(θ["p.phase2_hunt.dispatch_checklist"]);                                              // src: vulnhunt/phases/phase2_hunt.md:73
+        p.must(θ["prompt.redispatch_on_failure"]);                                                       // src: vulnhunt/phases/phase2_hunt.md:77
+        p.rule(θ["p.phase2_hunt.failed_agent_is_unknown_coverage"]);                                     // src: vulnhunt/phases/phase2_hunt.md:78
+        p.forbid(θ["p.phase2_hunt.no_proceeding_with_gaps"]);                                            // src: vulnhunt/phases/phase2_hunt.md:79
+        return p;
+    }
+
+    Prompt orchestratorOnly(Theta θ) {
+        Prompt p = new Prompt();
+        p.rule(θ["p.phase2_hunt.short_prompt_no_interpolation"]);                                        // src: vulnhunt/phases/phase2_hunt.md:84
+        p.forbid(θ["p.phase2_hunt.orchestrator_sections_withheld"]);                                     // src: vulnhunt/phases/phase2_hunt.md:128
+        p.rule(θ["p.phase2_hunt.sink_driven_parallel_with_trace"]);                                      // src: vulnhunt/phases/phase2_hunt.md:134
+        p.rule(θ["p.phase2_hunt.merge_sink_driven_candidates"]);                                         // src: vulnhunt/phases/phase2_hunt.md:205
+        return p;
+    }
+
+    Prompt aggregation(Theta θ) {
+        Prompt p = new Prompt();
+        p.tiebreak(θ["prompt.aggregate.any_candidate_wins"]);                                            // src: vulnhunt/phases/phase2_hunt.md:215
+        p.rule(θ["p.phase2_hunt.safe_requires_all_agents"]);                                             // src: vulnhunt/phases/phase2_hunt.md:216
+        p.rule(θ["p.phase2_hunt.cross_class_resolution"]);                                               // src: vulnhunt/phases/phase2_hunt.md:217
+        p.rule(θ["p.phase2_hunt.cross_class_redispatch_condition"]);                                     // src: vulnhunt/phases/phase2_hunt.md:219
+        p.must(θ["p.phase2_hunt.missing_disposition_redispatch"]);                                       // src: vulnhunt/phases/phase2_hunt.md:221
+        p.rule(θ["p.phase2_hunt.vuln_ids_assigned_at_aggregation"]);                                     // src: vulnhunt/phases/phase2_hunt.md:223
+        p.format(θ["p.phase2_hunt.vuln_id_ordering"]);                                                   // src: vulnhunt/phases/phase2_hunt.md:224
+        p.rule(θ["prompt.aggregate.same_sink_dedup"]);                                                   // src: vulnhunt/phases/phase2_hunt.md:227
+        p.rule(θ["p.phase2_hunt.dedup_same_sink_file_line"]);                                            // src: vulnhunt/phases/phase2_hunt.md:227
+        p.tiebreak(θ["p.phase2_hunt.dedup_keep_pessimistic_union"]);                                     // src: vulnhunt/phases/phase2_hunt.md:229
+        p.must(θ["p.phase2_hunt.disposition_count_check"]);                                              // src: vulnhunt/phases/phase2_hunt.md:232
+        p.must(θ["p.phase2_hunt.unresolved_inputs_redispatch"]);                                         // src: vulnhunt/phases/phase2_hunt.md:233
+        p.must(θ["p.phase2_hunt.present_candidates_to_user"]);                                           // src: vulnhunt/phases/phase2_hunt.md:236
+        p.must(θ["p.phase2_hunt.orchestrator_absent_input_checkpoint"]);                                 // src: vulnhunt/phases/phase2_hunt.md:239
+        p.checklist(θ["p.phase2_hunt.absent_input_security_blocks"]);                                    // src: vulnhunt/phases/phase2_hunt.md:241
+        p.rule(θ["p.phase2_hunt.fail_open_is_cvb_cwe306"]);                                              // src: vulnhunt/phases/phase2_hunt.md:243
+        return p;
+    }
+
+    Prompt fallback(Theta θ) {
+        Prompt p = new Prompt();
+        p.rule(θ["prompt.hunt.sequential_fallback"]);                                                    // src: vulnhunt/phases/phase2_hunt.md:246
+        p.step(1, θ["p.phase2_hunt.fallback_group_by_entry_point"]);                                     // src: vulnhunt/phases/phase2_hunt.md:251
+        p.step(2, θ["p.phase2_hunt.fallback_class_group_order"]);                                        // src: vulnhunt/phases/phase2_hunt.md:252
+        p.step(3, θ["p.phase2_hunt.fallback_checkpoint_files"]);                                         // src: vulnhunt/phases/phase2_hunt.md:254
+        p.step(5, θ["p.phase2_hunt.fallback_merge_into_aggregation"]);                                   // src: vulnhunt/phases/phase2_hunt.md:258
+        return p;
+    }
+}
+
+// The short dispatch prompt each class-group trace agent receives (template, placeholders substituted).
+@executedBy(MODEL) @role(prompt) @stage("P2")
+class TraceAgentPrompt {
+
+    Prompt build(HuntJob job, Theta θ) {
+        Prompt p = new Prompt();
+        // placeholders: θ["p.phase2_hunt.prompt_template_variables"] = CLASS, CLASS_FOCUS, SG_ID, VULNHUNT_DIR, PHASES_DIR
+        p.context(substitute(θ["p.phase2_hunt.prompt_template_variables"], job));                        // src: vulnhunt/phases/phase2_hunt.md:86
+        p.persona(θ["p.phase2_hunt.trace_agent_persona"]);  // "You are a <CLASS> trace agent for partition <SG_ID>." // src: vulnhunt/phases/phase2_hunt.md:90
+        p.must(θ["p.phase2_hunt.agent_own_class_only"]);                                                 // src: vulnhunt/phases/phase2_hunt.md:93
+        p.format(θ["p.phase2_hunt.cross_class_flag_format"]);                                            // src: vulnhunt/phases/phase2_hunt.md:95
+        p.checklist(θ["prompt.trace_agent_reading_list"]);  // shared.md, class_<class>.md, partitions/sg-<SG_ID>_data.md, IN ORDER // src: vulnhunt/phases/phase2_hunt.md:97
+        p.choose(θ["prompt.dispositions"]);                                                              // src: vulnhunt/phases/phase2_hunt.md:102
+        p.format(θ["p.phase2_hunt.candidate_disposition_fields"]);                                       // src: vulnhunt/phases/phase2_hunt.md:103
+        p.rule(θ["p.phase2_hunt.safe_scoped_to_own_class"]);                                             // src: vulnhunt/phases/phase2_hunt.md:104
+        p.rule(θ["p.phase2_hunt.no_match_disposition"]);                                                 // src: vulnhunt/phases/phase2_hunt.md:105
+        p.rule(θ["p.phase2_hunt.design_intent_disposition"]);                                            // src: vulnhunt/phases/phase2_hunt.md:107
+        p.format(θ["p.phase2_hunt.trace_results_path"]);                                                 // src: vulnhunt/phases/phase2_hunt.md:109
+        p.threshold(θ["p.phase2_hunt.trace_agent_return_words"]);                                        // src: vulnhunt/phases/phase2_hunt.md:111
+        return p;
+    }
+}
+
+// Sink-driven audit agent: backward traces from dangerous sinks; six audits in order.
+@executedBy(MODEL) @role(agent) @stage("P2")
+class SinkDrivenAuditAgent {
+
+    HuntResult run(Theta θ) {
+        Prompt p = prompt(θ);                                                                            // src: vulnhunt/phases/phase2_hunt.md:141
+        Runtime.subagent(p, null);
+        List<Candidate> cs = new List();
+        if (!θ["p.phase2_hunt.sink_driven_backward_trace"]) return new HuntResult(cs);                   // src: vulnhunt/phases/phase2_hunt.md:135
+        List<String> audits = θ["prompt.sink_audits"];                                                   // src: vulnhunt/phases/phase2_hunt.md:146
+        if (audits.contains("action-scope")) cs.addAll(actionScopeAudit(θ));                             // src: vulnhunt/phases/phase2_hunt.md:148
+        if (audits.contains("credential-issuing")) cs.addAll(credentialIssuingAudit(θ));                 // src: vulnhunt/phases/phase2_hunt.md:159
+        if (audits.contains("crypto")) cs.addAll(cryptoAudit(θ));                                        // src: vulnhunt/phases/phase2_hunt.md:166
+        if (audits.contains("sensitive-storage")) cs.addAll(sensitiveStorageAudit(θ));                   // src: vulnhunt/phases/phase2_hunt.md:178
+        if (audits.contains("concurrency")) cs.addAll(concurrencyAudit(θ));                              // src: vulnhunt/phases/phase2_hunt.md:183
+        if (audits.contains("rate-limit")) cs.addAll(rateLimitAudit(θ));                                 // src: vulnhunt/phases/phase2_hunt.md:194
+        for (Candidate c : cs) {
+            if (θ["p.phase2_hunt.sink_driven_output_format"]) c.id = null;  // trace candidate format, no VULN-NNN // src: vulnhunt/phases/phase2_hunt.md:201
+            if (θ["p.phase2_hunt.sink_driven_gate_results"]) c.gates = Phase2Shared.recordGateResultsWhereApplicable(c, θ); // src: vulnhunt/phases/phase2_hunt.md:202
+        }
+        return new HuntResult(cs);
+    }
+
+    Prompt prompt(Theta θ) {
+        Prompt p = new Prompt();
+        p.persona(θ["p.phase2_hunt.sink_driven_persona"]);                                               // src: vulnhunt/phases/phase2_hunt.md:142
+        p.checklist(θ["prompt.sink_audits"]);                                                            // src: vulnhunt/phases/phase2_hunt.md:146
+        return p;
+    }
+
+    // Audit 1: wildcard permission constants in the detected cloud/auth SDK.
+    List<Candidate> actionScopeAudit(Theta θ) {
+        List<Candidate> out = new List();
+        if (!θ["p.phase2_hunt.audit_action_scope"]) return out;                                          // src: vulnhunt/phases/phase2_hunt.md:148
+        for (Hit w : grep(θ["p.phase2_hunt.action_scope_cloud_patterns"])) {                              // src: vulnhunt/phases/phase2_hunt.md:150
+            Function f = read(w.enclosingFunction);                                                       // src: vulnhunt/phases/phase2_hunt.md:154
+            boolean over = θ["p.phase2_hunt.action_scope_parallel_branch_test"] && f.hasParallelBranchWithRestrictedSet(); // src: vulnhunt/phases/phase2_hunt.md:155
+            boolean destructive = θ["p.phase2_hunt.action_scope_destructive_ops_test"] && w.includesDestructiveOpsBeyondFeature(); // src: vulnhunt/phases/phase2_hunt.md:156
+            if (over || destructive) out.add(Candidate.of(w));
+        }
+        return out;
+    }
+
+    // Audit 2: every caller of a credential-issuing function must branch on request type / access level.
+    List<Candidate> credentialIssuingAudit(Theta θ) {
+        List<Candidate> out = new List();
+        for (Function issuer : grep(θ["p.phase2_hunt.audit_credential_issuing"])) {                      // src: vulnhunt/phases/phase2_hunt.md:159
+            for (CallSite caller : issuer.callers()) {
+                if (θ["p.phase2_hunt.credential_caller_branch_check"] && !caller.branchesOnAccessLevel()) { // src: vulnhunt/phases/phase2_hunt.md:161
+                    if (θ["p.phase2_hunt.credential_no_branch_candidate"]) out.add(Candidate.of(caller)); // src: vulnhunt/phases/phase2_hunt.md:162
+                }
+            }
+        }
+        return out;
+    }
+
+    // Audit 3: crypto API calls in production code (adapt to stack).
+    List<Candidate> cryptoAudit(Theta θ) {
+        List<Candidate> out = new List();
+        if (!θ["p.phase2_hunt.audit_crypto"]) return out;                                                // src: vulnhunt/phases/phase2_hunt.md:166
+        for (CallSite c : grepCryptoApis().filter(x -> x.isProduction())) {
+            boolean weak = θ["p.phase2_hunt.crypto_check_algorithm"] && c.weakAlgorithmModeOrKeySize();   // src: vulnhunt/phases/phase2_hunt.md:168
+            boolean sensitive = c.contextIn(θ["p.phase2_hunt.crypto_check_context"]);                    // src: vulnhunt/phases/phase2_hunt.md:169
+            if (c.extractableKeySerializedToStorageCookiesLogsOrNetwork()) out.add(Candidate.of(c, θ["p.phase2_hunt.crypto_check_key_storage"])); // src: vulnhunt/phases/phase2_hunt.md:170
+            if (c.authFactorFromNonCryptoPrng()) out.add(Candidate.of(c, θ["p.phase2_hunt.crypto_check_entropy"])); // src: vulnhunt/phases/phase2_hunt.md:172
+            if (weak && sensitive) out.add(Candidate.of(c, θ["p.phase2_hunt.weak_crypto_candidate_rule"])); // src: vulnhunt/phases/phase2_hunt.md:174
+        }
+        // Attacker-controlled input NOT required; never apply Gate 2a to eliminate crypto findings.
+        for (Candidate k : out) {
+            k.requiresAttackerInput = !θ["p.phase2_hunt.crypto_no_attacker_input_needed"];              // src: vulnhunt/phases/phase2_hunt.md:175
+            k.gate2aExempt = θ["p.phase2_hunt.crypto_gate2a_exempt"];                                    // src: vulnhunt/phases/phase2_hunt.md:176
+        }
+        return out;
+    }
+
+    // Audit 4: web storage / cookie writes holding secrets or PII.
+    List<Candidate> sensitiveStorageAudit(Theta θ) {
+        List<Candidate> out = new List();
+        for (Hit h : grep(θ["p.phase2_hunt.audit_sensitive_storage"])) {                                 // src: vulnhunt/phases/phase2_hunt.md:178
+            if (h.valueHoldsKeysTokensCredentialsOrPii()) out.add(Candidate.of(h, θ["p.phase2_hunt.sensitive_storage_cwe312"])); // src: vulnhunt/phases/phase2_hunt.md:179
+            if (θ["p.phase2_hunt.storage_fallback_path_check"] && h.protectedDataDegradesToPlaintext()) out.add(Candidate.of(h, θ["p.phase2_hunt.sensitive_storage_cwe312"])); // src: vulnhunt/phases/phase2_hunt.md:180
+        }
+        return out;
+    }
+
+    // Audit 5: async dispatch with dependent synchronous operation and no sync -> TOCTOU.
+    List<Candidate> concurrencyAudit(Theta θ) {
+        List<Candidate> out = new List();
+        for (CallSite a : grep(θ["p.phase2_hunt.audit_concurrency"]).filter(x -> x.isProduction())) {   // src: vulnhunt/phases/phase2_hunt.md:183
+            // questions: θ["p.phase2_hunt.concurrency_three_questions"]                                   // src: vulnhunt/phases/phase2_hunt.md:189
+            State s = a.modifiedState();                                                                 // src: vulnhunt/phases/phase2_hunt.md:189
+            boolean dependent = a.laterSyncOpDependsOn(s);                                               // src: vulnhunt/phases/phase2_hunt.md:190
+            boolean synced = a.hasLockTransactionOrSync();                                               // src: vulnhunt/phases/phase2_hunt.md:191
+            if (θ["p.phase2_hunt.concurrency_three_questions"] != null && dependent && !synced) out.add(Candidate.of(a, θ["p.phase2_hunt.concurrency_no_lock_cwe367"])); // src: vulnhunt/phases/phase2_hunt.md:192
+        }
+        return out;
+    }
+
+    // Audit 6: session-bound attempt counters on unauthenticated endpoints.
+    List<Candidate> rateLimitAudit(Theta θ) {
+        List<Candidate> out = new List();
+        if (!θ["p.phase2_hunt.audit_rate_limit"]) return out;                                            // src: vulnhunt/phases/phase2_hunt.md:194
+        for (Hit h : grepSessionWrites().filter(x -> x.matchesAny(θ["p.phase2_hunt.rate_limit_keywords"]))) { // src: vulnhunt/phases/phase2_hunt.md:196
+            if (θ["p.phase2_hunt.rate_limit_unauth_scope"] && !h.endpointUnauthenticated()) continue;    // src: vulnhunt/phases/phase2_hunt.md:197
+            if (h.bindingIdentifierRotatable()) out.add(Candidate.of(h, θ["p.phase2_hunt.rate_limit_rotatable_cwe307"])); // src: vulnhunt/phases/phase2_hunt.md:198
+        }
+        return out;
+    }
+}

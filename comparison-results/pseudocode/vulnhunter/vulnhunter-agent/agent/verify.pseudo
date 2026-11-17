@@ -1,0 +1,351 @@
+// file: vulnhunter-agent/agent/verify.py
+// --mode=verify orchestrator: fetch closed issues (+ edit history), reconstruct original bodies, extract markers,
+// enforce one repo + one report per run, clone target, stage the named report, Haiku pre-flight for cross-repo
+// references, one /vulnhunt-fix-verify session (VerifyRunner), then post verdicts / reopen and emit audit events.
+
+@executedBy(CODE) @role(pipeline) @stage("verify")
+class AgentVerify {
+
+    // run_verify: returns the process exit code; never raises on expected failures.
+    int run(AgentConfig config, List<String> issueUrls, String commit, Path scratchBaseDir, boolean noPost, boolean noReopen, String modelOverride, AuditWriter auditWriter, RepoProperties auditRepoProperties) {
+        Map<String, Integer> exit = θ["code.agent.verify.exit_codes"];                          // src: vulnhunter-agent/agent/verify.py:92
+        if (issueUrls.isEmpty()) return exit.get("bad_args");                                     // src: vulnhunter-agent/agent/verify.py:157
+        List<IssueRef> refs;
+        try {
+            refs = issueUrls.map(u -> GithubVerify.parseIssueUrl(u));                             // src: vulnhunter-agent/agent/verify.py:166
+        } catch (GitHubVerifyError exc) {
+            return exit.get("infra");                                                             // src: vulnhunter-agent/agent/verify.py:172
+        }
+        String scanToken = TokenClient.getGithubToken("scan", θ["github.*"]);                     // src: vulnhunter-agent/agent/verify.py:174
+        if (scanToken == "") return exit.get("auth");                                             // src: vulnhunter-agent/agent/verify.py:175
+        Set<String> hosts = issueUrls.map(u -> GithubVerify.issueHost(u)).toSet();                // src: vulnhunter-agent/agent/verify.py:188
+        if (hosts.size() != 1) return exit.get("infra");                                          // src: vulnhunter-agent/agent/verify.py:189
+        String host = hosts.first();                                                              // src: vulnhunter-agent/agent/verify.py:194
+
+        HttpClient client = GithubVerify.makeClient(scanToken, Auth.resolveVerify(θ), θ);         // src: vulnhunter-agent/agent/verify.py:197
+        List<FetchedRecord> records;
+        try {
+            records = fetchAllIssues(client, host, refs);                                         // src: vulnhunter-agent/agent/verify.py:199
+        } catch (GitHubVerifyError | MarkerExtractionError | DiffApplyError exc) {
+            return exit.get("infra");                                                             // src: vulnhunter-agent/agent/verify.py:202
+        }
+        try {
+            enforceHomogeneity(records);                                                          // src: vulnhunter-agent/agent/verify.py:214
+        } catch (ValueError exc) {
+            return exit.get("infra");                                                             // src: vulnhunter-agent/agent/verify.py:217
+        }
+
+        // audit context (all records share one repo + scan id now)
+        String auditScanId = records.get(0).markers.resultsDir;                                   // src: vulnhunter-agent/agent/verify.py:222
+        String auditRepoSlug = targetRepoUrlToSlug(records, host);                                // src: vulnhunter-agent/agent/verify.py:223
+        String auditTargetSha = orElse(commit, "");                                               // src: vulnhunter-agent/agent/verify.py:224
+        String auditModelVersion = orElse(modelOverride, config.anthropic.model);                 // src: vulnhunter-agent/agent/verify.py:225
+        RepoProperties auditProps = orElse(auditRepoProperties, new RepoProperties());            // src: vulnhunter-agent/agent/verify.py:227
+        CompletedEmitter done = new CompletedEmitter(auditWriter, auditRepoSlug, auditScanId, auditModelVersion, auditTargetSha, now());
+        if (auditWriter != null) auditWriter.emitAudit(Audit.buildVerifyStarted(config.audit.appId, config.audit.actor, auditRepoSlug, auditScanId, auditModelVersion, auditTargetSha, "", θ), θ); // src: vulnhunter-agent/agent/verify.py:285
+
+        // scratch tree
+        Path scratchRoot = orElse(scratchBaseDir, Path(θ["verify.*"].scratchBaseDir)).expanduser().resolve(); // src: vulnhunter-agent/agent/verify.py:298
+        String runId = makeRunId(records);                                                        // src: vulnhunter-agent/agent/verify.py:299
+        Path runDir = containedRunDir(scratchRoot, runId);                                        // src: vulnhunter-agent/agent/verify.py:300
+        runDir.mkdirs();
+        Path logPath = runDir.resolve("agent.log");                                               // src: vulnhunter-agent/agent/verify.py:302
+
+        String targetRepoUrl;
+        Path targetRepo;
+        try {
+            targetRepoUrl = targetRepoUrl(records, host);                                         // src: vulnhunter-agent/agent/verify.py:306
+            targetRepo = VerifyResolve.cloneTargetRepo(targetRepoUrl, runDir.resolve("repo"), commit, scanToken, host, θ["verify.*"].cloneTimeoutSeconds); // src: vulnhunter-agent/agent/verify.py:307
+        } catch (ResolveError exc) {
+            return done.emitCompletedAndExit(exit.get("infra"), "failed: clone_target_repo");     // src: vulnhunter-agent/agent/verify.py:317
+        }
+        Path report;
+        try {
+            report = VerifyResolve.stageReport(targetRepoUrl, records.get(0).markers.resultsDir, runDir.resolve("report")); // src: vulnhunter-agent/agent/verify.py:323
+        } catch (ResolveError exc) {
+            return done.emitCompletedAndExit(exit.get("infra"), "failed: stage_report");          // src: vulnhunter-agent/agent/verify.py:331
+        }
+
+        List<IssueNarrative> narratives = records.map(r -> VerifyExtract.buildNarrative(r.issue, r.comments, r.events, r.markers.findingId)); // src: vulnhunter-agent/agent/verify.py:336
+        List<String> fixedIds = records.map(r -> r.markers.findingId);                            // src: vulnhunter-agent/agent/verify.py:340
+        Path commentsPath = runDir.resolve("comments.md");                                        // src: vulnhunter-agent/agent/verify.py:341
+        TokenProvider tokenManager = Auth.makeTokenManager(θ, "verify");                          // src: vulnhunter-agent/agent/verify.py:343
+        RunState state = new RunState();                                                          // src: vulnhunter-agent/agent/verify.py:344
+        preflightCloneRequests(records, state, host, runDir);                                     // non-fatal pre-flight // src: vulnhunter-agent/agent/verify.py:352
+
+        VerifySessionResult sessionResult = runSkill(tokenManager, runDir, logPath, targetRepo, report, commentsPath, narratives, fixedIds, state, modelOverride); // src: vulnhunter-agent/agent/verify.py:360
+        if (sessionResult.kind == OutputKind.EMPTY || sessionResult.kind == OutputKind.SCHEMA_INVALID) { // src: vulnhunter-agent/agent/verify.py:374
+            return done.emitCompletedAndExit(exit.get("infra"), "failed: skill output");          // src: vulnhunter-agent/agent/verify.py:380
+        }
+        try {
+            verifyEntryCount(sessionResult, fixedIds);                                            // src: vulnhunter-agent/agent/verify.py:387
+        } catch (ValueError exc) {
+            return done.emitCompletedAndExit(exit.get("infra"), "failed: verify_entry_count");    // src: vulnhunter-agent/agent/verify.py:390
+        }
+
+        PostOutcome outcome = postDispositions(client, host, records, orElse(sessionResult.parsed, Map.of()), noPost, noReopen); // src: vulnhunter-agent/agent/verify.py:404
+        try {
+            emitVerifyDispositions(auditWriter, config, sessionResult.parsed.getOrDefault("dispositions", List.of()), auditScanId, auditRepoSlug, auditModelVersion, auditTargetSha, auditProps); // src: vulnhunter-agent/agent/verify.py:420
+        } catch (AuditWriteError e) {
+            printSummary(outcome.succeeded, runDir, noPost, outcome.failed);                      // src: vulnhunter-agent/agent/verify.py:434
+            throw e;                                                                              // src: vulnhunter-agent/agent/verify.py:437
+        } catch (Exception e) {
+            // logged and swallowed
+        }
+        printSummary(outcome.succeeded, runDir, noPost, outcome.failed);                          // src: vulnhunter-agent/agent/verify.py:440
+        List<PostResult> partialFailures = outcome.succeeded.filter(r -> r.reopenFailed || r.archivalFailed); // src: vulnhunter-agent/agent/verify.py:443
+        if (!outcome.failed.isEmpty()) return done.emitCompletedAndExit(exit.get("infra"), "failed: issue post(s) failed"); // src: vulnhunter-agent/agent/verify.py:446
+        if (θ["code.agent.verify.partial_post_is_failure"] && !partialFailures.isEmpty())         // src: vulnhunter-agent/agent/verify.py:460
+            return done.emitCompletedAndExit(exit.get("infra"), "failed: partial post failure(s)"); // src: vulnhunter-agent/agent/verify.py:469
+        done.dispositionsCount = sessionResult.parsed.getOrDefault("dispositions", List.of()).size(); // src: vulnhunter-agent/agent/verify.py:474
+        return done.emitCompletedAndExit(exit.get("ok"), "");                                     // src: vulnhunter-agent/agent/verify.py:477
+    }
+
+    // _fetch_all_issues: sequential; open issues skipped; edited bodies reconstructed; markers from the original body.
+    List<FetchedRecord> fetchAllIssues(HttpClient client, String host, List<IssueRef> refs) {
+        List<FetchedRecord> records = new List();
+        List<IssueRef> skippedOpen = new List();
+        for (IssueRef ref : refs) {                                                               // src: vulnhunter-agent/agent/verify.py:506
+            FetchedIssue issue = GithubVerify.getIssue(client, host, ref, θ);                     // src: vulnhunter-agent/agent/verify.py:507
+            if (θ["code.agent.verify.closed_issues_only"] && issue.state != "closed") {           // src: vulnhunter-agent/agent/verify.py:508
+                skippedOpen.add(ref);                                                             // src: vulnhunter-agent/agent/verify.py:517
+                continue;
+            }
+            // max_edit_diff_bytes / max_edit_total_bytes bound the GraphQL edit history
+            List<UserContentEdit> edits = GithubVerify.listUserContentEdits(client, host, ref, θ); // θ["verify.*"] edit bounds // src: vulnhunter-agent/agent/verify.py:519
+            boolean bodyTampered = !edits.isEmpty();                                              // src: vulnhunter-agent/agent/verify.py:526
+            String originalBody;
+            if (bodyTampered) {
+                try {
+                    originalBody = BodyReconstruct.reconstructOriginal(issue.body, edits.map(e -> Map.of("editedAt", e.editedAt, "diff", e.diff)), θ); // src: vulnhunter-agent/agent/verify.py:556
+                } catch (DiffApplyError exc) {
+                    throw new DiffApplyError("could not reconstruct original body");              // src: vulnhunter-agent/agent/verify.py:564
+                }
+            } else {
+                originalBody = issue.body;                                                        // src: vulnhunter-agent/agent/verify.py:574
+            }
+            VerifyMarkers markers = VerifyExtract.extractMarkers(originalBody, "issue #" + ref.number); // src: vulnhunter-agent/agent/verify.py:576
+            List<IssueComment> comments = GithubVerify.listComments(client, host, ref, θ);        // max_comment_pages, max_timeline_bytes from θ["verify.*"] // src: vulnhunter-agent/agent/verify.py:581
+            List<IssueEvent> events = GithubVerify.listEvents(client, host, ref, θ);              // max_event_pages from θ["verify.*"] // src: vulnhunter-agent/agent/verify.py:588
+            records.add(new FetchedRecord(ref, issue, markers, bodyTampered, originalBody, comments, events)); // src: vulnhunter-agent/agent/verify.py:591
+        }
+        if (records.isEmpty()) throw new GitHubVerifyError("No closed issues to verify; every supplied issue is open"); // src: vulnhunter-agent/agent/verify.py:602
+        return records;
+    }
+
+    // _enforce_homogeneity: one (owner, repo, results_dir) per run.
+    void enforceHomogeneity(List<FetchedRecord> records) {
+        Set keys = records.map(r -> θ["code.agent.verify.homogeneity_key"].of(r.ref.owner.lower(), r.ref.repo.lower(), r.markers.resultsDir)).toSet(); // src: vulnhunter-agent/agent/verify.py:627
+        if (keys.size() == 1) return;                                                             // src: vulnhunter-agent/agent/verify.py:631
+        throw new ValueError("Verify run requires all issues to share the same (repo, scan_id)"); // src: vulnhunter-agent/agent/verify.py:637
+    }
+
+    String targetRepoUrl(List<FetchedRecord> records, String host) {
+        return "https://" + host + "/" + records.get(0).ref.owner + "/" + records.get(0).ref.repo + ".git"; // src: vulnhunter-agent/agent/verify.py:647
+    }
+
+    String targetRepoUrlToSlug(List<FetchedRecord> records, String host) {
+        return records.get(0).ref.owner + "/" + records.get(0).ref.repo;                          // src: vulnhunter-agent/agent/verify.py:658
+    }
+
+    // _emit_verify_dispositions: one verify_decision per row; a findings transition only when status moves.
+    void emitVerifyDispositions(AuditWriter auditWriter, AgentConfig config, List<Map> dispositions, String reportId, String repoSlug, String model, String targetSha, RepoProperties repoProperties) {
+        if (auditWriter == null) return;                                                          // src: vulnhunter-agent/agent/verify.py:681
+        for (Object row : dispositions) {                                                         // src: vulnhunter-agent/agent/verify.py:683
+            if (!(row instanceof Map)) continue;                                                  // src: vulnhunter-agent/agent/verify.py:684
+            String vulnId = str(orElse(row.get("finding_id"), "")).strip();                       // src: vulnhunter-agent/agent/verify.py:686
+            String verdictRaw = str(orElse(row.get("verdict"), "")).strip().upper();              // src: vulnhunter-agent/agent/verify.py:687
+            (String auditVerdict, String toStatus) = mapVerifyVerdict(verdictRaw);                // src: vulnhunter-agent/agent/verify.py:688
+            String findingId = Audit.findingIdFor(reportId, vulnId);                              // src: vulnhunter-agent/agent/verify.py:689
+            String rationale = str(orElse(row.get("rationale"), "")).strip();                     // src: vulnhunter-agent/agent/verify.py:690
+            auditWriter.emitAudit(Audit.buildVerifyDecision(config.audit.appId, config.audit.actor, repoSlug, reportId, findingId, auditVerdict, toStatus, "OPEN", rationale, model, targetSha, "verdict=" + verdictRaw, θ), θ); // src: vulnhunter-agent/agent/verify.py:691
+            if (toStatus != "") {                                                                 // src: vulnhunter-agent/agent/verify.py:707
+                auditWriter.emitFinding(Audit.buildFindingEvent(config.audit.appId, repoSlug, reportId, findingId, vulnId, "", "CWE-UNKNOWN", "informational", toStatus, "", rationale, "", "", "", "", "", "", "", "", "", false, repoProperties.values), θ); // src: vulnhunter-agent/agent/verify.py:708
+            }
+        }
+    }
+
+    // _map_verify_verdict: verdict -> (audit verdict, to_status).
+    String[] mapVerifyVerdict(String verdict) {
+        Map<String, String[]> m = θ["code.agent.verify.verdict_status_map"];                     // src: vulnhunter-agent/agent/verify.py:730
+        if (verdict == "FIXED") return ["PASS", "RESOLVED"];                                      // src: vulnhunter-agent/agent/verify.py:737
+        if (List.of("NOT_FIXED", "PARTIAL", "INCONCLUSIVE").contains(verdict)) return ["FAIL", "REOPENED"]; // src: vulnhunter-agent/agent/verify.py:739
+        if (verdict == "INVALID_INPUT") return ["FAIL", ""];                                      // src: vulnhunter-agent/agent/verify.py:741
+        return ["FAIL", ""];                                                                      // unknown verdict: FAIL, no transition // src: vulnhunter-agent/agent/verify.py:748
+    }
+
+    // _contained_run_dir: CWE-22 sink guard.
+    Path containedRunDir(Path scratchRoot, String runId) {
+        Path root = scratchRoot.resolve();                                                        // src: vulnhunter-agent/agent/verify.py:758
+        Path runDir = root.resolve(runId).resolve();                                              // src: vulnhunter-agent/agent/verify.py:759
+        if (runDir != root && !runDir.isRelativeTo(root)) throw new ValueError("run_dir escapes scratch_root"); // src: vulnhunter-agent/agent/verify.py:760
+        return runDir;
+    }
+
+    // _make_run_id: <repo>-<scan-id-short>-<utc-ts>.
+    String makeRunId(List<FetchedRecord> records) {
+        FetchedRecord r = records.get(0);
+        String resultsDir = r.markers.resultsDir;                                                 // src: vulnhunter-agent/agent/verify.py:776
+        String scanShort = resultsDir.contains("_") ? resultsDir.split("_").last() : "noscanid";  // src: vulnhunter-agent/agent/verify.py:777
+        return r.ref.repo.lower() + "-" + scanShort + "-" + utcNow("%Y%m%d-%H%M%S");             // src: vulnhunter-agent/agent/verify.py:779
+    }
+
+    // _run_skill: write comments.md, build kickoff, one verify session (no retry loop).
+    VerifySessionResult runSkill(TokenProvider tokenManager, Path runDir, Path logPath, Path targetRepo, Path report, Path commentsPath, List<IssueNarrative> narratives, List<String> fixedIds, RunState state, String modelOverride) {
+        VerifyExtract.writeCommentsFile(commentsPath, narratives, state.ignoredHints.sorted());   // src: vulnhunter-agent/agent/verify.py:808
+        Path outDir = runDir.resolve("out/iter-1");                                               // src: vulnhunter-agent/agent/verify.py:814
+        outDir.mkdirs();
+        String prompt = VerifyRunner.buildKickoffPrompt(targetRepo, report, fixedIds, outDir, commentsPath,
+                state.additionalRepos.isEmpty() ? null : state.additionalRepos, θ);                // src: vulnhunter-agent/agent/verify.py:817
+        String authToken = tokenManager.getValidToken();                                          // src: vulnhunter-agent/agent/verify.py:825
+        int sessions = θ["code.agent.verify.skill_invocations"];                                  // single call, no retry // src: vulnhunter-agent/agent/verify.py:831
+        return VerifyRunner.runVerifySession(θ, authToken, runDir, outDir, prompt, logPath, modelOverride); // src: vulnhunter-agent/agent/verify.py:831
+    }
+
+    // _preflight_clone_requests: Haiku extractor over ALL comments (no close filter); resolve + clone hints; non-fatal.
+    void preflightCloneRequests(List<FetchedRecord> records, RunState state, String host, Path runDir) {
+        String preflightText = buildPreflightText(records);                                       // src: vulnhunter-agent/agent/verify.py:867
+        if (preflightText == "") return;                                                          // src: vulnhunter-agent/agent/verify.py:869
+        TokenProvider refsTokenMgr = Auth.makeTokenManager(θ, "verify-refs");                     // src: vulnhunter-agent/agent/verify.py:882
+        List<Map> references = VerifyRefs.extractCrossRepoReferences(preflightText, θ, refsTokenMgr, null); // src: vulnhunter-agent/agent/verify.py:883
+        if (references.isEmpty()) return;                                                         // src: vulnhunter-agent/agent/verify.py:888
+        List<String> allowedHosts = θ["code.agent.verify.issue_host_always_allowed"]
+                ? List.of(host) + θ["verify.*"].allowedCloneHosts : θ["verify.*"].allowedCloneHosts; // src: vulnhunter-agent/agent/verify.py:909
+        processCloneRequest(Map.of("requested_sources", references), state,
+                TokenClient.getGithubToken("scan", θ["github.*"]), host,                          // src: vulnhunter-agent/agent/verify.py:904
+                θ["verify.*"].cloneTimeoutSeconds, runDir.resolve("additional_repos"),           // src: vulnhunter-agent/agent/verify.py:906
+                θ["verify.*"].repoAliases, allowedHosts,                                          // src: vulnhunter-agent/agent/verify.py:908
+                VerifyResolve.authorizedTokenPathPrefixes(θ["verify.*"].repoAliases, θ["verify.*"].tokenPathPrefixes)); // src: vulnhunter-agent/agent/verify.py:910
+    }
+
+    // _build_preflight_text: one section per non-empty comment, boundary markers neutralized.
+    String buildPreflightText(List<FetchedRecord> records) {
+        List<String> sections = new List();
+        for (FetchedRecord r : records) {                                                         // src: vulnhunter-agent/agent/verify.py:942
+            for (IssueComment c : r.comments) {                                                   // src: vulnhunter-agent/agent/verify.py:943
+                String body = orElse(c.body, "").strip();                                         // src: vulnhunter-agent/agent/verify.py:944
+                if (body == "") continue;                                                         // src: vulnhunter-agent/agent/verify.py:945
+                sections.add("### Comment on issue #" + r.ref.number + " from @" + orElse(c.author, "(unknown)") + " " + neutralizePreflightBody(body)); // src: vulnhunter-agent/agent/verify.py:947
+            }
+        }
+        return String.join("\n", sections);                                                       // src: vulnhunter-agent/agent/verify.py:952
+    }
+
+    String neutralizePreflightBody(String body) {
+        for (String[] sub : θ["code.agent.verify.preflight_boundary_substitutions"]) body = body.replace(sub[0], sub[1]); // src: vulnhunter-agent/agent/verify.py:969
+        return body;
+    }
+
+    // _process_clone_request: resolve each hint; clone or record as ignored (R6).
+    void processCloneRequest(Map payload, RunState state, String githubToken, String githubHost, int timeoutSeconds, Path additionalReposDir, Map<String, String> aliases, List<String> allowedHosts, List<String> allowedTokenPathPrefixes) {
+        additionalReposDir.mkdirs();                                                              // src: vulnhunter-agent/agent/verify.py:995
+        for (Map entry : orElse(payload.get("requested_sources"), List.of())) {                   // src: vulnhunter-agent/agent/verify.py:997
+            String hint = orElse(entry, Map.of()).getOrDefault("repo_hint", "");                  // src: vulnhunter-agent/agent/verify.py:998
+            if (hint == "" || state.ignoredHints.contains(hint)) continue;                        // src: vulnhunter-agent/agent/verify.py:999
+            String url = VerifyResolve.resolveRepoHint(hint, aliases, allowedHosts);              // src: vulnhunter-agent/agent/verify.py:1001
+            if (url == null) {                                                                    // src: vulnhunter-agent/agent/verify.py:1002
+                state.ignoredHints.add(hint);                                                     // src: vulnhunter-agent/agent/verify.py:1003
+                continue;
+            }
+            Path local;
+            try {
+                Path cloneRoot = additionalReposDir.resolve(sanitizeCloneSubdir(hint));           // src: vulnhunter-agent/agent/verify.py:1011
+                local = VerifyResolve.cloneAdditionalRepo(url, cloneRoot, githubToken, githubHost, timeoutSeconds, allowedTokenPathPrefixes); // src: vulnhunter-agent/agent/verify.py:1012
+            } catch (ResolveError exc) {
+                state.ignoredHints.add(hint);                                                     // src: vulnhunter-agent/agent/verify.py:1021
+                continue;
+            }
+            if (state.additionalRepos.contains(local)) continue;                                  // src: vulnhunter-agent/agent/verify.py:1030
+            state.additionalRepos.add(local);                                                     // src: vulnhunter-agent/agent/verify.py:1032
+        }
+    }
+
+    // _sanitize_clone_subdir: [A-Za-z0-9-_] only, truncated; degenerate names -> additional-repo-<sha256[:12]>.
+    String sanitizeCloneSubdir(String hint) {
+        String safe = hint.map(c -> (c.isalnum() || "-_".contains(c)) ? c : "_");                 // src: vulnhunter-agent/agent/verify.py:1053
+        safe = safe.take(θ["code.agent.verify.clone_subdir_max_chars"]);                          // src: vulnhunter-agent/agent/verify.py:1057
+        if (safe == "" || safe.chars().toSet().isSubsetOf(Set.of("_", "-"))) {                    // src: vulnhunter-agent/agent/verify.py:1058
+            return "additional-repo-" + sha256(hint).take(12);                                    // src: vulnhunter-agent/agent/verify.py:1061
+        }
+        return safe;
+    }
+
+    // _verify_entry_count: dispositions must cover exactly the requested finding ids.
+    void verifyEntryCount(VerifySessionResult sessionResult, List<String> fixedIds) {
+        List<Map> dispositions = orElse(sessionResult.parsed, Map.of()).getOrDefault("dispositions", List.of()); // src: vulnhunter-agent/agent/verify.py:1075
+        Set<String> gotIds = dispositions.map(d -> d.get("finding_id")).toSet();                  // src: vulnhunter-agent/agent/verify.py:1076
+        Set<String> wantIds = fixedIds.toSet();                                                   // src: vulnhunter-agent/agent/verify.py:1077
+        if (θ["code.agent.verify.require_exact_disposition_ids"] && gotIds != wantIds)            // src: vulnhunter-agent/agent/verify.py:1078
+            throw new ValueError("Disposition entry-count mismatch");                             // src: vulnhunter-agent/agent/verify.py:1081
+    }
+
+    // _post_dispositions: (succeeded, failed); --no-post is a dry-run that records "(dry-run)".
+    PostOutcome postDispositions(HttpClient client, String host, List<FetchedRecord> records, Map dispositionDoc, boolean noPost, boolean noReopen) {
+        Map<String, FetchedRecord> byFinding = records.toMap(r -> r.markers.findingId);           // src: vulnhunter-agent/agent/verify.py:1104
+        PostOutcome out = new PostOutcome();
+        for (Map entry : orElse(dispositionDoc.get("dispositions"), List.of())) {                 // src: vulnhunter-agent/agent/verify.py:1107
+            String findingId = entry.getOrDefault("finding_id", "");                              // src: vulnhunter-agent/agent/verify.py:1108
+            FetchedRecord record = byFinding.get(findingId);                                      // src: vulnhunter-agent/agent/verify.py:1109
+            if (record == null) continue;                                                         // src: vulnhunter-agent/agent/verify.py:1110
+            String verdict = entry.getOrDefault("verdict", "");                                   // src: vulnhunter-agent/agent/verify.py:1122
+            String issueComment = entry.getOrDefault("issue_comment", "");                        // src: vulnhunter-agent/agent/verify.py:1123
+            if (noPost) {                                                                         // src: vulnhunter-agent/agent/verify.py:1124
+                out.succeeded.add(new PostResult(findingId, record.ref.number, verdict, "(dry-run)", "", false, false, false)); // src: vulnhunter-agent/agent/verify.py:1132
+                continue;
+            }
+            try {
+                out.succeeded.add(VerifyPost.postDisposition(client, host, record.ref, findingId, verdict, issueComment, record.bodyTampered, record.originalBody, !noReopen)); // src: vulnhunter-agent/agent/verify.py:1144
+            } catch (GitHubVerifyError exc) {
+                out.failed.add(findingId);                                                        // src: vulnhunter-agent/agent/verify.py:1163
+            }
+        }
+        return out;
+    }
+
+    // _print_summary: per-finding labels reopened / left closed / REOPEN_FAILED / ARCHIVAL_FAILED, plus POST_FAILED.
+    void printSummary(List<PostResult> results, Path runDir, boolean noPost, List<String> failed) {
+        Map<String, Integer> counts = results.countBy(r -> r.verdict);                            // src: vulnhunter-agent/agent/verify.py:1189
+        print("Verify complete" + (noPost ? " (dry-run)" : "") + ". Run: " + runDir.name);        // src: vulnhunter-agent/agent/verify.py:1193
+        if (results.isEmpty() && failed.isEmpty()) { print("  (no results)"); return; }           // src: vulnhunter-agent/agent/verify.py:1195
+        for (PostResult r : results) {                                                            // src: vulnhunter-agent/agent/verify.py:1198
+            List<String> labels = new List();
+            if (r.reopened) labels.add("reopened");                                               // src: vulnhunter-agent/agent/verify.py:1200
+            else if (List.of("FIXED", "INVALID_INPUT").contains(r.verdict)) labels.add("left closed"); // src: vulnhunter-agent/agent/verify.py:1202
+            if (r.reopenFailed) labels.add("REOPEN_FAILED");                                      // src: vulnhunter-agent/agent/verify.py:1204
+            if (r.archivalFailed) labels.add("ARCHIVAL_FAILED");                                  // src: vulnhunter-agent/agent/verify.py:1206
+            print(r.findingId + " (#" + r.issueNumber + "): " + r.verdict + labels);
+        }
+        for (String id : failed) print(id + ": POST_FAILED");                                     // src: vulnhunter-agent/agent/verify.py:1211
+        print("Totals: " + counts);                                                               // src: vulnhunter-agent/agent/verify.py:1220
+    }
+}
+
+// The _emit_completed_and_exit closure: verify_completed fires exactly once on every exit path after verify_started.
+@executedBy(CODE) @role(io) @stage("verify")
+class CompletedEmitter {
+    boolean doneFlag = false;
+    Integer dispositionsCount = null;
+
+    int emitCompletedAndExit(int exitCode, String notes) {
+        if (auditWriter == null || doneFlag) return exitCode;                                     // src: vulnhunter-agent/agent/verify.py:247
+        doneFlag = true;                                                                          // src: vulnhunter-agent/agent/verify.py:249
+        try {
+            auditWriter.emitAudit(Audit.buildVerifyCompleted(config.audit.appId, config.audit.actor, repoSlug, scanId, modelVersion, targetSha, dispositionsCount, int(now() - wallStart), null, notes, θ), θ); // src: vulnhunter-agent/agent/verify.py:251
+        } catch (AuditWriteError e) {
+            if (exitCode == 0) throw e;                                                           // strict-mode audit failure surfaces only on success // src: vulnhunter-agent/agent/verify.py:273
+        } catch (Exception e) {
+            // logged and swallowed
+        }
+        return exitCode;
+    }
+}
+
+@executedBy(CODE) @role(types)
+record FetchedRecord(IssueRef ref, FetchedIssue issue, VerifyMarkers markers, boolean bodyTampered,
+                     String originalBody, List<IssueComment> comments, List<IssueEvent> events) { }
+
+@executedBy(CODE) @role(types)
+record RunState(List<Path> additionalRepos, Set<String> ignoredHints) { }
+
+@executedBy(CODE) @role(types)
+record PostOutcome(List<PostResult> succeeded, List<String> failed) { }

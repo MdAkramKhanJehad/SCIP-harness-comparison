@@ -1,0 +1,244 @@
+// file: vvaharness/pipeline/stages/s4/session.py
+// One agentic session per unit (or per batch of units): tool set, middleware (budgets, planner, evidence gate,
+// model-call cap), dispatch with a deadline/resume/replay fallback, JSON repair, and reduction to findings.
+
+@executedBy(CODE) @role(step) @stage("S4")
+class S4Session {
+
+    // The native tool allowlist every S4 session passes to dispatch_agentic.
+    List<String> deepdiveTools(Config cfg, Theta θ) {
+        // without one the cli bridge sends --tools "" and the plain cli leg no jail at all
+        return validateDetectionTools(θ["step4.allowed_tools"], "step4.allowed_tools", resolve(cfg.models.deepdive).via); // src: vvaharness/pipeline/stages/s4/session.py:87
+    }
+
+    // A ToolCallBudget metering names, or null when the configured limit <= 0 (unmetered).
+    ToolBudget budget(int limit, Set<String> names, String counter) {
+        if (limit <= 0) return null;                                                                     // src: vvaharness/pipeline/stages/s4/session.py:94
+        return new ToolBudget(names, limit, counter);                                                    // src: vvaharness/pipeline/stages/s4/session.py:96
+    }
+
+    int batchLimit(int limit, int members) {
+        return limit + max(0, members - 1);    // one extra model call per extra batch member             // src: vvaharness/pipeline/stages/s4/session.py:101
+    }
+
+    ModelCallBudget callBudget(String outcomeTool, int members, String tag, Theta θ) {
+        int limit = θ["step4.max_model_calls"];                                                          // src: vvaharness/pipeline/stages/s4/session.py:107
+        if (limit <= 0) return null;           // unmetered                                              // src: vvaharness/pipeline/stages/s4/session.py:108
+        // raise_when_exhausted: VVAH-E007 if the forced final turn still does not end the session
+        return new ModelCallBudget(batchLimit(limit, members), Set.of(outcomeTool), "s4_model_call_budget_final_turn", true, tag); // src: vvaharness/pipeline/stages/s4/session.py:110
+    }
+
+    // The ONE predicate every graph-naming prompt is gated on.
+    boolean graphToolsRegistered(ContextPackage ctx, Config cfg) {
+        return ctx.graphHandle != null && !graphIsDegenerate(ctx, cfg);                                  // src: vvaharness/pipeline/stages/s4/session.py:119
+    }
+
+    TodoListMiddleware planner(boolean graph, Theta θ) {
+        if (!θ["step4.planning"]) return null;                                                           // src: vvaharness/pipeline/stages/s4/session.py:124
+        return new TodoListMiddleware(S4Prompts.buildPlanSystemPrompt(graph, θ), S4Prompts.planToolDescription(θ)); // src: vvaharness/pipeline/stages/s4/session.py:126
+    }
+
+    EvidenceGate gate(ContextPackage ctx, Config cfg, Theta θ) {
+        // the gate only enforces anything when a plan exists
+        if (!θ["step4.planning"] || !θ["step4.evidence_gate"]) return null;                              // src: vvaharness/pipeline/stages/s4/session.py:134
+        boolean declared = θ["step4.require_graph"];                                                     // src: vvaharness/pipeline/stages/s4/session.py:136
+        boolean degenerate = declared && graphIsDegenerate(ctx, cfg);                                    // src: vvaharness/pipeline/stages/s4/session.py:137
+        if (degenerate) {
+            // WARN once + counter evidence_gate_stood_down_degenerate_graph; todo-list gate still applies
+            Counters.bump("evidence_gate_stood_down_degenerate_graph");                                  // src: vvaharness/pipeline/stages/s4/session.py:148
+        }
+        Set<String> required = (declared && !degenerate) ? GRAPH_TOOL_NAMES : Set.of();                 // src: vvaharness/pipeline/stages/s4/session.py:150
+        return new EvidenceGate(θ["step4.evidence_gate_refusals"], "s4_evidence_gate_rejected", required, false, Set.of()); // src: vvaharness/pipeline/stages/s4/session.py:151
+    }
+
+    // Compose S4's tool builders, fact-tool names and per-session middleware (rebuilt per attempt: all stateful).
+    ToolSetup toolSetup(ContextPackage ctx, Config cfg, String outcomeTool, int members, String tag, boolean graph, Theta θ) {
+        List<Tool> builders = List.of(GraphTools.build(ctx));                                            // src: vvaharness/pipeline/stages/s4/session.py:162
+        List<String> names = GraphTools.names();                                                         // src: vvaharness/pipeline/stages/s4/session.py:163
+        List<Middleware> middleware = List.of(budget(θ["step4.graph_tool_budget"], GraphTools.names(), "s4_graph_tool_budget_exhausted")); // src: vvaharness/pipeline/stages/s4/session.py:164
+        if (θ["step4.cwe_tools"]) {                                                                      // src: vvaharness/pipeline/stages/s4/session.py:166
+            builders.add(KbTools.buildKbToolBuilder(options, θ));     // CweGuidance                                            // src: vvaharness/pipeline/stages/s4/session.py:167
+            names.addAll(KB_TOOL_NAMES);
+            middleware.add(budget(θ["step4.cwe_tool_budget"], KB_TOOL_NAMES, "s4_cwe_tool_budget_exhausted")); // src: vvaharness/pipeline/stages/s4/session.py:169
+        }
+        middleware.add(planner(graph, θ));                                                               // src: vvaharness/pipeline/stages/s4/session.py:171
+        middleware.add(gate(ctx, cfg, θ));                                                               // src: vvaharness/pipeline/stages/s4/session.py:172
+        middleware.add(callBudget(outcomeTool, members, tag, θ));                                        // src: vvaharness/pipeline/stages/s4/session.py:174
+        return new ToolSetup(compose(builders), names, middleware.filter(m -> m != null));               // src: vvaharness/pipeline/stages/s4/session.py:175
+    }
+
+    // Whole-file source when step4.inline_source is on; null otherwise and always for LARGE units.
+    String loadCode(InvestigationUnit unit, Path repoRoot, Theta θ) {
+        if (unit.size == UnitSize.LARGE || !θ["step4.inline_source"]) return null;                       // src: vvaharness/pipeline/stages/s4/session.py:180
+        return S4Deepdive.loadFilesFull(unit.files, repoRoot, "s4");                                     // src: vvaharness/pipeline/stages/s4/session.py:183
+    }
+
+    int deadlineSeconds(Theta θ) {
+        return θ["step4.deadline"];            // 0 = no clock                                           // src: vvaharness/pipeline/stages/s4/session.py:202
+    }
+
+    // The route session clock, stopping the session before step4.deadline abandons it.
+    Duration sessionTimeout(Config cfg, Effort effort, Theta θ) {
+        return deadlineBound(null, deadlineSeconds(θ), effort, resolve(cfg.models.deepdive).via);       // src: vvaharness/pipeline/stages/s4/session.py:208
+    }
+
+    // The call's reply, or a resume of its own session once step4.deadline elapses.
+    String deadlineBounded(Supplier<String> call, Supplier<String> replay, Config cfg, String tag, String sessionId, Theta θ) {
+        int seconds = deadlineSeconds(θ);
+        try {
+            return runWithDeadline(call, seconds, tag, Effort.LOW);                                      // src: vvaharness/pipeline/stages/s4/session.py:216
+        } catch (CallTimeoutError e) {
+            // resume the live session (tools withdrawn, outcome only); fall back to the tool-free replay
+            return resumeOrReplay(sessionId, replay, cfg.models.deepdive, S4_REPLAY_INSTRUCTION, θ["step4.resume_timeout"]); // src: vvaharness/pipeline/stages/s4/session.py:220
+        }
+    }
+
+    // One tool-free, lowest-effort re-ask for the outcome the killed session never reported.
+    String replayCall(String promptText, Transcript transcript, Config cfg, String tag, Schema responseModel, Theta θ) {
+        Counters.bump("s4_deadline_replay");                                                             // src: vvaharness/pipeline/stages/s4/session.py:228
+        ModelSpec m = new ModelSpec(cfg.models.deepdive, "deepagents", null, Effort.LOW, θ["step4.replay_max_tokens"]); // src: vvaharness/pipeline/stages/s4/session.py:236
+        Duration timeout = θ["step4.replay_timeout"];                                                    // src: vvaharness/pipeline/stages/s4/session.py:237
+        return Runtime.llm(m, null, replayPrompt(transcript, promptText, S4_REPLAY_INSTRUCTION), responseModel).text; // src: vvaharness/pipeline/stages/s4/session.py:229
+    }
+
+    // Builds the AgentSpec for one S4 session and runs it on the deepagents route.
+    @executedBy(MIXED)
+    String agentic(String initial, ToolSetup setup, Config cfg, Path repoRoot, ContextPackage ctx, Schema responseModel, boolean graph, boolean dropThinking, String tag, String sessionId, Theta θ) {
+        Effort effort = dropThinking ? null : θ["step4.effort"];                                         // src: vvaharness/pipeline/stages/s4/session.py:296
+        ModelSpec m = new ModelSpec(cfg.models.deepdive, resolve(cfg.models.deepdive).via, null, effort, θ["step4.max_tokens"]); // src: vvaharness/pipeline/stages/s4/session.py:293
+        Prompt system = S4Prompts.buildSystemPrompt(θ["step4.bash"], graph, θ);                          // src: vvaharness/pipeline/stages/s4/session.py:284
+        List<Tool> tools = concat(deepdiveTools(cfg, θ), setup.factTools);                               // src: vvaharness/pipeline/stages/s4/session.py:291
+        if (θ["step4.bash"]) tools.add("execute");   // allow_shell: unjailed, natives unscoped           // src: vvaharness/pipeline/stages/s4/session.py:300
+        List<Skill> skills = θ["step4.skills"] ? injectSkills(repoRoot) : null;   // 17 lens playbooks    // src: vvaharness/pipeline/stages/s4/session.py:295
+        // max_turns is a recursion FLOOR on deepagents (+ code.deepagents.recursion_headroom), a hard cap on sdk/cli
+        Bounds bounds = new Bounds(θ["step4.max_turns"], θ["step4.max_model_calls"], sessionTimeout(cfg, effort, θ), null); // src: vvaharness/pipeline/stages/s4/session.py:297
+        boolean planning = θ["step4.planning"];
+        Prompt cachePrefix = new Prompt().context(S4Deepdive.buildSharedContextBlock(ctx));             // src: vvaharness/pipeline/stages/s4/session.py:294
+        AgentSpec spec = new AgentSpec(m, tools, skills, system, new Prompt().include(cachePrefix).context(initial), bounds, responseModel, planning);
+        // via backends/llm/deepagents.dispatch_agentic -> DeepAgentHarness.run_streaming (Client); middleware = setup.middleware
+        return Client.runStreaming(spec, setup.middleware, sessionId, θ);                                // src: vvaharness/pipeline/stages/s4/session.py:279
+    }
+
+    // Run one agentic session for the unit and return the findings it reported.
+    List<Finding> investigateUnitOnce(InvestigationUnit unit, ContextPackage ctx, Path repoRoot, Config cfg, Theta θ) {
+        String code = loadCode(unit, repoRoot, θ);                                                       // src: vvaharness/pipeline/stages/s4/session.py:249
+        Schema responseModel = isStructuredVia(cfg.models.deepdive) ? S4Outcomes.investigationOutcomeSchema(θ) : null; // src: vvaharness/pipeline/stages/s4/session.py:250
+        String tag = "s4 " + unit.id;
+        boolean graph = graphToolsRegistered(ctx, cfg);       // one value for every prompt this session renders // src: vvaharness/pipeline/stages/s4/session.py:257
+        Function<Boolean, String> dispatch = dropThinking -> {
+            ToolSetup setup = toolSetup(ctx, cfg, "InvestigationOutcome", 1, tag, graph, θ);             // src: vvaharness/pipeline/stages/s4/session.py:262
+            String initial = S4Prompts.buildInitialPrompt(unit, code, θ["step4.max_model_calls"], graph, θ); // src: vvaharness/pipeline/stages/s4/session.py:266
+            Transcript transcript = new Transcript();
+            setup.middleware.add(new RecordTranscript(transcript));                                      // src: vvaharness/pipeline/stages/s4/session.py:268
+            String sessionId = pinnedSession("s4", unit.id);                                             // src: vvaharness/pipeline/stages/s4/session.py:269
+            return deadlineBounded(() -> agentic(initial, setup, cfg, repoRoot, ctx, responseModel, graph, dropThinking, tag, sessionId, θ),
+                                   () -> replayCall(initial, transcript, cfg, tag, responseModel, θ), cfg, tag, sessionId, θ); // src: vvaharness/pipeline/stages/s4/session.py:270
+        };
+        // retries the dispatch with thinking dropped when a forced/thinking conflict or refusal calls for it
+        String raw = dispatchOrRetryUnforced(dispatch, unit.id, "s4", droppableEffort(cfg.models.deepdive, θ["step4.effort"]), refusalResendAllowed(cfg)); // src: vvaharness/pipeline/stages/s4/session.py:304
+        Reduced red = S4OutcomeReducer.reduceOutcomes(List.of(unit), Map.of(unit.id, raw), ctx.repoRoot, ctx.allFiles, θ); // src: vvaharness/pipeline/stages/s4/session.py:308
+        if (red.byUnit.get(unit.id) == "failed") {                                                       // src: vvaharness/pipeline/stages/s4/session.py:310
+            // one bounded repair re-ask, no tools
+            ModelSpec m = new ModelSpec(cfg.models.deepdive, "deepagents", null, null, θ["step4.max_tokens"]); // src: vvaharness/pipeline/stages/s4/session.py:326
+            String repaired = Runtime.llm(m, null, RepairPrompts.single(raw, unit.id), responseModel).text; // src: vvaharness/pipeline/stages/s4/session.py:318
+            red = S4OutcomeReducer.reduceOutcomes(List.of(unit), Map.of(unit.id, repaired), ctx.repoRoot, ctx.allFiles, θ); // src: vvaharness/pipeline/stages/s4/session.py:329
+        }
+        if (red.byUnit.get(unit.id) == "failed") {                                                       // src: vvaharness/pipeline/stages/s4/session.py:333
+            throw new RuntimeError("session reply did not parse as an InvestigationOutcome, even after repair"); // src: vvaharness/pipeline/stages/s4/session.py:334
+        }
+        // NOTE: verdict (confirmed/refuted/inconclusive) does not filter findings here; all reduced findings pass on
+        return capFindings(unit.id, red.findings, θ);                                                    // src: vvaharness/pipeline/stages/s4/session.py:337
+    }
+
+    // Keep the first step4.max_findings_per_run findings (emission order); overflow counted as truncated.
+    List<Finding> capFindings(String unitId, List<Finding> findings, Theta θ) {
+        int cap = θ["step4.max_findings_per_run"];                                                       // src: vvaharness/pipeline/stages/s4/session.py:342
+        if (cap > 0 && findings.size() > cap) {                                                          // src: vvaharness/pipeline/stages/s4/session.py:343
+            Counters.bump("s4_findings_truncated", findings.size() - cap);                               // src: vvaharness/pipeline/stages/s4/session.py:346
+            findings = findings.subList(0, cap);                                                         // src: vvaharness/pipeline/stages/s4/session.py:349
+        }
+        return findings;
+    }
+
+    // Collapse same-canonical-key findings; first seen wins.
+    Pair<List<Finding>, Integer> dedupByKey(List<Finding> findings, int lineBucket) {
+        Map<Key, Finding> byKey = new Map();
+        for (Finding f : findings) byKey.putIfAbsent(f.canonicalKey(lineBucket), f);                     // src: vvaharness/pipeline/stages/s4/session.py:358
+        int merged = findings.size() - byKey.size();                                                     // src: vvaharness/pipeline/stages/s4/session.py:360
+        return Pair.of(byKey.values(), merged);
+    }
+
+    List<Finding> investigateUnit(InvestigationUnit unit, ContextPackage ctx, Path repoRoot, Config cfg, Theta θ) {
+        if (Cli.aborted()) throw new RuntimeError("aborted by user (Ctrl-C)");                           // src: vvaharness/pipeline/stages/s4/session.py:369
+        int lineBucket = θ["step4.line_bucket"];                                                         // src: vvaharness/pipeline/stages/s4/session.py:371
+        List<Finding> findings = investigateUnitOnce(unit, ctx, repoRoot, cfg, θ);                       // src: vvaharness/pipeline/stages/s4/session.py:372
+        return dedupByKey(findings, lineBucket).first;                                                   // src: vvaharness/pipeline/stages/s4/session.py:373
+    }
+
+    // Run one shared session over the batch and return its raw reply.
+    String batchReply(List<InvestigationUnit> batch, ContextPackage ctx, Path repoRoot, Config cfg, Theta θ) {
+        List<String> files = batch.flatMap(u -> u.files).distinct();                                     // src: vvaharness/pipeline/stages/s4/session.py:398
+        String code = (θ["step4.inline_source"] && batch.all(u -> u.size != UnitSize.LARGE))
+                      ? S4Deepdive.loadFilesFull(files, repoRoot, "s4") : null;                          // src: vvaharness/pipeline/stages/s4/session.py:399
+        Schema responseModel = isStructuredVia(cfg.models.deepdive) ? S4Outcomes.investigationOutcomesSchema(θ) : null; // src: vvaharness/pipeline/stages/s4/session.py:402
+        String tag = "s4 batch[" + batch.size() + "] " + batch.get(0).id;
+        boolean graph = graphToolsRegistered(ctx, cfg);                                                  // src: vvaharness/pipeline/stages/s4/session.py:409
+        Function<Boolean, String> dispatch = dropThinking -> {
+            // model-call cap grows by one per extra member (batchLimit)
+            ToolSetup setup = toolSetup(ctx, cfg, "InvestigationOutcomes", batch.size(), tag, graph, θ); // src: vvaharness/pipeline/stages/s4/session.py:414
+            String initial = S4Prompts.buildBatchPrompt(batch, code, files.size(), θ["step4.max_model_calls"], graph, θ); // src: vvaharness/pipeline/stages/s4/session.py:418
+            Transcript transcript = new Transcript();
+            setup.middleware.add(new RecordTranscript(transcript));
+            String sessionId = pinnedSession("s4", batch.get(0).id);                                     // src: vvaharness/pipeline/stages/s4/session.py:422
+            return deadlineBounded(() -> agentic(initial, setup, cfg, repoRoot, ctx, responseModel, graph, dropThinking, tag, sessionId, θ),
+                                   () -> replayCall(initial, transcript, cfg, tag, responseModel, θ), cfg, tag, sessionId, θ); // src: vvaharness/pipeline/stages/s4/session.py:423
+        };
+        return dispatchOrRetryUnforced(dispatch, tag, "s4", droppableEffort(cfg.models.deepdive, θ["step4.effort"]), refusalResendAllowed(cfg)); // src: vvaharness/pipeline/stages/s4/session.py:456
+    }
+
+    // Each member's findings and per-unit verdict ("uninvestigated"/"failed" for omitted / unparsable members).
+    Pair<Map<String, List<Finding>>, Map<String, String>> investigateBatch(List<InvestigationUnit> batch, ContextPackage ctx, Path repoRoot, Config cfg, Theta θ) {
+        List<String> ids = batch.map(u -> u.id);
+        String raw = batchReply(batch, ctx, repoRoot, cfg, θ);                                           // src: vvaharness/pipeline/stages/s4/session.py:469
+        Map<String, String> perUnit = S4OutcomeReducer.splitBatchReply(raw, ids);                              // src: vvaharness/pipeline/stages/s4/session.py:470
+        if (perUnit.isEmpty()) {                                                                         // src: vvaharness/pipeline/stages/s4/session.py:471
+            ModelSpec m = new ModelSpec(cfg.models.deepdive, "deepagents", null, null, θ["step4.max_tokens"]); // src: vvaharness/pipeline/stages/s4/session.py:486
+            String repaired = Runtime.llm(m, null, RepairPrompts.batch(raw, ids), S4Outcomes.investigationOutcomesSchema(θ)).text; // src: vvaharness/pipeline/stages/s4/session.py:478
+            perUnit = S4OutcomeReducer.splitBatchReply(repaired, ids);                                         // src: vvaharness/pipeline/stages/s4/session.py:491
+        }
+        if (perUnit.isEmpty()) throw new RuntimeError("shared session returned no parseable InvestigationOutcomes, even after repair"); // src: vvaharness/pipeline/stages/s4/session.py:495
+        Reduced red = S4OutcomeReducer.reduceOutcomes(batch, perUnit, ctx.repoRoot, ctx.allFiles, θ);         // src: vvaharness/pipeline/stages/s4/session.py:497
+        Map<String, List<Finding>> out = new Map();
+        for (Finding f : red.findings) out.computeIfAbsent(f.chunkId).add(f);                            // src: vvaharness/pipeline/stages/s4/session.py:501
+        int lineBucket = θ["step4.line_bucket"];                                                         // src: vvaharness/pipeline/stages/s4/session.py:504
+        for (InvestigationUnit u : batch) {
+            List<Finding> capped = capFindings(u.id, out.get(u.id), θ);                                  // src: vvaharness/pipeline/stages/s4/session.py:507
+            out.put(u.id, dedupByKey(capped, lineBucket).first);                                         // src: vvaharness/pipeline/stages/s4/session.py:508
+        }
+        return Pair.of(out, red.byUnit);                                                                 // src: vvaharness/pipeline/stages/s4/session.py:514
+    }
+}
+
+@executedBy(MODEL) @role(prompt) @stage("S4")
+class RepairPrompts {
+
+    Prompt single(String raw, String unitId) {
+        Prompt p = new Prompt();
+        p.rule("REPAIR TASK: the previous reply was supposed to be a JSON object matching the InvestigationOutcome schema (unit_id, verdict, rationale, findings[]) but failed to parse."); // src: vvaharness/pipeline/stages/s4/session.py:188
+        p.format("Return ONLY the corrected JSON object.");                                              // src: vvaharness/pipeline/stages/s4/session.py:190
+        p.must("unit_id MUST be exactly " + unitId);                                                     // src: vvaharness/pipeline/stages/s4/session.py:190
+        p.must("Preserve every finding and fact already present.");                                      // src: vvaharness/pipeline/stages/s4/session.py:191
+        p.context(raw);                                                                                  // src: vvaharness/pipeline/stages/s4/session.py:192
+        return p;
+    }
+
+    Prompt batch(String raw, List<String> unitIds) {
+        Prompt p = new Prompt();
+        p.rule("REPAIR TASK: the previous reply was supposed to be a JSON object outcomes:[...] holding one InvestigationOutcome for EACH of these units, but failed to parse."); // src: vvaharness/pipeline/stages/s4/session.py:381
+        p.format("Return ONLY the corrected JSON object.");                                              // src: vvaharness/pipeline/stages/s4/session.py:383
+        p.must("The unit_id values MUST be exactly these, one entry each: " + unitIds);                  // src: vvaharness/pipeline/stages/s4/session.py:384
+        p.must("Preserve every finding and fact already present.");                                      // src: vvaharness/pipeline/stages/s4/session.py:385
+        p.context(raw);                                                                                  // src: vvaharness/pipeline/stages/s4/session.py:385
+        return p;
+    }
+}

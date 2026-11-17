@@ -1,0 +1,73 @@
+// file: vvaharness/backends/harness/deepagents/client.py, vvaharness/backends/harness/deepagents/options/streaming.py, vvaharness/backends/harness/deepagents/options/graph_builder.py
+// DeepAgentHarness: the deepagents/LangGraph agent loop an S4 session runs on. Shows how the session's graph is
+// built (model, system prompt + suffixes, tools, skills, middleware stack, recursion limit) and how the stream is
+// bounded by the session timeout and the recursion limit. Short summary; retry/transport-fallback arms condensed.
+
+@executedBy(CODE) @role(backend)
+class Client {
+
+    // Entry used by S4Session.agentic (via backends/llm/deepagents.dispatch_agentic -> drain_streaming).
+    String runStreaming(AgentSpec spec, List<Middleware> parentMiddleware, String sessionId, Theta θ) {
+        CompiledGraph g = buildStreamingAgent(spec, parentMiddleware, sessionId, θ);                     // src: vvaharness/backends/harness/deepagents/client.py:556
+        Transcript t;
+        try {
+            // the stage loop: model call -> tool calls -> model call ..., until a structured outcome or a stop
+            t = Runtime.agent(spec);                                                                     // src: vvaharness/backends/harness/deepagents/client.py:569
+            t = boundedStream(t, spec.bounds.deadline);   // CallTimeoutError on expiry (S4 then resumes/replays) // src: vvaharness/backends/harness/deepagents/client.py:575
+        } catch (GraphRecursionError e) {
+            // recursion limit hit: snapshot terminal state so consumers can force-finalize from it
+            t = finalState(g);                                                                           // src: vvaharness/backends/harness/deepagents/client.py:647
+            throw new HarnessProcessError("DeepAgents stream failed", true, t);                          // src: vvaharness/backends/harness/deepagents/client.py:655
+        } catch (Exception e) {
+            // reasoning-effort step-down, lower-tier probe on persistent 5xx, Responses->chat-completions fallback
+            if (relearnedForRerun(e) || shouldFallBack(e)) return runStreaming(spec, parentMiddleware, sessionId, θ); // src: vvaharness/backends/harness/deepagents/client.py:609
+            throw new HarnessProcessError("DeepAgents stream failed", false, null);                      // src: vvaharness/backends/harness/deepagents/client.py:655
+        }
+        return t.structuredResponseOrText();                                                             // src: vvaharness/backends/harness/deepagents/client.py:589
+    }
+
+    // Continue the same checkpointed conversation (deadline resume): one more user turn, tools withdrawn by the caller.
+    Transcript resumeStreaming(String instruction, String sessionId) {
+        CompiledGraph held = resumable(sessionId);                                                       // src: vvaharness/backends/harness/deepagents/client.py:524
+        if (held == null) throw new SessionNotResumableError(sessionId);                                 // src: vvaharness/backends/harness/deepagents/client.py:526
+        return held.stream(instruction);                                                                 // src: vvaharness/backends/harness/deepagents/client.py:536
+    }
+
+    CompiledGraph buildStreamingAgent(AgentSpec spec, List<Middleware> parentMiddleware, String sessionId, Theta θ) {
+        Graph graph = createAgent(spec, parentMiddleware, θ);                                            // src: vvaharness/backends/harness/deepagents/options/streaming.py:136
+        // max_turns is a floor: LangGraph counts supersteps (graph nodes), not turns
+        int recursionLimit = DeepagentsLimits.recursionLimit(spec.bounds.maxTurns, θ);                   // src: vvaharness/backends/harness/deepagents/options/streaming.py:141
+        CompiledGraph g = new CompiledGraph(graph, sessionId, recursionLimit);                           // src: vvaharness/backends/harness/deepagents/options/streaming.py:136
+        if (sessionId != null) SESSIONS.put(sessionId, g);    // held so a deadline resume reaches the same MemorySaver // src: vvaharness/backends/harness/deepagents/options/streaming.py:148
+        return g;
+    }
+
+    // graph_builder._create_agent: model, system prompt, tools, skills, middleware order.
+    Graph createAgent(AgentSpec spec, List<Middleware> parentMiddleware, Theta θ) {
+        ChatModel model = ModelBuilding.buildModel(spec.model.model, env(), spec.model.provider, spec.model.effort, null, false, θ); // src: vvaharness/backends/harness/deepagents/options/graph_builder.py:396
+        Object responseFormat = ResponseFormat.responseFormat(spec.outputSchema, spec.model.model, spec.model.provider); // src: vvaharness/backends/harness/deepagents/options/streaming.py:111
+        Prompt system = ResponseFormat.submitInstructedPrompt(spec.system, model, spec.outputSchema, responseFormat, θ); // src: vvaharness/backends/harness/deepagents/options/graph_builder.py:400
+        DeepagentsProfiles.registerVvahHarnessProfiles(θ);   // openai: investigation-floor suffix        // src: vvaharness/backends/harness/deepagents/options/graph_builder.py:401
+        // think_in_prompt is false on the S4 path (dispatch_agentic does not set it)
+        List<Middleware> mw = new List();
+        mw.addAll(readOnlyMiddleware());                     // redact reads + exclude unpermitted natives   // src: vvaharness/backends/harness/deepagents/options/graph_builder.py:428
+        // S4 parent middleware in order: graph ToolBudget, CweGuidance ToolBudget, TodoListMiddleware (planning),
+        // EvidenceGate, ModelCallBudget, RecordTranscript. ForceVerdictOnly is NOT added (force_verdict_only false).
+        mw.addAll(parentMiddleware);                                                                     // src: vvaharness/backends/harness/deepagents/options/streaming.py:121
+        mw.add(new RepairInvalidToolArgs());                                                             // src: vvaharness/backends/harness/deepagents/options/graph_builder.py:435
+        if (spec.model.maxTokens > 0) mw.add(new CapOutputTokens(spec.model.maxTokens));   // step4.max_tokens; truncated call retried once at double budget // src: vvaharness/backends/harness/deepagents/options/graph_builder.py:439
+        mw.add(new PermitTools(spec.tools));                 // executor gate: unpermitted calls refused   // src: vvaharness/backends/harness/deepagents/options/graph_builder.py:442
+        mw.add(new BlockMarkerPromptCaching());              // cache the shared context prefix            // src: vvaharness/backends/harness/deepagents/options/graph_builder.py:445
+        mw.add(new LogToolCalls());                                                                      // src: vvaharness/backends/harness/deepagents/options/graph_builder.py:449
+        mw.add(CONNECTION_RETRY_MIDDLEWARE);                                                             // src: vvaharness/backends/harness/deepagents/options/graph_builder.py:454
+        // skills: SkillsMiddleware mounted only when skill_root is given (step4.skills)
+        return createDeepAgent(model, system, spec.tools, spec.skills, mw, responseFormat);              // src: vvaharness/backends/harness/deepagents/options/graph_builder.py:458
+    }
+
+    // Bound the event stream by one deadline instant; falsy timeout = unbounded.
+    Transcript boundedStream(Transcript stream, Duration timeout) {
+        if (timeout == null || timeout.isZero()) return stream;                                          // src: vvaharness/backends/harness/deepagents/client.py:127
+        if (stream.elapsed() > timeout) throw new CallTimeoutError("deepagents session exceeded timeout"); // src: vvaharness/backends/harness/deepagents/client.py:144
+        return stream;
+    }
+}

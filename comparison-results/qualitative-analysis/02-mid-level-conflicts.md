@@ -10,20 +10,20 @@ Layer one (`01-high-level-design-conflicts.md`) compared architecture. This laye
 
 | Number | Mechanism | The conflict in one sentence |
 |---|---|---|
-| 1 | Severity | A model-judged tier by attacker position versus a code-computed score from a model-chosen vector; and a harness that forbids its own top label in output versus one that uses it |
-| 2 | Verification procedure | In one harness an elimination that all agents agree on stands without re-reading the source; in the other even a verifier's refutation is checked against the file |
-| 3 | Deduplication | Default bias to keep findings apart versus default bias to merge neighbours |
-| 4 | Context supply | The model finds its own context versus code selects and inlines it |
-| 5 | Navigation tools | A default tool list without a search tool for prompts written around search, versus a default with search and a code graph |
-| 6 | Write authority of the detection model | The scanning model may write files; the detection model in the other harness never can |
-| 7 | Planning and reasoning control | A fixed prose procedure with no reasoning setting versus a planning object, an evidence gate and a reasoning setting per stage |
-| 8 | Sibling and variant search | A mandatory separate phase with re-entry versus an instruction inside each unit's session |
-| 9 | Knowledge supply | Class procedures always in the prompt versus knowledge fetched from a tool, skills and injected data |
-| 10 | Structured output | Data recovered from prose by a second model call versus prose rendered from typed data |
-| 11 | Fix strategy | The model designs the fix under evidence requirements versus the model chooses from a playbook under policy |
-| 12 | Fix validation | One independent verifier with four gates versus three voters with consensus |
-| 13 | Protection against a hostile repository | Defence by session configuration and prompt envelopes versus defence by tool and middleware layers |
-| 14 | Concurrency | Concurrency decided by the model within one conversation versus by a thread pool |
+| 1 | Severity | VulnHunter asks the model to choose a severity level and uses `High+` as its highest label; VVAH calculates severity from a model-supplied scoring vector and uses `Critical` as its highest label. |
+| 2 | Verification procedure | VulnHunter can discard a candidate without rereading the source when its agents agree that the first gate fails; VVAH checks certain reasons for rejecting a finding against the source code. |
+| 3 | Deduplication | VulnHunter normally keeps findings separate when their inputs or attack paths differ; VVAH can merge findings with compatible weakness labels and similar titles when their source locations are close. |
+| 4 | Context supply | VulnHunter's model chooses which files to read; VVAH's code assembles an initial evidence package and can include source files directly in the model's prompt. |
+| 5 | Navigation tools | VulnHunter's default launcher omits content search even though its prompts require it; VVAH provides content search and tools for navigating code relationships. |
+| 6 | Write authority of the detection model | VulnHunter's scanning model writes reports and supporting files; VVAH's detection model returns structured results that code writes to disk. |
+| 7 | Planning and reasoning control | VulnHunter gives the model a written investigation procedure; VVAH also offers configurable task lists, checks on required investigation steps, and reasoning effort settings for each stage. |
+| 8 | Sibling and variant search | VulnHunter requires a separate search across the repository for related weaknesses and sends new discoveries through verification; VVAH asks for that search during each investigation session. |
+| 9 | Knowledge supply | VulnHunter supplies vulnerability-class procedures in its phase prompts; VVAH also supplies knowledge through guidance tools, selectable skills, and additional reference data. |
+| 10 | Structured output | VulnHunter uses another model call to extract structured findings from its written report when filing issues; VVAH generates reports from findings already stored as structured data. |
+| 11 | Fix strategy | VulnHunter lets the model design a fix and requires evidence that it works; VVAH directs the model to follow a supplied playbook strategy and checks edits against its remediation policy. |
+| 12 | Fix validation | VulnHunter uses one independent verifier to check a fix against four requirements; VVAH combines assessments from three reviewers and calculates a weighted score. |
+| 13 | Protection against a hostile repository | VulnHunter restricts session permissions and marks repository text as untrusted; VVAH also restricts file access through its tools and removes sensitive values from tool results before the model sees them. |
+| 14 | Concurrency | VulnHunter asks the model to launch agents in limited groups; VVAH's code controls how many tasks run at once through configured worker limits. |
 
 ---
 

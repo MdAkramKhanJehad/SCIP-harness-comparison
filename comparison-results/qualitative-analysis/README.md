@@ -1,6 +1,6 @@
 # Qualitative analysis of conflicts and contradictions in VulnHunter and VVAH
 
-This folder compares two vulnerability-detection harnesses in three layers. The first two layers ask where the two harnesses make incompatible choices. The third layer asks where each harness contradicts itself.
+This folder compares two vulnerability-detection harnesses in three layers. The first two layers ask where the two harnesses make incompatible choices. The third layer examines low-level contradictions within each harness and between the two harnesses.
 
 | Layer | Question | File |
 |---|---|---|
@@ -8,6 +8,7 @@ This folder compares two vulnerability-detection harnesses in three layers. The 
 | Two: mechanisms | Where do comparable mechanisms follow rules that cannot both hold? | `02-mid-level-conflicts.md` |
 | Three: contradictions inside VulnHunter | Where does VulnHunter disagree with itself? | `03-low-level-contradictions-within-vulnhunter.md` |
 | Three: contradictions inside VVAH | Where does VVAH disagree with itself? | `04-low-level-contradictions-within-vvah.md` |
+| Three: contradictions between the harnesses | Which specific rules make VVAH and VulnHunter treat the same case differently? | [05-low-level-contradictions-between-vvah-and-vulnhunter.md](05-low-level-contradictions-between-vvah-and-vulnhunter.md) |
 
 The two harnesses are VulnHunter (a collection of prompt-driven Claude Code skills with a Python launcher; repository `VulnHunter/`, commit 6d25b5c) and VVAH, the Visa Vulnerability Agentic Harness (a Python pipeline of stages that call models; repository `visa-vulnerability-agentic-harness/`, package `vvaharness` version 1.5.1, commit 0e6f00d). Neither repository was modified.
 

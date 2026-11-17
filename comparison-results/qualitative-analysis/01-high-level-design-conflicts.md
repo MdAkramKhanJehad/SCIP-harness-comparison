@@ -1,4 +1,4 @@
-# Layer one: conflicts in high-level design decisions between VulnHunter and VVAH
+# Conflicts in high-level design decisions between VulnHunter and VVAH
 
 This document compares the two harnesses at the level of architecture: who is in control, how the search for vulnerabilities is organised, what counts as proof, and how resources are governed. A conflict here means the two harnesses make opposite or incompatible choices about the same design question, so that one cannot simply be switched into the other by changing a setting.
 

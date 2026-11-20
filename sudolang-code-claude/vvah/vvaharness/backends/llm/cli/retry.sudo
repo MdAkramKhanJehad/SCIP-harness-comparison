@@ -1,0 +1,170 @@
+# vvaharness/backends/llm/cli/retry.py
+
+The retry policy for one `claude` subprocess: which non-zero exits are retried (transient rate limits and connection drops, authentication clock skew, one time-out), which are raised at once (proxy and TLS errors, refusals, exhausted authentication retries), the backoff schedules, and the shared helpers for the one doubled-budget truncation retry (VVAH-E005).
+
+Source: `vvaharness/backends/llm/cli/retry.py` (lines 1-353)
+Executor: code
+Called from: `cli/oneshot.sudo` `prompt`, `cli/session.sudo` `agentic`; regular expressions and truncation helpers are reused by `cli_mcp.sudo`
+
+// src: vvaharness/backends/llm/cli/retry.py:55-95; constants from vvaharness/backends/llm/models.py:44-48,104-125,226-227,292-295,312-317
+Constants {
+  _RL_HARD_CAP = /hit your (usage )?limit.*resets/i   // a hard usage cap that resets later: never retried
+  _RL_MAX_RETRIES = 4
+  _RL_BACKOFF = (30, 60, 120, 240)   // seconds
+  _TIMEOUT_MAX_RETRIES = TIMEOUT_MAX_RETRIES = 1   // default; both callers in this batch pass timeout_retries=0
+  _PENDING_RESULT_RX = /__PENDING__|still executing|(?:task\s+is\s+)?still\s+pending|waiting\s+for\s+(?:background\s+)?sub-?agent|background\s+sub-?agent/i
+  _PENDING_MAX_RETRIES = 3
+  _PENDING_BACKOFF = (5, 15, 30)   // seconds
+  _AUTH_FAILURE = /\b401\b|unauthorized|invalid[_ ]api[_ ]key|invalid.*token|token.*(?:expired|invalid|revoked)|authentication[_ ]failed|access[_ ]denied/i
+  _AUTH_MAX_RETRIES = 3   // fast retries absorb JWT clock skew only, then halt for a credential refresh (VVAH-E001)
+  _AUTH_BACKOFF = (2, 4, 8)   // seconds
+  _PROXY_FAILURE = PROXY_CAUSE_RX = /\b407\b|proxy[_ ]auth|tunnel[_ ](?:connection[_ ])?(?:failed|error)|(?-i:\bCONNECT\b).*failed|SSL.*CERTIFICATE|CERTIFICATE.*VERIFY.*FAILED|CERT_VERIFY_FAILED|certificate[_ ]verify[_ ]failed/i   // never heals: raised immediately (VVAH-E002)
+  CLI_RETRYABLE_STATUS = {429, 500, 502, 503, 504, 529} minus {500, 504} = {429, 502, 503, 529}   // the binary already retried 500 and 504
+  RATE_LIMIT_TRANSIENT_RX = /rate.?limit|too many requests|overloaded|temporarily unavailable/i
+  CLI_STATUS_429_RX = /\b429\b/
+  CLI_CONN_TRANSIENT_RX = /socket connection was closed|connection (?:reset|closed|aborted)|ECONNRESET|EPIPE|broken pipe|incomplete(?:ly)? read|premature(?:ly)? closed|EOF occurred/i
+  CLI_TOKEN_CAP_RX = /exceeded the (\d+) output token maximum/i
+  TIMEOUT_STOP_GRACE_SECONDS = 20
+}
+
+// src: vvaharness/backends/llm/cli/retry.py:75-78
+fn _is_pending_result(text):executor=code { return text is a string && _PENDING_RESULT_RX matches text }
+
+// src: vvaharness/backends/llm/cli/retry.py:98-147
+fn _terminal_result_fields(stdout):executor=code {
+  // Returns [api_error_status, result_text, envelope_found]
+  if (!stdout) return [null, null, false]
+  parse JSON from the first "{" or "[" in stdout
+  catch parse error => {
+    env = last stdout line that parses as a JSON event of type "result"   // _last_result_line: stream-json is one event per line
+    return if (env) [env.api_error_status if an integer, env.result || env.error || env.message if a string, true] else [null, null, false]
+  }
+  if (parsed is a list) { env = last "result" event; if (none) return [null, null, false] }   // truncated stream: no terminal event
+  if (env is not a dict) return [null, null, false]
+  return [status if an integer, text if a string, true]
+}
+
+// src: vvaharness/backends/llm/cli/retry.py:150-161
+fn _truncation_cap(result):executor=code {
+  // Text, not status: the cap reports api_error_status null; no backoff here, the E005 retry owns it
+  [_, text, found] = _terminal_result_fields(result.stdout)
+  blob = if (found && text) text else result.stdout + "\n" + result.stderr
+  m = CLI_TOKEN_CAP_RX match in blob
+  return if (m) integer(m.group1) else null
+}
+
+// src: vvaharness/backends/llm/cli/retry.py:164-179
+fn _truncation_error(requested, retried, tag, retry_at, produced?):executor=code {
+  COUNTERS.bump(TRUNCATED_REPLIES_COUNTER)
+  if (truncated_below_budget(produced, requested)) COUNTERS.bump(LLM_TRUNCATED_BELOW_BUDGET_COUNTER)
+  msg = match {
+    case retried => "reply still hit the output-token budget after the doubled retry"
+    case retry_at == null => "max_tokens=$requested is already at the model output cap ($MODEL_MAX_OUTPUT_TOKENS); no useful retry"   // MODEL_MAX_OUTPUT_TOKENS = 64000
+    default => "reply hit the output-token budget with no retry budget left"
+  }
+  return TruncatedResponseError(msg, stage=tag || "", requested, retried, produced)   // returned; the caller raises it
+}
+
+// src: vvaharness/backends/llm/cli/retry.py:182-198
+fn _log_truncation_retry(tag, requested, retry_at, label):executor=code {
+  COUNTERS.bump(TRUNCATED_RETRY_ATTEMPTED_COUNTER); warn TRUNCATED_RETRY
+  errlog.log(tag || label, tag || "truncation", "VVAH-E005 warning: reply truncated at max_tokens=$requested; retrying once at $retry_at", recovered=true)
+}
+fn _accept_reply(text, trunc_retried):executor=code {
+  if (trunc_retried) COUNTERS.bump(TRUNCATED_RETRY_RECOVERED_COUNTER)
+  return text
+}
+
+// src: vvaharness/backends/llm/cli/retry.py:201-218
+fn _is_transient_failure(result):executor=code {
+  [status, text, found] = _terminal_result_fields(result.stdout)
+  if (found) {
+    if (status in CLI_RETRYABLE_STATUS) return true
+    return status == null && text matches (RATE_LIMIT_TRANSIENT_RX || CLI_STATUS_429_RX || CLI_CONN_TRANSIENT_RX)   // a null-status "Overloaded" still retries
+  }
+  // No terminal event: stdout is the model's own streamed content, so only stderr is scanned
+  return result.stderr matches (RATE_LIMIT_TRANSIENT_RX || CLI_STATUS_429_RX || CLI_CONN_TRANSIENT_RX)
+}
+
+// src: vvaharness/backends/llm/cli/retry.py:221-232
+fn _is_auth_failure(result):executor=code {
+  [status, text, found] = _terminal_result_fields(result.stdout)
+  if (found) return status == 401 || (text && _AUTH_FAILURE matches text)
+  return _AUTH_FAILURE matches result.stderr   // never stdout: model content routinely contains these substrings
+}
+
+// src: vvaharness/backends/llm/cli/retry.py:235-258
+fn _proxy_failure_evidence(result):executor=code {
+  [status, text, found] = _terminal_result_fields(result.stdout)
+  if (found) {
+    if (status == 407) return "terminal result reported status 407"
+    haystack = text || ""
+  } else {
+    haystack = result.stdout + "\n" + result.stderr
+    // preserved: unlike the auth and transient checks, stdout IS scanned here when no terminal event exists, because a connection-time proxy failure prints its prose on stdout; the source states this is deliberate
+  }
+  m = _PROXY_FAILURE match in haystack
+  return if (m) "matched '<m>' in: ...<120 characters either side>..." else null
+}
+fn _is_proxy_failure(result):executor=code { return _proxy_failure_evidence(result) != null }
+
+// src: vvaharness/backends/llm/cli/retry.py:261-264
+fn _rotate_session_id(cmd):executor=code {
+  if ("--session-id" in cmd) replace the value after it with a fresh uuid4, in place   // the CLI rejects a reused session id
+}
+
+// src: vvaharness/backends/llm/cli/retry.py:267-330
+fn _run_with_retry(cmd, label, timeout_retries=_TIMEOUT_MAX_RETRIES, ...kw):executor=code {
+  attempt = 0; auth_attempt = 0; timeout_attempt = 0
+  loop {
+    try result = process._run(cmd, ...kw)
+    catch subprocess.TimeoutExpired => {
+      if (cancel._ABORT is set || timeout_attempt >= timeout_retries) throw   // propagates the time-out
+      timeout_attempt += 1
+      console "timed out — retrying once ($timeout_attempt/$timeout_retries)"
+      continue   // preserved: the session id is not rotated on a time-out retry
+    }
+    if (result.returncode == 0) return result
+
+    [_, text, _] = _terminal_result_fields(result.stdout)
+    err_text = text || result.stdout + "\n" + result.stderr
+
+    // 1. Refusal first, so a refusal's stray "token" substrings never reach the auth regex
+    envelope._raise_if_refused_exit(result.stdout, tag=label)
+
+    // 2. Proxy or TLS: raised immediately
+    proxy_evidence = _proxy_failure_evidence(result)
+    require !proxy_evidence => throw ProxyError("${redact(err_text)[:400]}\n  classified E002 because: ${redact(proxy_evidence)[:400]}", status_code=407 if err_text contains \b407\b else null, backend="cli")
+
+    // 3. Authentication: up to 3 fast retries, then raise
+    if (_is_auth_failure(result)) {
+      if (auth_attempt < _AUTH_MAX_RETRIES) {
+        wait = _AUTH_BACKOFF[min(auth_attempt, 2)]
+        sleep(wait)   // preserved: this sleep does not poll the abort flag, unlike the transient backoff below
+        auth_attempt += 1
+        _rotate_session_id(cmd)
+        continue
+      }
+      throw AuthenticationError(redact(err_text)[:400], status_code=401, backend="cli")
+    }
+
+    // 4. Hard usage cap: return the failed result without retrying
+    if (_RL_HARD_CAP matches err_text) { console "hard usage cap reached — not retrying"; return result }
+
+    // 5. Transient: up to 4 retries with 30/60/120/240 second backoff; anything else is returned to the caller as a failed result
+    if (attempt >= _RL_MAX_RETRIES || !_is_transient_failure(result)) return result
+    wait = _RL_BACKOFF[min(attempt, 3)]
+    slept = 0
+    while (slept < wait) {
+      require cancel._ABORT is not set => throw RuntimeError("aborted by user (Ctrl-C)")
+      sleep(min(5, wait - slept)); slept += 5
+    }
+    _rotate_session_id(cmd)
+    attempt += 1
+  }
+}
+
+// src: vvaharness/backends/llm/cli/retry.py:333-353
+fn _log_usage(usage, stop_reason?, model_usage?):executor=code {
+  // abstracted: one console line "[cli] usage: in=<input + cache read + cache write> (cache_read, cache_write) out=<output> stop_reason=... model=<resolved model>=$<cost>"; no decisions
+}

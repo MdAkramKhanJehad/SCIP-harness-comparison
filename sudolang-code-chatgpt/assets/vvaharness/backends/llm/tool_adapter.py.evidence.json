@@ -1,0 +1,3402 @@
+{
+  "source": "vvaharness/backends/llm/tool_adapter.py",
+  "sha256": "7b7dab400a62c95af804b6ba20f7c4519e1c90a690d896c5c09ae98a84858572",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"In-process langchain-tool adapter: caller fact tools on `via: sdk` / `via: openai`.\"\"\"\n\n# In-process is the only transport (live ArcadeDB GraphHandle); todos/subagents stay deepagents-only\nfrom __future__ import annotations\n\nimport json\nfrom dataclasses import dataclass, field\nfrom pathlib import Path\nfrom typing import TYPE_CHECKING, Any\n\nfrom pydantic import ValidationError\n\nfrom vvaharness.backends.llm import tools as _localtools\nfrom vvaharness.report.redact import redact, redact_counts\nfrom vvaharness.util import console\nfrom vvaharness.util.counters import COUNTERS\nfrom vvaharness.util.scan_progress import is_stage_only\nfrom vvaharness.util.warn_once import warn_once\n\nif TYPE_CHECKING:\n    from collections.abc import Sequence\n\n#: Bumped when a session shipped a verdict without ever calling a required tool.\nEVIDENCE_UNENFORCED_COUNTER = \"llm_adapter_evidence_gate_unenforced\"\n\n#: One entry per distinct degradation already reported, so stderr is not flooded.\n_WARNED: set[str] = set()\n\n\ndef _materialize(tool_builder: Any, *, model: str, cwd: str,\n                 fact_tools: Sequence[str]) -> list[Any]:\n    \"\"\"Run the caller's ``ToolBuilder`` and keep only its fact tools.\"\"\"\n    from vvaharness.backends.harness import StreamingOptions  # noqa: PLC0415 — lazy\n\n    wanted = set(fact_tools)\n    if not wanted:\n        return []\n    options = StreamingOptions(model=model, cwd=Path(cwd),\n                               fact_tools=tuple(fact_tools))\n    built = tool_builder(options, allowed_tools=()) or []\n    return [t for t in built if getattr(t, \"name\", None) in wanted]\n\n\ndef _tool_schema(langchain_tool: Any) -> dict[str, Any]:\n    \"\"\"The JSON-schema object for a langchain tool's arguments.\"\"\"\n    args = dict(getattr(langchain_tool, \"args\", None) or {})\n    required = [\n        name for name, spec in args.items()\n        if isinstance(spec, dict) and \"default\" not in spec\n    ]\n    return {\"type\": \"object\", \"properties\": args, \"required\": required}\n\n\ndef _anthropic_schema(langchain_tool: Any) -> dict[str, Any]:\n    \"\"\"One Anthropic Messages tool schema for a langchain tool.\"\"\"\n    name = str(getattr(langchain_tool, \"name\", \"\") or \"\")\n    desc = (getattr(langchain_tool, \"description\", \"\") or \"\").strip()\n    return {\"name\": name, \"description\": desc or name,\n            \"input_schema\": _tool_schema(langchain_tool)}\n\n\ndef _budget_refusal(parent_middleware: Sequence[Any], name: str) -> str | None:\n    \"\"\"Refusal text when one of the caller's own budgets has no allowance left.\"\"\"\n    for mw in parent_middleware or ():\n        refusal = getattr(mw, \"refusal_for\", None)\n        if refusal is None:\n            continue\n        text = refusal(name)\n        if text:\n            return text\n    return None\n\n\ndef _required_fact_tools(parent_middleware: Sequence[Any]) -> frozenset[str]:\n    \"\"\"Tool names the caller's EvidenceGate would have demanded before a verdict.\"\"\"\n    required: set[str] = set()\n    for mw in parent_middleware or ():\n        names = getattr(mw, \"required_tools\", None)\n        if names:\n            required |= set(names)\n    return frozenset(required)\n\n\ndef _serialize(result: object) -> str:\n    \"\"\"Render a tool result as text, JSON when it is structured.\"\"\"\n    if isinstance(result, str):\n        return result\n    try:\n        return json.dumps(result, default=str)\n    except (TypeError, ValueError):\n        return str(result)\n\n\n@dataclass\nclass ToolStack:\n    \"\"\"The materialised tools for one session, in the shape both agentic loops accept.\"\"\"\n\n    #: Anthropic-shape tool schemas to pass as ``extra_tools``.\n    schemas: list[dict[str, Any]]\n    #: Tool names, for the dispatch log line.\n    names: tuple[str, ...]\n    #: Tools a verdict must be backed by, per the caller's EvidenceGate.\n    required: frozenset[str] = frozenset()\n    _tools: dict[str, Any] = field(default_factory=dict)\n    _middleware: tuple[Any, ...] = ()\n    _called: set[str] = field(default_factory=set)\n\n    @staticmethod\n    def _validation_error(lc_tool: Any, args: dict[str, Any]) -> ValidationError | None:\n        \"\"\"*args* checked against *lc_tool*'s schema, or ``None`` when it has none or passes.\"\"\"\n        schema = getattr(lc_tool, \"args_schema\", None)\n        if not hasattr(schema, \"model_validate\"):\n            return None\n        try:\n            schema.model_validate(args or {})\n        except ValidationError as exc:\n            return exc\n        return None\n\n    def _tool_fault(self, name: str, args: dict[str, Any], exc: Exception, *,\n                    tag: str | None) -> str:\n        \"\"\"Count, log, and format a tool fault as the adapter's standard error string.\"\"\"\n        COUNTERS.bump(f\"llm_adapter_tool_error_{name}\")\n        err = f\"ERROR: {type(exc).__name__}: {redact(str(exc))}\"\n        self._log_dispatch(name, args, err, tag=tag)\n        return err\n\n    def _rejected(self, lc_tool: Any, name: str, args: dict[str, Any], *,\n                 tag: str | None) -> str | None:\n        \"\"\"Validation or budget rejection text for this call, or ``None`` to proceed.\"\"\"\n        invalid = self._validation_error(lc_tool, args)\n        if invalid is not None:\n            return self._tool_fault(name, args, invalid, tag=tag)\n        refusal = _budget_refusal(self._middleware, name)\n        if refusal is not None:\n            self._log_dispatch(name, args, f\"refused: {refusal}\", tag=tag)\n            return refusal\n        return None\n\n    def dispatch(self, name: str, args: dict[str, Any], *,\n                tag: str | None = None) -> str | None:\n        \"\"\"Run one adapted tool, or return ``None`` so the loop's localtools get the name.\"\"\"\n        lc_tool = self._tools.get(name)\n        if lc_tool is None:\n            return None\n        rejection = self._rejected(lc_tool, name, args, tag=tag)\n        if rejection is not None:\n            return rejection\n        self._called.add(name)\n        for mw in self._middleware or ():\n            note = getattr(mw, \"note_call\", None)\n            if note is not None:\n                note(name)\n        try:\n            result = lc_tool.invoke(dict(args or {}))\n        except Exception as exc:\n            return self._tool_fault(name, args, exc, tag=tag)\n        masked, _ = redact_counts(_serialize(result))\n        out = _localtools.cap_tool_result(masked)\n        self._log_dispatch(name, args, f\"{len(out)} chars\", tag=tag)\n        return out\n\n    def _log_dispatch(self, name: str, args: dict[str, Any], outcome: str, *,\n                      tag: str | None = None) -> None:\n        if is_stage_only():\n            return\n        console.write(f\"      [tool-adapter] tool {name}({_localtools.summarize_args(args)}) \"\n                      f\"-> {outcome}{f' [{tag}]' if tag else ''}\")\n\n    def exhausted_tools(self) -> frozenset[str]:\n        \"\"\"Union of every metered tool name whose caller-owned budget is now spent.\"\"\"\n        out: set[str] = set()\n        for mw in self._middleware or ():\n            names = getattr(mw, \"exhausted_tools\", None)\n            if names is None:\n                continue\n            out |= set(names())\n        return frozenset(out)\n\n    def submit_guard(self) -> str | None:\n        \"\"\"Text to hand back as a tool result instead of the verdict, or ``None`` to allow it.\"\"\"\n        for mw in self._middleware or ():\n            hold = getattr(mw, \"hold_for_verdict\", None)\n            if hold is None:\n                continue\n            text = hold()\n            if text:\n                return text\n        return None\n\n    def report_evidence_degradation(self, *, tag: str, label: str) -> None:\n        \"\"\"Count and announce a verdict that shipped without ever consulting a required tool.\"\"\"\n        # submit_guard already relented after max_rejections; residual telemetry, not a skipped gate\n        if not self.required or (self.required & self._called):\n            return\n        COUNTERS.bump(EVIDENCE_UNENFORCED_COUNTER)\n        warn_once(\n            _WARNED, f\"evidence-gate:{label}:{tag}\",\n            f\"WARN [{label}]: {tag or 'this stage'} requires graph evidence, but the \"\n            f\"session called none of {sorted(self.required)}. submit_guard already \"\n            f\"rejected this verdict's submit up to max_rejections times (the same \"\n            f\"relent every EvidenceGate performs, in-loop or out-of-loop) before \"\n            f\"letting it through. The reply was accepted as-is and counted under \"\n            f\"`{EVIDENCE_UNENFORCED_COUNTER}` in Pipeline Diagnostics.\")\n\n\ndef build(tool_builder: Any, *, model: str, cwd: str,\n          fact_tools: Sequence[str],\n          parent_middleware: Sequence[Any] = ()) -> ToolStack | None:\n    \"\"\"Adapt the caller's ``tool_builder`` for one ``sdk``/``openai`` agentic session.\"\"\"\n    # None means \"nothing to carry\" so the caller withholds the tool paragraph from the prompt\n    if tool_builder is None or not fact_tools:\n        return None\n    lc_tools = _materialize(tool_builder, model=model, cwd=cwd,\n                            fact_tools=fact_tools)\n    if not lc_tools:\n        return None\n    return ToolStack(\n        schemas=[_anthropic_schema(t) for t in lc_tools],\n        names=tuple(str(t.name) for t in lc_tools),\n        required=_required_fact_tools(parent_middleware),\n        _tools={str(t.name): t for t in lc_tools},\n        _middleware=tuple(parent_middleware or ()),\n    )\n\n\n__all__ = [\n    \"EVIDENCE_UNENFORCED_COUNTER\",\n    \"ToolStack\",\n    \"build\",\n]\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/backends/llm/tool_adapter.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "In-process langchain-tool adapter: caller fact tools on `via: sdk` / `via: openai`.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_46_4": {
+      "source": "vvaharness/backends/llm/tool_adapter.py",
+      "line_start": 46,
+      "line_end": 46,
+      "value": "Run the caller's ``ToolBuilder`` and keep only its fact tools.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_59_4": {
+      "source": "vvaharness/backends/llm/tool_adapter.py",
+      "line_start": 59,
+      "line_end": 59,
+      "value": "The JSON-schema object for a langchain tool's arguments.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_69_4": {
+      "source": "vvaharness/backends/llm/tool_adapter.py",
+      "line_start": 69,
+      "line_end": 69,
+      "value": "One Anthropic Messages tool schema for a langchain tool.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_77_4": {
+      "source": "vvaharness/backends/llm/tool_adapter.py",
+      "line_start": 77,
+      "line_end": 77,
+      "value": "Refusal text when one of the caller's own budgets has no allowance left.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_89_4": {
+      "source": "vvaharness/backends/llm/tool_adapter.py",
+      "line_start": 89,
+      "line_end": 89,
+      "value": "Tool names the caller's EvidenceGate would have demanded before a verdict.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_99_4": {
+      "source": "vvaharness/backends/llm/tool_adapter.py",
+      "line_start": 99,
+      "line_end": 99,
+      "value": "Render a tool result as text, JSON when it is structured.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_110_4": {
+      "source": "vvaharness/backends/llm/tool_adapter.py",
+      "line_start": 110,
+      "line_end": 110,
+      "value": "The materialised tools for one session, in the shape both agentic loops accept.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_124_8": {
+      "source": "vvaharness/backends/llm/tool_adapter.py",
+      "line_start": 124,
+      "line_end": 124,
+      "value": "*args* checked against *lc_tool*'s schema, or ``None`` when it has none or passes.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_136_8": {
+      "source": "vvaharness/backends/llm/tool_adapter.py",
+      "line_start": 136,
+      "line_end": 136,
+      "value": "Count, log, and format a tool fault as the adapter's standard error string.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_137_22": {
+      "source": "vvaharness/backends/llm/tool_adapter.py",
+      "line_start": 137,
+      "line_end": 137,
+      "source_expression": "f\"llm_adapter_tool_error_{name}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_138_14": {
+      "source": "vvaharness/backends/llm/tool_adapter.py",
+      "line_start": 138,
+      "line_end": 138,
+      "source_expression": "f\"ERROR: {type(exc).__name__}: {redact(str(exc))}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_144_8": {
+      "source": "vvaharness/backends/llm/tool_adapter.py",
+      "line_start": 144,
+      "line_end": 144,
+      "value": "Validation or budget rejection text for this call, or ``None`` to proceed.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_150_43": {
+      "source": "vvaharness/backends/llm/tool_adapter.py",
+      "line_start": 150,
+      "line_end": 150,
+      "source_expression": "f\"refused: {refusal}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_156_8": {
+      "source": "vvaharness/backends/llm/tool_adapter.py",
+      "line_start": 156,
+      "line_end": 156,
+      "value": "Run one adapted tool, or return ``None`` so the loop's localtools get the name.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_174_39": {
+      "source": "vvaharness/backends/llm/tool_adapter.py",
+      "line_start": 174,
+      "line_end": 174,
+      "source_expression": "f\"{len(out)} chars\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_181_22": {
+      "source": "vvaharness/backends/llm/tool_adapter.py",
+      "line_start": 181,
+      "line_end": 182,
+      "source_expression": "f\"      [tool-adapter] tool {name}({_localtools.summarize_args(args)}) \"\n                      f\"-> {outcome}{f' [{tag}]' if tag else ''}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_185_8": {
+      "source": "vvaharness/backends/llm/tool_adapter.py",
+      "line_start": 185,
+      "line_end": 185,
+      "value": "Union of every metered tool name whose caller-owned budget is now spent.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_195_8": {
+      "source": "vvaharness/backends/llm/tool_adapter.py",
+      "line_start": 195,
+      "line_end": 195,
+      "value": "Text to hand back as a tool result instead of the verdict, or ``None`` to allow it.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_206_8": {
+      "source": "vvaharness/backends/llm/tool_adapter.py",
+      "line_start": 206,
+      "line_end": 206,
+      "value": "Count and announce a verdict that shipped without ever consulting a required tool.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_212_21": {
+      "source": "vvaharness/backends/llm/tool_adapter.py",
+      "line_start": 212,
+      "line_end": 212,
+      "source_expression": "f\"evidence-gate:{label}:{tag}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_213_12": {
+      "source": "vvaharness/backends/llm/tool_adapter.py",
+      "line_start": 213,
+      "line_end": 218,
+      "source_expression": "f\"WARN [{label}]: {tag or 'this stage'} requires graph evidence, but the \"\n            f\"session called none of {sorted(self.required)}. submit_guard already \"\n            f\"rejected this verdict's submit up to max_rejections times (the same \"\n            f\"relent every EvidenceGate performs, in-loop or out-of-loop) before \"\n            f\"letting it through. The reply was accepted as-is and counted under \"\n            f\"`{EVIDENCE_UNENFORCED_COUNTER}` in Pipeline Diagnostics.\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_224_4": {
+      "source": "vvaharness/backends/llm/tool_adapter.py",
+      "line_start": 224,
+      "line_end": 224,
+      "value": "Adapt the caller's ``tool_builder`` for one ``sdk``/``openai`` agentic session.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "In-process langchain-tool adapter: caller fact tools on `via: sdk` / `via: openai`.",
+      "context": "literal"
+    },
+    {
+      "line_start": 38,
+      "line_end": 38,
+      "column": 30,
+      "value": "llm_adapter_evidence_gate_unenforced",
+      "context": "literal"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 4,
+      "value": "Run the caller's ``ToolBuilder`` and keep only its fact tools.",
+      "context": "literal"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 4,
+      "value": "The JSON-schema object for a langchain tool's arguments.",
+      "context": "literal"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 4,
+      "value": "One Anthropic Messages tool schema for a langchain tool.",
+      "context": "literal"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 4,
+      "value": "Refusal text when one of the caller's own budgets has no allowance left.",
+      "context": "literal"
+    },
+    {
+      "line_start": 89,
+      "line_end": 89,
+      "column": 4,
+      "value": "Tool names the caller's EvidenceGate would have demanded before a verdict.",
+      "context": "literal"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 4,
+      "value": "Render a tool result as text, JSON when it is structured.",
+      "context": "literal"
+    },
+    {
+      "line_start": 110,
+      "line_end": 110,
+      "column": 4,
+      "value": "The materialised tools for one session, in the shape both agentic loops accept.",
+      "context": "literal"
+    },
+    {
+      "line_start": 224,
+      "line_end": 224,
+      "column": 4,
+      "value": "Adapt the caller's ``tool_builder`` for one ``sdk``/``openai`` agentic session.",
+      "context": "literal"
+    },
+    {
+      "line_start": 242,
+      "line_end": 242,
+      "column": 4,
+      "value": "EVIDENCE_UNENFORCED_COUNTER",
+      "context": "literal"
+    },
+    {
+      "line_start": 243,
+      "line_end": 243,
+      "column": 4,
+      "value": "ToolStack",
+      "context": "literal"
+    },
+    {
+      "line_start": 244,
+      "line_end": 244,
+      "column": 4,
+      "value": "build",
+      "context": "literal"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 12,
+      "value": "type",
+      "context": "literal"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 30,
+      "value": "properties",
+      "context": "literal"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 50,
+      "value": "required",
+      "context": "literal"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 20,
+      "value": "object",
+      "context": "literal"
+    },
+    {
+      "line_start": 72,
+      "line_end": 72,
+      "column": 12,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 72,
+      "line_end": 72,
+      "column": 26,
+      "value": "description",
+      "context": "literal"
+    },
+    {
+      "line_start": 73,
+      "line_end": 73,
+      "column": 12,
+      "value": "input_schema",
+      "context": "literal"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 8,
+      "value": "*args* checked against *lc_tool*'s schema, or ``None`` when it has none or passes.",
+      "context": "literal"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 8,
+      "value": "Count, log, and format a tool fault as the adapter's standard error string.",
+      "context": "literal"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 8,
+      "value": "Validation or budget rejection text for this call, or ``None`` to proceed.",
+      "context": "literal"
+    },
+    {
+      "line_start": 156,
+      "line_end": 156,
+      "column": 8,
+      "value": "Run one adapted tool, or return ``None`` so the loop's localtools get the name.",
+      "context": "literal"
+    },
+    {
+      "line_start": 185,
+      "line_end": 185,
+      "column": 8,
+      "value": "Union of every metered tool name whose caller-owned budget is now spent.",
+      "context": "literal"
+    },
+    {
+      "line_start": 195,
+      "line_end": 195,
+      "column": 8,
+      "value": "Text to hand back as a tool result instead of the verdict, or ``None`` to allow it.",
+      "context": "literal"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 8,
+      "value": "Count and announce a verdict that shipped without ever consulting a required tool.",
+      "context": "literal"
+    },
+    {
+      "line_start": 70,
+      "line_end": 70,
+      "column": 54,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 79,
+      "line_end": 79,
+      "column": 30,
+      "value": "refusal_for",
+      "context": "literal"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 28,
+      "value": "required_tools",
+      "context": "literal"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 34,
+      "value": "args_schema",
+      "context": "literal"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 16,
+      "value": "ERROR: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 43,
+      "value": ": ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 40,
+      "value": "args",
+      "context": "literal"
+    },
+    {
+      "line_start": 70,
+      "line_end": 70,
+      "column": 39,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 70,
+      "line_end": 70,
+      "column": 47,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 58,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 31,
+      "value": "model_validate",
+      "context": "literal"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 24,
+      "value": "llm_adapter_tool_error_",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 31,
+      "value": "note_call",
+      "context": "literal"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 51,
+      "value": " chars",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 24,
+      "value": "      [tool-adapter] tool ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 56,
+      "value": "(",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 181,
+      "line_end": 182,
+      "column": 91,
+      "value": ") -> ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 32,
+      "value": "exhausted_tools",
+      "context": "literal"
+    },
+    {
+      "line_start": 197,
+      "line_end": 197,
+      "column": 31,
+      "value": "hold_for_verdict",
+      "context": "literal"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 23,
+      "value": "evidence-gate:",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 44,
+      "value": ":",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 213,
+      "line_end": 213,
+      "column": 14,
+      "value": "WARN [",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 213,
+      "line_end": 213,
+      "column": 27,
+      "value": "]: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 213,
+      "line_end": 214,
+      "column": 51,
+      "value": " requires graph evidence, but the session called none of ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 214,
+      "line_end": 218,
+      "column": 60,
+      "value": ". submit_guard already rejected this verdict's submit up to max_rejections times (the same relent every EvidenceGate performs, in-loop or out-of-loop) before letting it through. The reply was accepted as-is and counted under `",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 218,
+      "line_end": 218,
+      "column": 44,
+      "value": "` in Pipeline Diagnostics.",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 43,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 63,
+      "line_end": 63,
+      "column": 38,
+      "value": "default",
+      "context": "literal"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 36,
+      "value": "description",
+      "context": "literal"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 51,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 45,
+      "value": "refused: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 61,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 213,
+      "line_end": 213,
+      "column": 38,
+      "value": "this stage",
+      "context": "literal"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 39,
+      "value": " [",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 46,
+      "value": "]",
+      "context": "f-string segment"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 17,
+      "text": "# In-process is the only transport (live ArcadeDB GraphHandle); todos/subagents stay deepagents-only"
+    },
+    {
+      "line": 37,
+      "text": "#: Bumped when a session shipped a verdict without ever calling a required tool."
+    },
+    {
+      "line": 40,
+      "text": "#: One entry per distinct degradation already reported, so stderr is not flooded."
+    },
+    {
+      "line": 47,
+      "text": "# noqa: PLC0415 — lazy"
+    },
+    {
+      "line": 112,
+      "text": "#: Anthropic-shape tool schemas to pass as ``extra_tools``."
+    },
+    {
+      "line": 114,
+      "text": "#: Tool names, for the dispatch log line."
+    },
+    {
+      "line": 116,
+      "text": "#: Tools a verdict must be backed by, per the caller's EvidenceGate."
+    },
+    {
+      "line": 207,
+      "text": "# submit_guard already relented after max_rejections; residual telemetry, not a skipped gate"
+    },
+    {
+      "line": 225,
+      "text": "# None means \"nothing to carry\" so the caller withholds the tool paragraph from the prompt"
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 18,
+      "line_end": 18,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 23,
+      "line_end": 23,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 27,
+      "line_end": 27,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 28,
+      "line_end": 28,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 29,
+      "line_end": 29,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 30,
+      "line_end": 30,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 31,
+      "line_end": 31,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 32,
+      "line_end": 32,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "If",
+      "line_start": 34,
+      "line_end": 35,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 7
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 35,
+      "line_end": 35,
+      "column": 4,
+      "owner": "module initialization",
+      "representation_line": 10
+    },
+    {
+      "kind": "Assign",
+      "line_start": 38,
+      "line_end": 38,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 13
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 41,
+      "line_end": 41,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 13
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 44,
+      "line_end": 55,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 14
+    },
+    {
+      "kind": "Expr",
+      "line_start": 46,
+      "line_end": 46,
+      "column": 4,
+      "owner": "_materialize",
+      "representation_line": 20
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 47,
+      "line_end": 47,
+      "column": 4,
+      "owner": "_materialize",
+      "representation_line": 20
+    },
+    {
+      "kind": "Assign",
+      "line_start": 49,
+      "line_end": 49,
+      "column": 4,
+      "owner": "_materialize",
+      "representation_line": 20
+    },
+    {
+      "kind": "If",
+      "line_start": 50,
+      "line_end": 51,
+      "column": 4,
+      "owner": "_materialize",
+      "representation_line": 21
+    },
+    {
+      "kind": "Return",
+      "line_start": 51,
+      "line_end": 51,
+      "column": 8,
+      "owner": "_materialize",
+      "representation_line": 23
+    },
+    {
+      "kind": "Assign",
+      "line_start": 52,
+      "line_end": 53,
+      "column": 4,
+      "owner": "_materialize",
+      "representation_line": 27
+    },
+    {
+      "kind": "Assign",
+      "line_start": 54,
+      "line_end": 54,
+      "column": 4,
+      "owner": "_materialize",
+      "representation_line": 27
+    },
+    {
+      "kind": "Return",
+      "line_start": 55,
+      "line_end": 55,
+      "column": 4,
+      "owner": "_materialize",
+      "representation_line": 28
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 58,
+      "line_end": 65,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 32
+    },
+    {
+      "kind": "Expr",
+      "line_start": 59,
+      "line_end": 59,
+      "column": 4,
+      "owner": "_tool_schema",
+      "representation_line": 38
+    },
+    {
+      "kind": "Assign",
+      "line_start": 60,
+      "line_end": 60,
+      "column": 4,
+      "owner": "_tool_schema",
+      "representation_line": 38
+    },
+    {
+      "kind": "Assign",
+      "line_start": 61,
+      "line_end": 64,
+      "column": 4,
+      "owner": "_tool_schema",
+      "representation_line": 38
+    },
+    {
+      "kind": "Return",
+      "line_start": 65,
+      "line_end": 65,
+      "column": 4,
+      "owner": "_tool_schema",
+      "representation_line": 39
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 68,
+      "line_end": 73,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 43
+    },
+    {
+      "kind": "Expr",
+      "line_start": 69,
+      "line_end": 69,
+      "column": 4,
+      "owner": "_anthropic_schema",
+      "representation_line": 49
+    },
+    {
+      "kind": "Assign",
+      "line_start": 70,
+      "line_end": 70,
+      "column": 4,
+      "owner": "_anthropic_schema",
+      "representation_line": 49
+    },
+    {
+      "kind": "Assign",
+      "line_start": 71,
+      "line_end": 71,
+      "column": 4,
+      "owner": "_anthropic_schema",
+      "representation_line": 49
+    },
+    {
+      "kind": "Return",
+      "line_start": 72,
+      "line_end": 73,
+      "column": 4,
+      "owner": "_anthropic_schema",
+      "representation_line": 50
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 76,
+      "line_end": 85,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 54
+    },
+    {
+      "kind": "Expr",
+      "line_start": 77,
+      "line_end": 77,
+      "column": 4,
+      "owner": "_budget_refusal",
+      "representation_line": 60
+    },
+    {
+      "kind": "For",
+      "line_start": 78,
+      "line_end": 84,
+      "column": 4,
+      "owner": "_budget_refusal",
+      "representation_line": 61
+    },
+    {
+      "kind": "Assign",
+      "line_start": 79,
+      "line_end": 79,
+      "column": 8,
+      "owner": "_budget_refusal",
+      "representation_line": 64
+    },
+    {
+      "kind": "If",
+      "line_start": 80,
+      "line_end": 81,
+      "column": 8,
+      "owner": "_budget_refusal",
+      "representation_line": 65
+    },
+    {
+      "kind": "Continue",
+      "line_start": 81,
+      "line_end": 81,
+      "column": 12,
+      "owner": "_budget_refusal",
+      "representation_line": 67
+    },
+    {
+      "kind": "Assign",
+      "line_start": 82,
+      "line_end": 82,
+      "column": 8,
+      "owner": "_budget_refusal",
+      "representation_line": 71
+    },
+    {
+      "kind": "If",
+      "line_start": 83,
+      "line_end": 84,
+      "column": 8,
+      "owner": "_budget_refusal",
+      "representation_line": 72
+    },
+    {
+      "kind": "Return",
+      "line_start": 84,
+      "line_end": 84,
+      "column": 12,
+      "owner": "_budget_refusal",
+      "representation_line": 74
+    },
+    {
+      "kind": "Return",
+      "line_start": 85,
+      "line_end": 85,
+      "column": 4,
+      "owner": "_budget_refusal",
+      "representation_line": 78
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 88,
+      "line_end": 95,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 82
+    },
+    {
+      "kind": "Expr",
+      "line_start": 89,
+      "line_end": 89,
+      "column": 4,
+      "owner": "_required_fact_tools",
+      "representation_line": 88
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 90,
+      "line_end": 90,
+      "column": 4,
+      "owner": "_required_fact_tools",
+      "representation_line": 88
+    },
+    {
+      "kind": "For",
+      "line_start": 91,
+      "line_end": 94,
+      "column": 4,
+      "owner": "_required_fact_tools",
+      "representation_line": 89
+    },
+    {
+      "kind": "Assign",
+      "line_start": 92,
+      "line_end": 92,
+      "column": 8,
+      "owner": "_required_fact_tools",
+      "representation_line": 92
+    },
+    {
+      "kind": "If",
+      "line_start": 93,
+      "line_end": 94,
+      "column": 8,
+      "owner": "_required_fact_tools",
+      "representation_line": 93
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 94,
+      "line_end": 94,
+      "column": 12,
+      "owner": "_required_fact_tools",
+      "representation_line": 96
+    },
+    {
+      "kind": "Return",
+      "line_start": 95,
+      "line_end": 95,
+      "column": 4,
+      "owner": "_required_fact_tools",
+      "representation_line": 99
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 98,
+      "line_end": 105,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 103
+    },
+    {
+      "kind": "Expr",
+      "line_start": 99,
+      "line_end": 99,
+      "column": 4,
+      "owner": "_serialize",
+      "representation_line": 109
+    },
+    {
+      "kind": "If",
+      "line_start": 100,
+      "line_end": 101,
+      "column": 4,
+      "owner": "_serialize",
+      "representation_line": 110
+    },
+    {
+      "kind": "Return",
+      "line_start": 101,
+      "line_end": 101,
+      "column": 8,
+      "owner": "_serialize",
+      "representation_line": 112
+    },
+    {
+      "kind": "Try",
+      "line_start": 102,
+      "line_end": 105,
+      "column": 4,
+      "owner": "_serialize",
+      "representation_line": 115
+    },
+    {
+      "kind": "Return",
+      "line_start": 103,
+      "line_end": 103,
+      "column": 8,
+      "owner": "_serialize",
+      "representation_line": 117
+    },
+    {
+      "kind": "Return",
+      "line_start": 105,
+      "line_end": 105,
+      "column": 8,
+      "owner": "_serialize",
+      "representation_line": 122
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 109,
+      "line_end": 218,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 127
+    },
+    {
+      "kind": "Expr",
+      "line_start": 110,
+      "line_end": 110,
+      "column": 4,
+      "owner": "ToolStack",
+      "representation_line": 135
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 113,
+      "line_end": 113,
+      "column": 4,
+      "owner": "ToolStack",
+      "representation_line": 135
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 115,
+      "line_end": 115,
+      "column": 4,
+      "owner": "ToolStack",
+      "representation_line": 135
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 117,
+      "line_end": 117,
+      "column": 4,
+      "owner": "ToolStack",
+      "representation_line": 135
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 118,
+      "line_end": 118,
+      "column": 4,
+      "owner": "ToolStack",
+      "representation_line": 135
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 119,
+      "line_end": 119,
+      "column": 4,
+      "owner": "ToolStack",
+      "representation_line": 137
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 120,
+      "line_end": 120,
+      "column": 4,
+      "owner": "ToolStack",
+      "representation_line": 137
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 123,
+      "line_end": 132,
+      "column": 4,
+      "owner": "ToolStack",
+      "representation_line": 138
+    },
+    {
+      "kind": "Expr",
+      "line_start": 124,
+      "line_end": 124,
+      "column": 8,
+      "owner": "ToolStack._validation_error",
+      "representation_line": 147
+    },
+    {
+      "kind": "Assign",
+      "line_start": 125,
+      "line_end": 125,
+      "column": 8,
+      "owner": "ToolStack._validation_error",
+      "representation_line": 147
+    },
+    {
+      "kind": "If",
+      "line_start": 126,
+      "line_end": 127,
+      "column": 8,
+      "owner": "ToolStack._validation_error",
+      "representation_line": 148
+    },
+    {
+      "kind": "Return",
+      "line_start": 127,
+      "line_end": 127,
+      "column": 12,
+      "owner": "ToolStack._validation_error",
+      "representation_line": 150
+    },
+    {
+      "kind": "Try",
+      "line_start": 128,
+      "line_end": 131,
+      "column": 8,
+      "owner": "ToolStack._validation_error",
+      "representation_line": 153
+    },
+    {
+      "kind": "Expr",
+      "line_start": 129,
+      "line_end": 129,
+      "column": 12,
+      "owner": "ToolStack._validation_error",
+      "representation_line": 156
+    },
+    {
+      "kind": "Return",
+      "line_start": 131,
+      "line_end": 131,
+      "column": 12,
+      "owner": "ToolStack._validation_error",
+      "representation_line": 160
+    },
+    {
+      "kind": "Return",
+      "line_start": 132,
+      "line_end": 132,
+      "column": 8,
+      "owner": "ToolStack._validation_error",
+      "representation_line": 163
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 134,
+      "line_end": 140,
+      "column": 4,
+      "owner": "ToolStack",
+      "representation_line": 168
+    },
+    {
+      "kind": "Expr",
+      "line_start": 136,
+      "line_end": 136,
+      "column": 8,
+      "owner": "ToolStack._tool_fault",
+      "representation_line": 174
+    },
+    {
+      "kind": "Expr",
+      "line_start": 137,
+      "line_end": 137,
+      "column": 8,
+      "owner": "ToolStack._tool_fault",
+      "representation_line": 174
+    },
+    {
+      "kind": "Assign",
+      "line_start": 138,
+      "line_end": 138,
+      "column": 8,
+      "owner": "ToolStack._tool_fault",
+      "representation_line": 174
+    },
+    {
+      "kind": "Expr",
+      "line_start": 139,
+      "line_end": 139,
+      "column": 8,
+      "owner": "ToolStack._tool_fault",
+      "representation_line": 174
+    },
+    {
+      "kind": "Return",
+      "line_start": 140,
+      "line_end": 140,
+      "column": 8,
+      "owner": "ToolStack._tool_fault",
+      "representation_line": 175
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 142,
+      "line_end": 152,
+      "column": 4,
+      "owner": "ToolStack",
+      "representation_line": 179
+    },
+    {
+      "kind": "Expr",
+      "line_start": 144,
+      "line_end": 144,
+      "column": 8,
+      "owner": "ToolStack._rejected",
+      "representation_line": 185
+    },
+    {
+      "kind": "Assign",
+      "line_start": 145,
+      "line_end": 145,
+      "column": 8,
+      "owner": "ToolStack._rejected",
+      "representation_line": 185
+    },
+    {
+      "kind": "If",
+      "line_start": 146,
+      "line_end": 147,
+      "column": 8,
+      "owner": "ToolStack._rejected",
+      "representation_line": 186
+    },
+    {
+      "kind": "Return",
+      "line_start": 147,
+      "line_end": 147,
+      "column": 12,
+      "owner": "ToolStack._rejected",
+      "representation_line": 188
+    },
+    {
+      "kind": "Assign",
+      "line_start": 148,
+      "line_end": 148,
+      "column": 8,
+      "owner": "ToolStack._rejected",
+      "representation_line": 192
+    },
+    {
+      "kind": "If",
+      "line_start": 149,
+      "line_end": 151,
+      "column": 8,
+      "owner": "ToolStack._rejected",
+      "representation_line": 193
+    },
+    {
+      "kind": "Expr",
+      "line_start": 150,
+      "line_end": 150,
+      "column": 12,
+      "owner": "ToolStack._rejected",
+      "representation_line": 196
+    },
+    {
+      "kind": "Return",
+      "line_start": 151,
+      "line_end": 151,
+      "column": 12,
+      "owner": "ToolStack._rejected",
+      "representation_line": 197
+    },
+    {
+      "kind": "Return",
+      "line_start": 152,
+      "line_end": 152,
+      "column": 8,
+      "owner": "ToolStack._rejected",
+      "representation_line": 200
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 154,
+      "line_end": 175,
+      "column": 4,
+      "owner": "ToolStack",
+      "representation_line": 204
+    },
+    {
+      "kind": "Expr",
+      "line_start": 156,
+      "line_end": 156,
+      "column": 8,
+      "owner": "ToolStack.dispatch",
+      "representation_line": 210
+    },
+    {
+      "kind": "Assign",
+      "line_start": 157,
+      "line_end": 157,
+      "column": 8,
+      "owner": "ToolStack.dispatch",
+      "representation_line": 210
+    },
+    {
+      "kind": "If",
+      "line_start": 158,
+      "line_end": 159,
+      "column": 8,
+      "owner": "ToolStack.dispatch",
+      "representation_line": 211
+    },
+    {
+      "kind": "Return",
+      "line_start": 159,
+      "line_end": 159,
+      "column": 12,
+      "owner": "ToolStack.dispatch",
+      "representation_line": 213
+    },
+    {
+      "kind": "Assign",
+      "line_start": 160,
+      "line_end": 160,
+      "column": 8,
+      "owner": "ToolStack.dispatch",
+      "representation_line": 217
+    },
+    {
+      "kind": "If",
+      "line_start": 161,
+      "line_end": 162,
+      "column": 8,
+      "owner": "ToolStack.dispatch",
+      "representation_line": 218
+    },
+    {
+      "kind": "Return",
+      "line_start": 162,
+      "line_end": 162,
+      "column": 12,
+      "owner": "ToolStack.dispatch",
+      "representation_line": 220
+    },
+    {
+      "kind": "Expr",
+      "line_start": 163,
+      "line_end": 163,
+      "column": 8,
+      "owner": "ToolStack.dispatch",
+      "representation_line": 224
+    },
+    {
+      "kind": "For",
+      "line_start": 164,
+      "line_end": 167,
+      "column": 8,
+      "owner": "ToolStack.dispatch",
+      "representation_line": 225
+    },
+    {
+      "kind": "Assign",
+      "line_start": 165,
+      "line_end": 165,
+      "column": 12,
+      "owner": "ToolStack.dispatch",
+      "representation_line": 228
+    },
+    {
+      "kind": "If",
+      "line_start": 166,
+      "line_end": 167,
+      "column": 12,
+      "owner": "ToolStack.dispatch",
+      "representation_line": 229
+    },
+    {
+      "kind": "Expr",
+      "line_start": 167,
+      "line_end": 167,
+      "column": 16,
+      "owner": "ToolStack.dispatch",
+      "representation_line": 232
+    },
+    {
+      "kind": "Try",
+      "line_start": 168,
+      "line_end": 171,
+      "column": 8,
+      "owner": "ToolStack.dispatch",
+      "representation_line": 235
+    },
+    {
+      "kind": "Assign",
+      "line_start": 169,
+      "line_end": 169,
+      "column": 12,
+      "owner": "ToolStack.dispatch",
+      "representation_line": 238
+    },
+    {
+      "kind": "Return",
+      "line_start": 171,
+      "line_end": 171,
+      "column": 12,
+      "owner": "ToolStack.dispatch",
+      "representation_line": 242
+    },
+    {
+      "kind": "Assign",
+      "line_start": 172,
+      "line_end": 172,
+      "column": 8,
+      "owner": "ToolStack.dispatch",
+      "representation_line": 246
+    },
+    {
+      "kind": "Assign",
+      "line_start": 173,
+      "line_end": 173,
+      "column": 8,
+      "owner": "ToolStack.dispatch",
+      "representation_line": 246
+    },
+    {
+      "kind": "Expr",
+      "line_start": 174,
+      "line_end": 174,
+      "column": 8,
+      "owner": "ToolStack.dispatch",
+      "representation_line": 246
+    },
+    {
+      "kind": "Return",
+      "line_start": 175,
+      "line_end": 175,
+      "column": 8,
+      "owner": "ToolStack.dispatch",
+      "representation_line": 247
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 177,
+      "line_end": 182,
+      "column": 4,
+      "owner": "ToolStack",
+      "representation_line": 251
+    },
+    {
+      "kind": "If",
+      "line_start": 179,
+      "line_end": 180,
+      "column": 8,
+      "owner": "ToolStack._log_dispatch",
+      "representation_line": 256
+    },
+    {
+      "kind": "Return",
+      "line_start": 180,
+      "line_end": 180,
+      "column": 12,
+      "owner": "ToolStack._log_dispatch",
+      "representation_line": 258
+    },
+    {
+      "kind": "Expr",
+      "line_start": 181,
+      "line_end": 182,
+      "column": 8,
+      "owner": "ToolStack._log_dispatch",
+      "representation_line": 262
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 184,
+      "line_end": 192,
+      "column": 4,
+      "owner": "ToolStack",
+      "representation_line": 265
+    },
+    {
+      "kind": "Expr",
+      "line_start": 185,
+      "line_end": 185,
+      "column": 8,
+      "owner": "ToolStack.exhausted_tools",
+      "representation_line": 271
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 186,
+      "line_end": 186,
+      "column": 8,
+      "owner": "ToolStack.exhausted_tools",
+      "representation_line": 271
+    },
+    {
+      "kind": "For",
+      "line_start": 187,
+      "line_end": 191,
+      "column": 8,
+      "owner": "ToolStack.exhausted_tools",
+      "representation_line": 272
+    },
+    {
+      "kind": "Assign",
+      "line_start": 188,
+      "line_end": 188,
+      "column": 12,
+      "owner": "ToolStack.exhausted_tools",
+      "representation_line": 275
+    },
+    {
+      "kind": "If",
+      "line_start": 189,
+      "line_end": 190,
+      "column": 12,
+      "owner": "ToolStack.exhausted_tools",
+      "representation_line": 276
+    },
+    {
+      "kind": "Continue",
+      "line_start": 190,
+      "line_end": 190,
+      "column": 16,
+      "owner": "ToolStack.exhausted_tools",
+      "representation_line": 278
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 191,
+      "line_end": 191,
+      "column": 12,
+      "owner": "ToolStack.exhausted_tools",
+      "representation_line": 282
+    },
+    {
+      "kind": "Return",
+      "line_start": 192,
+      "line_end": 192,
+      "column": 8,
+      "owner": "ToolStack.exhausted_tools",
+      "representation_line": 284
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 194,
+      "line_end": 203,
+      "column": 4,
+      "owner": "ToolStack",
+      "representation_line": 288
+    },
+    {
+      "kind": "Expr",
+      "line_start": 195,
+      "line_end": 195,
+      "column": 8,
+      "owner": "ToolStack.submit_guard",
+      "representation_line": 294
+    },
+    {
+      "kind": "For",
+      "line_start": 196,
+      "line_end": 202,
+      "column": 8,
+      "owner": "ToolStack.submit_guard",
+      "representation_line": 295
+    },
+    {
+      "kind": "Assign",
+      "line_start": 197,
+      "line_end": 197,
+      "column": 12,
+      "owner": "ToolStack.submit_guard",
+      "representation_line": 298
+    },
+    {
+      "kind": "If",
+      "line_start": 198,
+      "line_end": 199,
+      "column": 12,
+      "owner": "ToolStack.submit_guard",
+      "representation_line": 299
+    },
+    {
+      "kind": "Continue",
+      "line_start": 199,
+      "line_end": 199,
+      "column": 16,
+      "owner": "ToolStack.submit_guard",
+      "representation_line": 301
+    },
+    {
+      "kind": "Assign",
+      "line_start": 200,
+      "line_end": 200,
+      "column": 12,
+      "owner": "ToolStack.submit_guard",
+      "representation_line": 305
+    },
+    {
+      "kind": "If",
+      "line_start": 201,
+      "line_end": 202,
+      "column": 12,
+      "owner": "ToolStack.submit_guard",
+      "representation_line": 306
+    },
+    {
+      "kind": "Return",
+      "line_start": 202,
+      "line_end": 202,
+      "column": 16,
+      "owner": "ToolStack.submit_guard",
+      "representation_line": 308
+    },
+    {
+      "kind": "Return",
+      "line_start": 203,
+      "line_end": 203,
+      "column": 8,
+      "owner": "ToolStack.submit_guard",
+      "representation_line": 312
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 205,
+      "line_end": 218,
+      "column": 4,
+      "owner": "ToolStack",
+      "representation_line": 316
+    },
+    {
+      "kind": "Expr",
+      "line_start": 206,
+      "line_end": 206,
+      "column": 8,
+      "owner": "ToolStack.report_evidence_degradation",
+      "representation_line": 322
+    },
+    {
+      "kind": "If",
+      "line_start": 208,
+      "line_end": 209,
+      "column": 8,
+      "owner": "ToolStack.report_evidence_degradation",
+      "representation_line": 323
+    },
+    {
+      "kind": "Return",
+      "line_start": 209,
+      "line_end": 209,
+      "column": 12,
+      "owner": "ToolStack.report_evidence_degradation",
+      "representation_line": 325
+    },
+    {
+      "kind": "Expr",
+      "line_start": 210,
+      "line_end": 210,
+      "column": 8,
+      "owner": "ToolStack.report_evidence_degradation",
+      "representation_line": 329
+    },
+    {
+      "kind": "Expr",
+      "line_start": 211,
+      "line_end": 218,
+      "column": 8,
+      "owner": "ToolStack.report_evidence_degradation",
+      "representation_line": 329
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 221,
+      "line_end": 238,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 334
+    },
+    {
+      "kind": "Expr",
+      "line_start": 224,
+      "line_end": 224,
+      "column": 4,
+      "owner": "build",
+      "representation_line": 340
+    },
+    {
+      "kind": "If",
+      "line_start": 226,
+      "line_end": 227,
+      "column": 4,
+      "owner": "build",
+      "representation_line": 341
+    },
+    {
+      "kind": "Return",
+      "line_start": 227,
+      "line_end": 227,
+      "column": 8,
+      "owner": "build",
+      "representation_line": 343
+    },
+    {
+      "kind": "Assign",
+      "line_start": 228,
+      "line_end": 229,
+      "column": 4,
+      "owner": "build",
+      "representation_line": 347
+    },
+    {
+      "kind": "If",
+      "line_start": 230,
+      "line_end": 231,
+      "column": 4,
+      "owner": "build",
+      "representation_line": 348
+    },
+    {
+      "kind": "Return",
+      "line_start": 231,
+      "line_end": 231,
+      "column": 8,
+      "owner": "build",
+      "representation_line": 350
+    },
+    {
+      "kind": "Return",
+      "line_start": 232,
+      "line_end": 238,
+      "column": 4,
+      "owner": "build",
+      "representation_line": 353
+    },
+    {
+      "kind": "Assign",
+      "line_start": 241,
+      "line_end": 245,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 358
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 3,
+      "kind": "Name",
+      "original_ast": "Name(id='TYPE_CHECKING', ctx=Load())",
+      "rendered": "TYPE_CHECKING"
+    },
+    {
+      "line_start": 38,
+      "line_end": 38,
+      "column": 30,
+      "kind": "Constant",
+      "original_ast": "Constant(value='llm_adapter_evidence_gate_unenforced')",
+      "rendered": "'llm_adapter_evidence_gate_unenforced'"
+    },
+    {
+      "line_start": 41,
+      "line_end": 41,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[Name(id='fact_tools', ctx=Load())], keywords=[])",
+      "rendered": "set(fact_tools)"
+    },
+    {
+      "line_start": 50,
+      "line_end": 50,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='wanted', ctx=Load()))",
+      "rendered": "not wanted"
+    },
+    {
+      "line_start": 51,
+      "line_end": 51,
+      "column": 15,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 52,
+      "line_end": 53,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='StreamingOptions', ctx=Load()), args=[], keywords=[keyword(arg='model', value=Name(id='model', ctx=Load())), keyword(arg='cwd', value=Call(func=Name(id='Path', ctx=Load()), args=[Name(id='cwd', ctx=Load())], keywords=[])), keyword(arg='fact_tools', value=Call(func=Name(id='tuple', ctx=Load()), args=[Name(id='fact_tools', ctx=Load())], keywords=[]))])",
+      "rendered": "StreamingOptions(model=model, cwd=Path(cwd), fact_tools=tuple(fact_tools))"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 12,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Name(id='tool_builder', ctx=Load()), args=[Name(id='options', ctx=Load())], keywords=[keyword(arg='allowed_tools', value=Tuple(elts=[], ctx=Load()))]), List(elts=[], ctx=Load())])",
+      "rendered": "tool_builder(options, allowed_tools=()) or []"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 11,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='t', ctx=Load()), generators=[comprehension(target=Name(id='t', ctx=Store()), iter=Name(id='built', ctx=Load()), ifs=[Compare(left=Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='t', ctx=Load()), Constant(value='name'), Constant(value=None)], keywords=[]), ops=[In()], comparators=[Name(id='wanted', ctx=Load())])], is_async=0)])",
+      "rendered": "[t for t in built if getattr(t, 'name', None) in wanted]"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dict', ctx=Load()), args=[BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='langchain_tool', ctx=Load()), Constant(value='args'), Constant(value=None)], keywords=[]), Dict(keys=[], values=[])])], keywords=[])",
+      "rendered": "dict(getattr(langchain_tool, 'args', None) or {})"
+    },
+    {
+      "line_start": 61,
+      "line_end": 64,
+      "column": 15,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='name', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='name', ctx=Store()), Name(id='spec', ctx=Store())], ctx=Store()), iter=Call(func=Attribute(value=Name(id='args', ctx=Load()), attr='items', ctx=Load()), args=[], keywords=[]), ifs=[BoolOp(op=And(), values=[Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='spec', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[]), Compare(left=Constant(value='default'), ops=[NotIn()], comparators=[Name(id='spec', ctx=Load())])])], is_async=0)])",
+      "rendered": "[name for name, spec in args.items() if isinstance(spec, dict) and 'default' not in spec]"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 11,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='type'), Constant(value='properties'), Constant(value='required')], values=[Constant(value='object'), Name(id='args', ctx=Load()), Name(id='required', ctx=Load())])",
+      "rendered": "{'type': 'object', 'properties': args, 'required': required}"
+    },
+    {
+      "line_start": 70,
+      "line_end": 70,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='str', ctx=Load()), args=[BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='langchain_tool', ctx=Load()), Constant(value='name'), Constant(value='')], keywords=[]), Constant(value='')])], keywords=[])",
+      "rendered": "str(getattr(langchain_tool, 'name', '') or '')"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='langchain_tool', ctx=Load()), Constant(value='description'), Constant(value='')], keywords=[]), Constant(value='')]), attr='strip', ctx=Load()), args=[], keywords=[])",
+      "rendered": "(getattr(langchain_tool, 'description', '') or '').strip()"
+    },
+    {
+      "line_start": 72,
+      "line_end": 73,
+      "column": 11,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='name'), Constant(value='description'), Constant(value='input_schema')], values=[Name(id='name', ctx=Load()), BoolOp(op=Or(), values=[Name(id='desc', ctx=Load()), Name(id='name', ctx=Load())]), Call(func=Name(id='_tool_schema', ctx=Load()), args=[Name(id='langchain_tool', ctx=Load())], keywords=[])])",
+      "rendered": "{'name': name, 'description': desc or name, 'input_schema': _tool_schema(langchain_tool)}"
+    },
+    {
+      "line_start": 78,
+      "line_end": 78,
+      "column": 14,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Name(id='parent_middleware', ctx=Load()), Tuple(elts=[], ctx=Load())])",
+      "rendered": "parent_middleware or ()"
+    },
+    {
+      "line_start": 79,
+      "line_end": 79,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='mw', ctx=Load()), Constant(value='refusal_for'), Constant(value=None)], keywords=[])",
+      "rendered": "getattr(mw, 'refusal_for', None)"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='refusal', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "refusal is None"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='refusal', ctx=Load()), args=[Name(id='name', ctx=Load())], keywords=[])",
+      "rendered": "refusal(name)"
+    },
+    {
+      "line_start": 83,
+      "line_end": 83,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='text', ctx=Load())",
+      "rendered": "text"
+    },
+    {
+      "line_start": 84,
+      "line_end": 84,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='text', ctx=Load())",
+      "rendered": "text"
+    },
+    {
+      "line_start": 85,
+      "line_end": 85,
+      "column": 11,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 90,
+      "line_end": 90,
+      "column": 25,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 14,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Name(id='parent_middleware', ctx=Load()), Tuple(elts=[], ctx=Load())])",
+      "rendered": "parent_middleware or ()"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='mw', ctx=Load()), Constant(value='required_tools'), Constant(value=None)], keywords=[])",
+      "rendered": "getattr(mw, 'required_tools', None)"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='names', ctx=Load())",
+      "rendered": "names"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='required', ctx=Store()), op=BitOr(), value=Call(func=Name(id='set', ctx=Load()), args=[Name(id='names', ctx=Load())], keywords=[]))",
+      "rendered": "required |= set(names)"
+    },
+    {
+      "line_start": 95,
+      "line_end": 95,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='frozenset', ctx=Load()), args=[Name(id='required', ctx=Load())], keywords=[])",
+      "rendered": "frozenset(required)"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='result', ctx=Load()), Name(id='str', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(result, str)"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='result', ctx=Load())",
+      "rendered": "result"
+    },
+    {
+      "line_start": 103,
+      "line_end": 103,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='json', ctx=Load()), attr='dumps', ctx=Load()), args=[Name(id='result', ctx=Load())], keywords=[keyword(arg='default', value=Name(id='str', ctx=Load()))])",
+      "rendered": "json.dumps(result, default=str)"
+    },
+    {
+      "line_start": 104,
+      "line_end": 104,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='TypeError', ctx=Load()), Name(id='ValueError', ctx=Load())], ctx=Load())",
+      "rendered": "(TypeError, ValueError)"
+    },
+    {
+      "line_start": 105,
+      "line_end": 105,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='str', ctx=Load()), args=[Name(id='result', ctx=Load())], keywords=[])",
+      "rendered": "str(result)"
+    },
+    {
+      "line_start": 108,
+      "line_end": 108,
+      "column": 1,
+      "kind": "Name",
+      "original_ast": "Name(id='dataclass', ctx=Load())",
+      "rendered": "dataclass"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 31,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='frozenset', ctx=Load()), args=[], keywords=[])",
+      "rendered": "frozenset()"
+    },
+    {
+      "line_start": 118,
+      "line_end": 118,
+      "column": 29,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='field', ctx=Load()), args=[], keywords=[keyword(arg='default_factory', value=Name(id='dict', ctx=Load()))])",
+      "rendered": "field(default_factory=dict)"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 35,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[], ctx=Load())",
+      "rendered": "()"
+    },
+    {
+      "line_start": 120,
+      "line_end": 120,
+      "column": 24,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='field', ctx=Load()), args=[], keywords=[keyword(arg='default_factory', value=Name(id='set', ctx=Load()))])",
+      "rendered": "field(default_factory=set)"
+    },
+    {
+      "line_start": 122,
+      "line_end": 122,
+      "column": 5,
+      "kind": "Name",
+      "original_ast": "Name(id='staticmethod', ctx=Load())",
+      "rendered": "staticmethod"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='lc_tool', ctx=Load()), Constant(value='args_schema'), Constant(value=None)], keywords=[])",
+      "rendered": "getattr(lc_tool, 'args_schema', None)"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='hasattr', ctx=Load()), args=[Name(id='schema', ctx=Load()), Constant(value='model_validate')], keywords=[]))",
+      "rendered": "not hasattr(schema, 'model_validate')"
+    },
+    {
+      "line_start": 127,
+      "line_end": 127,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 129,
+      "line_end": 129,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='schema', ctx=Load()), attr='model_validate', ctx=Load()), args=[BoolOp(op=Or(), values=[Name(id='args', ctx=Load()), Dict(keys=[], values=[])])], keywords=[])",
+      "rendered": "schema.model_validate(args or {})"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='ValidationError', ctx=Load())",
+      "rendered": "ValidationError"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='exc', ctx=Load())",
+      "rendered": "exc"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[JoinedStr(values=[Constant(value='llm_adapter_tool_error_'), FormattedValue(value=Name(id='name', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "COUNTERS.bump(source_template_137_22)"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 14,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[Constant(value='ERROR: '), FormattedValue(value=Attribute(value=Call(func=Name(id='type', ctx=Load()), args=[Name(id='exc', ctx=Load())], keywords=[]), attr='__name__', ctx=Load()), conversion=-1), Constant(value=': '), FormattedValue(value=Call(func=Name(id='redact', ctx=Load()), args=[Call(func=Name(id='str', ctx=Load()), args=[Name(id='exc', ctx=Load())], keywords=[])], keywords=[]), conversion=-1)])",
+      "rendered": "source_template_138_14"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_log_dispatch', ctx=Load()), args=[Name(id='name', ctx=Load()), Name(id='args', ctx=Load()), Name(id='err', ctx=Load())], keywords=[keyword(arg='tag', value=Name(id='tag', ctx=Load()))])",
+      "rendered": "self._log_dispatch(name, args, err, tag=tag)"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='err', ctx=Load())",
+      "rendered": "err"
+    },
+    {
+      "line_start": 145,
+      "line_end": 145,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_validation_error', ctx=Load()), args=[Name(id='lc_tool', ctx=Load()), Name(id='args', ctx=Load())], keywords=[])",
+      "rendered": "self._validation_error(lc_tool, args)"
+    },
+    {
+      "line_start": 146,
+      "line_end": 146,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='invalid', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "invalid is not None"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_tool_fault', ctx=Load()), args=[Name(id='name', ctx=Load()), Name(id='args', ctx=Load()), Name(id='invalid', ctx=Load())], keywords=[keyword(arg='tag', value=Name(id='tag', ctx=Load()))])",
+      "rendered": "self._tool_fault(name, args, invalid, tag=tag)"
+    },
+    {
+      "line_start": 148,
+      "line_end": 148,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_budget_refusal', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='_middleware', ctx=Load()), Name(id='name', ctx=Load())], keywords=[])",
+      "rendered": "_budget_refusal(self._middleware, name)"
+    },
+    {
+      "line_start": 149,
+      "line_end": 149,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='refusal', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "refusal is not None"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_log_dispatch', ctx=Load()), args=[Name(id='name', ctx=Load()), Name(id='args', ctx=Load()), JoinedStr(values=[Constant(value='refused: '), FormattedValue(value=Name(id='refusal', ctx=Load()), conversion=-1)])], keywords=[keyword(arg='tag', value=Name(id='tag', ctx=Load()))])",
+      "rendered": "self._log_dispatch(name, args, source_template_150_43, tag=tag)"
+    },
+    {
+      "line_start": 151,
+      "line_end": 151,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='refusal', ctx=Load())",
+      "rendered": "refusal"
+    },
+    {
+      "line_start": 152,
+      "line_end": 152,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 157,
+      "line_end": 157,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_tools', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='name', ctx=Load())], keywords=[])",
+      "rendered": "self._tools.get(name)"
+    },
+    {
+      "line_start": 158,
+      "line_end": 158,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='lc_tool', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "lc_tool is None"
+    },
+    {
+      "line_start": 159,
+      "line_end": 159,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 160,
+      "line_end": 160,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_rejected', ctx=Load()), args=[Name(id='lc_tool', ctx=Load()), Name(id='name', ctx=Load()), Name(id='args', ctx=Load())], keywords=[keyword(arg='tag', value=Name(id='tag', ctx=Load()))])",
+      "rendered": "self._rejected(lc_tool, name, args, tag=tag)"
+    },
+    {
+      "line_start": 161,
+      "line_end": 161,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='rejection', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "rejection is not None"
+    },
+    {
+      "line_start": 162,
+      "line_end": 162,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='rejection', ctx=Load())",
+      "rendered": "rejection"
+    },
+    {
+      "line_start": 163,
+      "line_end": 163,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_called', ctx=Load()), attr='add', ctx=Load()), args=[Name(id='name', ctx=Load())], keywords=[])",
+      "rendered": "self._called.add(name)"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 18,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Attribute(value=Name(id='self', ctx=Load()), attr='_middleware', ctx=Load()), Tuple(elts=[], ctx=Load())])",
+      "rendered": "self._middleware or ()"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='mw', ctx=Load()), Constant(value='note_call'), Constant(value=None)], keywords=[])",
+      "rendered": "getattr(mw, 'note_call', None)"
+    },
+    {
+      "line_start": 166,
+      "line_end": 166,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='note', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "note is not None"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='note', ctx=Load()), args=[Name(id='name', ctx=Load())], keywords=[])",
+      "rendered": "note(name)"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='lc_tool', ctx=Load()), attr='invoke', ctx=Load()), args=[Call(func=Name(id='dict', ctx=Load()), args=[BoolOp(op=Or(), values=[Name(id='args', ctx=Load()), Dict(keys=[], values=[])])], keywords=[])], keywords=[])",
+      "rendered": "lc_tool.invoke(dict(args or {}))"
+    },
+    {
+      "line_start": 170,
+      "line_end": 170,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 171,
+      "line_end": 171,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_tool_fault', ctx=Load()), args=[Name(id='name', ctx=Load()), Name(id='args', ctx=Load()), Name(id='exc', ctx=Load())], keywords=[keyword(arg='tag', value=Name(id='tag', ctx=Load()))])",
+      "rendered": "self._tool_fault(name, args, exc, tag=tag)"
+    },
+    {
+      "line_start": 172,
+      "line_end": 172,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='redact_counts', ctx=Load()), args=[Call(func=Name(id='_serialize', ctx=Load()), args=[Name(id='result', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "redact_counts(_serialize(result))"
+    },
+    {
+      "line_start": 173,
+      "line_end": 173,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_localtools', ctx=Load()), attr='cap_tool_result', ctx=Load()), args=[Name(id='masked', ctx=Load())], keywords=[])",
+      "rendered": "_localtools.cap_tool_result(masked)"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_log_dispatch', ctx=Load()), args=[Name(id='name', ctx=Load()), Name(id='args', ctx=Load()), JoinedStr(values=[FormattedValue(value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='out', ctx=Load())], keywords=[]), conversion=-1), Constant(value=' chars')])], keywords=[keyword(arg='tag', value=Name(id='tag', ctx=Load()))])",
+      "rendered": "self._log_dispatch(name, args, source_template_174_39, tag=tag)"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='out', ctx=Load())",
+      "rendered": "out"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='is_stage_only', ctx=Load()), args=[], keywords=[])",
+      "rendered": "is_stage_only()"
+    },
+    {
+      "line_start": 181,
+      "line_end": 182,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='      [tool-adapter] tool '), FormattedValue(value=Name(id='name', ctx=Load()), conversion=-1), Constant(value='('), FormattedValue(value=Call(func=Attribute(value=Name(id='_localtools', ctx=Load()), attr='summarize_args', ctx=Load()), args=[Name(id='args', ctx=Load())], keywords=[]), conversion=-1), Constant(value=') -> '), FormattedValue(value=Name(id='outcome', ctx=Load()), conversion=-1), FormattedValue(value=IfExp(test=Name(id='tag', ctx=Load()), body=JoinedStr(values=[Constant(value=' ['), FormattedValue(value=Name(id='tag', ctx=Load()), conversion=-1), Constant(value=']')]), orelse=Constant(value='')), conversion=-1)])], keywords=[])",
+      "rendered": "console.write(source_template_181_22)"
+    },
+    {
+      "line_start": 186,
+      "line_end": 186,
+      "column": 24,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 18,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Attribute(value=Name(id='self', ctx=Load()), attr='_middleware', ctx=Load()), Tuple(elts=[], ctx=Load())])",
+      "rendered": "self._middleware or ()"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='mw', ctx=Load()), Constant(value='exhausted_tools'), Constant(value=None)], keywords=[])",
+      "rendered": "getattr(mw, 'exhausted_tools', None)"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='names', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "names is None"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='out', ctx=Store()), op=BitOr(), value=Call(func=Name(id='set', ctx=Load()), args=[Call(func=Name(id='names', ctx=Load()), args=[], keywords=[])], keywords=[]))",
+      "rendered": "out |= set(names())"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='frozenset', ctx=Load()), args=[Name(id='out', ctx=Load())], keywords=[])",
+      "rendered": "frozenset(out)"
+    },
+    {
+      "line_start": 196,
+      "line_end": 196,
+      "column": 18,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Attribute(value=Name(id='self', ctx=Load()), attr='_middleware', ctx=Load()), Tuple(elts=[], ctx=Load())])",
+      "rendered": "self._middleware or ()"
+    },
+    {
+      "line_start": 197,
+      "line_end": 197,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='mw', ctx=Load()), Constant(value='hold_for_verdict'), Constant(value=None)], keywords=[])",
+      "rendered": "getattr(mw, 'hold_for_verdict', None)"
+    },
+    {
+      "line_start": 198,
+      "line_end": 198,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='hold', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "hold is None"
+    },
+    {
+      "line_start": 200,
+      "line_end": 200,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='hold', ctx=Load()), args=[], keywords=[])",
+      "rendered": "hold()"
+    },
+    {
+      "line_start": 201,
+      "line_end": 201,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='text', ctx=Load())",
+      "rendered": "text"
+    },
+    {
+      "line_start": 202,
+      "line_end": 202,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='text', ctx=Load())",
+      "rendered": "text"
+    },
+    {
+      "line_start": 203,
+      "line_end": 203,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 208,
+      "line_end": 208,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[UnaryOp(op=Not(), operand=Attribute(value=Name(id='self', ctx=Load()), attr='required', ctx=Load())), BinOp(left=Attribute(value=Name(id='self', ctx=Load()), attr='required', ctx=Load()), op=BitAnd(), right=Attribute(value=Name(id='self', ctx=Load()), attr='_called', ctx=Load()))])",
+      "rendered": "not self.required or self.required & self._called"
+    },
+    {
+      "line_start": 210,
+      "line_end": 210,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Name(id='EVIDENCE_UNENFORCED_COUNTER', ctx=Load())], keywords=[])",
+      "rendered": "COUNTERS.bump(EVIDENCE_UNENFORCED_COUNTER)"
+    },
+    {
+      "line_start": 211,
+      "line_end": 218,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='warn_once', ctx=Load()), args=[Name(id='_WARNED', ctx=Load()), JoinedStr(values=[Constant(value='evidence-gate:'), FormattedValue(value=Name(id='label', ctx=Load()), conversion=-1), Constant(value=':'), FormattedValue(value=Name(id='tag', ctx=Load()), conversion=-1)]), JoinedStr(values=[Constant(value='WARN ['), FormattedValue(value=Name(id='label', ctx=Load()), conversion=-1), Constant(value=']: '), FormattedValue(value=BoolOp(op=Or(), values=[Name(id='tag', ctx=Load()), Constant(value='this stage')]), conversion=-1), Constant(value=' requires graph evidence, but the session called none of '), FormattedValue(value=Call(func=Name(id='sorted', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='required', ctx=Load())], keywords=[]), conversion=-1), Constant(value=\". submit_guard already rejected this verdict's submit up to max_rejections times (the same relent every EvidenceGate performs, in-loop or out-of-loop) before letting it through. The reply was accepted as-is and counted under `\"), FormattedValue(value=Name(id='EVIDENCE_UNENFORCED_COUNTER', ctx=Load()), conversion=-1), Constant(value='` in Pipeline Diagnostics.')])], keywords=[])",
+      "rendered": "warn_once(_WARNED, source_template_212_21, source_template_213_12)"
+    },
+    {
+      "line_start": 226,
+      "line_end": 226,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Compare(left=Name(id='tool_builder', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)]), UnaryOp(op=Not(), operand=Name(id='fact_tools', ctx=Load()))])",
+      "rendered": "tool_builder is None or not fact_tools"
+    },
+    {
+      "line_start": 227,
+      "line_end": 227,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 228,
+      "line_end": 229,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_materialize', ctx=Load()), args=[Name(id='tool_builder', ctx=Load())], keywords=[keyword(arg='model', value=Name(id='model', ctx=Load())), keyword(arg='cwd', value=Name(id='cwd', ctx=Load())), keyword(arg='fact_tools', value=Name(id='fact_tools', ctx=Load()))])",
+      "rendered": "_materialize(tool_builder, model=model, cwd=cwd, fact_tools=fact_tools)"
+    },
+    {
+      "line_start": 230,
+      "line_end": 230,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='lc_tools', ctx=Load()))",
+      "rendered": "not lc_tools"
+    },
+    {
+      "line_start": 231,
+      "line_end": 231,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 232,
+      "line_end": 238,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ToolStack', ctx=Load()), args=[], keywords=[keyword(arg='schemas', value=ListComp(elt=Call(func=Name(id='_anthropic_schema', ctx=Load()), args=[Name(id='t', ctx=Load())], keywords=[]), generators=[comprehension(target=Name(id='t', ctx=Store()), iter=Name(id='lc_tools', ctx=Load()), ifs=[], is_async=0)])), keyword(arg='names', value=Call(func=Name(id='tuple', ctx=Load()), args=[GeneratorExp(elt=Call(func=Name(id='str', ctx=Load()), args=[Attribute(value=Name(id='t', ctx=Load()), attr='name', ctx=Load())], keywords=[]), generators=[comprehension(target=Name(id='t', ctx=Store()), iter=Name(id='lc_tools', ctx=Load()), ifs=[], is_async=0)])], keywords=[])), keyword(arg='required', value=Call(func=Name(id='_required_fact_tools', ctx=Load()), args=[Name(id='parent_middleware', ctx=Load())], keywords=[])), keyword(arg='_tools', value=DictComp(key=Call(func=Name(id='str', ctx=Load()), args=[Attribute(value=Name(id='t', ctx=Load()), attr='name', ctx=Load())], keywords=[]), value=Name(id='t', ctx=Load()), generators=[comprehension(target=Name(id='t', ctx=Store()), iter=Name(id='lc_tools', ctx=Load()), ifs=[], is_async=0)])), keyword(arg='_middleware', value=Call(func=Name(id='tuple', ctx=Load()), args=[BoolOp(op=Or(), values=[Name(id='parent_middleware', ctx=Load()), Tuple(elts=[], ctx=Load())])], keywords=[]))])",
+      "rendered": "ToolStack(schemas=[_anthropic_schema(t) for t in lc_tools], names=tuple((str(t.name) for t in lc_tools)), required=_required_fact_tools(parent_middleware), _tools={str(t.name): t for t in lc_tools}, _middleware=tuple(parent_middleware or ()))"
+    },
+    {
+      "line_start": 241,
+      "line_end": 245,
+      "column": 10,
+      "kind": "List",
+      "original_ast": "List(elts=[Constant(value='EVIDENCE_UNENFORCED_COUNTER'), Constant(value='ToolStack'), Constant(value='build')], ctx=Load())",
+      "rendered": "['EVIDENCE_UNENFORCED_COUNTER', 'ToolStack', 'build']"
+    }
+  ],
+  "calls": [
+    {
+      "line": 41,
+      "end_line": 41,
+      "callee": "set",
+      "enclosing": "module initialization",
+      "expression": "set()"
+    },
+    {
+      "line": 49,
+      "end_line": 49,
+      "callee": "set",
+      "enclosing": "_materialize",
+      "expression": "set(fact_tools)"
+    },
+    {
+      "line": 52,
+      "end_line": 53,
+      "callee": "StreamingOptions",
+      "enclosing": "_materialize",
+      "expression": "StreamingOptions(model=model, cwd=Path(cwd),\n                               fact_tools=tuple(fact_tools))"
+    },
+    {
+      "line": 60,
+      "end_line": 60,
+      "callee": "dict",
+      "enclosing": "_tool_schema",
+      "expression": "dict(getattr(langchain_tool, \"args\", None) or {})"
+    },
+    {
+      "line": 70,
+      "end_line": 70,
+      "callee": "str",
+      "enclosing": "_anthropic_schema",
+      "expression": "str(getattr(langchain_tool, \"name\", \"\") or \"\")"
+    },
+    {
+      "line": 71,
+      "end_line": 71,
+      "callee": "(getattr(langchain_tool, 'description', '') or '').strip",
+      "enclosing": "_anthropic_schema",
+      "expression": "(getattr(langchain_tool, \"description\", \"\") or \"\").strip()"
+    },
+    {
+      "line": 90,
+      "end_line": 90,
+      "callee": "set",
+      "enclosing": "_required_fact_tools",
+      "expression": "set()"
+    },
+    {
+      "line": 95,
+      "end_line": 95,
+      "callee": "frozenset",
+      "enclosing": "_required_fact_tools",
+      "expression": "frozenset(required)"
+    },
+    {
+      "line": 100,
+      "end_line": 100,
+      "callee": "isinstance",
+      "enclosing": "_serialize",
+      "expression": "isinstance(result, str)"
+    },
+    {
+      "line": 117,
+      "end_line": 117,
+      "callee": "frozenset",
+      "enclosing": "ToolStack",
+      "expression": "frozenset()"
+    },
+    {
+      "line": 118,
+      "end_line": 118,
+      "callee": "field",
+      "enclosing": "ToolStack",
+      "expression": "field(default_factory=dict)"
+    },
+    {
+      "line": 120,
+      "end_line": 120,
+      "callee": "field",
+      "enclosing": "ToolStack",
+      "expression": "field(default_factory=set)"
+    },
+    {
+      "line": 228,
+      "end_line": 229,
+      "callee": "_materialize",
+      "enclosing": "build",
+      "expression": "_materialize(tool_builder, model=model, cwd=cwd,\n                            fact_tools=fact_tools)"
+    },
+    {
+      "line": 232,
+      "end_line": 238,
+      "callee": "ToolStack",
+      "enclosing": "build",
+      "expression": "ToolStack(\n        schemas=[_anthropic_schema(t) for t in lc_tools],\n        names=tuple(str(t.name) for t in lc_tools),\n        required=_required_fact_tools(parent_middleware),\n        _tools={str(t.name): t for t in lc_tools},\n        _middleware=tuple(parent_middleware or ()),\n    )"
+    },
+    {
+      "line": 54,
+      "end_line": 54,
+      "callee": "tool_builder",
+      "enclosing": "_materialize",
+      "expression": "tool_builder(options, allowed_tools=())"
+    },
+    {
+      "line": 73,
+      "end_line": 73,
+      "callee": "_tool_schema",
+      "enclosing": "_anthropic_schema",
+      "expression": "_tool_schema(langchain_tool)"
+    },
+    {
+      "line": 79,
+      "end_line": 79,
+      "callee": "getattr",
+      "enclosing": "_budget_refusal",
+      "expression": "getattr(mw, \"refusal_for\", None)"
+    },
+    {
+      "line": 82,
+      "end_line": 82,
+      "callee": "refusal",
+      "enclosing": "_budget_refusal",
+      "expression": "refusal(name)"
+    },
+    {
+      "line": 92,
+      "end_line": 92,
+      "callee": "getattr",
+      "enclosing": "_required_fact_tools",
+      "expression": "getattr(mw, \"required_tools\", None)"
+    },
+    {
+      "line": 103,
+      "end_line": 103,
+      "callee": "json.dumps",
+      "enclosing": "_serialize",
+      "expression": "json.dumps(result, default=str)"
+    },
+    {
+      "line": 125,
+      "end_line": 125,
+      "callee": "getattr",
+      "enclosing": "ToolStack._validation_error",
+      "expression": "getattr(lc_tool, \"args_schema\", None)"
+    },
+    {
+      "line": 137,
+      "end_line": 137,
+      "callee": "COUNTERS.bump",
+      "enclosing": "ToolStack._tool_fault",
+      "expression": "COUNTERS.bump(f\"llm_adapter_tool_error_{name}\")"
+    },
+    {
+      "line": 139,
+      "end_line": 139,
+      "callee": "self._log_dispatch",
+      "enclosing": "ToolStack._tool_fault",
+      "expression": "self._log_dispatch(name, args, err, tag=tag)"
+    },
+    {
+      "line": 145,
+      "end_line": 145,
+      "callee": "self._validation_error",
+      "enclosing": "ToolStack._rejected",
+      "expression": "self._validation_error(lc_tool, args)"
+    },
+    {
+      "line": 148,
+      "end_line": 148,
+      "callee": "_budget_refusal",
+      "enclosing": "ToolStack._rejected",
+      "expression": "_budget_refusal(self._middleware, name)"
+    },
+    {
+      "line": 157,
+      "end_line": 157,
+      "callee": "self._tools.get",
+      "enclosing": "ToolStack.dispatch",
+      "expression": "self._tools.get(name)"
+    },
+    {
+      "line": 160,
+      "end_line": 160,
+      "callee": "self._rejected",
+      "enclosing": "ToolStack.dispatch",
+      "expression": "self._rejected(lc_tool, name, args, tag=tag)"
+    },
+    {
+      "line": 163,
+      "end_line": 163,
+      "callee": "self._called.add",
+      "enclosing": "ToolStack.dispatch",
+      "expression": "self._called.add(name)"
+    },
+    {
+      "line": 172,
+      "end_line": 172,
+      "callee": "redact_counts",
+      "enclosing": "ToolStack.dispatch",
+      "expression": "redact_counts(_serialize(result))"
+    },
+    {
+      "line": 173,
+      "end_line": 173,
+      "callee": "_localtools.cap_tool_result",
+      "enclosing": "ToolStack.dispatch",
+      "expression": "_localtools.cap_tool_result(masked)"
+    },
+    {
+      "line": 174,
+      "end_line": 174,
+      "callee": "self._log_dispatch",
+      "enclosing": "ToolStack.dispatch",
+      "expression": "self._log_dispatch(name, args, f\"{len(out)} chars\", tag=tag)"
+    },
+    {
+      "line": 179,
+      "end_line": 179,
+      "callee": "is_stage_only",
+      "enclosing": "ToolStack._log_dispatch",
+      "expression": "is_stage_only()"
+    },
+    {
+      "line": 181,
+      "end_line": 182,
+      "callee": "console.write",
+      "enclosing": "ToolStack._log_dispatch",
+      "expression": "console.write(f\"      [tool-adapter] tool {name}({_localtools.summarize_args(args)}) \"\n                      f\"-> {outcome}{f' [{tag}]' if tag else ''}\")"
+    },
+    {
+      "line": 186,
+      "end_line": 186,
+      "callee": "set",
+      "enclosing": "ToolStack.exhausted_tools",
+      "expression": "set()"
+    },
+    {
+      "line": 192,
+      "end_line": 192,
+      "callee": "frozenset",
+      "enclosing": "ToolStack.exhausted_tools",
+      "expression": "frozenset(out)"
+    },
+    {
+      "line": 210,
+      "end_line": 210,
+      "callee": "COUNTERS.bump",
+      "enclosing": "ToolStack.report_evidence_degradation",
+      "expression": "COUNTERS.bump(EVIDENCE_UNENFORCED_COUNTER)"
+    },
+    {
+      "line": 211,
+      "end_line": 218,
+      "callee": "warn_once",
+      "enclosing": "ToolStack.report_evidence_degradation",
+      "expression": "warn_once(\n            _WARNED, f\"evidence-gate:{label}:{tag}\",\n            f\"WARN [{label}]: {tag or 'this stage'} requires graph evidence, but the \"\n            f\"session called none of {sorted(self.required)}. submit_guard already \"\n            f\"rejected this verdict's submit up to max_rejections times (the same \"\n            f\"relent every EvidenceGate performs, in-loop or out-of-loop) before \"\n            f\"letting it through. The reply was accepted as-is and counted under \"\n            f\"`{EVIDENCE_UNENFORCED_COUNTER}` in Pipeline Diagnostics.\")"
+    },
+    {
+      "line": 52,
+      "end_line": 52,
+      "callee": "Path",
+      "enclosing": "_materialize",
+      "expression": "Path(cwd)"
+    },
+    {
+      "line": 53,
+      "end_line": 53,
+      "callee": "tuple",
+      "enclosing": "_materialize",
+      "expression": "tuple(fact_tools)"
+    },
+    {
+      "line": 60,
+      "end_line": 60,
+      "callee": "getattr",
+      "enclosing": "_tool_schema",
+      "expression": "getattr(langchain_tool, \"args\", None)"
+    },
+    {
+      "line": 62,
+      "end_line": 62,
+      "callee": "args.items",
+      "enclosing": "_tool_schema",
+      "expression": "args.items()"
+    },
+    {
+      "line": 70,
+      "end_line": 70,
+      "callee": "getattr",
+      "enclosing": "_anthropic_schema",
+      "expression": "getattr(langchain_tool, \"name\", \"\")"
+    },
+    {
+      "line": 94,
+      "end_line": 94,
+      "callee": "set",
+      "enclosing": "_required_fact_tools",
+      "expression": "set(names)"
+    },
+    {
+      "line": 105,
+      "end_line": 105,
+      "callee": "str",
+      "enclosing": "_serialize",
+      "expression": "str(result)"
+    },
+    {
+      "line": 126,
+      "end_line": 126,
+      "callee": "hasattr",
+      "enclosing": "ToolStack._validation_error",
+      "expression": "hasattr(schema, \"model_validate\")"
+    },
+    {
+      "line": 129,
+      "end_line": 129,
+      "callee": "schema.model_validate",
+      "enclosing": "ToolStack._validation_error",
+      "expression": "schema.model_validate(args or {})"
+    },
+    {
+      "line": 147,
+      "end_line": 147,
+      "callee": "self._tool_fault",
+      "enclosing": "ToolStack._rejected",
+      "expression": "self._tool_fault(name, args, invalid, tag=tag)"
+    },
+    {
+      "line": 150,
+      "end_line": 150,
+      "callee": "self._log_dispatch",
+      "enclosing": "ToolStack._rejected",
+      "expression": "self._log_dispatch(name, args, f\"refused: {refusal}\", tag=tag)"
+    },
+    {
+      "line": 165,
+      "end_line": 165,
+      "callee": "getattr",
+      "enclosing": "ToolStack.dispatch",
+      "expression": "getattr(mw, \"note_call\", None)"
+    },
+    {
+      "line": 169,
+      "end_line": 169,
+      "callee": "lc_tool.invoke",
+      "enclosing": "ToolStack.dispatch",
+      "expression": "lc_tool.invoke(dict(args or {}))"
+    },
+    {
+      "line": 172,
+      "end_line": 172,
+      "callee": "_serialize",
+      "enclosing": "ToolStack.dispatch",
+      "expression": "_serialize(result)"
+    },
+    {
+      "line": 188,
+      "end_line": 188,
+      "callee": "getattr",
+      "enclosing": "ToolStack.exhausted_tools",
+      "expression": "getattr(mw, \"exhausted_tools\", None)"
+    },
+    {
+      "line": 191,
+      "end_line": 191,
+      "callee": "set",
+      "enclosing": "ToolStack.exhausted_tools",
+      "expression": "set(names())"
+    },
+    {
+      "line": 197,
+      "end_line": 197,
+      "callee": "getattr",
+      "enclosing": "ToolStack.submit_guard",
+      "expression": "getattr(mw, \"hold_for_verdict\", None)"
+    },
+    {
+      "line": 200,
+      "end_line": 200,
+      "callee": "hold",
+      "enclosing": "ToolStack.submit_guard",
+      "expression": "hold()"
+    },
+    {
+      "line": 234,
+      "end_line": 234,
+      "callee": "tuple",
+      "enclosing": "build",
+      "expression": "tuple(str(t.name) for t in lc_tools)"
+    },
+    {
+      "line": 235,
+      "end_line": 235,
+      "callee": "_required_fact_tools",
+      "enclosing": "build",
+      "expression": "_required_fact_tools(parent_middleware)"
+    },
+    {
+      "line": 237,
+      "end_line": 237,
+      "callee": "tuple",
+      "enclosing": "build",
+      "expression": "tuple(parent_middleware or ())"
+    },
+    {
+      "line": 55,
+      "end_line": 55,
+      "callee": "getattr",
+      "enclosing": "_materialize",
+      "expression": "getattr(t, \"name\", None)"
+    },
+    {
+      "line": 63,
+      "end_line": 63,
+      "callee": "isinstance",
+      "enclosing": "_tool_schema",
+      "expression": "isinstance(spec, dict)"
+    },
+    {
+      "line": 71,
+      "end_line": 71,
+      "callee": "getattr",
+      "enclosing": "_anthropic_schema",
+      "expression": "getattr(langchain_tool, \"description\", \"\")"
+    },
+    {
+      "line": 138,
+      "end_line": 138,
+      "callee": "redact",
+      "enclosing": "ToolStack._tool_fault",
+      "expression": "redact(str(exc))"
+    },
+    {
+      "line": 167,
+      "end_line": 167,
+      "callee": "note",
+      "enclosing": "ToolStack.dispatch",
+      "expression": "note(name)"
+    },
+    {
+      "line": 169,
+      "end_line": 169,
+      "callee": "dict",
+      "enclosing": "ToolStack.dispatch",
+      "expression": "dict(args or {})"
+    },
+    {
+      "line": 171,
+      "end_line": 171,
+      "callee": "self._tool_fault",
+      "enclosing": "ToolStack.dispatch",
+      "expression": "self._tool_fault(name, args, exc, tag=tag)"
+    },
+    {
+      "line": 191,
+      "end_line": 191,
+      "callee": "names",
+      "enclosing": "ToolStack.exhausted_tools",
+      "expression": "names()"
+    },
+    {
+      "line": 233,
+      "end_line": 233,
+      "callee": "_anthropic_schema",
+      "enclosing": "build",
+      "expression": "_anthropic_schema(t)"
+    },
+    {
+      "line": 236,
+      "end_line": 236,
+      "callee": "str",
+      "enclosing": "build",
+      "expression": "str(t.name)"
+    },
+    {
+      "line": 138,
+      "end_line": 138,
+      "callee": "type",
+      "enclosing": "ToolStack._tool_fault",
+      "expression": "type(exc)"
+    },
+    {
+      "line": 138,
+      "end_line": 138,
+      "callee": "str",
+      "enclosing": "ToolStack._tool_fault",
+      "expression": "str(exc)"
+    },
+    {
+      "line": 174,
+      "end_line": 174,
+      "callee": "len",
+      "enclosing": "ToolStack.dispatch",
+      "expression": "len(out)"
+    },
+    {
+      "line": 181,
+      "end_line": 181,
+      "callee": "_localtools.summarize_args",
+      "enclosing": "ToolStack._log_dispatch",
+      "expression": "_localtools.summarize_args(args)"
+    },
+    {
+      "line": 214,
+      "end_line": 214,
+      "callee": "sorted",
+      "enclosing": "ToolStack.report_evidence_degradation",
+      "expression": "sorted(self.required)"
+    },
+    {
+      "line": 234,
+      "end_line": 234,
+      "callee": "str",
+      "enclosing": "build",
+      "expression": "str(t.name)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 18,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "import json",
+      "targets": [
+        "json"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "from dataclasses import dataclass, field",
+      "targets": [
+        "dataclasses",
+        "dataclasses.dataclass",
+        "dataclasses.field"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "from pathlib import Path",
+      "targets": [
+        "pathlib",
+        "pathlib.Path"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 23,
+      "source_expression": "from typing import TYPE_CHECKING, Any",
+      "targets": [
+        "typing",
+        "typing.TYPE_CHECKING",
+        "typing.Any"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 25,
+      "source_expression": "from pydantic import ValidationError",
+      "targets": [
+        "pydantic",
+        "pydantic.ValidationError"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 27,
+      "source_expression": "from vvaharness.backends.llm import tools as _localtools",
+      "targets": [
+        "vvaharness.backends.llm",
+        "vvaharness.backends.llm.tools"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/llm/__init__.py",
+        "vvaharness/backends/llm/tools.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 28,
+      "source_expression": "from vvaharness.report.redact import redact, redact_counts",
+      "targets": [
+        "vvaharness.report.redact",
+        "vvaharness.report.redact.redact",
+        "vvaharness.report.redact.redact_counts"
+      ],
+      "local_source_paths": [
+        "vvaharness/report/redact.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 29,
+      "source_expression": "from vvaharness.util import console",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.console"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/console.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 30,
+      "source_expression": "from vvaharness.util.counters import COUNTERS",
+      "targets": [
+        "vvaharness.util.counters",
+        "vvaharness.util.counters.COUNTERS"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/counters.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 31,
+      "source_expression": "from vvaharness.util.scan_progress import is_stage_only",
+      "targets": [
+        "vvaharness.util.scan_progress",
+        "vvaharness.util.scan_progress.is_stage_only"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/scan_progress.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 32,
+      "source_expression": "from vvaharness.util.warn_once import warn_once",
+      "targets": [
+        "vvaharness.util.warn_once",
+        "vvaharness.util.warn_once.warn_once"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/warn_once.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 35,
+      "source_expression": "from collections.abc import Sequence",
+      "targets": [
+        "collections.abc",
+        "collections.abc.Sequence"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 47,
+      "source_expression": "from vvaharness.backends.harness import StreamingOptions",
+      "targets": [
+        "vvaharness.backends.harness",
+        "vvaharness.backends.harness.StreamingOptions"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

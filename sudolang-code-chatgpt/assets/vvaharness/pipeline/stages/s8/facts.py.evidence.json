@@ -1,0 +1,3677 @@
+{
+  "source": "vvaharness/pipeline/stages/s8/facts.py",
+  "sha256": "a0790d668a814fd32eccf984145a0138d63c8f12b1ddf0e4a597a82177b352f2",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\n\"\"\"Deterministic code and repo-level facts for the chaining pass: shown, never interpreted.\"\"\"\nfrom __future__ import annotations\n\nimport re\nfrom functools import lru_cache\nfrom pathlib import Path\nfrom stat import S_ISREG\n\nfrom vvaharness.detect.matcher import split_lines\nfrom vvaharness.models import ContextPackage, Finding\nfrom vvaharness.util import net as _net\n\n# Producers already cap snippets.\nMAX_SNIPPET_CHARS = 1200\n\n# A registration sits 1-3 lines above the def in every framework shape observed; past that, not one\nMAX_DECORATOR_LINES = 4\n\n# Prepended BEFORE the MAX_SNIPPET_CHARS cap, so one long decorator line could evict the CODE block\nMAX_PROLOGUE_CHARS = 200\n\n# Whole-line decorator/annotation; anchored at BOTH ends, or a prefix match admits injected prose\n_ANNOTATION_RX = re.compile(r\"\"\"(?x)\n    ^\\s*(?:\n        @\\s*[A-Za-z_][\\w.]*(?:\\(.*\\))?   # decorator / annotation, whole line\n      | \\#?\\[[^\\]\\s][^\\]]*\\]             # attribute, alone on its line\n    )\\s*$\"\"\")\n\n# Effective user = LAST USER of the LAST stage: earlier ones are build stages, later USER root wins\n_FROM_RX = re.compile(r\"^[^\\S\\n]*FROM[^\\S\\n]\", re.IGNORECASE | re.MULTILINE)\n_USER_RX = re.compile(r\"^[^\\S\\n]*USER[^\\S\\n]+(?P<user>\\S+)\", re.IGNORECASE | re.MULTILINE)\n\n# name/uid/name:group only: spliced under an OVERRIDE header, so \\S+ carries prompt injection\n_USER_TOKEN_RX = re.compile(r\"^[A-Za-z0-9_.:\\-]{1,64}$\")\n\n\ndef _is_dockerfile_name(name: str) -> bool:\n    \"\"\"Whether *name* is ``Dockerfile`` or ``Dockerfile.<variant>``.\"\"\"\n    low = name.lower()\n    if low == \"dockerfile\":\n        return True\n    # A bare startswith(\"dockerfile\") also matched dockerfile_util.py, then stated as deploy fact\n    prefix, dot, suffix = low.partition(\".\")\n    return prefix == \"dockerfile\" and bool(dot) and suffix not in {\n        \"py\", \"pyi\", \"js\", \"ts\", \"rb\", \"go\", \"java\", \"cs\", \"php\", \"sh\",\n        \"yml\", \"yaml\", \"json\", \"md\", \"txt\", \"html\"}\n\n# _real_host AND binding context, or SSRF/argv tokens fake \"reachable\"; localhost needs its own alt\n_ADDR = r\"\\[?[0-9a-fA-F:.]+\\]?|(?i:localhost)\"\n_BIND_RX = re.compile(\n    rf\"\"\"(?x)\n    # a server started with an explicit bind: app.run(host=),\n    # uvicorn.run(..., host=), serve(host=)\n      (?:\\.(?:run|serve|bind|listen|create_server)\\s*\\(\n         [^)\\n]{{0,200}}?host\\s*=\\s*['\"](?P<host>{_ADDR})['\"])\n    # socket-style bind/listen on an (\"addr\", port) tuple\n    | (?:\\.(?:bind|listen|create_server)\\s*\\(\\s*\\(\\s*['\"](?P<tuple>{_ADDR})['\"])\n    # a declared listen address constant, at statement position\n    | (?:^[^\\S\\n]*(?:self\\.)?\n         (?:LISTEN_ADDRESS|BIND_ADDRESS|BIND_HOST|SERVER_HOST|HOST)\\b\n         [^=\\n]{{0,40}}=\\s*['\"](?P<const>{_ADDR})['\"])\n    # compose/K8s published port mapping\n    | (?:^\\s*-\\s*['\"]?(?P<port>\\d{{2,5}}):\\d{{2,5}}['\"]?\\s*$)\n    # a Dockerfile rewriting the bind at build time\n    | (?:sed\\s+-i\\s+['\"]?s/(?P<from>[0-9.]+)/(?P<to>[0-9.]+)/)\n    \"\"\", re.MULTILINE)\n\n\ndef _real_host(host: str) -> bool:\n    \"\"\"Whether *host* is a complete IP literal or a loopback name, so fragments yield no fact.\"\"\"\n    return _net.is_loopback_host(host) or bool(_net.ip_literal(host))\n\n\ndef snippet_for(f: Finding, repo_root: str | Path, *,\n                include_decorators: bool = False) -> str:\n    \"\"\"The finding's redacted snippet, or its cited lines read from disk, optionally widened over decorator lines.\"\"\"\n    from vvaharness.pipeline.stages.s4_deepdive import _redact_source\n    text = (f.code_snippet or \"\").strip()\n    if text:\n        # Redact on BOTH paths: s5 backfills from raw text, and some routes reject prompts carrying PII\n        text = _redact_source(text, f.file, stage=\"s8\")\n    else:\n        text = _read_range(repo_root, f.file, f.line_start, f.line_end)\n    if include_decorators:\n        prologue = _decorator_lines(repo_root, f.file, f.line_start)\n        # A producer that cut above the decorator repeats its nearest line, so test only that line\n        if prologue and prologue.rsplit(\"\\n\", 1)[-1].strip() not in text:\n            text = f\"{prologue}\\n{text}\" if text else prologue\n    if len(text) > MAX_SNIPPET_CHARS:\n        text = text[:MAX_SNIPPET_CHARS] + \"\\n… (snippet truncated)\"\n    return text\n\n\n# s8.validate delegates its _line_text here — keep this signature stable.\ndef _file_lines(repo_root: str | Path, file: str) -> list[str]:\n    \"\"\"``file``'s lines, or [] when it is unreadable or escapes the repo.\"\"\"\n    try:\n        root = Path(repo_root).resolve()\n        target = (root / file).resolve()\n        target.relative_to(root)\n        st = target.stat()\n        if not S_ISREG(st.st_mode):\n            # A FIFO would BLOCK the read, not fail it.\n            return []\n        return list(_lines_cached(str(target), st.st_mtime_ns, st.st_size))\n    except (OSError, ValueError, RuntimeError):\n        return []\n\n\n# Keying on (mtime, size) re-reads an edited file, so a long-lived process never serves a stale scan\n@lru_cache(maxsize=256)\ndef _lines_cached(path: str, mtime_ns: int, size: int) -> tuple[str, ...]:\n    # split_lines, not str.splitlines(): its extra breaks (\\f, U+2028) shift ast/git line numbers\n    return tuple(split_lines(\n        Path(path).read_text(encoding=\"utf-8\", errors=\"replace\")))\n\n\ndef _read_range(repo_root: str | Path, file: str, start: int, end: int) -> str:\n    \"\"\"``file`` lines ``start..end``, redacted, or \"\" when unreadable.\"\"\"\n    lines = _file_lines(repo_root, file)\n    if not lines:\n        return \"\"\n    lo = max(start - 1, 0)\n    hi = max(end or start, start)\n    from vvaharness.pipeline.stages.s4_deepdive import _redact_source\n    return _redact_source(\"\\n\".join(lines[lo:hi]), file, stage=\"s8\")\n\n\ndef _decorator_lines(repo_root: str | Path, file: str, start: int) -> str:\n    \"\"\"The contiguous whole-line decorator/annotation lines directly above ``start``, redacted.\"\"\"\n    if start <= 1:\n        return \"\"\n    lines = _file_lines(repo_root, file)\n    if not lines:\n        return \"\"\n    picked: list[str] = []\n    total = 0\n    i = min(start - 1, len(lines)) - 1          # 0-based line above `start`\n    while i >= 0 and len(picked) < MAX_DECORATOR_LINES:\n        if not _ANNOTATION_RX.match(lines[i]):\n            break\n        total += len(lines[i]) + 1\n        if total > MAX_PROLOGUE_CHARS:\n                # Nearest-first, so an oversized outer line drops instead of evicting CODE\n            break\n        picked.append(lines[i])\n        i -= 1\n    if not picked:\n        return \"\"\n    from vvaharness.pipeline.stages.s4_deepdive import _redact_source\n    return _redact_source(\"\\n\".join(reversed(picked)), file, stage=\"s8\")\n\n\ndef same_location_groups(findings: list[Finding],\n                         labels: list[str]) -> list[str]:\n    \"\"\"Prompt lines naming findings that share a ``file:line``, since one line cannot be its own precondition.\"\"\"\n    groups: dict[tuple[str, int], list[str]] = {}\n    for lbl, f in zip(labels, findings):\n        groups.setdefault((f.file, f.line_start), []).append(lbl)\n    return [f\"{', '.join(ids)} are all at {file}:{line} — ONE code fact\"\n            for (file, line), ids in groups.items() if len(ids) > 1]\n\n\ndef _user_directive_facts(rel: str, text: str) -> list[str]:\n    \"\"\"Prompt lines stating ``rel``'s USER directives as written and where they sit relative to the last ``FROM``.\"\"\"\n    matches = list(_USER_RX.finditer(text))\n    # Dropping an unstateable token beats \"no USER directive\": neither way states a false fact\n    users = [m for m in matches if _USER_TOKEN_RX.match(m.group(\"user\"))]\n    if matches and not users:\n        return []\n    if not users:\n        return [f\"{rel} declares no USER directive\"]\n    froms = list(_FROM_RX.finditer(text))\n    last_from = froms[-1].start() if froms else -1\n    final = [m for m in users if m.start() > last_from]\n    if final:\n        return [f\"{rel} final stage runs as USER {final[-1].group('user')} \"\n                f\"(last USER directive after the last FROM)\"]\n    earlier = \", \".join(dict.fromkeys(m.group(\"user\") for m in users))\n    return [f\"{rel} declares no USER directive after its last FROM \"\n            f\"(earlier build stage(s) declare: {earlier})\"]\n\n\ndef exposure_facts(ctx: ContextPackage, findings: list[Finding], *,\n                   user_facts: bool = False) -> list[str]:\n    \"\"\"How this app is reachable — binds, published ports, bind rewrites, and with ``user_facts`` each Dockerfile's USER.\"\"\"\n    root = Path(ctx.repo_root)\n    facts: list[str] = []\n    # Finding files too (a launcher's bind is in source); _BIND_RX's context, not the name, gates it\n    names = [\"Dockerfile\", \"docker-compose.yml\", \"docker-compose.yaml\",\n             \"compose.yml\", \"Makefile\"]\n    names += sorted({f.file for f in findings})[:60]\n    for rel in dict.fromkeys(names):\n        try:\n            target = (root / rel).resolve()\n            target.relative_to(root.resolve())\n            if not target.is_file():          # a FIFO would block the read\n                continue\n            text = target.read_text(encoding=\"utf-8\", errors=\"replace\")\n        except (OSError, ValueError, RuntimeError):\n            continue\n        if user_facts and _is_dockerfile_name(Path(rel).name):\n            facts += _user_directive_facts(rel, text)\n        for m in _BIND_RX.finditer(text):\n            host = m.group(\"host\") or m.group(\"tuple\") or m.group(\"const\")\n            if host:\n                if not _real_host(host):\n                    continue\n                loop = _net.is_loopback_host(host)\n                facts.append(\n                    f\"{rel} binds {host}\"\n                    + (\" (LOOPBACK — not remotely reachable as written)\"\n                       if loop else \" (all interfaces — remotely reachable)\"))\n            elif m.group(\"port\"):\n                # Only compose maps ports; the same \"- 80:80\" elsewhere is a prose bullet\n                if \"compose\" in Path(rel).name.lower():\n                    facts.append(\n                        f\"{rel} publishes port {m.group('port')} to the host\")\n            elif m.group(\"to\"):\n                if _real_host(m.group(\"from\")) and _real_host(m.group(\"to\")):\n                    facts.append(f\"{rel} rewrites the bind \"\n                                 f\"{m.group('from')} -> {m.group('to')}\")\n    return list(dict.fromkeys(facts))[:12]\n\n\n\n",
+  "literals": {
+    "source_literal_16_0": {
+      "source": "vvaharness/pipeline/stages/s8/facts.py",
+      "line_start": 16,
+      "line_end": 16,
+      "value": "Deterministic code and repo-level facts for the chaining pass: shown, never interpreted.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_38_28": {
+      "source": "vvaharness/pipeline/stages/s8/facts.py",
+      "line_start": 38,
+      "line_end": 42,
+      "value": "(?x)\n    ^\\s*(?:\n        @\\s*[A-Za-z_][\\w.]*(?:\\(.*\\))?   # decorator / annotation, whole line\n      | \\#?\\[[^\\]\\s][^\\]]*\\]             # attribute, alone on its line\n    )\\s*$",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_53_4": {
+      "source": "vvaharness/pipeline/stages/s8/facts.py",
+      "line_start": 53,
+      "line_end": 53,
+      "value": "Whether *name* is ``Dockerfile`` or ``Dockerfile.<variant>``.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_66_4": {
+      "source": "vvaharness/pipeline/stages/s8/facts.py",
+      "line_start": 66,
+      "line_end": 81,
+      "source_expression": "rf\"\"\"(?x)\n    # a server started with an explicit bind: app.run(host=),\n    # uvicorn.run(..., host=), serve(host=)\n      (?:\\.(?:run|serve|bind|listen|create_server)\\s*\\(\n         [^)\\n]{{0,200}}?host\\s*=\\s*['\"](?P<host>{_ADDR})['\"])\n    # socket-style bind/listen on an (\"addr\", port) tuple\n    | (?:\\.(?:bind|listen|create_server)\\s*\\(\\s*\\(\\s*['\"](?P<tuple>{_ADDR})['\"])\n    # a declared listen address constant, at statement position\n    | (?:^[^\\S\\n]*(?:self\\.)?\n         (?:LISTEN_ADDRESS|BIND_ADDRESS|BIND_HOST|SERVER_HOST|HOST)\\b\n         [^=\\n]{{0,40}}=\\s*['\"](?P<const>{_ADDR})['\"])\n    # compose/K8s published port mapping\n    | (?:^\\s*-\\s*['\"]?(?P<port>\\d{{2,5}}):\\d{{2,5}}['\"]?\\s*$)\n    # a Dockerfile rewriting the bind at build time\n    | (?:sed\\s+-i\\s+['\"]?s/(?P<from>[0-9.]+)/(?P<to>[0-9.]+)/)\n    \"\"\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_85_4": {
+      "source": "vvaharness/pipeline/stages/s8/facts.py",
+      "line_start": 85,
+      "line_end": 85,
+      "value": "Whether *host* is a complete IP literal or a loopback name, so fragments yield no fact.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_91_4": {
+      "source": "vvaharness/pipeline/stages/s8/facts.py",
+      "line_start": 91,
+      "line_end": 91,
+      "value": "The finding's redacted snippet, or its cited lines read from disk, optionally widened over decorator lines.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_102_40": {
+      "source": "vvaharness/pipeline/stages/s8/facts.py",
+      "line_start": 102,
+      "line_end": 102,
+      "value": "\n",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_103_19": {
+      "source": "vvaharness/pipeline/stages/s8/facts.py",
+      "line_start": 103,
+      "line_end": 103,
+      "source_expression": "f\"{prologue}\\n{text}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_105_42": {
+      "source": "vvaharness/pipeline/stages/s8/facts.py",
+      "line_start": 105,
+      "line_end": 105,
+      "value": "\n… (snippet truncated)",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_111_4": {
+      "source": "vvaharness/pipeline/stages/s8/facts.py",
+      "line_start": 111,
+      "line_end": 111,
+      "value": "``file``'s lines, or [] when it is unreadable or escapes the repo.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_134_4": {
+      "source": "vvaharness/pipeline/stages/s8/facts.py",
+      "line_start": 134,
+      "line_end": 134,
+      "value": "``file`` lines ``start..end``, redacted, or \"\" when unreadable.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_141_26": {
+      "source": "vvaharness/pipeline/stages/s8/facts.py",
+      "line_start": 141,
+      "line_end": 141,
+      "value": "\n",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_145_4": {
+      "source": "vvaharness/pipeline/stages/s8/facts.py",
+      "line_start": 145,
+      "line_end": 145,
+      "value": "The contiguous whole-line decorator/annotation lines directly above ``start``, redacted.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_166_26": {
+      "source": "vvaharness/pipeline/stages/s8/facts.py",
+      "line_start": 166,
+      "line_end": 166,
+      "value": "\n",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_171_4": {
+      "source": "vvaharness/pipeline/stages/s8/facts.py",
+      "line_start": 171,
+      "line_end": 171,
+      "value": "Prompt lines naming findings that share a ``file:line``, since one line cannot be its own precondition.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_175_12": {
+      "source": "vvaharness/pipeline/stages/s8/facts.py",
+      "line_start": 175,
+      "line_end": 175,
+      "source_expression": "f\"{', '.join(ids)} are all at {file}:{line} — ONE code fact\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_180_4": {
+      "source": "vvaharness/pipeline/stages/s8/facts.py",
+      "line_start": 180,
+      "line_end": 180,
+      "value": "Prompt lines stating ``rel``'s USER directives as written and where they sit relative to the last ``FROM``.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_187_16": {
+      "source": "vvaharness/pipeline/stages/s8/facts.py",
+      "line_start": 187,
+      "line_end": 187,
+      "source_expression": "f\"{rel} declares no USER directive\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_192_16": {
+      "source": "vvaharness/pipeline/stages/s8/facts.py",
+      "line_start": 192,
+      "line_end": 193,
+      "source_expression": "f\"{rel} final stage runs as USER {final[-1].group('user')} \"\n                f\"(last USER directive after the last FROM)\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_195_12": {
+      "source": "vvaharness/pipeline/stages/s8/facts.py",
+      "line_start": 195,
+      "line_end": 196,
+      "source_expression": "f\"{rel} declares no USER directive after its last FROM \"\n            f\"(earlier build stage(s) declare: {earlier})\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_201_4": {
+      "source": "vvaharness/pipeline/stages/s8/facts.py",
+      "line_start": 201,
+      "line_end": 201,
+      "value": "How this app is reachable — binds, published ports, bind rewrites, and with ``user_facts`` each Dockerfile's USER.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_226_20": {
+      "source": "vvaharness/pipeline/stages/s8/facts.py",
+      "line_start": 226,
+      "line_end": 226,
+      "source_expression": "f\"{rel} binds {host}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_233_24": {
+      "source": "vvaharness/pipeline/stages/s8/facts.py",
+      "line_start": 233,
+      "line_end": 233,
+      "source_expression": "f\"{rel} publishes port {m.group('port')} to the host\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_236_33": {
+      "source": "vvaharness/pipeline/stages/s8/facts.py",
+      "line_start": 236,
+      "line_end": 237,
+      "source_expression": "f\"{rel} rewrites the bind \"\n                                 f\"{m.group('from')} -> {m.group('to')}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "value": "Deterministic code and repo-level facts for the chaining pass: shown, never interpreted.",
+      "context": "literal"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 8,
+      "value": "\\[?[0-9a-fA-F:.]+\\]?|(?i:localhost)",
+      "context": "literal"
+    },
+    {
+      "line_start": 38,
+      "line_end": 42,
+      "column": 28,
+      "value": "(?x)\n    ^\\s*(?:\n        @\\s*[A-Za-z_][\\w.]*(?:\\(.*\\))?   # decorator / annotation, whole line\n      | \\#?\\[[^\\]\\s][^\\]]*\\]             # attribute, alone on its line\n    )\\s*$",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 22,
+      "value": "^[^\\S\\n]*FROM[^\\S\\n]",
+      "context": "literal"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 22,
+      "value": "^[^\\S\\n]*USER[^\\S\\n]+(?P<user>\\S+)",
+      "context": "literal"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 28,
+      "value": "^[A-Za-z0-9_.:\\-]{1,64}$",
+      "context": "literal"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 4,
+      "value": "Whether *name* is ``Dockerfile`` or ``Dockerfile.<variant>``.",
+      "context": "literal"
+    },
+    {
+      "line_start": 85,
+      "line_end": 85,
+      "column": 4,
+      "value": "Whether *host* is a complete IP literal or a loopback name, so fragments yield no fact.",
+      "context": "literal"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 4,
+      "value": "The finding's redacted snippet, or its cited lines read from disk, optionally widened over decorator lines.",
+      "context": "literal"
+    },
+    {
+      "line_start": 111,
+      "line_end": 111,
+      "column": 4,
+      "value": "``file``'s lines, or [] when it is unreadable or escapes the repo.",
+      "context": "literal"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 4,
+      "value": "``file`` lines ``start..end``, redacted, or \"\" when unreadable.",
+      "context": "literal"
+    },
+    {
+      "line_start": 145,
+      "line_end": 145,
+      "column": 4,
+      "value": "The contiguous whole-line decorator/annotation lines directly above ``start``, redacted.",
+      "context": "literal"
+    },
+    {
+      "line_start": 171,
+      "line_end": 171,
+      "column": 4,
+      "value": "Prompt lines naming findings that share a ``file:line``, since one line cannot be its own precondition.",
+      "context": "literal"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 4,
+      "value": "Prompt lines stating ``rel``'s USER directives as written and where they sit relative to the last ``FROM``.",
+      "context": "literal"
+    },
+    {
+      "line_start": 201,
+      "line_end": 201,
+      "column": 4,
+      "value": "How this app is reachable — binds, published ports, bind rewrites, and with ``user_facts`` each Dockerfile's USER.",
+      "context": "literal"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 14,
+      "value": "dockerfile",
+      "context": "literal"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 40,
+      "value": ".",
+      "context": "literal"
+    },
+    {
+      "line_start": 66,
+      "line_end": 70,
+      "column": 9,
+      "value": "(?x)\n    # a server started with an explicit bind: app.run(host=),\n    # uvicorn.run(..., host=), serve(host=)\n      (?:\\.(?:run|serve|bind|listen|create_server)\\s*\\(\n         [^)\\n]{0,200}?host\\s*=\\s*['\"](?P<host>",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 70,
+      "line_end": 72,
+      "column": 56,
+      "value": ")['\"])\n    # socket-style bind/listen on an (\"addr\", port) tuple\n    | (?:\\.(?:bind|listen|create_server)\\s*\\(\\s*\\(\\s*['\"](?P<tuple>",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 72,
+      "line_end": 76,
+      "column": 74,
+      "value": ")['\"])\n    # a declared listen address constant, at statement position\n    | (?:^[^\\S\\n]*(?:self\\.)?\n         (?:LISTEN_ADDRESS|BIND_ADDRESS|BIND_HOST|SERVER_HOST|HOST)\\b\n         [^=\\n]{0,40}=\\s*['\"](?P<const>",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 76,
+      "line_end": 81,
+      "column": 48,
+      "value": ")['\"])\n    # compose/K8s published port mapping\n    | (?:^\\s*-\\s*['\"]?(?P<port>\\d{2,5}):\\d{2,5}['\"]?\\s*$)\n    # a Dockerfile rewriting the bind at build time\n    | (?:sed\\s+-i\\s+['\"]?s/(?P<from>[0-9.]+)/(?P<to>[0-9.]+)/)\n    ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 15,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 15,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 15,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 15,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 13,
+      "value": "Dockerfile",
+      "context": "literal"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 27,
+      "value": "docker-compose.yml",
+      "context": "literal"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 49,
+      "value": "docker-compose.yaml",
+      "context": "literal"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 13,
+      "value": "compose.yml",
+      "context": "literal"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 28,
+      "value": "Makefile",
+      "context": "literal"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 21,
+      "value": "dockerfile",
+      "context": "literal"
+    },
+    {
+      "line_start": 105,
+      "line_end": 105,
+      "column": 42,
+      "value": "\n… (snippet truncated)",
+      "context": "literal"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 63,
+      "value": "s8",
+      "context": "literal"
+    },
+    {
+      "line_start": 166,
+      "line_end": 166,
+      "column": 67,
+      "value": "s8",
+      "context": "literal"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 30,
+      "value": " are all at ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 48,
+      "value": ":",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 55,
+      "value": " — ONE code fact",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 14,
+      "value": ", ",
+      "context": "literal"
+    },
+    {
+      "line_start": 195,
+      "line_end": 196,
+      "column": 19,
+      "value": " declares no USER directive after its last FROM (earlier build stage(s) declare: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 196,
+      "line_end": 196,
+      "column": 56,
+      "value": ")",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 8,
+      "value": "py",
+      "context": "literal"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 14,
+      "value": "pyi",
+      "context": "literal"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 21,
+      "value": "js",
+      "context": "literal"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 27,
+      "value": "ts",
+      "context": "literal"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 33,
+      "value": "rb",
+      "context": "literal"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 39,
+      "value": "go",
+      "context": "literal"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 45,
+      "value": "java",
+      "context": "literal"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 53,
+      "value": "cs",
+      "context": "literal"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 59,
+      "value": "php",
+      "context": "literal"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 66,
+      "value": "sh",
+      "context": "literal"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 8,
+      "value": "yml",
+      "context": "literal"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 15,
+      "value": "yaml",
+      "context": "literal"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 23,
+      "value": "json",
+      "context": "literal"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 31,
+      "value": "md",
+      "context": "literal"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 37,
+      "value": "txt",
+      "context": "literal"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 44,
+      "value": "html",
+      "context": "literal"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 30,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 50,
+      "value": "s8",
+      "context": "literal"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 26,
+      "value": "\n",
+      "context": "literal"
+    },
+    {
+      "line_start": 166,
+      "line_end": 166,
+      "column": 26,
+      "value": "\n",
+      "context": "literal"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 23,
+      "value": " declares no USER directive",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 23,
+      "value": " final stage runs as USER ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 192,
+      "line_end": 193,
+      "column": 74,
+      "value": " (last USER directive after the last FROM)",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 103,
+      "line_end": 103,
+      "column": 31,
+      "value": "\n",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 38,
+      "value": "utf-8",
+      "context": "literal"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 54,
+      "value": "replace",
+      "context": "literal"
+    },
+    {
+      "line_start": 183,
+      "line_end": 183,
+      "column": 64,
+      "value": "user",
+      "context": "literal"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 46,
+      "value": "user",
+      "context": "literal"
+    },
+    {
+      "line_start": 214,
+      "line_end": 214,
+      "column": 45,
+      "value": "utf-8",
+      "context": "literal"
+    },
+    {
+      "line_start": 214,
+      "line_end": 214,
+      "column": 61,
+      "value": "replace",
+      "context": "literal"
+    },
+    {
+      "line_start": 220,
+      "line_end": 220,
+      "column": 27,
+      "value": "host",
+      "context": "literal"
+    },
+    {
+      "line_start": 220,
+      "line_end": 220,
+      "column": 46,
+      "value": "tuple",
+      "context": "literal"
+    },
+    {
+      "line_start": 220,
+      "line_end": 220,
+      "column": 66,
+      "value": "const",
+      "context": "literal"
+    },
+    {
+      "line_start": 229,
+      "line_end": 229,
+      "column": 25,
+      "value": "port",
+      "context": "literal"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 15,
+      "value": ", ",
+      "context": "literal"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 66,
+      "value": "user",
+      "context": "literal"
+    },
+    {
+      "line_start": 231,
+      "line_end": 231,
+      "column": 19,
+      "value": "compose",
+      "context": "literal"
+    },
+    {
+      "line_start": 234,
+      "line_end": 234,
+      "column": 25,
+      "value": "to",
+      "context": "literal"
+    },
+    {
+      "line_start": 226,
+      "line_end": 226,
+      "column": 27,
+      "value": " binds ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 227,
+      "line_end": 227,
+      "column": 23,
+      "value": " (LOOPBACK — not remotely reachable as written)",
+      "context": "literal"
+    },
+    {
+      "line_start": 228,
+      "line_end": 228,
+      "column": 36,
+      "value": " (all interfaces — remotely reachable)",
+      "context": "literal"
+    },
+    {
+      "line_start": 102,
+      "line_end": 102,
+      "column": 40,
+      "value": "\n",
+      "context": "literal"
+    },
+    {
+      "line_start": 233,
+      "line_end": 233,
+      "column": 31,
+      "value": " publishes port ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 233,
+      "line_end": 233,
+      "column": 64,
+      "value": " to the host",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 235,
+      "line_end": 235,
+      "column": 38,
+      "value": "from",
+      "context": "literal"
+    },
+    {
+      "line_start": 235,
+      "line_end": 235,
+      "column": 70,
+      "value": "to",
+      "context": "literal"
+    },
+    {
+      "line_start": 236,
+      "line_end": 236,
+      "column": 40,
+      "value": " rewrites the bind ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 237,
+      "line_end": 237,
+      "column": 52,
+      "value": " -> ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 233,
+      "line_end": 233,
+      "column": 56,
+      "value": "port",
+      "context": "literal"
+    },
+    {
+      "line_start": 237,
+      "line_end": 237,
+      "column": 44,
+      "value": "from",
+      "context": "literal"
+    },
+    {
+      "line_start": 237,
+      "line_end": 237,
+      "column": 65,
+      "value": "to",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 28,
+      "text": "# Producers already cap snippets."
+    },
+    {
+      "line": 31,
+      "text": "# A registration sits 1-3 lines above the def in every framework shape observed; past that, not one"
+    },
+    {
+      "line": 34,
+      "text": "# Prepended BEFORE the MAX_SNIPPET_CHARS cap, so one long decorator line could evict the CODE block"
+    },
+    {
+      "line": 37,
+      "text": "# Whole-line decorator/annotation; anchored at BOTH ends, or a prefix match admits injected prose"
+    },
+    {
+      "line": 44,
+      "text": "# Effective user = LAST USER of the LAST stage: earlier ones are build stages, later USER root wins"
+    },
+    {
+      "line": 48,
+      "text": "# name/uid/name:group only: spliced under an OVERRIDE header, so \\S+ carries prompt injection"
+    },
+    {
+      "line": 57,
+      "text": "# A bare startswith(\"dockerfile\") also matched dockerfile_util.py, then stated as deploy fact"
+    },
+    {
+      "line": 63,
+      "text": "# _real_host AND binding context, or SSRF/argv tokens fake \"reachable\"; localhost needs its own alt"
+    },
+    {
+      "line": 95,
+      "text": "# Redact on BOTH paths: s5 backfills from raw text, and some routes reject prompts carrying PII"
+    },
+    {
+      "line": 101,
+      "text": "# A producer that cut above the decorator repeats its nearest line, so test only that line"
+    },
+    {
+      "line": 109,
+      "text": "# s8.validate delegates its _line_text here — keep this signature stable."
+    },
+    {
+      "line": 118,
+      "text": "# A FIFO would BLOCK the read, not fail it."
+    },
+    {
+      "line": 125,
+      "text": "# Keying on (mtime, size) re-reads an edited file, so a long-lived process never serves a stale scan"
+    },
+    {
+      "line": 128,
+      "text": "# split_lines, not str.splitlines(): its extra breaks (\\f, U+2028) shift ast/git line numbers"
+    },
+    {
+      "line": 153,
+      "text": "# 0-based line above `start`"
+    },
+    {
+      "line": 159,
+      "text": "# Nearest-first, so an oversized outer line drops instead of evicting CODE"
+    },
+    {
+      "line": 182,
+      "text": "# Dropping an unstateable token beats \"no USER directive\": neither way states a false fact"
+    },
+    {
+      "line": 204,
+      "text": "# Finding files too (a launcher's bind is in source); _BIND_RX's context, not the name, gates it"
+    },
+    {
+      "line": 212,
+      "text": "# a FIFO would block the read"
+    },
+    {
+      "line": 230,
+      "text": "# Only compose maps ports; the same \"- 80:80\" elsewhere is a prose bullet"
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 26,
+      "line_end": 26,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "Assign",
+      "line_start": 29,
+      "line_end": 29,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "Assign",
+      "line_start": 32,
+      "line_end": 32,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 35,
+      "line_end": 35,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 38,
+      "line_end": 42,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 45,
+      "line_end": 45,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 46,
+      "line_end": 46,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 49,
+      "line_end": 49,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 52,
+      "line_end": 61,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 9
+    },
+    {
+      "kind": "Expr",
+      "line_start": 53,
+      "line_end": 53,
+      "column": 4,
+      "owner": "_is_dockerfile_name",
+      "representation_line": 15
+    },
+    {
+      "kind": "Assign",
+      "line_start": 54,
+      "line_end": 54,
+      "column": 4,
+      "owner": "_is_dockerfile_name",
+      "representation_line": 15
+    },
+    {
+      "kind": "If",
+      "line_start": 55,
+      "line_end": 56,
+      "column": 4,
+      "owner": "_is_dockerfile_name",
+      "representation_line": 16
+    },
+    {
+      "kind": "Return",
+      "line_start": 56,
+      "line_end": 56,
+      "column": 8,
+      "owner": "_is_dockerfile_name",
+      "representation_line": 18
+    },
+    {
+      "kind": "Assign",
+      "line_start": 58,
+      "line_end": 58,
+      "column": 4,
+      "owner": "_is_dockerfile_name",
+      "representation_line": 22
+    },
+    {
+      "kind": "Return",
+      "line_start": 59,
+      "line_end": 61,
+      "column": 4,
+      "owner": "_is_dockerfile_name",
+      "representation_line": 23
+    },
+    {
+      "kind": "Assign",
+      "line_start": 64,
+      "line_end": 64,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 28
+    },
+    {
+      "kind": "Assign",
+      "line_start": 65,
+      "line_end": 81,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 28
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 84,
+      "line_end": 86,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 29
+    },
+    {
+      "kind": "Expr",
+      "line_start": 85,
+      "line_end": 85,
+      "column": 4,
+      "owner": "_real_host",
+      "representation_line": 35
+    },
+    {
+      "kind": "Return",
+      "line_start": 86,
+      "line_end": 86,
+      "column": 4,
+      "owner": "_real_host",
+      "representation_line": 36
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 89,
+      "line_end": 106,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 40
+    },
+    {
+      "kind": "Expr",
+      "line_start": 91,
+      "line_end": 91,
+      "column": 4,
+      "owner": "snippet_for",
+      "representation_line": 46
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 92,
+      "line_end": 92,
+      "column": 4,
+      "owner": "snippet_for",
+      "representation_line": 46
+    },
+    {
+      "kind": "Assign",
+      "line_start": 93,
+      "line_end": 93,
+      "column": 4,
+      "owner": "snippet_for",
+      "representation_line": 46
+    },
+    {
+      "kind": "If",
+      "line_start": 94,
+      "line_end": 98,
+      "column": 4,
+      "owner": "snippet_for",
+      "representation_line": 47
+    },
+    {
+      "kind": "Assign",
+      "line_start": 96,
+      "line_end": 96,
+      "column": 8,
+      "owner": "snippet_for",
+      "representation_line": 50
+    },
+    {
+      "kind": "Assign",
+      "line_start": 98,
+      "line_end": 98,
+      "column": 8,
+      "owner": "snippet_for",
+      "representation_line": 54
+    },
+    {
+      "kind": "If",
+      "line_start": 99,
+      "line_end": 103,
+      "column": 4,
+      "owner": "snippet_for",
+      "representation_line": 56
+    },
+    {
+      "kind": "Assign",
+      "line_start": 100,
+      "line_end": 100,
+      "column": 8,
+      "owner": "snippet_for",
+      "representation_line": 59
+    },
+    {
+      "kind": "If",
+      "line_start": 102,
+      "line_end": 103,
+      "column": 8,
+      "owner": "snippet_for",
+      "representation_line": 60
+    },
+    {
+      "kind": "Assign",
+      "line_start": 103,
+      "line_end": 103,
+      "column": 12,
+      "owner": "snippet_for",
+      "representation_line": 63
+    },
+    {
+      "kind": "If",
+      "line_start": 104,
+      "line_end": 105,
+      "column": 4,
+      "owner": "snippet_for",
+      "representation_line": 66
+    },
+    {
+      "kind": "Assign",
+      "line_start": 105,
+      "line_end": 105,
+      "column": 8,
+      "owner": "snippet_for",
+      "representation_line": 69
+    },
+    {
+      "kind": "Return",
+      "line_start": 106,
+      "line_end": 106,
+      "column": 4,
+      "owner": "snippet_for",
+      "representation_line": 71
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 110,
+      "line_end": 122,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 75
+    },
+    {
+      "kind": "Expr",
+      "line_start": 111,
+      "line_end": 111,
+      "column": 4,
+      "owner": "_file_lines",
+      "representation_line": 81
+    },
+    {
+      "kind": "Try",
+      "line_start": 112,
+      "line_end": 122,
+      "column": 4,
+      "owner": "_file_lines",
+      "representation_line": 82
+    },
+    {
+      "kind": "Assign",
+      "line_start": 113,
+      "line_end": 113,
+      "column": 8,
+      "owner": "_file_lines",
+      "representation_line": 85
+    },
+    {
+      "kind": "Assign",
+      "line_start": 114,
+      "line_end": 114,
+      "column": 8,
+      "owner": "_file_lines",
+      "representation_line": 85
+    },
+    {
+      "kind": "Expr",
+      "line_start": 115,
+      "line_end": 115,
+      "column": 8,
+      "owner": "_file_lines",
+      "representation_line": 85
+    },
+    {
+      "kind": "Assign",
+      "line_start": 116,
+      "line_end": 116,
+      "column": 8,
+      "owner": "_file_lines",
+      "representation_line": 85
+    },
+    {
+      "kind": "If",
+      "line_start": 117,
+      "line_end": 119,
+      "column": 8,
+      "owner": "_file_lines",
+      "representation_line": 86
+    },
+    {
+      "kind": "Return",
+      "line_start": 119,
+      "line_end": 119,
+      "column": 12,
+      "owner": "_file_lines",
+      "representation_line": 88
+    },
+    {
+      "kind": "Return",
+      "line_start": 120,
+      "line_end": 120,
+      "column": 8,
+      "owner": "_file_lines",
+      "representation_line": 91
+    },
+    {
+      "kind": "Return",
+      "line_start": 122,
+      "line_end": 122,
+      "column": 8,
+      "owner": "_file_lines",
+      "representation_line": 96
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 127,
+      "line_end": 130,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 101
+    },
+    {
+      "kind": "Return",
+      "line_start": 129,
+      "line_end": 130,
+      "column": 4,
+      "owner": "_lines_cached",
+      "representation_line": 109
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 133,
+      "line_end": 141,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 114
+    },
+    {
+      "kind": "Expr",
+      "line_start": 134,
+      "line_end": 134,
+      "column": 4,
+      "owner": "_read_range",
+      "representation_line": 120
+    },
+    {
+      "kind": "Assign",
+      "line_start": 135,
+      "line_end": 135,
+      "column": 4,
+      "owner": "_read_range",
+      "representation_line": 120
+    },
+    {
+      "kind": "If",
+      "line_start": 136,
+      "line_end": 137,
+      "column": 4,
+      "owner": "_read_range",
+      "representation_line": 121
+    },
+    {
+      "kind": "Return",
+      "line_start": 137,
+      "line_end": 137,
+      "column": 8,
+      "owner": "_read_range",
+      "representation_line": 123
+    },
+    {
+      "kind": "Assign",
+      "line_start": 138,
+      "line_end": 138,
+      "column": 4,
+      "owner": "_read_range",
+      "representation_line": 127
+    },
+    {
+      "kind": "Assign",
+      "line_start": 139,
+      "line_end": 139,
+      "column": 4,
+      "owner": "_read_range",
+      "representation_line": 127
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 140,
+      "line_end": 140,
+      "column": 4,
+      "owner": "_read_range",
+      "representation_line": 127
+    },
+    {
+      "kind": "Return",
+      "line_start": 141,
+      "line_end": 141,
+      "column": 4,
+      "owner": "_read_range",
+      "representation_line": 128
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 144,
+      "line_end": 166,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 132
+    },
+    {
+      "kind": "Expr",
+      "line_start": 145,
+      "line_end": 145,
+      "column": 4,
+      "owner": "_decorator_lines",
+      "representation_line": 138
+    },
+    {
+      "kind": "If",
+      "line_start": 146,
+      "line_end": 147,
+      "column": 4,
+      "owner": "_decorator_lines",
+      "representation_line": 139
+    },
+    {
+      "kind": "Return",
+      "line_start": 147,
+      "line_end": 147,
+      "column": 8,
+      "owner": "_decorator_lines",
+      "representation_line": 141
+    },
+    {
+      "kind": "Assign",
+      "line_start": 148,
+      "line_end": 148,
+      "column": 4,
+      "owner": "_decorator_lines",
+      "representation_line": 145
+    },
+    {
+      "kind": "If",
+      "line_start": 149,
+      "line_end": 150,
+      "column": 4,
+      "owner": "_decorator_lines",
+      "representation_line": 146
+    },
+    {
+      "kind": "Return",
+      "line_start": 150,
+      "line_end": 150,
+      "column": 8,
+      "owner": "_decorator_lines",
+      "representation_line": 148
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 151,
+      "line_end": 151,
+      "column": 4,
+      "owner": "_decorator_lines",
+      "representation_line": 152
+    },
+    {
+      "kind": "Assign",
+      "line_start": 152,
+      "line_end": 152,
+      "column": 4,
+      "owner": "_decorator_lines",
+      "representation_line": 152
+    },
+    {
+      "kind": "Assign",
+      "line_start": 153,
+      "line_end": 153,
+      "column": 4,
+      "owner": "_decorator_lines",
+      "representation_line": 152
+    },
+    {
+      "kind": "While",
+      "line_start": 154,
+      "line_end": 162,
+      "column": 4,
+      "owner": "_decorator_lines",
+      "representation_line": 153
+    },
+    {
+      "kind": "If",
+      "line_start": 155,
+      "line_end": 156,
+      "column": 8,
+      "owner": "_decorator_lines",
+      "representation_line": 155
+    },
+    {
+      "kind": "Break",
+      "line_start": 156,
+      "line_end": 156,
+      "column": 12,
+      "owner": "_decorator_lines",
+      "representation_line": 157
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 157,
+      "line_end": 157,
+      "column": 8,
+      "owner": "_decorator_lines",
+      "representation_line": 161
+    },
+    {
+      "kind": "If",
+      "line_start": 158,
+      "line_end": 160,
+      "column": 8,
+      "owner": "_decorator_lines",
+      "representation_line": 162
+    },
+    {
+      "kind": "Break",
+      "line_start": 160,
+      "line_end": 160,
+      "column": 12,
+      "owner": "_decorator_lines",
+      "representation_line": 164
+    },
+    {
+      "kind": "Expr",
+      "line_start": 161,
+      "line_end": 161,
+      "column": 8,
+      "owner": "_decorator_lines",
+      "representation_line": 168
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 162,
+      "line_end": 162,
+      "column": 8,
+      "owner": "_decorator_lines",
+      "representation_line": 168
+    },
+    {
+      "kind": "If",
+      "line_start": 163,
+      "line_end": 164,
+      "column": 4,
+      "owner": "_decorator_lines",
+      "representation_line": 170
+    },
+    {
+      "kind": "Return",
+      "line_start": 164,
+      "line_end": 164,
+      "column": 8,
+      "owner": "_decorator_lines",
+      "representation_line": 172
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 165,
+      "line_end": 165,
+      "column": 4,
+      "owner": "_decorator_lines",
+      "representation_line": 176
+    },
+    {
+      "kind": "Return",
+      "line_start": 166,
+      "line_end": 166,
+      "column": 4,
+      "owner": "_decorator_lines",
+      "representation_line": 177
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 169,
+      "line_end": 176,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 181
+    },
+    {
+      "kind": "Expr",
+      "line_start": 171,
+      "line_end": 171,
+      "column": 4,
+      "owner": "same_location_groups",
+      "representation_line": 187
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 172,
+      "line_end": 172,
+      "column": 4,
+      "owner": "same_location_groups",
+      "representation_line": 187
+    },
+    {
+      "kind": "For",
+      "line_start": 173,
+      "line_end": 174,
+      "column": 4,
+      "owner": "same_location_groups",
+      "representation_line": 188
+    },
+    {
+      "kind": "Expr",
+      "line_start": 174,
+      "line_end": 174,
+      "column": 8,
+      "owner": "same_location_groups",
+      "representation_line": 191
+    },
+    {
+      "kind": "Return",
+      "line_start": 175,
+      "line_end": 176,
+      "column": 4,
+      "owner": "same_location_groups",
+      "representation_line": 193
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 179,
+      "line_end": 196,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 197
+    },
+    {
+      "kind": "Expr",
+      "line_start": 180,
+      "line_end": 180,
+      "column": 4,
+      "owner": "_user_directive_facts",
+      "representation_line": 203
+    },
+    {
+      "kind": "Assign",
+      "line_start": 181,
+      "line_end": 181,
+      "column": 4,
+      "owner": "_user_directive_facts",
+      "representation_line": 203
+    },
+    {
+      "kind": "Assign",
+      "line_start": 183,
+      "line_end": 183,
+      "column": 4,
+      "owner": "_user_directive_facts",
+      "representation_line": 203
+    },
+    {
+      "kind": "If",
+      "line_start": 184,
+      "line_end": 185,
+      "column": 4,
+      "owner": "_user_directive_facts",
+      "representation_line": 204
+    },
+    {
+      "kind": "Return",
+      "line_start": 185,
+      "line_end": 185,
+      "column": 8,
+      "owner": "_user_directive_facts",
+      "representation_line": 206
+    },
+    {
+      "kind": "If",
+      "line_start": 186,
+      "line_end": 187,
+      "column": 4,
+      "owner": "_user_directive_facts",
+      "representation_line": 209
+    },
+    {
+      "kind": "Return",
+      "line_start": 187,
+      "line_end": 187,
+      "column": 8,
+      "owner": "_user_directive_facts",
+      "representation_line": 211
+    },
+    {
+      "kind": "Assign",
+      "line_start": 188,
+      "line_end": 188,
+      "column": 4,
+      "owner": "_user_directive_facts",
+      "representation_line": 215
+    },
+    {
+      "kind": "Assign",
+      "line_start": 189,
+      "line_end": 189,
+      "column": 4,
+      "owner": "_user_directive_facts",
+      "representation_line": 215
+    },
+    {
+      "kind": "Assign",
+      "line_start": 190,
+      "line_end": 190,
+      "column": 4,
+      "owner": "_user_directive_facts",
+      "representation_line": 215
+    },
+    {
+      "kind": "If",
+      "line_start": 191,
+      "line_end": 193,
+      "column": 4,
+      "owner": "_user_directive_facts",
+      "representation_line": 216
+    },
+    {
+      "kind": "Return",
+      "line_start": 192,
+      "line_end": 193,
+      "column": 8,
+      "owner": "_user_directive_facts",
+      "representation_line": 218
+    },
+    {
+      "kind": "Assign",
+      "line_start": 194,
+      "line_end": 194,
+      "column": 4,
+      "owner": "_user_directive_facts",
+      "representation_line": 222
+    },
+    {
+      "kind": "Return",
+      "line_start": 195,
+      "line_end": 196,
+      "column": 4,
+      "owner": "_user_directive_facts",
+      "representation_line": 223
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 199,
+      "line_end": 238,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 227
+    },
+    {
+      "kind": "Expr",
+      "line_start": 201,
+      "line_end": 201,
+      "column": 4,
+      "owner": "exposure_facts",
+      "representation_line": 233
+    },
+    {
+      "kind": "Assign",
+      "line_start": 202,
+      "line_end": 202,
+      "column": 4,
+      "owner": "exposure_facts",
+      "representation_line": 233
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 203,
+      "line_end": 203,
+      "column": 4,
+      "owner": "exposure_facts",
+      "representation_line": 233
+    },
+    {
+      "kind": "Assign",
+      "line_start": 205,
+      "line_end": 206,
+      "column": 4,
+      "owner": "exposure_facts",
+      "representation_line": 233
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 207,
+      "line_end": 207,
+      "column": 4,
+      "owner": "exposure_facts",
+      "representation_line": 233
+    },
+    {
+      "kind": "For",
+      "line_start": 208,
+      "line_end": 237,
+      "column": 4,
+      "owner": "exposure_facts",
+      "representation_line": 234
+    },
+    {
+      "kind": "Try",
+      "line_start": 209,
+      "line_end": 216,
+      "column": 8,
+      "owner": "exposure_facts",
+      "representation_line": 236
+    },
+    {
+      "kind": "Assign",
+      "line_start": 210,
+      "line_end": 210,
+      "column": 12,
+      "owner": "exposure_facts",
+      "representation_line": 239
+    },
+    {
+      "kind": "Expr",
+      "line_start": 211,
+      "line_end": 211,
+      "column": 12,
+      "owner": "exposure_facts",
+      "representation_line": 239
+    },
+    {
+      "kind": "If",
+      "line_start": 212,
+      "line_end": 213,
+      "column": 12,
+      "owner": "exposure_facts",
+      "representation_line": 240
+    },
+    {
+      "kind": "Continue",
+      "line_start": 213,
+      "line_end": 213,
+      "column": 16,
+      "owner": "exposure_facts",
+      "representation_line": 242
+    },
+    {
+      "kind": "Assign",
+      "line_start": 214,
+      "line_end": 214,
+      "column": 12,
+      "owner": "exposure_facts",
+      "representation_line": 246
+    },
+    {
+      "kind": "Continue",
+      "line_start": 216,
+      "line_end": 216,
+      "column": 12,
+      "owner": "exposure_facts",
+      "representation_line": 250
+    },
+    {
+      "kind": "If",
+      "line_start": 217,
+      "line_end": 218,
+      "column": 8,
+      "owner": "exposure_facts",
+      "representation_line": 253
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 218,
+      "line_end": 218,
+      "column": 12,
+      "owner": "exposure_facts",
+      "representation_line": 256
+    },
+    {
+      "kind": "For",
+      "line_start": 219,
+      "line_end": 237,
+      "column": 8,
+      "owner": "exposure_facts",
+      "representation_line": 258
+    },
+    {
+      "kind": "Assign",
+      "line_start": 220,
+      "line_end": 220,
+      "column": 12,
+      "owner": "exposure_facts",
+      "representation_line": 261
+    },
+    {
+      "kind": "If",
+      "line_start": 221,
+      "line_end": 237,
+      "column": 12,
+      "owner": "exposure_facts",
+      "representation_line": 262
+    },
+    {
+      "kind": "If",
+      "line_start": 222,
+      "line_end": 223,
+      "column": 16,
+      "owner": "exposure_facts",
+      "representation_line": 264
+    },
+    {
+      "kind": "Continue",
+      "line_start": 223,
+      "line_end": 223,
+      "column": 20,
+      "owner": "exposure_facts",
+      "representation_line": 266
+    },
+    {
+      "kind": "Assign",
+      "line_start": 224,
+      "line_end": 224,
+      "column": 16,
+      "owner": "exposure_facts",
+      "representation_line": 270
+    },
+    {
+      "kind": "Expr",
+      "line_start": 225,
+      "line_end": 228,
+      "column": 16,
+      "owner": "exposure_facts",
+      "representation_line": 270
+    },
+    {
+      "kind": "If",
+      "line_start": 229,
+      "line_end": 237,
+      "column": 12,
+      "owner": "exposure_facts",
+      "representation_line": 273
+    },
+    {
+      "kind": "If",
+      "line_start": 231,
+      "line_end": 233,
+      "column": 16,
+      "owner": "exposure_facts",
+      "representation_line": 275
+    },
+    {
+      "kind": "Expr",
+      "line_start": 232,
+      "line_end": 233,
+      "column": 20,
+      "owner": "exposure_facts",
+      "representation_line": 278
+    },
+    {
+      "kind": "If",
+      "line_start": 234,
+      "line_end": 237,
+      "column": 12,
+      "owner": "exposure_facts",
+      "representation_line": 282
+    },
+    {
+      "kind": "If",
+      "line_start": 235,
+      "line_end": 237,
+      "column": 16,
+      "owner": "exposure_facts",
+      "representation_line": 284
+    },
+    {
+      "kind": "Expr",
+      "line_start": 236,
+      "line_end": 237,
+      "column": 20,
+      "owner": "exposure_facts",
+      "representation_line": 287
+    },
+    {
+      "kind": "Return",
+      "line_start": 238,
+      "line_end": 238,
+      "column": 4,
+      "owner": "exposure_facts",
+      "representation_line": 294
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 29,
+      "line_end": 29,
+      "column": 20,
+      "kind": "Constant",
+      "original_ast": "Constant(value=1200)",
+      "rendered": "1200"
+    },
+    {
+      "line_start": 32,
+      "line_end": 32,
+      "column": 22,
+      "kind": "Constant",
+      "original_ast": "Constant(value=4)",
+      "rendered": "4"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 21,
+      "kind": "Constant",
+      "original_ast": "Constant(value=200)",
+      "rendered": "200"
+    },
+    {
+      "line_start": 38,
+      "line_end": 42,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='re', ctx=Load()), attr='compile', ctx=Load()), args=[Constant(value='(?x)\\n    ^\\\\s*(?:\\n        @\\\\s*[A-Za-z_][\\\\w.]*(?:\\\\(.*\\\\))?   # decorator / annotation, whole line\\n      | \\\\#?\\\\[[^\\\\]\\\\s][^\\\\]]*\\\\]             # attribute, alone on its line\\n    )\\\\s*$')], keywords=[])",
+      "rendered": "re.compile(source_literal_38_28)"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='re', ctx=Load()), attr='compile', ctx=Load()), args=[Constant(value='^[^\\\\S\\\\n]*FROM[^\\\\S\\\\n]'), BinOp(left=Attribute(value=Name(id='re', ctx=Load()), attr='IGNORECASE', ctx=Load()), op=BitOr(), right=Attribute(value=Name(id='re', ctx=Load()), attr='MULTILINE', ctx=Load()))], keywords=[])",
+      "rendered": "re.compile('^[^\\\\S\\\\n]*FROM[^\\\\S\\\\n]', re.IGNORECASE | re.MULTILINE)"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='re', ctx=Load()), attr='compile', ctx=Load()), args=[Constant(value='^[^\\\\S\\\\n]*USER[^\\\\S\\\\n]+(?P<user>\\\\S+)'), BinOp(left=Attribute(value=Name(id='re', ctx=Load()), attr='IGNORECASE', ctx=Load()), op=BitOr(), right=Attribute(value=Name(id='re', ctx=Load()), attr='MULTILINE', ctx=Load()))], keywords=[])",
+      "rendered": "re.compile('^[^\\\\S\\\\n]*USER[^\\\\S\\\\n]+(?P<user>\\\\S+)', re.IGNORECASE | re.MULTILINE)"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='re', ctx=Load()), attr='compile', ctx=Load()), args=[Constant(value='^[A-Za-z0-9_.:\\\\-]{1,64}$')], keywords=[])",
+      "rendered": "re.compile('^[A-Za-z0-9_.:\\\\-]{1,64}$')"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='name', ctx=Load()), attr='lower', ctx=Load()), args=[], keywords=[])",
+      "rendered": "name.lower()"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='low', ctx=Load()), ops=[Eq()], comparators=[Constant(value='dockerfile')])",
+      "rendered": "low == 'dockerfile'"
+    },
+    {
+      "line_start": 56,
+      "line_end": 56,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='low', ctx=Load()), attr='partition', ctx=Load()), args=[Constant(value='.')], keywords=[])",
+      "rendered": "low.partition('.')"
+    },
+    {
+      "line_start": 59,
+      "line_end": 61,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='prefix', ctx=Load()), ops=[Eq()], comparators=[Constant(value='dockerfile')]), Call(func=Name(id='bool', ctx=Load()), args=[Name(id='dot', ctx=Load())], keywords=[]), Compare(left=Name(id='suffix', ctx=Load()), ops=[NotIn()], comparators=[Set(elts=[Constant(value='py'), Constant(value='pyi'), Constant(value='js'), Constant(value='ts'), Constant(value='rb'), Constant(value='go'), Constant(value='java'), Constant(value='cs'), Constant(value='php'), Constant(value='sh'), Constant(value='yml'), Constant(value='yaml'), Constant(value='json'), Constant(value='md'), Constant(value='txt'), Constant(value='html')])])])",
+      "rendered": "prefix == 'dockerfile' and bool(dot) and (suffix not in {'py', 'pyi', 'js', 'ts', 'rb', 'go', 'java', 'cs', 'php', 'sh', 'yml', 'yaml', 'json', 'md', 'txt', 'html'})"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 8,
+      "kind": "Constant",
+      "original_ast": "Constant(value='\\\\[?[0-9a-fA-F:.]+\\\\]?|(?i:localhost)')",
+      "rendered": "'\\\\[?[0-9a-fA-F:.]+\\\\]?|(?i:localhost)'"
+    },
+    {
+      "line_start": 65,
+      "line_end": 81,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='re', ctx=Load()), attr='compile', ctx=Load()), args=[JoinedStr(values=[Constant(value='(?x)\\n    # a server started with an explicit bind: app.run(host=),\\n    # uvicorn.run(..., host=), serve(host=)\\n      (?:\\\\.(?:run|serve|bind|listen|create_server)\\\\s*\\\\(\\n         [^)\\\\n]{0,200}?host\\\\s*=\\\\s*[\\'\"](?P<host>'), FormattedValue(value=Name(id='_ADDR', ctx=Load()), conversion=-1), Constant(value=')[\\'\"])\\n    # socket-style bind/listen on an (\"addr\", port) tuple\\n    | (?:\\\\.(?:bind|listen|create_server)\\\\s*\\\\(\\\\s*\\\\(\\\\s*[\\'\"](?P<tuple>'), FormattedValue(value=Name(id='_ADDR', ctx=Load()), conversion=-1), Constant(value=')[\\'\"])\\n    # a declared listen address constant, at statement position\\n    | (?:^[^\\\\S\\\\n]*(?:self\\\\.)?\\n         (?:LISTEN_ADDRESS|BIND_ADDRESS|BIND_HOST|SERVER_HOST|HOST)\\\\b\\n         [^=\\\\n]{0,40}=\\\\s*[\\'\"](?P<const>'), FormattedValue(value=Name(id='_ADDR', ctx=Load()), conversion=-1), Constant(value=')[\\'\"])\\n    # compose/K8s published port mapping\\n    | (?:^\\\\s*-\\\\s*[\\'\"]?(?P<port>\\\\d{2,5}):\\\\d{2,5}[\\'\"]?\\\\s*$)\\n    # a Dockerfile rewriting the bind at build time\\n    | (?:sed\\\\s+-i\\\\s+[\\'\"]?s/(?P<from>[0-9.]+)/(?P<to>[0-9.]+)/)\\n    ')]), Attribute(value=Name(id='re', ctx=Load()), attr='MULTILINE', ctx=Load())], keywords=[])",
+      "rendered": "re.compile(source_template_66_4, re.MULTILINE)"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='_net', ctx=Load()), attr='is_loopback_host', ctx=Load()), args=[Name(id='host', ctx=Load())], keywords=[]), Call(func=Name(id='bool', ctx=Load()), args=[Call(func=Attribute(value=Name(id='_net', ctx=Load()), attr='ip_literal', ctx=Load()), args=[Name(id='host', ctx=Load())], keywords=[])], keywords=[])])",
+      "rendered": "_net.is_loopback_host(host) or bool(_net.ip_literal(host))"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=BoolOp(op=Or(), values=[Attribute(value=Name(id='f', ctx=Load()), attr='code_snippet', ctx=Load()), Constant(value='')]), attr='strip', ctx=Load()), args=[], keywords=[])",
+      "rendered": "(f.code_snippet or '').strip()"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='text', ctx=Load())",
+      "rendered": "text"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_redact_source', ctx=Load()), args=[Name(id='text', ctx=Load()), Attribute(value=Name(id='f', ctx=Load()), attr='file', ctx=Load())], keywords=[keyword(arg='stage', value=Constant(value='s8'))])",
+      "rendered": "_redact_source(text, f.file, stage='s8')"
+    },
+    {
+      "line_start": 98,
+      "line_end": 98,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_read_range', ctx=Load()), args=[Name(id='repo_root', ctx=Load()), Attribute(value=Name(id='f', ctx=Load()), attr='file', ctx=Load()), Attribute(value=Name(id='f', ctx=Load()), attr='line_start', ctx=Load()), Attribute(value=Name(id='f', ctx=Load()), attr='line_end', ctx=Load())], keywords=[])",
+      "rendered": "_read_range(repo_root, f.file, f.line_start, f.line_end)"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='include_decorators', ctx=Load())",
+      "rendered": "include_decorators"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_decorator_lines', ctx=Load()), args=[Name(id='repo_root', ctx=Load()), Attribute(value=Name(id='f', ctx=Load()), attr='file', ctx=Load()), Attribute(value=Name(id='f', ctx=Load()), attr='line_start', ctx=Load())], keywords=[])",
+      "rendered": "_decorator_lines(repo_root, f.file, f.line_start)"
+    },
+    {
+      "line_start": 102,
+      "line_end": 102,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Name(id='prologue', ctx=Load()), Compare(left=Call(func=Attribute(value=Subscript(value=Call(func=Attribute(value=Name(id='prologue', ctx=Load()), attr='rsplit', ctx=Load()), args=[Constant(value='\\n'), Constant(value=1)], keywords=[]), slice=UnaryOp(op=USub(), operand=Constant(value=1)), ctx=Load()), attr='strip', ctx=Load()), args=[], keywords=[]), ops=[NotIn()], comparators=[Name(id='text', ctx=Load())])])",
+      "rendered": "prologue and prologue.rsplit(source_literal_102_40, 1)[-1].strip() not in text"
+    },
+    {
+      "line_start": 103,
+      "line_end": 103,
+      "column": 19,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='text', ctx=Load()), body=JoinedStr(values=[FormattedValue(value=Name(id='prologue', ctx=Load()), conversion=-1), Constant(value='\\n'), FormattedValue(value=Name(id='text', ctx=Load()), conversion=-1)]), orelse=Name(id='prologue', ctx=Load()))",
+      "rendered": "source_template_103_19 if text else prologue"
+    },
+    {
+      "line_start": 104,
+      "line_end": 104,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='text', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Name(id='MAX_SNIPPET_CHARS', ctx=Load())])",
+      "rendered": "len(text) > MAX_SNIPPET_CHARS"
+    },
+    {
+      "line_start": 105,
+      "line_end": 105,
+      "column": 15,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Subscript(value=Name(id='text', ctx=Load()), slice=Slice(upper=Name(id='MAX_SNIPPET_CHARS', ctx=Load())), ctx=Load()), op=Add(), right=Constant(value='\\n… (snippet truncated)'))",
+      "rendered": "text[:MAX_SNIPPET_CHARS] + source_literal_105_42"
+    },
+    {
+      "line_start": 106,
+      "line_end": 106,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='text', ctx=Load())",
+      "rendered": "text"
+    },
+    {
+      "line_start": 113,
+      "line_end": 113,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Name(id='Path', ctx=Load()), args=[Name(id='repo_root', ctx=Load())], keywords=[]), attr='resolve', ctx=Load()), args=[], keywords=[])",
+      "rendered": "Path(repo_root).resolve()"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=BinOp(left=Name(id='root', ctx=Load()), op=Div(), right=Name(id='file', ctx=Load())), attr='resolve', ctx=Load()), args=[], keywords=[])",
+      "rendered": "(root / file).resolve()"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='target', ctx=Load()), attr='relative_to', ctx=Load()), args=[Name(id='root', ctx=Load())], keywords=[])",
+      "rendered": "target.relative_to(root)"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='target', ctx=Load()), attr='stat', ctx=Load()), args=[], keywords=[])",
+      "rendered": "target.stat()"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='S_ISREG', ctx=Load()), args=[Attribute(value=Name(id='st', ctx=Load()), attr='st_mode', ctx=Load())], keywords=[]))",
+      "rendered": "not S_ISREG(st.st_mode)"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 19,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 120,
+      "line_end": 120,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='list', ctx=Load()), args=[Call(func=Name(id='_lines_cached', ctx=Load()), args=[Call(func=Name(id='str', ctx=Load()), args=[Name(id='target', ctx=Load())], keywords=[]), Attribute(value=Name(id='st', ctx=Load()), attr='st_mtime_ns', ctx=Load()), Attribute(value=Name(id='st', ctx=Load()), attr='st_size', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "list(_lines_cached(str(target), st.st_mtime_ns, st.st_size))"
+    },
+    {
+      "line_start": 121,
+      "line_end": 121,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='OSError', ctx=Load()), Name(id='ValueError', ctx=Load()), Name(id='RuntimeError', ctx=Load())], ctx=Load())",
+      "rendered": "(OSError, ValueError, RuntimeError)"
+    },
+    {
+      "line_start": 122,
+      "line_end": 122,
+      "column": 15,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 1,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='lru_cache', ctx=Load()), args=[], keywords=[keyword(arg='maxsize', value=Constant(value=256))])",
+      "rendered": "lru_cache(maxsize=256)"
+    },
+    {
+      "line_start": 129,
+      "line_end": 130,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='tuple', ctx=Load()), args=[Call(func=Name(id='split_lines', ctx=Load()), args=[Call(func=Attribute(value=Call(func=Name(id='Path', ctx=Load()), args=[Name(id='path', ctx=Load())], keywords=[]), attr='read_text', ctx=Load()), args=[], keywords=[keyword(arg='encoding', value=Constant(value='utf-8')), keyword(arg='errors', value=Constant(value='replace'))])], keywords=[])], keywords=[])",
+      "rendered": "tuple(split_lines(Path(path).read_text(encoding='utf-8', errors='replace')))"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_file_lines', ctx=Load()), args=[Name(id='repo_root', ctx=Load()), Name(id='file', ctx=Load())], keywords=[])",
+      "rendered": "_file_lines(repo_root, file)"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='lines', ctx=Load()))",
+      "rendered": "not lines"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value='')",
+      "rendered": "''"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='max', ctx=Load()), args=[BinOp(left=Name(id='start', ctx=Load()), op=Sub(), right=Constant(value=1)), Constant(value=0)], keywords=[])",
+      "rendered": "max(start - 1, 0)"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='max', ctx=Load()), args=[BoolOp(op=Or(), values=[Name(id='end', ctx=Load()), Name(id='start', ctx=Load())]), Name(id='start', ctx=Load())], keywords=[])",
+      "rendered": "max(end or start, start)"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_redact_source', ctx=Load()), args=[Call(func=Attribute(value=Constant(value='\\n'), attr='join', ctx=Load()), args=[Subscript(value=Name(id='lines', ctx=Load()), slice=Slice(lower=Name(id='lo', ctx=Load()), upper=Name(id='hi', ctx=Load())), ctx=Load())], keywords=[]), Name(id='file', ctx=Load())], keywords=[keyword(arg='stage', value=Constant(value='s8'))])",
+      "rendered": "_redact_source(source_literal_141_26.join(lines[lo:hi]), file, stage='s8')"
+    },
+    {
+      "line_start": 146,
+      "line_end": 146,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='start', ctx=Load()), ops=[LtE()], comparators=[Constant(value=1)])",
+      "rendered": "start <= 1"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value='')",
+      "rendered": "''"
+    },
+    {
+      "line_start": 148,
+      "line_end": 148,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_file_lines', ctx=Load()), args=[Name(id='repo_root', ctx=Load()), Name(id='file', ctx=Load())], keywords=[])",
+      "rendered": "_file_lines(repo_root, file)"
+    },
+    {
+      "line_start": 149,
+      "line_end": 149,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='lines', ctx=Load()))",
+      "rendered": "not lines"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value='')",
+      "rendered": "''"
+    },
+    {
+      "line_start": 151,
+      "line_end": 151,
+      "column": 24,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 152,
+      "line_end": 152,
+      "column": 12,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 153,
+      "line_end": 153,
+      "column": 8,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Name(id='min', ctx=Load()), args=[BinOp(left=Name(id='start', ctx=Load()), op=Sub(), right=Constant(value=1)), Call(func=Name(id='len', ctx=Load()), args=[Name(id='lines', ctx=Load())], keywords=[])], keywords=[]), op=Sub(), right=Constant(value=1))",
+      "rendered": "min(start - 1, len(lines)) - 1"
+    },
+    {
+      "line_start": 154,
+      "line_end": 154,
+      "column": 10,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='i', ctx=Load()), ops=[GtE()], comparators=[Constant(value=0)]), Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='picked', ctx=Load())], keywords=[]), ops=[Lt()], comparators=[Name(id='MAX_DECORATOR_LINES', ctx=Load())])])",
+      "rendered": "i >= 0 and len(picked) < MAX_DECORATOR_LINES"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='_ANNOTATION_RX', ctx=Load()), attr='match', ctx=Load()), args=[Subscript(value=Name(id='lines', ctx=Load()), slice=Name(id='i', ctx=Load()), ctx=Load())], keywords=[]))",
+      "rendered": "not _ANNOTATION_RX.match(lines[i])"
+    },
+    {
+      "line_start": 157,
+      "line_end": 157,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='total', ctx=Store()), op=Add(), value=BinOp(left=Call(func=Name(id='len', ctx=Load()), args=[Subscript(value=Name(id='lines', ctx=Load()), slice=Name(id='i', ctx=Load()), ctx=Load())], keywords=[]), op=Add(), right=Constant(value=1)))",
+      "rendered": "total += len(lines[i]) + 1"
+    },
+    {
+      "line_start": 158,
+      "line_end": 158,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='total', ctx=Load()), ops=[Gt()], comparators=[Name(id='MAX_PROLOGUE_CHARS', ctx=Load())])",
+      "rendered": "total > MAX_PROLOGUE_CHARS"
+    },
+    {
+      "line_start": 161,
+      "line_end": 161,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='picked', ctx=Load()), attr='append', ctx=Load()), args=[Subscript(value=Name(id='lines', ctx=Load()), slice=Name(id='i', ctx=Load()), ctx=Load())], keywords=[])",
+      "rendered": "picked.append(lines[i])"
+    },
+    {
+      "line_start": 162,
+      "line_end": 162,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='i', ctx=Store()), op=Sub(), value=Constant(value=1))",
+      "rendered": "i -= 1"
+    },
+    {
+      "line_start": 163,
+      "line_end": 163,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='picked', ctx=Load()))",
+      "rendered": "not picked"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value='')",
+      "rendered": "''"
+    },
+    {
+      "line_start": 166,
+      "line_end": 166,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_redact_source', ctx=Load()), args=[Call(func=Attribute(value=Constant(value='\\n'), attr='join', ctx=Load()), args=[Call(func=Name(id='reversed', ctx=Load()), args=[Name(id='picked', ctx=Load())], keywords=[])], keywords=[]), Name(id='file', ctx=Load())], keywords=[keyword(arg='stage', value=Constant(value='s8'))])",
+      "rendered": "_redact_source(source_literal_166_26.join(reversed(picked)), file, stage='s8')"
+    },
+    {
+      "line_start": 172,
+      "line_end": 172,
+      "column": 47,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 173,
+      "line_end": 173,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='zip', ctx=Load()), args=[Name(id='labels', ctx=Load()), Name(id='findings', ctx=Load())], keywords=[])",
+      "rendered": "zip(labels, findings)"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Name(id='groups', ctx=Load()), attr='setdefault', ctx=Load()), args=[Tuple(elts=[Attribute(value=Name(id='f', ctx=Load()), attr='file', ctx=Load()), Attribute(value=Name(id='f', ctx=Load()), attr='line_start', ctx=Load())], ctx=Load()), List(elts=[], ctx=Load())], keywords=[]), attr='append', ctx=Load()), args=[Name(id='lbl', ctx=Load())], keywords=[])",
+      "rendered": "groups.setdefault((f.file, f.line_start), []).append(lbl)"
+    },
+    {
+      "line_start": 175,
+      "line_end": 176,
+      "column": 11,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=JoinedStr(values=[FormattedValue(value=Call(func=Attribute(value=Constant(value=', '), attr='join', ctx=Load()), args=[Name(id='ids', ctx=Load())], keywords=[]), conversion=-1), Constant(value=' are all at '), FormattedValue(value=Name(id='file', ctx=Load()), conversion=-1), Constant(value=':'), FormattedValue(value=Name(id='line', ctx=Load()), conversion=-1), Constant(value=' — ONE code fact')]), generators=[comprehension(target=Tuple(elts=[Tuple(elts=[Name(id='file', ctx=Store()), Name(id='line', ctx=Store())], ctx=Store()), Name(id='ids', ctx=Store())], ctx=Store()), iter=Call(func=Attribute(value=Name(id='groups', ctx=Load()), attr='items', ctx=Load()), args=[], keywords=[]), ifs=[Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='ids', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Constant(value=1)])], is_async=0)])",
+      "rendered": "[source_template_175_12 for (file, line), ids in groups.items() if len(ids) > 1]"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='list', ctx=Load()), args=[Call(func=Attribute(value=Name(id='_USER_RX', ctx=Load()), attr='finditer', ctx=Load()), args=[Name(id='text', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "list(_USER_RX.finditer(text))"
+    },
+    {
+      "line_start": 183,
+      "line_end": 183,
+      "column": 12,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='m', ctx=Load()), generators=[comprehension(target=Name(id='m', ctx=Store()), iter=Name(id='matches', ctx=Load()), ifs=[Call(func=Attribute(value=Name(id='_USER_TOKEN_RX', ctx=Load()), attr='match', ctx=Load()), args=[Call(func=Attribute(value=Name(id='m', ctx=Load()), attr='group', ctx=Load()), args=[Constant(value='user')], keywords=[])], keywords=[])], is_async=0)])",
+      "rendered": "[m for m in matches if _USER_TOKEN_RX.match(m.group('user'))]"
+    },
+    {
+      "line_start": 184,
+      "line_end": 184,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Name(id='matches', ctx=Load()), UnaryOp(op=Not(), operand=Name(id='users', ctx=Load()))])",
+      "rendered": "matches and (not users)"
+    },
+    {
+      "line_start": 185,
+      "line_end": 185,
+      "column": 15,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 186,
+      "line_end": 186,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='users', ctx=Load()))",
+      "rendered": "not users"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 15,
+      "kind": "List",
+      "original_ast": "List(elts=[JoinedStr(values=[FormattedValue(value=Name(id='rel', ctx=Load()), conversion=-1), Constant(value=' declares no USER directive')])], ctx=Load())",
+      "rendered": "[source_template_187_16]"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='list', ctx=Load()), args=[Call(func=Attribute(value=Name(id='_FROM_RX', ctx=Load()), attr='finditer', ctx=Load()), args=[Name(id='text', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "list(_FROM_RX.finditer(text))"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 16,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='froms', ctx=Load()), body=Call(func=Attribute(value=Subscript(value=Name(id='froms', ctx=Load()), slice=UnaryOp(op=USub(), operand=Constant(value=1)), ctx=Load()), attr='start', ctx=Load()), args=[], keywords=[]), orelse=UnaryOp(op=USub(), operand=Constant(value=1)))",
+      "rendered": "froms[-1].start() if froms else -1"
+    },
+    {
+      "line_start": 190,
+      "line_end": 190,
+      "column": 12,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='m', ctx=Load()), generators=[comprehension(target=Name(id='m', ctx=Store()), iter=Name(id='users', ctx=Load()), ifs=[Compare(left=Call(func=Attribute(value=Name(id='m', ctx=Load()), attr='start', ctx=Load()), args=[], keywords=[]), ops=[Gt()], comparators=[Name(id='last_from', ctx=Load())])], is_async=0)])",
+      "rendered": "[m for m in users if m.start() > last_from]"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='final', ctx=Load())",
+      "rendered": "final"
+    },
+    {
+      "line_start": 192,
+      "line_end": 193,
+      "column": 15,
+      "kind": "List",
+      "original_ast": "List(elts=[JoinedStr(values=[FormattedValue(value=Name(id='rel', ctx=Load()), conversion=-1), Constant(value=' final stage runs as USER '), FormattedValue(value=Call(func=Attribute(value=Subscript(value=Name(id='final', ctx=Load()), slice=UnaryOp(op=USub(), operand=Constant(value=1)), ctx=Load()), attr='group', ctx=Load()), args=[Constant(value='user')], keywords=[]), conversion=-1), Constant(value=' (last USER directive after the last FROM)')])], ctx=Load())",
+      "rendered": "[source_template_192_16]"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Constant(value=', '), attr='join', ctx=Load()), args=[Call(func=Attribute(value=Name(id='dict', ctx=Load()), attr='fromkeys', ctx=Load()), args=[GeneratorExp(elt=Call(func=Attribute(value=Name(id='m', ctx=Load()), attr='group', ctx=Load()), args=[Constant(value='user')], keywords=[]), generators=[comprehension(target=Name(id='m', ctx=Store()), iter=Name(id='users', ctx=Load()), ifs=[], is_async=0)])], keywords=[])], keywords=[])",
+      "rendered": "', '.join(dict.fromkeys((m.group('user') for m in users)))"
+    },
+    {
+      "line_start": 195,
+      "line_end": 196,
+      "column": 11,
+      "kind": "List",
+      "original_ast": "List(elts=[JoinedStr(values=[FormattedValue(value=Name(id='rel', ctx=Load()), conversion=-1), Constant(value=' declares no USER directive after its last FROM (earlier build stage(s) declare: '), FormattedValue(value=Name(id='earlier', ctx=Load()), conversion=-1), Constant(value=')')])], ctx=Load())",
+      "rendered": "[source_template_195_12]"
+    },
+    {
+      "line_start": 202,
+      "line_end": 202,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='Path', ctx=Load()), args=[Attribute(value=Name(id='ctx', ctx=Load()), attr='repo_root', ctx=Load())], keywords=[])",
+      "rendered": "Path(ctx.repo_root)"
+    },
+    {
+      "line_start": 203,
+      "line_end": 203,
+      "column": 23,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 205,
+      "line_end": 206,
+      "column": 12,
+      "kind": "List",
+      "original_ast": "List(elts=[Constant(value='Dockerfile'), Constant(value='docker-compose.yml'), Constant(value='docker-compose.yaml'), Constant(value='compose.yml'), Constant(value='Makefile')], ctx=Load())",
+      "rendered": "['Dockerfile', 'docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'Makefile']"
+    },
+    {
+      "line_start": 207,
+      "line_end": 207,
+      "column": 4,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='names', ctx=Store()), op=Add(), value=Subscript(value=Call(func=Name(id='sorted', ctx=Load()), args=[SetComp(elt=Attribute(value=Name(id='f', ctx=Load()), attr='file', ctx=Load()), generators=[comprehension(target=Name(id='f', ctx=Store()), iter=Name(id='findings', ctx=Load()), ifs=[], is_async=0)])], keywords=[]), slice=Slice(upper=Constant(value=60)), ctx=Load()))",
+      "rendered": "names += sorted({f.file for f in findings})[:60]"
+    },
+    {
+      "line_start": 208,
+      "line_end": 208,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='dict', ctx=Load()), attr='fromkeys', ctx=Load()), args=[Name(id='names', ctx=Load())], keywords=[])",
+      "rendered": "dict.fromkeys(names)"
+    },
+    {
+      "line_start": 210,
+      "line_end": 210,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=BinOp(left=Name(id='root', ctx=Load()), op=Div(), right=Name(id='rel', ctx=Load())), attr='resolve', ctx=Load()), args=[], keywords=[])",
+      "rendered": "(root / rel).resolve()"
+    },
+    {
+      "line_start": 211,
+      "line_end": 211,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='target', ctx=Load()), attr='relative_to', ctx=Load()), args=[Call(func=Attribute(value=Name(id='root', ctx=Load()), attr='resolve', ctx=Load()), args=[], keywords=[])], keywords=[])",
+      "rendered": "target.relative_to(root.resolve())"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 15,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='target', ctx=Load()), attr='is_file', ctx=Load()), args=[], keywords=[]))",
+      "rendered": "not target.is_file()"
+    },
+    {
+      "line_start": 214,
+      "line_end": 214,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='target', ctx=Load()), attr='read_text', ctx=Load()), args=[], keywords=[keyword(arg='encoding', value=Constant(value='utf-8')), keyword(arg='errors', value=Constant(value='replace'))])",
+      "rendered": "target.read_text(encoding='utf-8', errors='replace')"
+    },
+    {
+      "line_start": 215,
+      "line_end": 215,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='OSError', ctx=Load()), Name(id='ValueError', ctx=Load()), Name(id='RuntimeError', ctx=Load())], ctx=Load())",
+      "rendered": "(OSError, ValueError, RuntimeError)"
+    },
+    {
+      "line_start": 217,
+      "line_end": 217,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Name(id='user_facts', ctx=Load()), Call(func=Name(id='_is_dockerfile_name', ctx=Load()), args=[Attribute(value=Call(func=Name(id='Path', ctx=Load()), args=[Name(id='rel', ctx=Load())], keywords=[]), attr='name', ctx=Load())], keywords=[])])",
+      "rendered": "user_facts and _is_dockerfile_name(Path(rel).name)"
+    },
+    {
+      "line_start": 218,
+      "line_end": 218,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='facts', ctx=Store()), op=Add(), value=Call(func=Name(id='_user_directive_facts', ctx=Load()), args=[Name(id='rel', ctx=Load()), Name(id='text', ctx=Load())], keywords=[]))",
+      "rendered": "facts += _user_directive_facts(rel, text)"
+    },
+    {
+      "line_start": 219,
+      "line_end": 219,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_BIND_RX', ctx=Load()), attr='finditer', ctx=Load()), args=[Name(id='text', ctx=Load())], keywords=[])",
+      "rendered": "_BIND_RX.finditer(text)"
+    },
+    {
+      "line_start": 220,
+      "line_end": 220,
+      "column": 19,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='m', ctx=Load()), attr='group', ctx=Load()), args=[Constant(value='host')], keywords=[]), Call(func=Attribute(value=Name(id='m', ctx=Load()), attr='group', ctx=Load()), args=[Constant(value='tuple')], keywords=[]), Call(func=Attribute(value=Name(id='m', ctx=Load()), attr='group', ctx=Load()), args=[Constant(value='const')], keywords=[])])",
+      "rendered": "m.group('host') or m.group('tuple') or m.group('const')"
+    },
+    {
+      "line_start": 221,
+      "line_end": 221,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='host', ctx=Load())",
+      "rendered": "host"
+    },
+    {
+      "line_start": 222,
+      "line_end": 222,
+      "column": 19,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='_real_host', ctx=Load()), args=[Name(id='host', ctx=Load())], keywords=[]))",
+      "rendered": "not _real_host(host)"
+    },
+    {
+      "line_start": 224,
+      "line_end": 224,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_net', ctx=Load()), attr='is_loopback_host', ctx=Load()), args=[Name(id='host', ctx=Load())], keywords=[])",
+      "rendered": "_net.is_loopback_host(host)"
+    },
+    {
+      "line_start": 225,
+      "line_end": 228,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='facts', ctx=Load()), attr='append', ctx=Load()), args=[BinOp(left=JoinedStr(values=[FormattedValue(value=Name(id='rel', ctx=Load()), conversion=-1), Constant(value=' binds '), FormattedValue(value=Name(id='host', ctx=Load()), conversion=-1)]), op=Add(), right=IfExp(test=Name(id='loop', ctx=Load()), body=Constant(value=' (LOOPBACK — not remotely reachable as written)'), orelse=Constant(value=' (all interfaces — remotely reachable)')))], keywords=[])",
+      "rendered": "facts.append(source_template_226_20 + (' (LOOPBACK — not remotely reachable as written)' if loop else ' (all interfaces — remotely reachable)'))"
+    },
+    {
+      "line_start": 229,
+      "line_end": 229,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='m', ctx=Load()), attr='group', ctx=Load()), args=[Constant(value='port')], keywords=[])",
+      "rendered": "m.group('port')"
+    },
+    {
+      "line_start": 231,
+      "line_end": 231,
+      "column": 19,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Constant(value='compose'), ops=[In()], comparators=[Call(func=Attribute(value=Attribute(value=Call(func=Name(id='Path', ctx=Load()), args=[Name(id='rel', ctx=Load())], keywords=[]), attr='name', ctx=Load()), attr='lower', ctx=Load()), args=[], keywords=[])])",
+      "rendered": "'compose' in Path(rel).name.lower()"
+    },
+    {
+      "line_start": 232,
+      "line_end": 233,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='facts', ctx=Load()), attr='append', ctx=Load()), args=[JoinedStr(values=[FormattedValue(value=Name(id='rel', ctx=Load()), conversion=-1), Constant(value=' publishes port '), FormattedValue(value=Call(func=Attribute(value=Name(id='m', ctx=Load()), attr='group', ctx=Load()), args=[Constant(value='port')], keywords=[]), conversion=-1), Constant(value=' to the host')])], keywords=[])",
+      "rendered": "facts.append(source_template_233_24)"
+    },
+    {
+      "line_start": 234,
+      "line_end": 234,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='m', ctx=Load()), attr='group', ctx=Load()), args=[Constant(value='to')], keywords=[])",
+      "rendered": "m.group('to')"
+    },
+    {
+      "line_start": 235,
+      "line_end": 235,
+      "column": 19,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Call(func=Name(id='_real_host', ctx=Load()), args=[Call(func=Attribute(value=Name(id='m', ctx=Load()), attr='group', ctx=Load()), args=[Constant(value='from')], keywords=[])], keywords=[]), Call(func=Name(id='_real_host', ctx=Load()), args=[Call(func=Attribute(value=Name(id='m', ctx=Load()), attr='group', ctx=Load()), args=[Constant(value='to')], keywords=[])], keywords=[])])",
+      "rendered": "_real_host(m.group('from')) and _real_host(m.group('to'))"
+    },
+    {
+      "line_start": 236,
+      "line_end": 237,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='facts', ctx=Load()), attr='append', ctx=Load()), args=[JoinedStr(values=[FormattedValue(value=Name(id='rel', ctx=Load()), conversion=-1), Constant(value=' rewrites the bind '), FormattedValue(value=Call(func=Attribute(value=Name(id='m', ctx=Load()), attr='group', ctx=Load()), args=[Constant(value='from')], keywords=[]), conversion=-1), Constant(value=' -> '), FormattedValue(value=Call(func=Attribute(value=Name(id='m', ctx=Load()), attr='group', ctx=Load()), args=[Constant(value='to')], keywords=[]), conversion=-1)])], keywords=[])",
+      "rendered": "facts.append(source_template_236_33)"
+    },
+    {
+      "line_start": 238,
+      "line_end": 238,
+      "column": 11,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Call(func=Name(id='list', ctx=Load()), args=[Call(func=Attribute(value=Name(id='dict', ctx=Load()), attr='fromkeys', ctx=Load()), args=[Name(id='facts', ctx=Load())], keywords=[])], keywords=[]), slice=Slice(upper=Constant(value=12)), ctx=Load())",
+      "rendered": "list(dict.fromkeys(facts))[:12]"
+    }
+  ],
+  "calls": [
+    {
+      "line": 38,
+      "end_line": 42,
+      "callee": "re.compile",
+      "enclosing": "module initialization",
+      "expression": "re.compile(r\"\"\"(?x)\n    ^\\s*(?:\n        @\\s*[A-Za-z_][\\w.]*(?:\\(.*\\))?   # decorator / annotation, whole line\n      | \\#?\\[[^\\]\\s][^\\]]*\\]             # attribute, alone on its line\n    )\\s*$\"\"\")"
+    },
+    {
+      "line": 45,
+      "end_line": 45,
+      "callee": "re.compile",
+      "enclosing": "module initialization",
+      "expression": "re.compile(r\"^[^\\S\\n]*FROM[^\\S\\n]\", re.IGNORECASE | re.MULTILINE)"
+    },
+    {
+      "line": 46,
+      "end_line": 46,
+      "callee": "re.compile",
+      "enclosing": "module initialization",
+      "expression": "re.compile(r\"^[^\\S\\n]*USER[^\\S\\n]+(?P<user>\\S+)\", re.IGNORECASE | re.MULTILINE)"
+    },
+    {
+      "line": 49,
+      "end_line": 49,
+      "callee": "re.compile",
+      "enclosing": "module initialization",
+      "expression": "re.compile(r\"^[A-Za-z0-9_.:\\-]{1,64}$\")"
+    },
+    {
+      "line": 65,
+      "end_line": 81,
+      "callee": "re.compile",
+      "enclosing": "module initialization",
+      "expression": "re.compile(\n    rf\"\"\"(?x)\n    # a server started with an explicit bind: app.run(host=),\n    # uvicorn.run(..., host=), serve(host=)\n      (?:\\.(?:run|serve|bind|listen|create_server)\\s*\\(\n         [^)\\n]{{0,200}}?host\\s*=\\s*['\"](?P<host>{_ADDR})['\"])\n    # socket-style bind/listen on an (\"addr\", port) tuple\n    | (?:\\.(?:bind|listen|create_server)\\s*\\(\\s*\\(\\s*['\"](?P<tuple>{_ADDR})['\"])\n    # a declared listen address constant, at statement position\n    | (?:^[^\\S\\n]*(?:self\\.)?\n         (?:LISTEN_ADDRESS|BIND_ADDRESS|BIND_HOST|SERVER_HOST|HOST)\\b\n         [^=\\n]{{0,40}}=\\s*['\"](?P<const>{_ADDR})['\"])\n    # compose/K8s published port mapping\n    | (?:^\\s*-\\s*['\"]?(?P<port>\\d{{2,5}}):\\d{{2,5}}['\"]?\\s*$)\n    # a Dockerfile rewriting the bind at build time\n    | (?:sed\\s+-i\\s+['\"]?s/(?P<from>[0-9.]+)/(?P<to>[0-9.]+)/)\n    \"\"\", re.MULTILINE)"
+    },
+    {
+      "line": 126,
+      "end_line": 126,
+      "callee": "lru_cache",
+      "enclosing": "_lines_cached",
+      "expression": "lru_cache(maxsize=256)"
+    },
+    {
+      "line": 54,
+      "end_line": 54,
+      "callee": "name.lower",
+      "enclosing": "_is_dockerfile_name",
+      "expression": "name.lower()"
+    },
+    {
+      "line": 58,
+      "end_line": 58,
+      "callee": "low.partition",
+      "enclosing": "_is_dockerfile_name",
+      "expression": "low.partition(\".\")"
+    },
+    {
+      "line": 93,
+      "end_line": 93,
+      "callee": "(f.code_snippet or '').strip",
+      "enclosing": "snippet_for",
+      "expression": "(f.code_snippet or \"\").strip()"
+    },
+    {
+      "line": 129,
+      "end_line": 130,
+      "callee": "tuple",
+      "enclosing": "_lines_cached",
+      "expression": "tuple(split_lines(\n        Path(path).read_text(encoding=\"utf-8\", errors=\"replace\")))"
+    },
+    {
+      "line": 135,
+      "end_line": 135,
+      "callee": "_file_lines",
+      "enclosing": "_read_range",
+      "expression": "_file_lines(repo_root, file)"
+    },
+    {
+      "line": 138,
+      "end_line": 138,
+      "callee": "max",
+      "enclosing": "_read_range",
+      "expression": "max(start - 1, 0)"
+    },
+    {
+      "line": 139,
+      "end_line": 139,
+      "callee": "max",
+      "enclosing": "_read_range",
+      "expression": "max(end or start, start)"
+    },
+    {
+      "line": 141,
+      "end_line": 141,
+      "callee": "_redact_source",
+      "enclosing": "_read_range",
+      "expression": "_redact_source(\"\\n\".join(lines[lo:hi]), file, stage=\"s8\")"
+    },
+    {
+      "line": 148,
+      "end_line": 148,
+      "callee": "_file_lines",
+      "enclosing": "_decorator_lines",
+      "expression": "_file_lines(repo_root, file)"
+    },
+    {
+      "line": 166,
+      "end_line": 166,
+      "callee": "_redact_source",
+      "enclosing": "_decorator_lines",
+      "expression": "_redact_source(\"\\n\".join(reversed(picked)), file, stage=\"s8\")"
+    },
+    {
+      "line": 173,
+      "end_line": 173,
+      "callee": "zip",
+      "enclosing": "same_location_groups",
+      "expression": "zip(labels, findings)"
+    },
+    {
+      "line": 181,
+      "end_line": 181,
+      "callee": "list",
+      "enclosing": "_user_directive_facts",
+      "expression": "list(_USER_RX.finditer(text))"
+    },
+    {
+      "line": 188,
+      "end_line": 188,
+      "callee": "list",
+      "enclosing": "_user_directive_facts",
+      "expression": "list(_FROM_RX.finditer(text))"
+    },
+    {
+      "line": 194,
+      "end_line": 194,
+      "callee": "', '.join",
+      "enclosing": "_user_directive_facts",
+      "expression": "\", \".join(dict.fromkeys(m.group(\"user\") for m in users))"
+    },
+    {
+      "line": 202,
+      "end_line": 202,
+      "callee": "Path",
+      "enclosing": "exposure_facts",
+      "expression": "Path(ctx.repo_root)"
+    },
+    {
+      "line": 208,
+      "end_line": 208,
+      "callee": "dict.fromkeys",
+      "enclosing": "exposure_facts",
+      "expression": "dict.fromkeys(names)"
+    },
+    {
+      "line": 59,
+      "end_line": 59,
+      "callee": "bool",
+      "enclosing": "_is_dockerfile_name",
+      "expression": "bool(dot)"
+    },
+    {
+      "line": 86,
+      "end_line": 86,
+      "callee": "_net.is_loopback_host",
+      "enclosing": "_real_host",
+      "expression": "_net.is_loopback_host(host)"
+    },
+    {
+      "line": 86,
+      "end_line": 86,
+      "callee": "bool",
+      "enclosing": "_real_host",
+      "expression": "bool(_net.ip_literal(host))"
+    },
+    {
+      "line": 96,
+      "end_line": 96,
+      "callee": "_redact_source",
+      "enclosing": "snippet_for",
+      "expression": "_redact_source(text, f.file, stage=\"s8\")"
+    },
+    {
+      "line": 98,
+      "end_line": 98,
+      "callee": "_read_range",
+      "enclosing": "snippet_for",
+      "expression": "_read_range(repo_root, f.file, f.line_start, f.line_end)"
+    },
+    {
+      "line": 100,
+      "end_line": 100,
+      "callee": "_decorator_lines",
+      "enclosing": "snippet_for",
+      "expression": "_decorator_lines(repo_root, f.file, f.line_start)"
+    },
+    {
+      "line": 104,
+      "end_line": 104,
+      "callee": "len",
+      "enclosing": "snippet_for",
+      "expression": "len(text)"
+    },
+    {
+      "line": 113,
+      "end_line": 113,
+      "callee": "Path(repo_root).resolve",
+      "enclosing": "_file_lines",
+      "expression": "Path(repo_root).resolve()"
+    },
+    {
+      "line": 114,
+      "end_line": 114,
+      "callee": "(root / file).resolve",
+      "enclosing": "_file_lines",
+      "expression": "(root / file).resolve()"
+    },
+    {
+      "line": 115,
+      "end_line": 115,
+      "callee": "target.relative_to",
+      "enclosing": "_file_lines",
+      "expression": "target.relative_to(root)"
+    },
+    {
+      "line": 116,
+      "end_line": 116,
+      "callee": "target.stat",
+      "enclosing": "_file_lines",
+      "expression": "target.stat()"
+    },
+    {
+      "line": 120,
+      "end_line": 120,
+      "callee": "list",
+      "enclosing": "_file_lines",
+      "expression": "list(_lines_cached(str(target), st.st_mtime_ns, st.st_size))"
+    },
+    {
+      "line": 129,
+      "end_line": 130,
+      "callee": "split_lines",
+      "enclosing": "_lines_cached",
+      "expression": "split_lines(\n        Path(path).read_text(encoding=\"utf-8\", errors=\"replace\"))"
+    },
+    {
+      "line": 141,
+      "end_line": 141,
+      "callee": "'\\n'.join",
+      "enclosing": "_read_range",
+      "expression": "\"\\n\".join(lines[lo:hi])"
+    },
+    {
+      "line": 153,
+      "end_line": 153,
+      "callee": "min",
+      "enclosing": "_decorator_lines",
+      "expression": "min(start - 1, len(lines))"
+    },
+    {
+      "line": 161,
+      "end_line": 161,
+      "callee": "picked.append",
+      "enclosing": "_decorator_lines",
+      "expression": "picked.append(lines[i])"
+    },
+    {
+      "line": 166,
+      "end_line": 166,
+      "callee": "'\\n'.join",
+      "enclosing": "_decorator_lines",
+      "expression": "\"\\n\".join(reversed(picked))"
+    },
+    {
+      "line": 174,
+      "end_line": 174,
+      "callee": "groups.setdefault((f.file, f.line_start), []).append",
+      "enclosing": "same_location_groups",
+      "expression": "groups.setdefault((f.file, f.line_start), []).append(lbl)"
+    },
+    {
+      "line": 181,
+      "end_line": 181,
+      "callee": "_USER_RX.finditer",
+      "enclosing": "_user_directive_facts",
+      "expression": "_USER_RX.finditer(text)"
+    },
+    {
+      "line": 188,
+      "end_line": 188,
+      "callee": "_FROM_RX.finditer",
+      "enclosing": "_user_directive_facts",
+      "expression": "_FROM_RX.finditer(text)"
+    },
+    {
+      "line": 189,
+      "end_line": 189,
+      "callee": "froms[-1].start",
+      "enclosing": "_user_directive_facts",
+      "expression": "froms[-1].start()"
+    },
+    {
+      "line": 194,
+      "end_line": 194,
+      "callee": "dict.fromkeys",
+      "enclosing": "_user_directive_facts",
+      "expression": "dict.fromkeys(m.group(\"user\") for m in users)"
+    },
+    {
+      "line": 207,
+      "end_line": 207,
+      "callee": "sorted",
+      "enclosing": "exposure_facts",
+      "expression": "sorted({f.file for f in findings})"
+    },
+    {
+      "line": 219,
+      "end_line": 219,
+      "callee": "_BIND_RX.finditer",
+      "enclosing": "exposure_facts",
+      "expression": "_BIND_RX.finditer(text)"
+    },
+    {
+      "line": 238,
+      "end_line": 238,
+      "callee": "list",
+      "enclosing": "exposure_facts",
+      "expression": "list(dict.fromkeys(facts))"
+    },
+    {
+      "line": 86,
+      "end_line": 86,
+      "callee": "_net.ip_literal",
+      "enclosing": "_real_host",
+      "expression": "_net.ip_literal(host)"
+    },
+    {
+      "line": 117,
+      "end_line": 117,
+      "callee": "S_ISREG",
+      "enclosing": "_file_lines",
+      "expression": "S_ISREG(st.st_mode)"
+    },
+    {
+      "line": 120,
+      "end_line": 120,
+      "callee": "_lines_cached",
+      "enclosing": "_file_lines",
+      "expression": "_lines_cached(str(target), st.st_mtime_ns, st.st_size)"
+    },
+    {
+      "line": 130,
+      "end_line": 130,
+      "callee": "Path(path).read_text",
+      "enclosing": "_lines_cached",
+      "expression": "Path(path).read_text(encoding=\"utf-8\", errors=\"replace\")"
+    },
+    {
+      "line": 153,
+      "end_line": 153,
+      "callee": "len",
+      "enclosing": "_decorator_lines",
+      "expression": "len(lines)"
+    },
+    {
+      "line": 154,
+      "end_line": 154,
+      "callee": "len",
+      "enclosing": "_decorator_lines",
+      "expression": "len(picked)"
+    },
+    {
+      "line": 155,
+      "end_line": 155,
+      "callee": "_ANNOTATION_RX.match",
+      "enclosing": "_decorator_lines",
+      "expression": "_ANNOTATION_RX.match(lines[i])"
+    },
+    {
+      "line": 157,
+      "end_line": 157,
+      "callee": "len",
+      "enclosing": "_decorator_lines",
+      "expression": "len(lines[i])"
+    },
+    {
+      "line": 166,
+      "end_line": 166,
+      "callee": "reversed",
+      "enclosing": "_decorator_lines",
+      "expression": "reversed(picked)"
+    },
+    {
+      "line": 176,
+      "end_line": 176,
+      "callee": "groups.items",
+      "enclosing": "same_location_groups",
+      "expression": "groups.items()"
+    },
+    {
+      "line": 183,
+      "end_line": 183,
+      "callee": "_USER_TOKEN_RX.match",
+      "enclosing": "_user_directive_facts",
+      "expression": "_USER_TOKEN_RX.match(m.group(\"user\"))"
+    },
+    {
+      "line": 210,
+      "end_line": 210,
+      "callee": "(root / rel).resolve",
+      "enclosing": "exposure_facts",
+      "expression": "(root / rel).resolve()"
+    },
+    {
+      "line": 211,
+      "end_line": 211,
+      "callee": "target.relative_to",
+      "enclosing": "exposure_facts",
+      "expression": "target.relative_to(root.resolve())"
+    },
+    {
+      "line": 214,
+      "end_line": 214,
+      "callee": "target.read_text",
+      "enclosing": "exposure_facts",
+      "expression": "target.read_text(encoding=\"utf-8\", errors=\"replace\")"
+    },
+    {
+      "line": 217,
+      "end_line": 217,
+      "callee": "_is_dockerfile_name",
+      "enclosing": "exposure_facts",
+      "expression": "_is_dockerfile_name(Path(rel).name)"
+    },
+    {
+      "line": 218,
+      "end_line": 218,
+      "callee": "_user_directive_facts",
+      "enclosing": "exposure_facts",
+      "expression": "_user_directive_facts(rel, text)"
+    },
+    {
+      "line": 238,
+      "end_line": 238,
+      "callee": "dict.fromkeys",
+      "enclosing": "exposure_facts",
+      "expression": "dict.fromkeys(facts)"
+    },
+    {
+      "line": 102,
+      "end_line": 102,
+      "callee": "prologue.rsplit('\\n', 1)[-1].strip",
+      "enclosing": "snippet_for",
+      "expression": "prologue.rsplit(\"\\n\", 1)[-1].strip()"
+    },
+    {
+      "line": 113,
+      "end_line": 113,
+      "callee": "Path",
+      "enclosing": "_file_lines",
+      "expression": "Path(repo_root)"
+    },
+    {
+      "line": 120,
+      "end_line": 120,
+      "callee": "str",
+      "enclosing": "_file_lines",
+      "expression": "str(target)"
+    },
+    {
+      "line": 174,
+      "end_line": 174,
+      "callee": "groups.setdefault",
+      "enclosing": "same_location_groups",
+      "expression": "groups.setdefault((f.file, f.line_start), [])"
+    },
+    {
+      "line": 175,
+      "end_line": 175,
+      "callee": "', '.join",
+      "enclosing": "same_location_groups",
+      "expression": "', '.join(ids)"
+    },
+    {
+      "line": 176,
+      "end_line": 176,
+      "callee": "len",
+      "enclosing": "same_location_groups",
+      "expression": "len(ids)"
+    },
+    {
+      "line": 183,
+      "end_line": 183,
+      "callee": "m.group",
+      "enclosing": "_user_directive_facts",
+      "expression": "m.group(\"user\")"
+    },
+    {
+      "line": 190,
+      "end_line": 190,
+      "callee": "m.start",
+      "enclosing": "_user_directive_facts",
+      "expression": "m.start()"
+    },
+    {
+      "line": 194,
+      "end_line": 194,
+      "callee": "m.group",
+      "enclosing": "_user_directive_facts",
+      "expression": "m.group(\"user\")"
+    },
+    {
+      "line": 211,
+      "end_line": 211,
+      "callee": "root.resolve",
+      "enclosing": "exposure_facts",
+      "expression": "root.resolve()"
+    },
+    {
+      "line": 212,
+      "end_line": 212,
+      "callee": "target.is_file",
+      "enclosing": "exposure_facts",
+      "expression": "target.is_file()"
+    },
+    {
+      "line": 220,
+      "end_line": 220,
+      "callee": "m.group",
+      "enclosing": "exposure_facts",
+      "expression": "m.group(\"host\")"
+    },
+    {
+      "line": 220,
+      "end_line": 220,
+      "callee": "m.group",
+      "enclosing": "exposure_facts",
+      "expression": "m.group(\"tuple\")"
+    },
+    {
+      "line": 220,
+      "end_line": 220,
+      "callee": "m.group",
+      "enclosing": "exposure_facts",
+      "expression": "m.group(\"const\")"
+    },
+    {
+      "line": 224,
+      "end_line": 224,
+      "callee": "_net.is_loopback_host",
+      "enclosing": "exposure_facts",
+      "expression": "_net.is_loopback_host(host)"
+    },
+    {
+      "line": 225,
+      "end_line": 228,
+      "callee": "facts.append",
+      "enclosing": "exposure_facts",
+      "expression": "facts.append(\n                    f\"{rel} binds {host}\"\n                    + (\" (LOOPBACK — not remotely reachable as written)\"\n                       if loop else \" (all interfaces — remotely reachable)\"))"
+    },
+    {
+      "line": 229,
+      "end_line": 229,
+      "callee": "m.group",
+      "enclosing": "exposure_facts",
+      "expression": "m.group(\"port\")"
+    },
+    {
+      "line": 130,
+      "end_line": 130,
+      "callee": "Path",
+      "enclosing": "_lines_cached",
+      "expression": "Path(path)"
+    },
+    {
+      "line": 192,
+      "end_line": 192,
+      "callee": "final[-1].group",
+      "enclosing": "_user_directive_facts",
+      "expression": "final[-1].group('user')"
+    },
+    {
+      "line": 217,
+      "end_line": 217,
+      "callee": "Path",
+      "enclosing": "exposure_facts",
+      "expression": "Path(rel)"
+    },
+    {
+      "line": 222,
+      "end_line": 222,
+      "callee": "_real_host",
+      "enclosing": "exposure_facts",
+      "expression": "_real_host(host)"
+    },
+    {
+      "line": 234,
+      "end_line": 234,
+      "callee": "m.group",
+      "enclosing": "exposure_facts",
+      "expression": "m.group(\"to\")"
+    },
+    {
+      "line": 231,
+      "end_line": 231,
+      "callee": "Path(rel).name.lower",
+      "enclosing": "exposure_facts",
+      "expression": "Path(rel).name.lower()"
+    },
+    {
+      "line": 232,
+      "end_line": 233,
+      "callee": "facts.append",
+      "enclosing": "exposure_facts",
+      "expression": "facts.append(\n                        f\"{rel} publishes port {m.group('port')} to the host\")"
+    },
+    {
+      "line": 102,
+      "end_line": 102,
+      "callee": "prologue.rsplit",
+      "enclosing": "snippet_for",
+      "expression": "prologue.rsplit(\"\\n\", 1)"
+    },
+    {
+      "line": 235,
+      "end_line": 235,
+      "callee": "_real_host",
+      "enclosing": "exposure_facts",
+      "expression": "_real_host(m.group(\"from\"))"
+    },
+    {
+      "line": 235,
+      "end_line": 235,
+      "callee": "_real_host",
+      "enclosing": "exposure_facts",
+      "expression": "_real_host(m.group(\"to\"))"
+    },
+    {
+      "line": 236,
+      "end_line": 237,
+      "callee": "facts.append",
+      "enclosing": "exposure_facts",
+      "expression": "facts.append(f\"{rel} rewrites the bind \"\n                                 f\"{m.group('from')} -> {m.group('to')}\")"
+    },
+    {
+      "line": 235,
+      "end_line": 235,
+      "callee": "m.group",
+      "enclosing": "exposure_facts",
+      "expression": "m.group(\"from\")"
+    },
+    {
+      "line": 235,
+      "end_line": 235,
+      "callee": "m.group",
+      "enclosing": "exposure_facts",
+      "expression": "m.group(\"to\")"
+    },
+    {
+      "line": 231,
+      "end_line": 231,
+      "callee": "Path",
+      "enclosing": "exposure_facts",
+      "expression": "Path(rel)"
+    },
+    {
+      "line": 233,
+      "end_line": 233,
+      "callee": "m.group",
+      "enclosing": "exposure_facts",
+      "expression": "m.group('port')"
+    },
+    {
+      "line": 237,
+      "end_line": 237,
+      "callee": "m.group",
+      "enclosing": "exposure_facts",
+      "expression": "m.group('from')"
+    },
+    {
+      "line": 237,
+      "end_line": 237,
+      "callee": "m.group",
+      "enclosing": "exposure_facts",
+      "expression": "m.group('to')"
+    }
+  ],
+  "imports": [
+    {
+      "line": 17,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "import re",
+      "targets": [
+        "re"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "from functools import lru_cache",
+      "targets": [
+        "functools",
+        "functools.lru_cache"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "from pathlib import Path",
+      "targets": [
+        "pathlib",
+        "pathlib.Path"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "from stat import S_ISREG",
+      "targets": [
+        "stat",
+        "stat.S_ISREG"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 24,
+      "source_expression": "from vvaharness.detect.matcher import split_lines",
+      "targets": [
+        "vvaharness.detect.matcher",
+        "vvaharness.detect.matcher.split_lines"
+      ],
+      "local_source_paths": [
+        "vvaharness/detect/matcher.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 25,
+      "source_expression": "from vvaharness.models import ContextPackage, Finding",
+      "targets": [
+        "vvaharness.models",
+        "vvaharness.models.ContextPackage",
+        "vvaharness.models.Finding"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 26,
+      "source_expression": "from vvaharness.util import net as _net",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.net"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/net.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 92,
+      "source_expression": "from vvaharness.pipeline.stages.s4_deepdive import _redact_source",
+      "targets": [
+        "vvaharness.pipeline.stages.s4_deepdive",
+        "vvaharness.pipeline.stages.s4_deepdive._redact_source"
+      ],
+      "local_source_paths": [
+        "vvaharness/pipeline/stages/s4_deepdive.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 140,
+      "source_expression": "from vvaharness.pipeline.stages.s4_deepdive import _redact_source",
+      "targets": [
+        "vvaharness.pipeline.stages.s4_deepdive",
+        "vvaharness.pipeline.stages.s4_deepdive._redact_source"
+      ],
+      "local_source_paths": [
+        "vvaharness/pipeline/stages/s4_deepdive.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 165,
+      "source_expression": "from vvaharness.pipeline.stages.s4_deepdive import _redact_source",
+      "targets": [
+        "vvaharness.pipeline.stages.s4_deepdive",
+        "vvaharness.pipeline.stages.s4_deepdive._redact_source"
+      ],
+      "local_source_paths": [
+        "vvaharness/pipeline/stages/s4_deepdive.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

@@ -1,0 +1,166 @@
+# vvaharness/remediation_agent/plugin_runner/run.py
+
+The harness guards around one remediation attempt. `apply_plugin` runs the policy pre-gate, takes content snapshots, calls the engine (`plugin_runner._invoke`, the model session), reverts in-flight edits if the engine raised, runs the policy post-gate, derives the diff from disk, and replaces the engine's self-report with what the harness can prove. It then writes the per-finding artifacts.
+
+Source: `vvaharness/remediation_agent/plugin_runner/run.py` (lines 1-351)
+Executor: code (the engine it wraps is mixed)
+Called from: `runner.sudo` remediate_one; `interactive/loop.sudo` _remediate_one
+
+// src: vvaharness/remediation_agent/plugin_runner/run.py:52
+ENGINE_ID = "vvaharness.remediation_agent"
+
+// src: vvaharness/remediation_agent/plugin_runner/run.py:55-69
+EngineRequest {
+  target; repo; mode; cfg; verbose = false; policy_ctx = null
+  enforce = policy_ctx != null && policy_ctx.enabled
+}
+
+// src: vvaharness/remediation_agent/plugin_runner/run.py:72-92
+GuardedCall { verdict; snapshot = {}; pre = null; meta = {}; denied = false; started = null; spend_before; pre_call_dirty = [] }   // pre is null on the denied path
+Amended { remediation; reverted_paths = []; meta = {} }
+
+// src: vvaharness/remediation_agent/plugin_runner/run.py:191-207
+fn apply_plugin(target, out_dir, cfg, repo, mode="fix", verbose=false, policy_ctx?):executor=code {
+  request = EngineRequest(target, repo, mode, cfg, verbose, policy_ctx)
+  guarded = call_with_guards(plugin_runner._invoke, request)   // see plugin_runner/__init__.sudo _invoke (the model session)
+  amended = harness_amend(guarded.verdict, guarded.snapshot, request, pre=guarded.pre, denied=guarded.denied, started=guarded.started, spend_before=guarded.spend_before, pre_call_dirty=guarded.pre_call_dirty)
+  artifacts.writer.write_case(out_dir, guarded.verdict, amended.remediation, meta = guarded.meta + amended.meta, target, reverted_paths=amended.reverted_paths)
+  // guarded.verdict has been mutated in place by the post-gate (policy/postgate.sudo) when it rejected the patch
+  return amended.remediation
+}
+
+// src: vvaharness/remediation_agent/plugin_runner/run.py:95-120
+fn call_with_guards(fn, request):executor=code {
+  started = now (UTC); spend_before = TOKENS.spend()
+  meta = _base_meta(request, started)   // severity, title, file, mode, generated timestamp (display only)
+
+  // src: run.py:102-106 — policy pre-gate BEFORE any model call
+  pre = if (request.enforce) policy.decide.pre_decision(request.policy_ctx, request.target) else null
+  if (request.verbose) _trace_policy(request, pre)   // abstracted: verbose console trace (trace.sudo); when pre is null it prints "enforcement disabled"
+  if (pre != null && !pre.allowed) return _denied(request, pre, meta, started, spend_before)   // no model call, no tokens
+
+  // src: run.py:107-111 — content baselines BEFORE the engine runs
+  pre_call_dirty = artifacts.diff.gitcapture.changed_files_whole_tree(request.repo)   // every path git already reports as changed ([] off git)
+  pre_call_snapshot = artifacts.diff.snapshot.snapshot_files(request.repo, pre_call_dirty)
+  snapshot = artifacts.diff.snapshot.snapshot_files(request.repo, _snapshot_targets(request))
+
+  // src: run.py:112-120
+  try raw = _call_engine(fn, request, pre);
+  catch error => return _engine_failed(request, error, pre_call_dirty, pre_call_snapshot, snapshot, pre, meta, started, spend_before)   // a timeout or crash is a case outcome, not a bug
+  return GuardedCall(verdict = helpers._coerce_verdict(raw, request.target), snapshot, pre, meta, started, spend_before, pre_call_dirty)
+}
+
+// src: vvaharness/remediation_agent/plugin_runner/run.py:305-316
+fn _snapshot_targets(request):executor=code {
+  targets = if (request.target.file) [request.target.file] else []
+  targets += policy.workflow_refs.workflow_snapshot_paths(request.repo)   // every .github/workflows/*.yml|*.yaml, always: workflow refs are judged against the PRE-EDIT text and need a rollback baseline
+  if (!request.enforce) return targets
+  patterns = gate.forbid_patch_paths + gate.deny_paths
+  return unique(targets + policy.postgate.worktree_forbidden_matches(request.repo, patterns))   // every file already matching a forbidden glob gets a baseline
+}
+
+// src: vvaharness/remediation_agent/plugin_runner/run.py:319-324
+fn _call_engine(fn, request, pre):executor=code {
+  // the policy context (strategy and globs for the prompt) is passed only on the enforced path
+  if (pre != null) return fn(request.target, request.cfg, request.repo, request.mode, request.verbose, pre, ctx=request.policy_ctx)
+  return fn(request.target, request.cfg, request.repo, request.mode, request.verbose)
+}
+
+// src: vvaharness/remediation_agent/plugin_runner/run.py:123-143
+fn _engine_failed(request, error, pre_call_dirty, pre_call_snapshot, snapshot, pre, meta, started, spend_before):executor=code {
+  now_dirty = changed_files_whole_tree(request.repo)
+  new_untracked = now_dirty where path not in pre_call_dirty
+  changed_during_call = changed_since_snapshot(request.repo, pre_call_snapshot)
+  to_revert = unique(changed_during_call + new_untracked)
+  // restored to the pre-call snapshot, not to HEAD, so an earlier case's still-uncommitted fix on the same path survives
+  reverted = if (to_revert) policy.revert.revert_files(request.repo, to_revert, pre_call_snapshot) else []
+  console "[guard] engine call failed for finding <index> (<error type>: <detail>); reverted <n> in-flight edit(s)"
+  verdict = RemediationVerdict(finding_index=request.target.index, verdict="Not Fixed", gates=Gates(), changes=[], summary="remediation session failed: <error type>: <error>")
+  return GuardedCall(verdict, snapshot, pre, meta, started, spend_before)
+  // pre_call_dirty is deliberately left empty here (run.py:141); the reverted list is not recorded in the case
+  // preserved: off git, changed_files_whole_tree returns [] both times and pre_call_snapshot is empty, so nothing is reverted after an engine failure (the per-target snapshot is not consulted here); in git, "new_untracked" also holds tracked files first modified during the call, which revert_files restores with git checkout
+}
+
+// src: vvaharness/remediation_agent/plugin_runner/run.py:289-302
+fn _denied(request, pre, meta, started, spend_before):executor=code {
+  verdict = policy.decide.guidance_verdict(request.policy_ctx, request.target, pre)   // verdict "Denied", summary "Denied by policy (<reason>). No patch generated."
+  console "[policy] pre-gate guidance-only for finding <index> (<reason>) — agent skipped"
+  return GuardedCall(verdict, meta = meta + { policy_action: pre.decision.action, policy_reason: pre.decision.reason, final_verdict: "REJECT" }, denied=true, started, spend_before)
+  // snapshot is empty, so the diff derived later is "" and files_touched comes only from git status
+}
+
+// src: vvaharness/remediation_agent/plugin_runner/run.py:146-168
+fn harness_amend(remediation, snapshot, request, pre?, denied=false, started?, spend_before, pre_call_dirty=[]):executor=code {
+  reverted = []; meta = {}
+  // src: run.py:154-158 — post-gate only on the enforced, allowed path (pre is null when policy is off or the finding was denied)
+  if (pre != null) {
+    post = policy.postgate.enforce_post(request.policy_ctx, request.target, remediation, pre, repo=request.repo, before_snapshot=snapshot)   // may revert files and mutate remediation
+    reverted = post.reverted
+    meta = _post_meta(pre, post)
+  }
+  // src: run.py:159-160 — the diff is the harness's account, read from disk after any revert
+  diff = artifacts.diff.derive.derive_diff(request.repo, snapshot, remediation.changes |> filter(c => c.file) |> map(c => c.file))
+  // preserved: the git diff is scoped to the files the MODEL listed in changes; an edited file the model omitted appears only through the snapshot fallback, and only when the model listed no file git could diff
+  evidence = models.verdict.to_evidence(remediation, provenance=_provenance(request, denied, started, spend_before))
+  // src: run.py:163-166 — mode, diff and file list come from the harness, not the engine
+  contract = finalize(evidence, mode=request.mode, diff, files_touched=_files_touched(request.repo, evidence, snapshot, pre_call_dirty))
+  // external: vvaharness/models/remediation.py finalize — kind from the verdict: Fixed / Partially Fixed -> edits_applied (fix mode) or diff_proposed ("report-only"/"report_only"); every other verdict -> no_action with a disposition (Denied -> policy_denied, False Positive -> false_positive, else not_applicable); edits_applied with no files touched and no diff becomes already_resolved
+  // preserved: request.mode is the requested mode; a fix run downgraded to "report" by the symlink check (plugin_runner/__init__.sudo) is still finalized as fix mode
+  meta = _reconcile_post_meta(meta, contract)
+  return Amended(remediation=contract, reverted_paths=reverted, meta)
+}
+
+// src: vvaharness/remediation_agent/plugin_runner/run.py:223-247
+fn _files_touched(repo, evidence, snapshot, pre_call_dirty=[]):executor=code {
+  proven = changed_files_whole_tree(repo)
+  if (proven) {
+    // drop paths dirty before this call UNLESS this case's own snapshot proves they changed further
+    changed_this_case = if (snapshot) changed_since_snapshot(repo, snapshot) else {}
+    return proven where (path not in pre_call_dirty) || (path in changed_this_case)   // paths compared after _norm_path
+  }
+  // off git: snapshot differences plus model-claimed files that resolve to a real file inside repo
+  return unique(changed_since_snapshot(repo, snapshot) + (evidence.changes where _resolves(repo, file)))
+  // preserved: off git, a claimed file counts as touched merely by existing inside the repository
+}
+
+// src: vvaharness/remediation_agent/plugin_runner/run.py:171-188
+fn _reconcile_post_meta(meta, remediation):executor=code {
+  // only a permitted patch is reconciled; pre-gate denials and post-gate reverts already carry a stronger reason
+  if (meta.policy_action != "patch" || meta.policy_reverted) return meta
+  no_action = remediation.kind in [no_action, already_resolved]
+  if (remediation.diff && !no_action) return meta
+  reason = if (!remediation.diff) "no_diff_captured" else "remediation_not_applied"
+  return meta + { policy_reason: reason, final_verdict: "REJECT", policy_pre_reason: meta.policy_reason (only when it differs) }
+}
+
+// src: vvaharness/remediation_agent/plugin_runner/run.py:261-274
+fn _post_meta(pre, post):executor=code {
+  meta = { policy_action: pre.decision.action, policy_reason: post.reason or pre.decision.reason, final_verdict: post.final_verdict }
+  if (post.reason) meta.policy_pre_reason = pre.decision.reason
+  if (post.reverted) { meta.policy_reverted = post.reverted; meta.policy_matched_globs = post.matched_globs }
+  return meta
+}
+
+// src: vvaharness/remediation_agent/plugin_runner/run.py:327-339
+fn _provenance(request, denied=false, started?, spend_before):executor=code {
+  // denied: refused before any token was spent, so no model is named
+  [model, backend] = if (denied) ["", ""] else engine_model(request.cfg)
+  [usd, turns] = if (denied) [0.0, 0] else reported_between(spend_before, TOKENS.spend())
+  return Provenance(engine=ENGINE_ID, engine_version=vvaharness.__version__, model, backend, started, ended = if (started) now else null, usd, turns)
+  // engine_version is hashed into the resume checkpoint key (runner.sudo step_key_of)
+}
+
+// src: vvaharness/remediation_agent/plugin_runner/run.py:342-351
+fn engine_model(cfg):executor=code {
+  try [mid, via] = resolve_model(knob("models.remediate"));
+  catch => return ["", ""]   // attribution, never a hard failure
+  return [mid, "${LLM_REGISTRY}:$via"]   // registry-qualified backend name
+}
+
+// src: vvaharness/remediation_agent/plugin_runner/run.py:210-220
+fn checkpoint_record(target, out_dir, remediation):executor=code {
+  // deliberately small: not the whole Remediation
+  return { finding_index: target.index, artifact_dir: out_dir, kind: remediation.kind, disposition: remediation.disposition or null, diff_captured: remediation.diff is non-empty }
+}
+
+// abstracted: run.py:242-258 (_resolves: _safe_repo_path and is a file; _base_meta: display-only fields), 277-286 (_trace_policy: verbose console text). None changes a decision.

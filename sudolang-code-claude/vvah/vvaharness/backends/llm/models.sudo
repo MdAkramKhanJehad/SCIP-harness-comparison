@@ -1,0 +1,363 @@
+# vvaharness/backends/llm/models.py
+
+The shared contract of the model routes (`cli`, `sdk`, `openai`, `deepagents`, `agent_sdk`). It holds the constants and helpers every route uses to decide whether to retry, how far to raise an output budget after a truncation, how to classify a refusal or a guardrail block, how to step a rejected reasoning-effort tier down, how per-request timeouts are clamped to a session clock, and which tools a detection stage may offer. It makes no model call itself.
+
+Source: `vvaharness/backends/llm/models.py` (lines 1-1039)
+Executor: code
+Called from: `vvaharness/backends/llm/openai.py`, `vvaharness/backends/llm/sdk.py`, `vvaharness/backends/llm/deepagents.py`, the `cli` route, and the stages s2, s4, s6 (guardrail gate, response-model routes)
+
+// src: vvaharness/backends/llm/models.py:17
+// The `cli`, `sdk`, `openai` and `agent_sdk` routes implement both `prompt()` and `agentic()`; the `deepagents` adapter has `prompt()` but NOT `agentic()`.
+
+## Retry vocabulary
+
+// src: vvaharness/backends/llm/models.py:44-56
+RETRYABLE_STATUS = {429, 500, 502, 503, 504, 529}   // every route that owns its HTTP transport (all but `cli`)
+CLI_RETRYABLE_STATUS = RETRYABLE_STATUS - {500, 504}   // the `claude` binary already retried 500 and 504
+SERVER_ERROR_STATUS = RETRYABLE_STATUS - {429}   // gate of the server-error probe: a rate limit is not a server fault, and a lower tier cannot clear it
+PARAM_REJECTION_STATUS = {400, 422}   // a gateway rejecting a request parameter; disjoint from retryable
+
+// src: vvaharness/backends/llm/models.py:86-125
+PARAM_REJECTION_ERROR_TYPES = {"invalid_request_error", "bad_request_error"}
+RATE_LIMIT_TRANSIENT_RX = /rate.?limit|too many requests|overloaded|temporarily unavailable/i   // transient prose inside an HTTP 200; deliberately no bare 429 (a "req-429-" id would promote)
+CLI_STATUS_429_RX = /\b429\b/   // `cli` only: no envelope status was parsed
+SERVER_ERROR_TRANSIENT_RX = /server_error|overloaded|service unavailable|internal server error|bad gateway|validation errors? for ChatCompletion(?:Chunk)?\b/i
+  // every route but `cli`; the last alternative is a gateway rejecting its upstream reply, sent as HTTP 400. No \b50\d\b because that matches "504 tokens"
+CLI_CONN_TRANSIENT_RX = /socket connection was closed|connection (?:reset|closed|aborted)|ECONNRESET|EPIPE|broken pipe|incomplete(?:ly)? read|premature(?:ly)? closed|EOF occurred/i   // `cli` only
+
+// src: vvaharness/backends/llm/models.py:59-73
+fn rejection_text(exc):executor=code {
+  // The rejection body to match parameter names against, minus any echoed request
+  if (exc.body.detail is not a list) return exc.message || str(exc)
+  return each detail entry with its "input" key removed and "loc" joined with ".", joined by "; "
+}
+
+// src: vvaharness/backends/llm/models.py:76-83
+fn is_param_rejection(exc, ...names):executor=code {
+  return any link in exception_chain(exc) with status_code in PARAM_REJECTION_STATUS whose lowercased rejection_text contains one of names
+}
+
+// src: vvaharness/backends/llm/models.py:92-100
+fn is_gateway_wrapped_param_rejection(exc):executor=code {
+  // a 200-status stream whose body (an SSE `error` event) is itself a parameter rejection
+  return exc.status_code == 200 && exc.type in PARAM_REJECTION_ERROR_TYPES
+}
+
+## Agentic and structured-output constants
+
+// src: vvaharness/backends/llm/models.py:127-144
+DEFAULT_READ_TOOLS = ("Read", "Glob", "Grep")   // tools an agentic call gets when the caller names none; read-only, no shell
+AGENTIC_MAX_TOKENS = 16000   // output cap for one agentic turn
+RESPONSE_MODEL_VIAS = {"deepagents", "sdk", "openai", "cli"}   // routes that accept a response model; `cli` cannot re-ask
+RESPONSE_MODEL_TOOL_NAME = "emit_structured_response"   // one name so the `sdk` and `openai` extractors match
+STRUCTURED_REASK_MAX = 2   // repair re-asks per turn, shared by `sdk` and `openai`, so one bad submit cannot eat the turn budget
+CLI_STRUCTURED_OUTPUT_TOOL = "StructuredOutput"   // the `cli` gate must allow it; never placed in allowed_tools
+
+// src: vvaharness/backends/llm/models.py:147-155
+fn response_model_tool(response_model):executor=code {
+  schema = response_model.model_json_schema() without "title"
+  return { name: RESPONSE_MODEL_TOOL_NAME, description: "Submit the final ${response_model.__name__}.", input_schema: schema }
+}
+
+// prompt-src: vvaharness/backends/llm/models.py:160-162
+STRUCTURED_PROSE_REASK {
+  // the once-only in-loop re-ask both raw loops (`sdk`, `openai`) send when a structured reply came back as prose
+  Constraints {
+    "Call the `emit_structured_response` tool now with your findings as its arguments. Do not reply with prose; the result is only accepted through that tool."
+  }
+}
+
+// prompt-src: vvaharness/backends/llm/models.py:165-174
+with_submit_instruction(system_prompt, response_model, tool_name = RESPONSE_MODEL_TOOL_NAME) {
+  // used where a request cannot FORCE the tool: a model remembered as rejecting tool forcing, manual thinking on `sdk`, or a `deepagents` graph whose client drops the forcing under thinking (that caller passes the response model class name as tool_name)
+  Constraints {
+    "When you have your final ${response_model.__name__}, call the `$tool_name` tool with it; a plain-text reply is not accepted."
+  }
+  return if (system_prompt) "$system_prompt\n\n<line>" else "<line>"
+}
+
+## Truncation
+
+// src: vvaharness/backends/llm/models.py:177-210
+DEEPAGENTS_MAX_PROMPT_TOKENS = 150000   // raises VVAH-E004 before dispatch; no configuration surface by design
+TRUNCATION_RETRY_MULTIPLIER = 2   // VVAH-E005
+TRUNCATED_REPLIES_COUNTER = "llm_truncated_replies"
+LLM_TRUNCATED_BELOW_BUDGET_COUNTER = "llm_truncated_below_budget"   // stopped below half the budget
+TRUNCATED_RETRY_ATTEMPTED_COUNTER = "llm_truncated_retry_attempted"
+TRUNCATED_RETRY_RECOVERED_COUNTER = "llm_truncated_retry_recovered"
+OPENAI_FINISH_LENGTH = "length"
+ANTHROPIC_STOP_MAX_TOKENS = "max_tokens"
+ANTHROPIC_STOP_CONTEXT_WINDOW = "model_context_window_exceeded"
+ANTHROPIC_STOP_REFUSAL = "refusal"   // not prose that a re-ask can turn into a submit
+RESPONSES_INCOMPLETE_MAX_OUTPUT = "max_output_tokens"
+_TRUNCATED_FINISHES = {"max_tokens", "model_context_window_exceeded", "length", "max_output_tokens"}
+
+// src: vvaharness/backends/llm/models.py:213-223
+fn reply_finish(meta):executor=code { return meta.stop_reason || meta.finish_reason || meta.incomplete_details.reason }
+fn finish_truncated(finish):executor=code { return finish is a string && finish in _TRUNCATED_FINISHES }
+
+// src: vvaharness/backends/llm/models.py:225-230
+CLI_TOKEN_CAP_RX = /exceeded the (\d+) output token maximum/i   // prose, because the CLI reports api_error_status null and stop_reason stop_sequence here
+CLI_CONTINUED_REPLIES_COUNTER = "cli_continued_replies"
+
+// src: vvaharness/backends/llm/models.py:233-238
+fn truncation_retry_max(requested, cap?):executor=code {
+  if (cap != null && requested >= cap) return null   // a retry at the cap is useless
+  doubled = requested * TRUNCATION_RETRY_MULTIPLIER
+  return if (cap == null) doubled else min(doubled, cap)
+}
+
+## Backoff jitter and timeouts
+
+// src: vvaharness/backends/llm/models.py:241-251
+RETRY_JITTER_SPREAD = 0.2
+fn jittered_delay(seconds, spread = RETRY_JITTER_SPREAD):executor=code {
+  return max(0.0, seconds * uniform random factor in [1 - spread, 1 + spread])   // breaks lockstep of s4/s6 pool workers
+}
+
+// src: vvaharness/backends/llm/models.py:254-285
+ClockKind { REQUEST = "request"; SESSION = "session" }
+EFFORT_TIME_FACTOR {
+  REQUEST: { LOW: 1.0, MEDIUM: 1.0, HIGH: 1.0, XHIGH: 1.1, MAX: 1.2 }
+  SESSION: { LOW: 1.0, MEDIUM: 1.0, HIGH: 1.0, XHIGH: 1.1, MAX: 1.5 }
+}
+fn effort_scaled_seconds(seconds, effort, kind):executor=code {
+  if (seconds == null || seconds <= 0) return seconds
+  tier = EffortLevel.parse(effort); if (tier == null) return seconds
+  scaled = seconds * EFFORT_TIME_FACTOR[kind][tier]
+  return if (seconds is an integer) ceil(scaled) else scaled
+}
+
+// src: vvaharness/backends/llm/models.py:288-307
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 900   // per-HTTP-request hang stop for `sdk` and `openai` when no stage timeout was passed
+TIMEOUT_STOP_GRACE_SECONDS = 20
+TIMEOUT_MAX_RETRIES = 1   // a timed-out call is re-sent at most once by the harness
+BUDGET_NEAR_RATIO = 0.75
+LLM_CALL_TIMEOUTS_COUNTER = "llm_call_timeouts"; LLM_CALL_BUDGET_NEAR_COUNTER = "llm_call_budget_near"
+_BUDGET_NEAR_TIERS = {XHIGH, MAX}
+
+// src: vvaharness/backends/llm/models.py:342-356
+fn call_timeout_error(stage, route, budget_s, effort, cause_text):executor=code {
+  COUNTERS.bump(LLM_CALL_TIMEOUTS_COUNTER)
+  return CallTimeoutError(cause_text, stage, route, budget_s, effort)   // VVAH-E008; callers raise it
+}
+fn note_budget_use(elapsed, budget_s, effort):executor=code {
+  if (budget_s > 0 && EffortLevel.parse(effort) in _BUDGET_NEAR_TIERS && elapsed >= BUDGET_NEAR_RATIO * budget_s) { COUNTERS.bump(LLM_CALL_BUDGET_NEAR_COUNTER) }
+}
+
+// src: vvaharness/backends/llm/models.py:884-917
+fn turn_timeout(session_t0, session_budget, request_timeout):executor=code {
+  if (session_budget == null) return request_timeout
+  remaining = session_budget - (now - session_t0)
+  return min(request_timeout, max(1.0, remaining))   // floor 1.0 second: a send past its deadline still gets one short try
+}
+fn turn_options(session_t0, session_budget, request_timeout):executor=code {
+  clocked = turn_timeout(session_t0, session_budget, request_timeout)
+  options = { timeout: clocked }
+  if (session_budget != null && request_timeout - clocked >= 1.0) { options.max_retries = 0 }   // a clock-clamped send gets no client-library retries
+  return options
+}
+fn wait_overrun(wait, session_t0, session_budget, stage, route, effort):executor=code {
+  if (session_budget == null || now - session_t0 + wait < session_budget) return null
+  return call_timeout_error(stage, route, budget_s=session_budget, effort, cause_text="retry wait of ${wait}s would cross the ${session_budget}s session clock")
+}
+
+## Proxy and TLS failures
+
+// src: vvaharness/backends/llm/models.py:310-339
+PROXY_CAUSE_RX = /\b407\b|proxy[_ ]auth|tunnel[_ ](?:connection[_ ])?(?:failed|error)|(?-i:\bCONNECT\b).*failed|SSL.*CERTIFICATE|CERTIFICATE.*VERIFY.*FAILED|CERT_VERIFY_FAILED|certificate[_ ]verify[_ ]failed/i
+fn proxy_error(e, backend):executor=code {
+  detail = the flattened cause chain of e when it or str(e) matches PROXY_CAUSE_RX, else null
+  if (detail == null) return null
+  return ProxyError(redact(detail) first 400 characters, status_code = if (detail contains 407) 407 else null, backend)   // VVAH-E002, never retried
+}
+
+## Detection-stage tool allowlist
+
+// src: vvaharness/backends/llm/models.py:359-379
+fn _named_tools(tools, config_key):executor=code {
+  if (tools == null) return DEFAULT_READ_TOOLS
+  require tools is not a bare string => throw ValueError("$config_key must be a YAML list of tool names ...")
+  require tools is not empty => throw ValueError("$config_key is an empty list, which would silently grant a default toolset instead of none ...")
+  require every tool is a string => throw ValueError
+  return list(tools)
+}
+
+// src: vvaharness/backends/llm/models.py:382-400
+fn validate_detection_tools(tools, config_key, via?):executor=code {
+  named = _named_tools(tools, config_key)
+  if (via == "cli") return named   // the only route whose agentic() honours the allowlist itself
+  bad = named where tool not in DEFAULT_READ_TOOLS
+  require bad is empty => throw ValueError("$config_key contains disallowed tool(s) ... only read-only tools ['Glob', 'Grep', 'Read'] are permitted ... (on `via: sdk` an unsupported or mutating tool delegates to the Agent SDK backend, which could modify the scanned repository ...)")
+  return named
+}
+
+## Resolved model and configuration shapes
+
+// src: vvaharness/backends/llm/models.py:403-475
+ModelExtras { temperature: Number; thinking_budget: Number; betas: [String] }   // only `sdk` reads all three
+ResolvedModel { model_id; via; extras: ModelExtras }
+EnvelopeResult { text; usage; turns = null; usd = null; stop_reason = null; model_usage = null }   // one `claude -p` JSON envelope
+CliConfig { verify_ssl; ca_cert; client_cert; no_proxy; effort; restricted: Boolean }   // `--restricted` is the `cli` route's only read jail
+SdkConfig { api_key; base_url; verify_ssl; ca_cert; client_cert; no_proxy; allow_api_key_fallback; cache_min_block_tokens; cache_route; cache_markers }
+OpenAiConfig { api_key; base_url; verify_ssl; ca_cert; organization; no_proxy; cache_markers }   // organization header is sent only on `via: openai`
+
+## Refusals and guardrail blocks
+
+// src: vvaharness/backends/llm/models.py:478-499
+GuardrailBlocked   // a provider guardrail declined the request; retrying the same prompt cannot help
+ModelRefusal { message; route; category }   // a subtype of GuardrailBlocked
+fn guardrail_gate_hit(e, hits, gate):executor=code {
+  // for the s4/s6 abort gate: only guardrail blocks count, refusals do not
+  if (e is ModelRefusal) return [hits, "model refusal, not gated"]
+  return [hits + 1, "${hits + 1}/$gate"]
+}
+
+// src: vvaharness/backends/llm/models.py:502-523
+LLM_MODEL_REFUSALS_COUNTER = "llm_model_refusals"
+REFUSAL_RETRY_ATTEMPTED_COUNTER = "llm_refusal_retry_attempted"; REFUSAL_RETRY_RECOVERED_COUNTER = "llm_refusal_retry_recovered"
+fn refusal_resend_allowed(cfg, model_cfg):executor=code {
+  if (int(knob(cfg, "refusal_retries", 1)) <= 0) return false
+  [model_id, via] = registry.resolve(model_cfg)
+  return manifest._resolved_route(via, model_id, registry.provider_of(model_cfg)) == "anthropic"
+  // Anthropic only: an OpenAI-compatible gateway's cyber filter can revoke the whole organization's access, so flagged content is never re-sent there
+}
+
+// src: vvaharness/backends/llm/models.py:526-543
+_CYBER_POLICY_REJECTION_RX = /\bcyber_policy\b|flagged for possible cybersecurity risk/i   // category "cyber"
+fn model_refusal(route, stage, category, detail = ""):executor=code {
+  COUNTERS.bump(LLM_MODEL_REFUSALS_COUNTER)
+  return ModelRefusal("model refused the request (route=$route, category=${category || \"unspecified\"}, stage=$stage): <redact(detail) first 200 characters>", route, category)
+  // redact runs before truncation so a credential is not bisected past its pattern
+}
+
+// src: vvaharness/backends/llm/models.py:551-603
+fn ai_message_refused(message):executor=code {
+  if (message.response_metadata.stop_reason == "refusal") return [true, message.response_metadata.stop_details.category]
+  return [message.additional_kwargs.refusal is set || any content block has type "refusal", null]   // the two OpenAI refusal shapes
+}
+fn _refusal_link(exc):executor=code {
+  for each link in exception_chain(exc) {
+    if ((link has status_code or body) && _CYBER_POLICY_REJECTION_RX matches rejection_text(link)) return [link, "cyber"]
+    // API error links only: scanned code echoed in an output failure may contain the marker
+    [refused, category] = ai_message_refused(link.ai_message)
+    if (refused) return [link, category]
+  }
+  return null
+}
+fn is_model_refusal_rejection(exc):executor=code { return _refusal_link(exc) != null }
+fn model_refusal_from(exc, route, stage):executor=code {
+  found = _refusal_link(exc); if (found == null) return null
+  return model_refusal(route, stage, category=found.category, detail=rejection_text(found.link))
+}
+
+## Reasoning-effort rejections
+
+// src: vvaharness/backends/llm/models.py:606-644
+_REASONING_EFFORT_RX = /reasoning[\s_.\-]?effort/
+_REASONING_CONTAINER_MARKERS = ["unsupported parameter: 'reasoning'", "unknown parameter: 'reasoning'"]
+_FIELD_UNSUPPORTED_MARKERS = ["unknown parameter", "unsupported parameter", "unrecognized request argument"]
+_TIER_VALUE_RX = /['"](?:none|low|medium|high|xhigh|max)['"]/
+
+// src: vvaharness/backends/llm/models.py:630-639
+fn _effort_rejection_text(exc):executor=code {
+  for each link in exception_chain(exc) {
+    if (link.status_code not in PARAM_REJECTION_STATUS && !is_gateway_wrapped_param_rejection(link)) continue
+    text = lowercase(rejection_text(link))
+    if (_REASONING_EFFORT_RX matches text || text contains one of _REASONING_CONTAINER_MARKERS) return text
+  }
+  return null
+}
+
+// src: vvaharness/backends/llm/models.py:658-681
+fn _effort_rejection_class(text):executor=code {
+  // order matters
+  if (text contains "supported values" || "invalid value" || "unsupported value") return "tier"   // the endpoint supports reasoning, only this value was rejected
+  if (text matches /\btools?\b/) return "tools_conflict"
+  is_field = !(_TIER_VALUE_RX matches text) && (text contains one of _FIELD_UNSUPPORTED_MARKERS || "not supported")
+  return if (is_field) "field" else "tier"   // ambiguous text defaults to the tier ladder, never a field-wide drop
+}
+
+// src: vvaharness/backends/llm/models.py:684-698
+fn classify_effort_rejection(exc):executor=code {
+  if (is_model_refusal_rejection(exc)) return null   // a refusal never earns a resend
+  text = _effort_rejection_text(exc)
+  return if (text == null) null else _effort_rejection_class(text)
+}
+fn is_reasoning_effort_rejection(exc):executor=code { return classify_effort_rejection(exc) != null }
+
+// src: vvaharness/backends/llm/models.py:701-711
+REASONING_EFFORT_LADDER = ("max", "high", "low")
+_LADDER_NEXT = { max: "high", xhigh: "high", high: "low", medium: "low", none: "low", low: null }
+fn next_effort_tier(tier):executor=code { return if (tier == null) null else _LADDER_NEXT[tier] }
+
+// src: vvaharness/backends/llm/models.py:714-757
+TRANSPORT_CHAT = TRANSPORT_CHAT_COMPLETIONS
+_TIER_RANK = { none: 0, minimal: 1, low: 2, medium: 3, high: 4, xhigh: 5, max: 6 }
+fn _listed_tiers(text):executor=code {
+  // quoted tier names in the body; a truncated quoted prefix (for example "'me...") counts only when the text enumerates a value list, and only when it uniquely prefixes one tier
+}
+fn _tiers_key(model, tier, transport):executor=code { return if (transport == TRANSPORT_CHAT) (model, tier) else (model, tier, transport) }
+
+// src: vvaharness/backends/llm/models.py:760-780
+fn step_down(model, sent, exc, transport = TRANSPORT_CHAT):executor=code {
+  EFFORT_REJECTIONS.tiers.add(_tiers_key(model, sent, transport))
+  listed_below = _listed_tiers(_effort_rejection_text(exc)) where rank < rank(sent)
+  if (transport != TRANSPORT_CHAT) { remove REASONING_OFF from listed_below }   // a gateway reasoning on Responses must stay silenced-off, so "none" never reaches that leg
+  nxt = if (listed_below) highest-ranked of listed_below else next_effort_tier(sent)
+  if (nxt != null) { EFFORT_REJECTIONS.step_to[(model, transport, sent)] = nxt }
+  return nxt
+}
+
+// src: vvaharness/backends/llm/models.py:783-799
+fn effort_after_rejections(model, tier, transport = TRANSPORT_CHAT):executor=code {
+  while (tier != null) {
+    learned = EFFORT_REJECTIONS.step_to[(model, transport, tier)]
+    if (learned != null) { tier = learned; continue }   // one hop to the highest listed value
+    if (_tiers_key(model, tier, transport) not in EFFORT_REJECTIONS.tiers) break
+    tier = next_effort_tier(tier)
+  }
+  return tier
+}
+
+// src: vvaharness/backends/llm/models.py:802-857
+REASONING_OFF = "none"
+EFFORT_REJECTIONS {
+  // process memory shared by the `openai` route and the `deepagents` client
+  tiers: set of (model, tier) for Chat, (model, tier, transport) otherwise
+  field: set of models whose endpoint rejects the effort field outright
+  tools_off: set of models that need reasoning_effort "none" on tool-carrying calls
+  step_to: map (model, transport, sent tier) -> highest listed tier below it
+  server_error_probed: keys already given one extra send after a persistent server error
+  server_error_recovered: keys already recovered once at the lower tier
+  _probe_lock   // s4/s6 worker threads: two threads on the same key must not both claim the one extra send
+
+  probe_once(key) { with _probe_lock: if (key in server_error_probed) return false; add key; return true }
+  recovered_twice(key) {
+    with _probe_lock:
+    if (key in server_error_recovered) return true   // the second recovery learns the lower tier
+    add key to server_error_recovered; remove key from server_error_probed; return false   // a first recovery frees the claim
+  }
+}
+
+// src: vvaharness/backends/llm/models.py:860-881
+TRANSPORT_MEMORY {
+  // shared by the `openai` route and the `deepagents` client
+  chat_only: models learned Chat-only (a Responses call failed, or pinned or measured broken)
+  responses_proven: models that completed at least one Responses call this process
+  no_include: models whose gateway rejected the `include` parameter
+}
+
+// src: vvaharness/backends/llm/models.py:920-936
+fn is_responses_shape_rejection(exc):executor=code {
+  if (any link in exception_chain(exc) has status_code 404) return true   // no /v1/responses route
+  if (classify_effort_rejection(exc) != null) return false
+  return is_param_rejection(exc, "unsupported parameter", "unknown parameter")
+}
+
+// src: vvaharness/backends/llm/models.py:939-949
+LlmBackend {
+  prompt(user_prompt, model, ...kwargs) => String   // single-turn completion
+  agentic(user_prompt, model, ...kwargs) => String   // tool-using loop to completion
+}
+// abstracted: models.py:952-1039 is the export list; nothing to represent

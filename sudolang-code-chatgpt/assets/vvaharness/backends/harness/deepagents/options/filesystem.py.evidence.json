@@ -1,0 +1,4068 @@
+{
+  "source": "vvaharness/backends/harness/deepagents/options/filesystem.py",
+  "sha256": "89b5cc8a12b26201a160a8cc8c1084114334a84bd3b680e1ec67d752c1fa4f90",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Filesystem permissioning, backend selection, and skill-source resolution.\"\"\"\n\nfrom __future__ import annotations\n\nimport contextlib\nfrom functools import lru_cache\nfrom pathlib import Path, PurePosixPath\n\nfrom deepagents.backends import FilesystemBackend\nfrom deepagents.backends import filesystem as _deepagents_filesystem\nfrom deepagents.backends.composite import CompositeBackend\nfrom deepagents.backends.filesystem import _raise_if_symlink_loop\nfrom deepagents.backends.local_shell import LocalShellBackend\nfrom deepagents.backends.protocol import (\n    BackendProtocol,\n    DeleteResult,\n    EditResult,\n    FileInfo,\n    FileUploadResponse,\n    GlobResult,\n    GrepResult,\n    LsResult,\n    ReadResult,\n    WriteResult,\n)\nfrom deepagents.middleware.filesystem import FilesystemPermission\n\n# Scan-scope registry is SHARED with sdk/openai, never re-derived: one s1 registration binds all\nfrom vvaharness.backends.harness.deepagents.models import (\n    GIT_INTERNALS_DENY,\n    READ_ONLY_PERMISSIONS,\n)\nfrom vvaharness.backends.harness.models import OneShotOptions, StreamingOptions\nfrom vvaharness.backends.llm import tools as _scan_scope\nfrom vvaharness.util.counters import COUNTERS\nfrom vvaharness.util.git_paths import is_git_metadata\n\n#: Refusal for a path that escapes the backend's root; only the model's own path is echoed.\n_JAIL_ERROR = \"ERROR: path '{path}' is outside the scan root; use a repo-relative path\"\n\n\ndef _filesystem_permissions(\n    options: OneShotOptions | StreamingOptions,\n) -> list[FilesystemPermission]:\n    \"\"\"Deny all writes for a read-only session; permit them when the caller opts in.\"\"\"\n    if options.allow_writes:\n        # DeepAgents' filesystem middleware is rooted at cwd; refuse a broader writable_paths scope.\n        root = options.cwd.resolve()\n        for raw in options.writable_paths:\n            candidate = Path(raw).resolve()\n            if candidate != root and root not in candidate.parents:\n                raise ValueError(f\"writable path escapes harness cwd: {raw}\")\n        return GIT_INTERNALS_DENY\n    return READ_ONLY_PERMISSIONS\n\n\n@lru_cache(maxsize=8)\ndef _in_scope_dirs(scope: frozenset[str]) -> frozenset[str]:\n    \"\"\"Every ancestor directory (repo-relative posix) of an in-scope file.\"\"\"\n    # ls shows only dirs holding in-scope files: an excluded file's NAME must not leak\n    dirs: set[str] = set()\n    for rel in scope:\n        parts = rel.split(\"/\")[:-1]\n        for depth in range(1, len(parts) + 1):\n            dirs.add(\"/\".join(parts[:depth]))\n    return frozenset(dirs)\n\n\n#: Refusal a detection session's backend returns for any write-class operation.\n_WRITE_REFUSED = \"write operations are disabled on detection sessions: {path}\"\n\n\nclass _NoWriteBackend(FilesystemBackend):\n    \"\"\"A ``FilesystemBackend`` whose write surface fails closed, touching no disk.\"\"\"\n    # Middleware writes (eviction/offload) bypass permissions into the scanned repo; failing = no-op\n\n    def write(self, file_path: str, content: str) -> WriteResult:  # noqa: ARG002\n        return WriteResult(error=_WRITE_REFUSED.format(path=file_path))\n\n    def edit(\n        self,\n        file_path: str,\n        old_string: str,  # noqa: ARG002\n        new_string: str,  # noqa: ARG002\n        replace_all: bool = False,  # noqa: ARG002 — upstream signature\n    ) -> EditResult:\n        return EditResult(error=_WRITE_REFUSED.format(path=file_path))\n\n    def delete(self, file_path: str) -> DeleteResult:\n        return DeleteResult(error=_WRITE_REFUSED.format(path=file_path))\n\n    def upload_files(\n        self, files: list[tuple[str, bytes]]\n    ) -> list[FileUploadResponse]:\n        return [\n            FileUploadResponse(path=path, error=_WRITE_REFUSED.format(path=path))\n            for path, _content in files\n        ]\n\n\nclass _PathJail:\n    \"\"\"Shared crash-proof ``_resolve_path`` jail (OSError subtype, not a raised exception); carries no read-reach narrowing of its own.\"\"\"\n\n    def _resolve_path(self, key: str) -> Path:\n        if not self.virtual_mode:\n            return super()._resolve_path(key)\n        vpath = key if key.startswith(\"/\") else f\"/{key}\"\n        # Tilde checked on the ORIGINAL key: vpath is always \"/\"-prefixed by now, so\n        # vpath.startswith(\"~\") can never fire.\n        if \"..\" in PurePosixPath(vpath).parts or key.startswith(\"~\"):\n            COUNTERS.bump(\"deepagents_path_jail_refused\")\n            raise PermissionError(_JAIL_ERROR.format(path=key))\n        full = (self.cwd / vpath.lstrip(\"/\")).resolve()\n        try:\n            full.relative_to(self.cwd)\n        except ValueError:\n            COUNTERS.bump(\"deepagents_path_jail_refused\")\n            raise PermissionError(_JAIL_ERROR.format(path=key)) from None\n        _raise_if_symlink_loop(full)\n        return full\n\n\nclass _ScopedReadBackend(_PathJail, _NoWriteBackend):\n    \"\"\"A ``FilesystemBackend`` whose READ surface is confined to the scan scope.\"\"\"\n    # Root jail NOT enough (.git/config, security-scan/); choke point scopes all reads, pre-s1 too\n\n    def _scope(self) -> frozenset[str] | None:\n        \"\"\"The registered inventory for this root, or None when s1 has not run.\"\"\"\n        return _scan_scope._scope_for(self.cwd)\n\n    def _rel_of(self, file_path: str) -> str | None:\n        \"\"\"Repo-relative posix path for *file_path*, or None when it cannot resolve.\"\"\"\n        # Resolution failures return None: the scope check must never REPLACE the jail's refusals\n        try:\n            return self._resolve_path(file_path).relative_to(self.cwd).as_posix()\n        except (ValueError, OSError, RuntimeError):\n            return None\n\n    def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:\n        rel = self._rel_of(file_path)\n        # Scope check BEFORE super()'s existence check, so it is never an existence oracle\n        if rel is not None and rel != \".\" and _scan_scope._excluded_rel(rel, self._scope()):\n            return ReadResult(error=_scan_scope._SCOPE_ERROR.format(path=file_path))\n        return super().read(file_path, offset, limit)\n\n    def grep(\n        self,\n        pattern: str,\n        path: str | None = None,\n        glob: str | None = None,\n        *,\n        max_count: int | None = None,\n        context_lines: int = 0,\n    ) -> GrepResult:\n        scope = self._scope()\n        if path is not None:\n            # Only a named excluded FILE is refused; dirs fall through or every subtree is refused\n            rel = self._rel_of(path)\n            if (\n                rel is not None\n                and rel != \".\"\n                and (self.cwd / rel).is_file()\n                and _scan_scope._excluded_rel(rel, scope)\n            ):\n                return GrepResult(\n                    error=_scan_scope._SCOPE_ERROR.format(path=path), matches=[]\n                )\n        result = super().grep(\n            pattern, path, glob, max_count=max_count, context_lines=context_lines\n        )\n        if result.matches:\n            # Match paths are virtual (\"/rel/posix\") on this always-virtual backend.\n            result.matches = [\n                m\n                for m in result.matches\n                if not _scan_scope._excluded_rel(m[\"path\"].lstrip(\"/\"), scope)\n            ]\n        return result\n\n    def glob(self, pattern: str, path: str | None = None) -> GlobResult:\n        result = super().glob(pattern, path)\n        if result.matches:\n            scope = self._scope()\n            result.matches = [\n                m\n                for m in result.matches\n                if not _scan_scope._excluded_rel(m[\"path\"].lstrip(\"/\"), scope)\n            ]\n        return result\n\n    def _entry_excluded(self, entry: FileInfo, scope: frozenset[str] | None) -> bool:\n        rel = entry[\"path\"].strip(\"/\")\n        if not entry.get(\"is_dir\"):\n            return bool(rel) and _scan_scope._excluded_rel(rel, scope)\n        return _dir_excluded(rel, scope)\n\n    def ls(self, path: str) -> LsResult:\n        result = super().ls(path)\n        if result.entries:\n            scope = self._scope()\n            result.entries = [\n                e for e in result.entries if not self._entry_excluded(e, scope)\n            ]\n        return result\n\n\ndef _dir_excluded(rel: str, scope: frozenset[str] | None) -> bool:\n    \"\"\"Whether ``ls`` should hide directory *rel* under the registered inventory *scope*.\"\"\"\n    if any(part.lower() in _scan_scope._ALWAYS_EXCLUDED_DIRS for part in rel.split(\"/\")):\n        return True\n    # .vvaharness/skills post-dates s1's walk; without this exemption every scan loads zero skills\n    if _scan_scope._always_allowed(rel + \"/\"):\n        return False\n    return bool(rel) and scope is not None and rel not in _in_scope_dirs(scope)\n\n\nclass _ShellScopedReadBackend(_ScopedReadBackend, LocalShellBackend):\n    \"\"\"Inventory-scoped file operations plus ``execute``, when a stage sets ``allow_shell``.\"\"\"\n\n\ndef _shell_composite(cwd: str) -> CompositeBackend:\n    \"\"\"A composite whose default AND sole route are one executing, scoped backend.\"\"\"\n    # execute ignores routing; a non-empty routes map is the ONLY way past the NotImplementedError\n    shell = _ShellScopedReadBackend(root_dir=cwd, virtual_mode=True, inherit_env=False)\n    return CompositeBackend(default=shell, routes={\"/\": shell})\n\n\ndef _scoped_backend(options: StreamingOptions) -> BackendProtocol:\n    \"\"\"The inventory-scoped read backend, wrapped for ``execute`` when ``allow_shell`` is set.\"\"\"\n    if getattr(options, \"allow_shell\", False):\n        return _shell_composite(options.cwd)\n    return _ScopedReadBackend(root_dir=options.cwd, virtual_mode=True)\n\n\n#: Refusal for a write into repository metadata, whatever the permission globs allowed.\n_GIT_WRITE_REFUSED = \"writes into version-control metadata (.git) are refused: {path}\"\n\n\nclass _StockReadBackend(_PathJail, FilesystemBackend):\n    \"\"\"The S10/S11 \"frozen\" backend: full stock ``FilesystemBackend`` reach, but a path-traversal/symlink-loop attempt returns ``error=...`` instead of killing the session.\"\"\"\n\n    # The async variants delegate to these via asyncio.to_thread, so this covers both.\n    def write(self, file_path: str, content: str) -> WriteResult:\n        if is_git_metadata(file_path):\n            return WriteResult(error=_GIT_WRITE_REFUSED.format(path=file_path))\n        return super().write(file_path, content)\n\n    def edit(\n        self,\n        file_path: str,\n        old_string: str,\n        new_string: str,\n        replace_all: bool = False,\n    ) -> EditResult:\n        if is_git_metadata(file_path):\n            return EditResult(error=_GIT_WRITE_REFUSED.format(path=file_path))\n        return super().edit(file_path, old_string, new_string, replace_all)\n\n    def delete(self, file_path: str) -> DeleteResult:\n        if is_git_metadata(file_path):\n            return DeleteResult(error=_GIT_WRITE_REFUSED.format(path=file_path))\n        return super().delete(file_path)\n\n    def upload_files(\n        self, files: list[tuple[str, bytes]]\n    ) -> list[FileUploadResponse]:\n        allowed = [(p, c) for p, c in files if not is_git_metadata(p)]\n        results = iter(super().upload_files(allowed) if allowed else [])\n        return [\n            FileUploadResponse(path=p, error=_GIT_WRITE_REFUSED.format(path=p))\n            if is_git_metadata(p) else next(results)\n            for p, _c in files\n        ]\n\n\ndef _session_backend(\n    options: OneShotOptions | StreamingOptions,\n) -> BackendProtocol | None:\n    \"\"\"Use a real, repo-confined filesystem; read-only sessions still need native reads.\"\"\"\n    # Always disk-backed: native read_file/grep/glob are the only read path; StateBackend is empty.\n    _filesystem_permissions(options)\n    # Opt-in per site, keyed off the SAME permitted_tool_calls as the gate, so the two cannot drift\n    if getattr(options, \"permitted_tool_calls\", None) is not None:\n        return _scoped_backend(options)\n    # One-shot = detection parser: fail closed, since a tool-less turn cannot recover an eviction\n    if isinstance(options, OneShotOptions):\n        return _NoWriteBackend(root_dir=options.cwd, virtual_mode=True)\n    # Frozen S10/S11 streaming: same read reach and write access as stock FilesystemBackend.\n    return _StockReadBackend(root_dir=options.cwd, virtual_mode=True)\n\n\n@contextlib.contextmanager\ndef patched_read_timeouts(seconds: float | None):\n    \"\"\"Temporarily raise deepagents' hardcoded 5s glob / 15s grep timeout (module-global, not safe to nest with a different value); ``None`` is a no-op.\"\"\"\n    if seconds is None:\n        yield\n        return\n    mod = _deepagents_filesystem\n    grep_timeout = int(seconds)\n    async_grep_timeout = 2 * grep_timeout + 5\n    python_search_defaults = mod.FilesystemBackend._python_search.__kwdefaults__\n    originals = (\n        mod._DEFAULT_GLOB_TIMEOUT,\n        mod.DEFAULT_GREP_TIMEOUT,\n        mod.ASYNC_GREP_TIMEOUT,\n        python_search_defaults[\"timeout\"],\n    )\n    try:\n        mod._DEFAULT_GLOB_TIMEOUT = seconds\n        mod.DEFAULT_GREP_TIMEOUT = grep_timeout\n        mod.ASYNC_GREP_TIMEOUT = async_grep_timeout\n        python_search_defaults[\"timeout\"] = grep_timeout\n        yield\n    finally:\n        (\n            mod._DEFAULT_GLOB_TIMEOUT,\n            mod.DEFAULT_GREP_TIMEOUT,\n            mod.ASYNC_GREP_TIMEOUT,\n            python_search_defaults[\"timeout\"],\n        ) = originals\n\n\ndef _skill_sources(skill_root: Path | None, cwd: Path) -> list[str]:\n    \"\"\"Return *skill_root* as a virtual-path skill source, re-rooted under the session cwd.\"\"\"\n    if skill_root is None or not skill_root.is_dir():\n        return []\n    root, base = skill_root.resolve(), cwd.resolve()\n    if not root.is_relative_to(base):\n        msg = f\"skill_root {root} must live under the session cwd {base}\"\n        raise ValueError(msg)\n    relative = root.relative_to(base).as_posix()\n    return [f\"/{relative}\" if relative != \".\" else \"/\"]\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/backends/harness/deepagents/options/filesystem.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "Filesystem permissioning, backend selection, and skill-source resolution.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_59_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/filesystem.py",
+      "line_start": 59,
+      "line_end": 59,
+      "value": "Deny all writes for a read-only session; permit them when the caller opts in.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_66_33": {
+      "source": "vvaharness/backends/harness/deepagents/options/filesystem.py",
+      "line_start": 66,
+      "line_end": 66,
+      "source_expression": "f\"writable path escapes harness cwd: {raw}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_73_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/filesystem.py",
+      "line_start": 73,
+      "line_end": 73,
+      "value": "Every ancestor directory (repo-relative posix) of an in-scope file.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_88_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/filesystem.py",
+      "line_start": 88,
+      "line_end": 88,
+      "value": "A ``FilesystemBackend`` whose write surface fails closed, touching no disk.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_116_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/filesystem.py",
+      "line_start": 116,
+      "line_end": 116,
+      "value": "Shared crash-proof ``_resolve_path`` jail (OSError subtype, not a raised exception); carries no read-reach narrowing of its own.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_121_48": {
+      "source": "vvaharness/backends/harness/deepagents/options/filesystem.py",
+      "line_start": 121,
+      "line_end": 121,
+      "source_expression": "f\"/{key}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_138_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/filesystem.py",
+      "line_start": 138,
+      "line_end": 138,
+      "value": "A ``FilesystemBackend`` whose READ surface is confined to the scan scope.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_142_8": {
+      "source": "vvaharness/backends/harness/deepagents/options/filesystem.py",
+      "line_start": 142,
+      "line_end": 142,
+      "value": "The registered inventory for this root, or None when s1 has not run.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_146_8": {
+      "source": "vvaharness/backends/harness/deepagents/options/filesystem.py",
+      "line_start": 146,
+      "line_end": 146,
+      "value": "Repo-relative posix path for *file_path*, or None when it cannot resolve.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_222_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/filesystem.py",
+      "line_start": 222,
+      "line_end": 222,
+      "value": "Whether ``ls`` should hide directory *rel* under the registered inventory *scope*.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_232_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/filesystem.py",
+      "line_start": 232,
+      "line_end": 232,
+      "value": "Inventory-scoped file operations plus ``execute``, when a stage sets ``allow_shell``.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_236_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/filesystem.py",
+      "line_start": 236,
+      "line_end": 236,
+      "value": "A composite whose default AND sole route are one executing, scoped backend.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_243_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/filesystem.py",
+      "line_start": 243,
+      "line_end": 243,
+      "value": "The inventory-scoped read backend, wrapped for ``execute`` when ``allow_shell`` is set.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_254_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/filesystem.py",
+      "line_start": 254,
+      "line_end": 254,
+      "value": "The S10/S11 \"frozen\" backend: full stock ``FilesystemBackend`` reach, but a path-traversal/symlink-loop attempt returns ``error=...`` instead of killing the session.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_293_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/filesystem.py",
+      "line_start": 293,
+      "line_end": 293,
+      "value": "Use a real, repo-confined filesystem; read-only sessions still need native reads.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_308_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/filesystem.py",
+      "line_start": 308,
+      "line_end": 308,
+      "value": "Temporarily raise deepagents' hardcoded 5s glob / 15s grep timeout (module-global, not safe to nest with a different value); ``None`` is a no-op.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_338_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/filesystem.py",
+      "line_start": 338,
+      "line_end": 338,
+      "value": "Return *skill_root* as a virtual-path skill source, re-rooted under the session cwd.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_343_14": {
+      "source": "vvaharness/backends/harness/deepagents/options/filesystem.py",
+      "line_start": 343,
+      "line_end": 343,
+      "source_expression": "f\"skill_root {root} must live under the session cwd {base}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_346_12": {
+      "source": "vvaharness/backends/harness/deepagents/options/filesystem.py",
+      "line_start": 346,
+      "line_end": 346,
+      "source_expression": "f\"/{relative}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "Filesystem permissioning, backend selection, and skill-source resolution.",
+      "context": "literal"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 14,
+      "value": "ERROR: path '{path}' is outside the scan root; use a repo-relative path",
+      "context": "literal"
+    },
+    {
+      "line_start": 84,
+      "line_end": 84,
+      "column": 17,
+      "value": "write operations are disabled on detection sessions: {path}",
+      "context": "literal"
+    },
+    {
+      "line_start": 250,
+      "line_end": 250,
+      "column": 21,
+      "value": "writes into version-control metadata (.git) are refused: {path}",
+      "context": "literal"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 4,
+      "value": "Deny all writes for a read-only session; permit them when the caller opts in.",
+      "context": "literal"
+    },
+    {
+      "line_start": 73,
+      "line_end": 73,
+      "column": 4,
+      "value": "Every ancestor directory (repo-relative posix) of an in-scope file.",
+      "context": "literal"
+    },
+    {
+      "line_start": 88,
+      "line_end": 88,
+      "column": 4,
+      "value": "A ``FilesystemBackend`` whose write surface fails closed, touching no disk.",
+      "context": "literal"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 4,
+      "value": "Shared crash-proof ``_resolve_path`` jail (OSError subtype, not a raised exception); carries no read-reach narrowing of its own.",
+      "context": "literal"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 4,
+      "value": "A ``FilesystemBackend`` whose READ surface is confined to the scan scope.",
+      "context": "literal"
+    },
+    {
+      "line_start": 222,
+      "line_end": 222,
+      "column": 4,
+      "value": "Whether ``ls`` should hide directory *rel* under the registered inventory *scope*.",
+      "context": "literal"
+    },
+    {
+      "line_start": 232,
+      "line_end": 232,
+      "column": 4,
+      "value": "Inventory-scoped file operations plus ``execute``, when a stage sets ``allow_shell``.",
+      "context": "literal"
+    },
+    {
+      "line_start": 236,
+      "line_end": 236,
+      "column": 4,
+      "value": "A composite whose default AND sole route are one executing, scoped backend.",
+      "context": "literal"
+    },
+    {
+      "line_start": 243,
+      "line_end": 243,
+      "column": 4,
+      "value": "The inventory-scoped read backend, wrapped for ``execute`` when ``allow_shell`` is set.",
+      "context": "literal"
+    },
+    {
+      "line_start": 254,
+      "line_end": 254,
+      "column": 4,
+      "value": "The S10/S11 \"frozen\" backend: full stock ``FilesystemBackend`` reach, but a path-traversal/symlink-loop attempt returns ``error=...`` instead of killing the session.",
+      "context": "literal"
+    },
+    {
+      "line_start": 293,
+      "line_end": 293,
+      "column": 4,
+      "value": "Use a real, repo-confined filesystem; read-only sessions still need native reads.",
+      "context": "literal"
+    },
+    {
+      "line_start": 308,
+      "line_end": 308,
+      "column": 4,
+      "value": "Temporarily raise deepagents' hardcoded 5s glob / 15s grep timeout (module-global, not safe to nest with a different value); ``None`` is a no-op.",
+      "context": "literal"
+    },
+    {
+      "line_start": 338,
+      "line_end": 338,
+      "column": 4,
+      "value": "Return *skill_root* as a virtual-path skill source, re-rooted under the session cwd.",
+      "context": "literal"
+    },
+    {
+      "line_start": 142,
+      "line_end": 142,
+      "column": 8,
+      "value": "The registered inventory for this root, or None when s1 has not run.",
+      "context": "literal"
+    },
+    {
+      "line_start": 146,
+      "line_end": 146,
+      "column": 8,
+      "value": "Repo-relative posix path for *file_path*, or None when it cannot resolve.",
+      "context": "literal"
+    },
+    {
+      "line_start": 244,
+      "line_end": 244,
+      "column": 24,
+      "value": "allow_shell",
+      "context": "literal"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 34,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 226,
+      "line_end": 226,
+      "column": 41,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 297,
+      "line_end": 297,
+      "column": 24,
+      "value": "permitted_tool_calls",
+      "context": "literal"
+    },
+    {
+      "line_start": 320,
+      "line_end": 320,
+      "column": 31,
+      "value": "timeout",
+      "context": "literal"
+    },
+    {
+      "line_start": 326,
+      "line_end": 326,
+      "column": 31,
+      "value": "timeout",
+      "context": "literal"
+    },
+    {
+      "line_start": 343,
+      "line_end": 343,
+      "column": 16,
+      "value": "skill_root ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 343,
+      "line_end": 343,
+      "column": 33,
+      "value": " must live under the session cwd ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 346,
+      "line_end": 346,
+      "column": 51,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 26,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 121,
+      "line_end": 121,
+      "column": 38,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 121,
+      "line_end": 121,
+      "column": 50,
+      "value": "/",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 11,
+      "value": "..",
+      "context": "literal"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 64,
+      "value": "~",
+      "context": "literal"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 26,
+      "value": "deepagents_path_jail_refused",
+      "context": "literal"
+    },
+    {
+      "line_start": 156,
+      "line_end": 156,
+      "column": 38,
+      "value": ".",
+      "context": "literal"
+    },
+    {
+      "line_start": 207,
+      "line_end": 207,
+      "column": 25,
+      "value": "is_dir",
+      "context": "literal"
+    },
+    {
+      "line_start": 239,
+      "line_end": 239,
+      "column": 51,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 333,
+      "line_end": 333,
+      "column": 35,
+      "value": "timeout",
+      "context": "literal"
+    },
+    {
+      "line_start": 346,
+      "line_end": 346,
+      "column": 42,
+      "value": ".",
+      "context": "literal"
+    },
+    {
+      "line_start": 346,
+      "line_end": 346,
+      "column": 14,
+      "value": "/",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 26,
+      "value": "deepagents_path_jail_refused",
+      "context": "literal"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 27,
+      "value": ".",
+      "context": "literal"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 20,
+      "value": "path",
+      "context": "literal"
+    },
+    {
+      "line_start": 223,
+      "line_end": 223,
+      "column": 83,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 35,
+      "value": "writable path escapes harness cwd: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 79,
+      "line_end": 79,
+      "column": 21,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 127,
+      "line_end": 127,
+      "column": 40,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 190,
+      "line_end": 190,
+      "column": 66,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 201,
+      "line_end": 201,
+      "column": 66,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 190,
+      "line_end": 190,
+      "column": 51,
+      "value": "path",
+      "context": "literal"
+    },
+    {
+      "line_start": 201,
+      "line_end": 201,
+      "column": 51,
+      "value": "path",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 42,
+      "text": "# Scan-scope registry is SHARED with sdk/openai, never re-derived: one s1 registration binds all"
+    },
+    {
+      "line": 52,
+      "text": "#: Refusal for a path that escapes the backend's root; only the model's own path is echoed."
+    },
+    {
+      "line": 61,
+      "text": "# DeepAgents' filesystem middleware is rooted at cwd; refuse a broader writable_paths scope."
+    },
+    {
+      "line": 74,
+      "text": "# ls shows only dirs holding in-scope files: an excluded file's NAME must not leak"
+    },
+    {
+      "line": 83,
+      "text": "#: Refusal a detection session's backend returns for any write-class operation."
+    },
+    {
+      "line": 89,
+      "text": "# Middleware writes (eviction/offload) bypass permissions into the scanned repo; failing = no-op"
+    },
+    {
+      "line": 91,
+      "text": "# noqa: ARG002"
+    },
+    {
+      "line": 97,
+      "text": "# noqa: ARG002"
+    },
+    {
+      "line": 98,
+      "text": "# noqa: ARG002"
+    },
+    {
+      "line": 99,
+      "text": "# noqa: ARG002 — upstream signature"
+    },
+    {
+      "line": 122,
+      "text": "# Tilde checked on the ORIGINAL key: vpath is always \"/\"-prefixed by now, so"
+    },
+    {
+      "line": 123,
+      "text": "# vpath.startswith(\"~\") can never fire."
+    },
+    {
+      "line": 139,
+      "text": "# Root jail NOT enough (.git/config, security-scan/); choke point scopes all reads, pre-s1 too"
+    },
+    {
+      "line": 147,
+      "text": "# Resolution failures return None: the scope check must never REPLACE the jail's refusals"
+    },
+    {
+      "line": 155,
+      "text": "# Scope check BEFORE super()'s existence check, so it is never an existence oracle"
+    },
+    {
+      "line": 171,
+      "text": "# Only a named excluded FILE is refused; dirs fall through or every subtree is refused"
+    },
+    {
+      "line": 186,
+      "text": "# Match paths are virtual (\"/rel/posix\") on this always-virtual backend."
+    },
+    {
+      "line": 225,
+      "text": "# .vvaharness/skills post-dates s1's walk; without this exemption every scan loads zero skills"
+    },
+    {
+      "line": 237,
+      "text": "# execute ignores routing; a non-empty routes map is the ONLY way past the NotImplementedError"
+    },
+    {
+      "line": 249,
+      "text": "#: Refusal for a write into repository metadata, whatever the permission globs allowed."
+    },
+    {
+      "line": 256,
+      "text": "# The async variants delegate to these via asyncio.to_thread, so this covers both."
+    },
+    {
+      "line": 294,
+      "text": "# Always disk-backed: native read_file/grep/glob are the only read path; StateBackend is empty."
+    },
+    {
+      "line": 296,
+      "text": "# Opt-in per site, keyed off the SAME permitted_tool_calls as the gate, so the two cannot drift"
+    },
+    {
+      "line": 299,
+      "text": "# One-shot = detection parser: fail closed, since a tool-less turn cannot recover an eviction"
+    },
+    {
+      "line": 302,
+      "text": "# Frozen S10/S11 streaming: same read reach and write access as stock FilesystemBackend."
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 23,
+      "line_end": 23,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 26,
+      "line_end": 26,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 27,
+      "line_end": 27,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 28,
+      "line_end": 39,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 40,
+      "line_end": 40,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 43,
+      "line_end": 46,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 47,
+      "line_end": 47,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 48,
+      "line_end": 48,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 49,
+      "line_end": 49,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 50,
+      "line_end": 50,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "Assign",
+      "line_start": 53,
+      "line_end": 53,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 56,
+      "line_end": 68,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 9
+    },
+    {
+      "kind": "Expr",
+      "line_start": 59,
+      "line_end": 59,
+      "column": 4,
+      "owner": "_filesystem_permissions",
+      "representation_line": 15
+    },
+    {
+      "kind": "If",
+      "line_start": 60,
+      "line_end": 67,
+      "column": 4,
+      "owner": "_filesystem_permissions",
+      "representation_line": 16
+    },
+    {
+      "kind": "Assign",
+      "line_start": 62,
+      "line_end": 62,
+      "column": 8,
+      "owner": "_filesystem_permissions",
+      "representation_line": 19
+    },
+    {
+      "kind": "For",
+      "line_start": 63,
+      "line_end": 66,
+      "column": 8,
+      "owner": "_filesystem_permissions",
+      "representation_line": 20
+    },
+    {
+      "kind": "Assign",
+      "line_start": 64,
+      "line_end": 64,
+      "column": 12,
+      "owner": "_filesystem_permissions",
+      "representation_line": 23
+    },
+    {
+      "kind": "If",
+      "line_start": 65,
+      "line_end": 66,
+      "column": 12,
+      "owner": "_filesystem_permissions",
+      "representation_line": 24
+    },
+    {
+      "kind": "Raise",
+      "line_start": 66,
+      "line_end": 66,
+      "column": 16,
+      "owner": "_filesystem_permissions",
+      "representation_line": 26
+    },
+    {
+      "kind": "Return",
+      "line_start": 67,
+      "line_end": 67,
+      "column": 8,
+      "owner": "_filesystem_permissions",
+      "representation_line": 30
+    },
+    {
+      "kind": "Return",
+      "line_start": 68,
+      "line_end": 68,
+      "column": 4,
+      "owner": "_filesystem_permissions",
+      "representation_line": 33
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 72,
+      "line_end": 80,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 37
+    },
+    {
+      "kind": "Expr",
+      "line_start": 73,
+      "line_end": 73,
+      "column": 4,
+      "owner": "_in_scope_dirs",
+      "representation_line": 46
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 75,
+      "line_end": 75,
+      "column": 4,
+      "owner": "_in_scope_dirs",
+      "representation_line": 46
+    },
+    {
+      "kind": "For",
+      "line_start": 76,
+      "line_end": 79,
+      "column": 4,
+      "owner": "_in_scope_dirs",
+      "representation_line": 47
+    },
+    {
+      "kind": "Assign",
+      "line_start": 77,
+      "line_end": 77,
+      "column": 8,
+      "owner": "_in_scope_dirs",
+      "representation_line": 50
+    },
+    {
+      "kind": "For",
+      "line_start": 78,
+      "line_end": 79,
+      "column": 8,
+      "owner": "_in_scope_dirs",
+      "representation_line": 51
+    },
+    {
+      "kind": "Expr",
+      "line_start": 79,
+      "line_end": 79,
+      "column": 12,
+      "owner": "_in_scope_dirs",
+      "representation_line": 54
+    },
+    {
+      "kind": "Return",
+      "line_start": 80,
+      "line_end": 80,
+      "column": 4,
+      "owner": "_in_scope_dirs",
+      "representation_line": 57
+    },
+    {
+      "kind": "Assign",
+      "line_start": 84,
+      "line_end": 84,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 63
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 87,
+      "line_end": 112,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 64
+    },
+    {
+      "kind": "Expr",
+      "line_start": 88,
+      "line_end": 88,
+      "column": 4,
+      "owner": "_NoWriteBackend",
+      "representation_line": 69
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 91,
+      "line_end": 92,
+      "column": 4,
+      "owner": "_NoWriteBackend",
+      "representation_line": 70
+    },
+    {
+      "kind": "Return",
+      "line_start": 92,
+      "line_end": 92,
+      "column": 8,
+      "owner": "_NoWriteBackend.write",
+      "representation_line": 75
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 94,
+      "line_end": 101,
+      "column": 4,
+      "owner": "_NoWriteBackend",
+      "representation_line": 79
+    },
+    {
+      "kind": "Return",
+      "line_start": 101,
+      "line_end": 101,
+      "column": 8,
+      "owner": "_NoWriteBackend.edit",
+      "representation_line": 84
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 103,
+      "line_end": 104,
+      "column": 4,
+      "owner": "_NoWriteBackend",
+      "representation_line": 88
+    },
+    {
+      "kind": "Return",
+      "line_start": 104,
+      "line_end": 104,
+      "column": 8,
+      "owner": "_NoWriteBackend.delete",
+      "representation_line": 93
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 106,
+      "line_end": 112,
+      "column": 4,
+      "owner": "_NoWriteBackend",
+      "representation_line": 97
+    },
+    {
+      "kind": "Return",
+      "line_start": 109,
+      "line_end": 112,
+      "column": 8,
+      "owner": "_NoWriteBackend.upload_files",
+      "representation_line": 102
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 115,
+      "line_end": 134,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 107
+    },
+    {
+      "kind": "Expr",
+      "line_start": 116,
+      "line_end": 116,
+      "column": 4,
+      "owner": "_PathJail",
+      "representation_line": 112
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 118,
+      "line_end": 134,
+      "column": 4,
+      "owner": "_PathJail",
+      "representation_line": 113
+    },
+    {
+      "kind": "If",
+      "line_start": 119,
+      "line_end": 120,
+      "column": 8,
+      "owner": "_PathJail._resolve_path",
+      "representation_line": 118
+    },
+    {
+      "kind": "Return",
+      "line_start": 120,
+      "line_end": 120,
+      "column": 12,
+      "owner": "_PathJail._resolve_path",
+      "representation_line": 120
+    },
+    {
+      "kind": "Assign",
+      "line_start": 121,
+      "line_end": 121,
+      "column": 8,
+      "owner": "_PathJail._resolve_path",
+      "representation_line": 124
+    },
+    {
+      "kind": "If",
+      "line_start": 124,
+      "line_end": 126,
+      "column": 8,
+      "owner": "_PathJail._resolve_path",
+      "representation_line": 125
+    },
+    {
+      "kind": "Expr",
+      "line_start": 125,
+      "line_end": 125,
+      "column": 12,
+      "owner": "_PathJail._resolve_path",
+      "representation_line": 128
+    },
+    {
+      "kind": "Raise",
+      "line_start": 126,
+      "line_end": 126,
+      "column": 12,
+      "owner": "_PathJail._resolve_path",
+      "representation_line": 129
+    },
+    {
+      "kind": "Assign",
+      "line_start": 127,
+      "line_end": 127,
+      "column": 8,
+      "owner": "_PathJail._resolve_path",
+      "representation_line": 133
+    },
+    {
+      "kind": "Try",
+      "line_start": 128,
+      "line_end": 132,
+      "column": 8,
+      "owner": "_PathJail._resolve_path",
+      "representation_line": 134
+    },
+    {
+      "kind": "Expr",
+      "line_start": 129,
+      "line_end": 129,
+      "column": 12,
+      "owner": "_PathJail._resolve_path",
+      "representation_line": 137
+    },
+    {
+      "kind": "Expr",
+      "line_start": 131,
+      "line_end": 131,
+      "column": 12,
+      "owner": "_PathJail._resolve_path",
+      "representation_line": 142
+    },
+    {
+      "kind": "Raise",
+      "line_start": 132,
+      "line_end": 132,
+      "column": 12,
+      "owner": "_PathJail._resolve_path",
+      "representation_line": 143
+    },
+    {
+      "kind": "Expr",
+      "line_start": 133,
+      "line_end": 133,
+      "column": 8,
+      "owner": "_PathJail._resolve_path",
+      "representation_line": 147
+    },
+    {
+      "kind": "Return",
+      "line_start": 134,
+      "line_end": 134,
+      "column": 8,
+      "owner": "_PathJail._resolve_path",
+      "representation_line": 148
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 137,
+      "line_end": 218,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 153
+    },
+    {
+      "kind": "Expr",
+      "line_start": 138,
+      "line_end": 138,
+      "column": 4,
+      "owner": "_ScopedReadBackend",
+      "representation_line": 158
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 141,
+      "line_end": 143,
+      "column": 4,
+      "owner": "_ScopedReadBackend",
+      "representation_line": 159
+    },
+    {
+      "kind": "Expr",
+      "line_start": 142,
+      "line_end": 142,
+      "column": 8,
+      "owner": "_ScopedReadBackend._scope",
+      "representation_line": 165
+    },
+    {
+      "kind": "Return",
+      "line_start": 143,
+      "line_end": 143,
+      "column": 8,
+      "owner": "_ScopedReadBackend._scope",
+      "representation_line": 166
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 145,
+      "line_end": 151,
+      "column": 4,
+      "owner": "_ScopedReadBackend",
+      "representation_line": 170
+    },
+    {
+      "kind": "Expr",
+      "line_start": 146,
+      "line_end": 146,
+      "column": 8,
+      "owner": "_ScopedReadBackend._rel_of",
+      "representation_line": 176
+    },
+    {
+      "kind": "Try",
+      "line_start": 148,
+      "line_end": 151,
+      "column": 8,
+      "owner": "_ScopedReadBackend._rel_of",
+      "representation_line": 177
+    },
+    {
+      "kind": "Return",
+      "line_start": 149,
+      "line_end": 149,
+      "column": 12,
+      "owner": "_ScopedReadBackend._rel_of",
+      "representation_line": 179
+    },
+    {
+      "kind": "Return",
+      "line_start": 151,
+      "line_end": 151,
+      "column": 12,
+      "owner": "_ScopedReadBackend._rel_of",
+      "representation_line": 184
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 153,
+      "line_end": 158,
+      "column": 4,
+      "owner": "_ScopedReadBackend",
+      "representation_line": 189
+    },
+    {
+      "kind": "Assign",
+      "line_start": 154,
+      "line_end": 154,
+      "column": 8,
+      "owner": "_ScopedReadBackend.read",
+      "representation_line": 195
+    },
+    {
+      "kind": "If",
+      "line_start": 156,
+      "line_end": 157,
+      "column": 8,
+      "owner": "_ScopedReadBackend.read",
+      "representation_line": 196
+    },
+    {
+      "kind": "Return",
+      "line_start": 157,
+      "line_end": 157,
+      "column": 12,
+      "owner": "_ScopedReadBackend.read",
+      "representation_line": 198
+    },
+    {
+      "kind": "Return",
+      "line_start": 158,
+      "line_end": 158,
+      "column": 8,
+      "owner": "_ScopedReadBackend.read",
+      "representation_line": 201
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 160,
+      "line_end": 192,
+      "column": 4,
+      "owner": "_ScopedReadBackend",
+      "representation_line": 205
+    },
+    {
+      "kind": "Assign",
+      "line_start": 169,
+      "line_end": 169,
+      "column": 8,
+      "owner": "_ScopedReadBackend.grep",
+      "representation_line": 211
+    },
+    {
+      "kind": "If",
+      "line_start": 170,
+      "line_end": 181,
+      "column": 8,
+      "owner": "_ScopedReadBackend.grep",
+      "representation_line": 212
+    },
+    {
+      "kind": "Assign",
+      "line_start": 172,
+      "line_end": 172,
+      "column": 12,
+      "owner": "_ScopedReadBackend.grep",
+      "representation_line": 215
+    },
+    {
+      "kind": "If",
+      "line_start": 173,
+      "line_end": 181,
+      "column": 12,
+      "owner": "_ScopedReadBackend.grep",
+      "representation_line": 216
+    },
+    {
+      "kind": "Return",
+      "line_start": 179,
+      "line_end": 181,
+      "column": 16,
+      "owner": "_ScopedReadBackend.grep",
+      "representation_line": 218
+    },
+    {
+      "kind": "Assign",
+      "line_start": 182,
+      "line_end": 184,
+      "column": 8,
+      "owner": "_ScopedReadBackend.grep",
+      "representation_line": 223
+    },
+    {
+      "kind": "If",
+      "line_start": 185,
+      "line_end": 191,
+      "column": 8,
+      "owner": "_ScopedReadBackend.grep",
+      "representation_line": 224
+    },
+    {
+      "kind": "Assign",
+      "line_start": 187,
+      "line_end": 191,
+      "column": 12,
+      "owner": "_ScopedReadBackend.grep",
+      "representation_line": 227
+    },
+    {
+      "kind": "Return",
+      "line_start": 192,
+      "line_end": 192,
+      "column": 8,
+      "owner": "_ScopedReadBackend.grep",
+      "representation_line": 229
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 194,
+      "line_end": 203,
+      "column": 4,
+      "owner": "_ScopedReadBackend",
+      "representation_line": 233
+    },
+    {
+      "kind": "Assign",
+      "line_start": 195,
+      "line_end": 195,
+      "column": 8,
+      "owner": "_ScopedReadBackend.glob",
+      "representation_line": 239
+    },
+    {
+      "kind": "If",
+      "line_start": 196,
+      "line_end": 202,
+      "column": 8,
+      "owner": "_ScopedReadBackend.glob",
+      "representation_line": 240
+    },
+    {
+      "kind": "Assign",
+      "line_start": 197,
+      "line_end": 197,
+      "column": 12,
+      "owner": "_ScopedReadBackend.glob",
+      "representation_line": 243
+    },
+    {
+      "kind": "Assign",
+      "line_start": 198,
+      "line_end": 202,
+      "column": 12,
+      "owner": "_ScopedReadBackend.glob",
+      "representation_line": 243
+    },
+    {
+      "kind": "Return",
+      "line_start": 203,
+      "line_end": 203,
+      "column": 8,
+      "owner": "_ScopedReadBackend.glob",
+      "representation_line": 245
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 205,
+      "line_end": 209,
+      "column": 4,
+      "owner": "_ScopedReadBackend",
+      "representation_line": 249
+    },
+    {
+      "kind": "Assign",
+      "line_start": 206,
+      "line_end": 206,
+      "column": 8,
+      "owner": "_ScopedReadBackend._entry_excluded",
+      "representation_line": 255
+    },
+    {
+      "kind": "If",
+      "line_start": 207,
+      "line_end": 208,
+      "column": 8,
+      "owner": "_ScopedReadBackend._entry_excluded",
+      "representation_line": 256
+    },
+    {
+      "kind": "Return",
+      "line_start": 208,
+      "line_end": 208,
+      "column": 12,
+      "owner": "_ScopedReadBackend._entry_excluded",
+      "representation_line": 258
+    },
+    {
+      "kind": "Return",
+      "line_start": 209,
+      "line_end": 209,
+      "column": 8,
+      "owner": "_ScopedReadBackend._entry_excluded",
+      "representation_line": 261
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 211,
+      "line_end": 218,
+      "column": 4,
+      "owner": "_ScopedReadBackend",
+      "representation_line": 265
+    },
+    {
+      "kind": "Assign",
+      "line_start": 212,
+      "line_end": 212,
+      "column": 8,
+      "owner": "_ScopedReadBackend.ls",
+      "representation_line": 271
+    },
+    {
+      "kind": "If",
+      "line_start": 213,
+      "line_end": 217,
+      "column": 8,
+      "owner": "_ScopedReadBackend.ls",
+      "representation_line": 272
+    },
+    {
+      "kind": "Assign",
+      "line_start": 214,
+      "line_end": 214,
+      "column": 12,
+      "owner": "_ScopedReadBackend.ls",
+      "representation_line": 275
+    },
+    {
+      "kind": "Assign",
+      "line_start": 215,
+      "line_end": 217,
+      "column": 12,
+      "owner": "_ScopedReadBackend.ls",
+      "representation_line": 275
+    },
+    {
+      "kind": "Return",
+      "line_start": 218,
+      "line_end": 218,
+      "column": 8,
+      "owner": "_ScopedReadBackend.ls",
+      "representation_line": 277
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 221,
+      "line_end": 228,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 282
+    },
+    {
+      "kind": "Expr",
+      "line_start": 222,
+      "line_end": 222,
+      "column": 4,
+      "owner": "_dir_excluded",
+      "representation_line": 288
+    },
+    {
+      "kind": "If",
+      "line_start": 223,
+      "line_end": 224,
+      "column": 4,
+      "owner": "_dir_excluded",
+      "representation_line": 289
+    },
+    {
+      "kind": "Return",
+      "line_start": 224,
+      "line_end": 224,
+      "column": 8,
+      "owner": "_dir_excluded",
+      "representation_line": 291
+    },
+    {
+      "kind": "If",
+      "line_start": 226,
+      "line_end": 227,
+      "column": 4,
+      "owner": "_dir_excluded",
+      "representation_line": 294
+    },
+    {
+      "kind": "Return",
+      "line_start": 227,
+      "line_end": 227,
+      "column": 8,
+      "owner": "_dir_excluded",
+      "representation_line": 296
+    },
+    {
+      "kind": "Return",
+      "line_start": 228,
+      "line_end": 228,
+      "column": 4,
+      "owner": "_dir_excluded",
+      "representation_line": 299
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 231,
+      "line_end": 232,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 303
+    },
+    {
+      "kind": "Expr",
+      "line_start": 232,
+      "line_end": 232,
+      "column": 4,
+      "owner": "_ShellScopedReadBackend",
+      "representation_line": 308
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 235,
+      "line_end": 239,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 310
+    },
+    {
+      "kind": "Expr",
+      "line_start": 236,
+      "line_end": 236,
+      "column": 4,
+      "owner": "_shell_composite",
+      "representation_line": 316
+    },
+    {
+      "kind": "Assign",
+      "line_start": 238,
+      "line_end": 238,
+      "column": 4,
+      "owner": "_shell_composite",
+      "representation_line": 316
+    },
+    {
+      "kind": "Return",
+      "line_start": 239,
+      "line_end": 239,
+      "column": 4,
+      "owner": "_shell_composite",
+      "representation_line": 317
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 242,
+      "line_end": 246,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 321
+    },
+    {
+      "kind": "Expr",
+      "line_start": 243,
+      "line_end": 243,
+      "column": 4,
+      "owner": "_scoped_backend",
+      "representation_line": 327
+    },
+    {
+      "kind": "If",
+      "line_start": 244,
+      "line_end": 245,
+      "column": 4,
+      "owner": "_scoped_backend",
+      "representation_line": 328
+    },
+    {
+      "kind": "Return",
+      "line_start": 245,
+      "line_end": 245,
+      "column": 8,
+      "owner": "_scoped_backend",
+      "representation_line": 330
+    },
+    {
+      "kind": "Return",
+      "line_start": 246,
+      "line_end": 246,
+      "column": 4,
+      "owner": "_scoped_backend",
+      "representation_line": 333
+    },
+    {
+      "kind": "Assign",
+      "line_start": 250,
+      "line_end": 250,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 338
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 253,
+      "line_end": 287,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 339
+    },
+    {
+      "kind": "Expr",
+      "line_start": 254,
+      "line_end": 254,
+      "column": 4,
+      "owner": "_StockReadBackend",
+      "representation_line": 344
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 257,
+      "line_end": 260,
+      "column": 4,
+      "owner": "_StockReadBackend",
+      "representation_line": 345
+    },
+    {
+      "kind": "If",
+      "line_start": 258,
+      "line_end": 259,
+      "column": 8,
+      "owner": "_StockReadBackend.write",
+      "representation_line": 350
+    },
+    {
+      "kind": "Return",
+      "line_start": 259,
+      "line_end": 259,
+      "column": 12,
+      "owner": "_StockReadBackend.write",
+      "representation_line": 352
+    },
+    {
+      "kind": "Return",
+      "line_start": 260,
+      "line_end": 260,
+      "column": 8,
+      "owner": "_StockReadBackend.write",
+      "representation_line": 355
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 262,
+      "line_end": 271,
+      "column": 4,
+      "owner": "_StockReadBackend",
+      "representation_line": 359
+    },
+    {
+      "kind": "If",
+      "line_start": 269,
+      "line_end": 270,
+      "column": 8,
+      "owner": "_StockReadBackend.edit",
+      "representation_line": 364
+    },
+    {
+      "kind": "Return",
+      "line_start": 270,
+      "line_end": 270,
+      "column": 12,
+      "owner": "_StockReadBackend.edit",
+      "representation_line": 366
+    },
+    {
+      "kind": "Return",
+      "line_start": 271,
+      "line_end": 271,
+      "column": 8,
+      "owner": "_StockReadBackend.edit",
+      "representation_line": 369
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 273,
+      "line_end": 276,
+      "column": 4,
+      "owner": "_StockReadBackend",
+      "representation_line": 373
+    },
+    {
+      "kind": "If",
+      "line_start": 274,
+      "line_end": 275,
+      "column": 8,
+      "owner": "_StockReadBackend.delete",
+      "representation_line": 378
+    },
+    {
+      "kind": "Return",
+      "line_start": 275,
+      "line_end": 275,
+      "column": 12,
+      "owner": "_StockReadBackend.delete",
+      "representation_line": 380
+    },
+    {
+      "kind": "Return",
+      "line_start": 276,
+      "line_end": 276,
+      "column": 8,
+      "owner": "_StockReadBackend.delete",
+      "representation_line": 383
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 278,
+      "line_end": 287,
+      "column": 4,
+      "owner": "_StockReadBackend",
+      "representation_line": 387
+    },
+    {
+      "kind": "Assign",
+      "line_start": 281,
+      "line_end": 281,
+      "column": 8,
+      "owner": "_StockReadBackend.upload_files",
+      "representation_line": 393
+    },
+    {
+      "kind": "Assign",
+      "line_start": 282,
+      "line_end": 282,
+      "column": 8,
+      "owner": "_StockReadBackend.upload_files",
+      "representation_line": 393
+    },
+    {
+      "kind": "Return",
+      "line_start": 283,
+      "line_end": 287,
+      "column": 8,
+      "owner": "_StockReadBackend.upload_files",
+      "representation_line": 394
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 290,
+      "line_end": 303,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 399
+    },
+    {
+      "kind": "Expr",
+      "line_start": 293,
+      "line_end": 293,
+      "column": 4,
+      "owner": "_session_backend",
+      "representation_line": 405
+    },
+    {
+      "kind": "Expr",
+      "line_start": 295,
+      "line_end": 295,
+      "column": 4,
+      "owner": "_session_backend",
+      "representation_line": 405
+    },
+    {
+      "kind": "If",
+      "line_start": 297,
+      "line_end": 298,
+      "column": 4,
+      "owner": "_session_backend",
+      "representation_line": 406
+    },
+    {
+      "kind": "Return",
+      "line_start": 298,
+      "line_end": 298,
+      "column": 8,
+      "owner": "_session_backend",
+      "representation_line": 408
+    },
+    {
+      "kind": "If",
+      "line_start": 300,
+      "line_end": 301,
+      "column": 4,
+      "owner": "_session_backend",
+      "representation_line": 411
+    },
+    {
+      "kind": "Return",
+      "line_start": 301,
+      "line_end": 301,
+      "column": 8,
+      "owner": "_session_backend",
+      "representation_line": 413
+    },
+    {
+      "kind": "Return",
+      "line_start": 303,
+      "line_end": 303,
+      "column": 4,
+      "owner": "_session_backend",
+      "representation_line": 416
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 307,
+      "line_end": 334,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 420
+    },
+    {
+      "kind": "Expr",
+      "line_start": 308,
+      "line_end": 308,
+      "column": 4,
+      "owner": "patched_read_timeouts",
+      "representation_line": 429
+    },
+    {
+      "kind": "If",
+      "line_start": 309,
+      "line_end": 311,
+      "column": 4,
+      "owner": "patched_read_timeouts",
+      "representation_line": 430
+    },
+    {
+      "kind": "Expr",
+      "line_start": 310,
+      "line_end": 310,
+      "column": 8,
+      "owner": "patched_read_timeouts",
+      "representation_line": 433
+    },
+    {
+      "kind": "Return",
+      "line_start": 311,
+      "line_end": 311,
+      "column": 8,
+      "owner": "patched_read_timeouts",
+      "representation_line": 434
+    },
+    {
+      "kind": "Assign",
+      "line_start": 312,
+      "line_end": 312,
+      "column": 4,
+      "owner": "patched_read_timeouts",
+      "representation_line": 438
+    },
+    {
+      "kind": "Assign",
+      "line_start": 313,
+      "line_end": 313,
+      "column": 4,
+      "owner": "patched_read_timeouts",
+      "representation_line": 438
+    },
+    {
+      "kind": "Assign",
+      "line_start": 314,
+      "line_end": 314,
+      "column": 4,
+      "owner": "patched_read_timeouts",
+      "representation_line": 438
+    },
+    {
+      "kind": "Assign",
+      "line_start": 315,
+      "line_end": 315,
+      "column": 4,
+      "owner": "patched_read_timeouts",
+      "representation_line": 438
+    },
+    {
+      "kind": "Assign",
+      "line_start": 316,
+      "line_end": 321,
+      "column": 4,
+      "owner": "patched_read_timeouts",
+      "representation_line": 438
+    },
+    {
+      "kind": "Try",
+      "line_start": 322,
+      "line_end": 334,
+      "column": 4,
+      "owner": "patched_read_timeouts",
+      "representation_line": 439
+    },
+    {
+      "kind": "Assign",
+      "line_start": 323,
+      "line_end": 323,
+      "column": 8,
+      "owner": "patched_read_timeouts",
+      "representation_line": 442
+    },
+    {
+      "kind": "Assign",
+      "line_start": 324,
+      "line_end": 324,
+      "column": 8,
+      "owner": "patched_read_timeouts",
+      "representation_line": 442
+    },
+    {
+      "kind": "Assign",
+      "line_start": 325,
+      "line_end": 325,
+      "column": 8,
+      "owner": "patched_read_timeouts",
+      "representation_line": 442
+    },
+    {
+      "kind": "Assign",
+      "line_start": 326,
+      "line_end": 326,
+      "column": 8,
+      "owner": "patched_read_timeouts",
+      "representation_line": 442
+    },
+    {
+      "kind": "Expr",
+      "line_start": 327,
+      "line_end": 327,
+      "column": 8,
+      "owner": "patched_read_timeouts",
+      "representation_line": 442
+    },
+    {
+      "kind": "Assign",
+      "line_start": 329,
+      "line_end": 334,
+      "column": 8,
+      "owner": "patched_read_timeouts",
+      "representation_line": 446
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 337,
+      "line_end": 346,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 451
+    },
+    {
+      "kind": "Expr",
+      "line_start": 338,
+      "line_end": 338,
+      "column": 4,
+      "owner": "_skill_sources",
+      "representation_line": 457
+    },
+    {
+      "kind": "If",
+      "line_start": 339,
+      "line_end": 340,
+      "column": 4,
+      "owner": "_skill_sources",
+      "representation_line": 458
+    },
+    {
+      "kind": "Return",
+      "line_start": 340,
+      "line_end": 340,
+      "column": 8,
+      "owner": "_skill_sources",
+      "representation_line": 460
+    },
+    {
+      "kind": "Assign",
+      "line_start": 341,
+      "line_end": 341,
+      "column": 4,
+      "owner": "_skill_sources",
+      "representation_line": 464
+    },
+    {
+      "kind": "If",
+      "line_start": 342,
+      "line_end": 344,
+      "column": 4,
+      "owner": "_skill_sources",
+      "representation_line": 465
+    },
+    {
+      "kind": "Assign",
+      "line_start": 343,
+      "line_end": 343,
+      "column": 8,
+      "owner": "_skill_sources",
+      "representation_line": 468
+    },
+    {
+      "kind": "Raise",
+      "line_start": 344,
+      "line_end": 344,
+      "column": 8,
+      "owner": "_skill_sources",
+      "representation_line": 469
+    },
+    {
+      "kind": "Assign",
+      "line_start": 345,
+      "line_end": 345,
+      "column": 4,
+      "owner": "_skill_sources",
+      "representation_line": 473
+    },
+    {
+      "kind": "Return",
+      "line_start": 346,
+      "line_end": 346,
+      "column": 4,
+      "owner": "_skill_sources",
+      "representation_line": 474
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 14,
+      "kind": "Constant",
+      "original_ast": "Constant(value=\"ERROR: path '{path}' is outside the scan root; use a repo-relative path\")",
+      "rendered": "\"ERROR: path '{path}' is outside the scan root; use a repo-relative path\""
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 7,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='options', ctx=Load()), attr='allow_writes', ctx=Load())",
+      "rendered": "options.allow_writes"
+    },
+    {
+      "line_start": 62,
+      "line_end": 62,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='options', ctx=Load()), attr='cwd', ctx=Load()), attr='resolve', ctx=Load()), args=[], keywords=[])",
+      "rendered": "options.cwd.resolve()"
+    },
+    {
+      "line_start": 63,
+      "line_end": 63,
+      "column": 19,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='options', ctx=Load()), attr='writable_paths', ctx=Load())",
+      "rendered": "options.writable_paths"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 24,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Name(id='Path', ctx=Load()), args=[Name(id='raw', ctx=Load())], keywords=[]), attr='resolve', ctx=Load()), args=[], keywords=[])",
+      "rendered": "Path(raw).resolve()"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 15,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='candidate', ctx=Load()), ops=[NotEq()], comparators=[Name(id='root', ctx=Load())]), Compare(left=Name(id='root', ctx=Load()), ops=[NotIn()], comparators=[Attribute(value=Name(id='candidate', ctx=Load()), attr='parents', ctx=Load())])])",
+      "rendered": "candidate != root and root not in candidate.parents"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ValueError', ctx=Load()), args=[JoinedStr(values=[Constant(value='writable path escapes harness cwd: '), FormattedValue(value=Name(id='raw', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "ValueError(source_template_66_33)"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='GIT_INTERNALS_DENY', ctx=Load())",
+      "rendered": "GIT_INTERNALS_DENY"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='READ_ONLY_PERMISSIONS', ctx=Load())",
+      "rendered": "READ_ONLY_PERMISSIONS"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 1,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='lru_cache', ctx=Load()), args=[], keywords=[keyword(arg='maxsize', value=Constant(value=8))])",
+      "rendered": "lru_cache(maxsize=8)"
+    },
+    {
+      "line_start": 75,
+      "line_end": 75,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 76,
+      "line_end": 76,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='scope', ctx=Load())",
+      "rendered": "scope"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 16,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Call(func=Attribute(value=Name(id='rel', ctx=Load()), attr='split', ctx=Load()), args=[Constant(value='/')], keywords=[]), slice=Slice(upper=UnaryOp(op=USub(), operand=Constant(value=1))), ctx=Load())",
+      "rendered": "rel.split('/')[:-1]"
+    },
+    {
+      "line_start": 78,
+      "line_end": 78,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='range', ctx=Load()), args=[Constant(value=1), BinOp(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='parts', ctx=Load())], keywords=[]), op=Add(), right=Constant(value=1))], keywords=[])",
+      "rendered": "range(1, len(parts) + 1)"
+    },
+    {
+      "line_start": 79,
+      "line_end": 79,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='dirs', ctx=Load()), attr='add', ctx=Load()), args=[Call(func=Attribute(value=Constant(value='/'), attr='join', ctx=Load()), args=[Subscript(value=Name(id='parts', ctx=Load()), slice=Slice(upper=Name(id='depth', ctx=Load())), ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "dirs.add('/'.join(parts[:depth]))"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='frozenset', ctx=Load()), args=[Name(id='dirs', ctx=Load())], keywords=[])",
+      "rendered": "frozenset(dirs)"
+    },
+    {
+      "line_start": 84,
+      "line_end": 84,
+      "column": 17,
+      "kind": "Constant",
+      "original_ast": "Constant(value='write operations are disabled on detection sessions: {path}')",
+      "rendered": "'write operations are disabled on detection sessions: {path}'"
+    },
+    {
+      "line_start": 87,
+      "line_end": 87,
+      "column": 22,
+      "kind": "Name",
+      "original_ast": "Name(id='FilesystemBackend', ctx=Load())",
+      "rendered": "FilesystemBackend"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='WriteResult', ctx=Load()), args=[], keywords=[keyword(arg='error', value=Call(func=Attribute(value=Name(id='_WRITE_REFUSED', ctx=Load()), attr='format', ctx=Load()), args=[], keywords=[keyword(arg='path', value=Name(id='file_path', ctx=Load()))]))])",
+      "rendered": "WriteResult(error=_WRITE_REFUSED.format(path=file_path))"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='EditResult', ctx=Load()), args=[], keywords=[keyword(arg='error', value=Call(func=Attribute(value=Name(id='_WRITE_REFUSED', ctx=Load()), attr='format', ctx=Load()), args=[], keywords=[keyword(arg='path', value=Name(id='file_path', ctx=Load()))]))])",
+      "rendered": "EditResult(error=_WRITE_REFUSED.format(path=file_path))"
+    },
+    {
+      "line_start": 104,
+      "line_end": 104,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='DeleteResult', ctx=Load()), args=[], keywords=[keyword(arg='error', value=Call(func=Attribute(value=Name(id='_WRITE_REFUSED', ctx=Load()), attr='format', ctx=Load()), args=[], keywords=[keyword(arg='path', value=Name(id='file_path', ctx=Load()))]))])",
+      "rendered": "DeleteResult(error=_WRITE_REFUSED.format(path=file_path))"
+    },
+    {
+      "line_start": 109,
+      "line_end": 112,
+      "column": 15,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Call(func=Name(id='FileUploadResponse', ctx=Load()), args=[], keywords=[keyword(arg='path', value=Name(id='path', ctx=Load())), keyword(arg='error', value=Call(func=Attribute(value=Name(id='_WRITE_REFUSED', ctx=Load()), attr='format', ctx=Load()), args=[], keywords=[keyword(arg='path', value=Name(id='path', ctx=Load()))]))]), generators=[comprehension(target=Tuple(elts=[Name(id='path', ctx=Store()), Name(id='_content', ctx=Store())], ctx=Store()), iter=Name(id='files', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "[FileUploadResponse(path=path, error=_WRITE_REFUSED.format(path=path)) for path, _content in files]"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Attribute(value=Name(id='self', ctx=Load()), attr='virtual_mode', ctx=Load()))",
+      "rendered": "not self.virtual_mode"
+    },
+    {
+      "line_start": 120,
+      "line_end": 120,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Name(id='super', ctx=Load()), args=[], keywords=[]), attr='_resolve_path', ctx=Load()), args=[Name(id='key', ctx=Load())], keywords=[])",
+      "rendered": "super()._resolve_path(key)"
+    },
+    {
+      "line_start": 121,
+      "line_end": 121,
+      "column": 16,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Attribute(value=Name(id='key', ctx=Load()), attr='startswith', ctx=Load()), args=[Constant(value='/')], keywords=[]), body=Name(id='key', ctx=Load()), orelse=JoinedStr(values=[Constant(value='/'), FormattedValue(value=Name(id='key', ctx=Load()), conversion=-1)]))",
+      "rendered": "key if key.startswith('/') else source_template_121_48"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Compare(left=Constant(value='..'), ops=[In()], comparators=[Attribute(value=Call(func=Name(id='PurePosixPath', ctx=Load()), args=[Name(id='vpath', ctx=Load())], keywords=[]), attr='parts', ctx=Load())]), Call(func=Attribute(value=Name(id='key', ctx=Load()), attr='startswith', ctx=Load()), args=[Constant(value='~')], keywords=[])])",
+      "rendered": "'..' in PurePosixPath(vpath).parts or key.startswith('~')"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Constant(value='deepagents_path_jail_refused')], keywords=[])",
+      "rendered": "COUNTERS.bump('deepagents_path_jail_refused')"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='PermissionError', ctx=Load()), args=[Call(func=Attribute(value=Name(id='_JAIL_ERROR', ctx=Load()), attr='format', ctx=Load()), args=[], keywords=[keyword(arg='path', value=Name(id='key', ctx=Load()))])], keywords=[])",
+      "rendered": "PermissionError(_JAIL_ERROR.format(path=key))"
+    },
+    {
+      "line_start": 127,
+      "line_end": 127,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=BinOp(left=Attribute(value=Name(id='self', ctx=Load()), attr='cwd', ctx=Load()), op=Div(), right=Call(func=Attribute(value=Name(id='vpath', ctx=Load()), attr='lstrip', ctx=Load()), args=[Constant(value='/')], keywords=[])), attr='resolve', ctx=Load()), args=[], keywords=[])",
+      "rendered": "(self.cwd / vpath.lstrip('/')).resolve()"
+    },
+    {
+      "line_start": 129,
+      "line_end": 129,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='full', ctx=Load()), attr='relative_to', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='cwd', ctx=Load())], keywords=[])",
+      "rendered": "full.relative_to(self.cwd)"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='ValueError', ctx=Load())",
+      "rendered": "ValueError"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Constant(value='deepagents_path_jail_refused')], keywords=[])",
+      "rendered": "COUNTERS.bump('deepagents_path_jail_refused')"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='PermissionError', ctx=Load()), args=[Call(func=Attribute(value=Name(id='_JAIL_ERROR', ctx=Load()), attr='format', ctx=Load()), args=[], keywords=[keyword(arg='path', value=Name(id='key', ctx=Load()))])], keywords=[])",
+      "rendered": "PermissionError(_JAIL_ERROR.format(path=key))"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 69,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_raise_if_symlink_loop', ctx=Load()), args=[Name(id='full', ctx=Load())], keywords=[])",
+      "rendered": "_raise_if_symlink_loop(full)"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='full', ctx=Load())",
+      "rendered": "full"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 25,
+      "kind": "Name",
+      "original_ast": "Name(id='_PathJail', ctx=Load())",
+      "rendered": "_PathJail"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 36,
+      "kind": "Name",
+      "original_ast": "Name(id='_NoWriteBackend', ctx=Load())",
+      "rendered": "_NoWriteBackend"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_scan_scope', ctx=Load()), attr='_scope_for', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='cwd', ctx=Load())], keywords=[])",
+      "rendered": "_scan_scope._scope_for(self.cwd)"
+    },
+    {
+      "line_start": 149,
+      "line_end": 149,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_resolve_path', ctx=Load()), args=[Name(id='file_path', ctx=Load())], keywords=[]), attr='relative_to', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='cwd', ctx=Load())], keywords=[]), attr='as_posix', ctx=Load()), args=[], keywords=[])",
+      "rendered": "self._resolve_path(file_path).relative_to(self.cwd).as_posix()"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='ValueError', ctx=Load()), Name(id='OSError', ctx=Load()), Name(id='RuntimeError', ctx=Load())], ctx=Load())",
+      "rendered": "(ValueError, OSError, RuntimeError)"
+    },
+    {
+      "line_start": 151,
+      "line_end": 151,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 154,
+      "line_end": 154,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_rel_of', ctx=Load()), args=[Name(id='file_path', ctx=Load())], keywords=[])",
+      "rendered": "self._rel_of(file_path)"
+    },
+    {
+      "line_start": 156,
+      "line_end": 156,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='rel', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), Compare(left=Name(id='rel', ctx=Load()), ops=[NotEq()], comparators=[Constant(value='.')]), Call(func=Attribute(value=Name(id='_scan_scope', ctx=Load()), attr='_excluded_rel', ctx=Load()), args=[Name(id='rel', ctx=Load()), Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_scope', ctx=Load()), args=[], keywords=[])], keywords=[])])",
+      "rendered": "rel is not None and rel != '.' and _scan_scope._excluded_rel(rel, self._scope())"
+    },
+    {
+      "line_start": 157,
+      "line_end": 157,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ReadResult', ctx=Load()), args=[], keywords=[keyword(arg='error', value=Call(func=Attribute(value=Attribute(value=Name(id='_scan_scope', ctx=Load()), attr='_SCOPE_ERROR', ctx=Load()), attr='format', ctx=Load()), args=[], keywords=[keyword(arg='path', value=Name(id='file_path', ctx=Load()))]))])",
+      "rendered": "ReadResult(error=_scan_scope._SCOPE_ERROR.format(path=file_path))"
+    },
+    {
+      "line_start": 158,
+      "line_end": 158,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Name(id='super', ctx=Load()), args=[], keywords=[]), attr='read', ctx=Load()), args=[Name(id='file_path', ctx=Load()), Name(id='offset', ctx=Load()), Name(id='limit', ctx=Load())], keywords=[])",
+      "rendered": "super().read(file_path, offset, limit)"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_scope', ctx=Load()), args=[], keywords=[])",
+      "rendered": "self._scope()"
+    },
+    {
+      "line_start": 170,
+      "line_end": 170,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='path', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "path is not None"
+    },
+    {
+      "line_start": 172,
+      "line_end": 172,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_rel_of', ctx=Load()), args=[Name(id='path', ctx=Load())], keywords=[])",
+      "rendered": "self._rel_of(path)"
+    },
+    {
+      "line_start": 174,
+      "line_end": 177,
+      "column": 16,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='rel', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), Compare(left=Name(id='rel', ctx=Load()), ops=[NotEq()], comparators=[Constant(value='.')]), Call(func=Attribute(value=BinOp(left=Attribute(value=Name(id='self', ctx=Load()), attr='cwd', ctx=Load()), op=Div(), right=Name(id='rel', ctx=Load())), attr='is_file', ctx=Load()), args=[], keywords=[]), Call(func=Attribute(value=Name(id='_scan_scope', ctx=Load()), attr='_excluded_rel', ctx=Load()), args=[Name(id='rel', ctx=Load()), Name(id='scope', ctx=Load())], keywords=[])])",
+      "rendered": "rel is not None and rel != '.' and (self.cwd / rel).is_file() and _scan_scope._excluded_rel(rel, scope)"
+    },
+    {
+      "line_start": 179,
+      "line_end": 181,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='GrepResult', ctx=Load()), args=[], keywords=[keyword(arg='error', value=Call(func=Attribute(value=Attribute(value=Name(id='_scan_scope', ctx=Load()), attr='_SCOPE_ERROR', ctx=Load()), attr='format', ctx=Load()), args=[], keywords=[keyword(arg='path', value=Name(id='path', ctx=Load()))])), keyword(arg='matches', value=List(elts=[], ctx=Load()))])",
+      "rendered": "GrepResult(error=_scan_scope._SCOPE_ERROR.format(path=path), matches=[])"
+    },
+    {
+      "line_start": 182,
+      "line_end": 184,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Name(id='super', ctx=Load()), args=[], keywords=[]), attr='grep', ctx=Load()), args=[Name(id='pattern', ctx=Load()), Name(id='path', ctx=Load()), Name(id='glob', ctx=Load())], keywords=[keyword(arg='max_count', value=Name(id='max_count', ctx=Load())), keyword(arg='context_lines', value=Name(id='context_lines', ctx=Load()))])",
+      "rendered": "super().grep(pattern, path, glob, max_count=max_count, context_lines=context_lines)"
+    },
+    {
+      "line_start": 185,
+      "line_end": 185,
+      "column": 11,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='result', ctx=Load()), attr='matches', ctx=Load())",
+      "rendered": "result.matches"
+    },
+    {
+      "line_start": 187,
+      "line_end": 191,
+      "column": 29,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='m', ctx=Load()), generators=[comprehension(target=Name(id='m', ctx=Store()), iter=Attribute(value=Name(id='result', ctx=Load()), attr='matches', ctx=Load()), ifs=[UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='_scan_scope', ctx=Load()), attr='_excluded_rel', ctx=Load()), args=[Call(func=Attribute(value=Subscript(value=Name(id='m', ctx=Load()), slice=Constant(value='path'), ctx=Load()), attr='lstrip', ctx=Load()), args=[Constant(value='/')], keywords=[]), Name(id='scope', ctx=Load())], keywords=[]))], is_async=0)])",
+      "rendered": "[m for m in result.matches if not _scan_scope._excluded_rel(m['path'].lstrip('/'), scope)]"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='result', ctx=Load())",
+      "rendered": "result"
+    },
+    {
+      "line_start": 195,
+      "line_end": 195,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Name(id='super', ctx=Load()), args=[], keywords=[]), attr='glob', ctx=Load()), args=[Name(id='pattern', ctx=Load()), Name(id='path', ctx=Load())], keywords=[])",
+      "rendered": "super().glob(pattern, path)"
+    },
+    {
+      "line_start": 196,
+      "line_end": 196,
+      "column": 11,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='result', ctx=Load()), attr='matches', ctx=Load())",
+      "rendered": "result.matches"
+    },
+    {
+      "line_start": 197,
+      "line_end": 197,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_scope', ctx=Load()), args=[], keywords=[])",
+      "rendered": "self._scope()"
+    },
+    {
+      "line_start": 198,
+      "line_end": 202,
+      "column": 29,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='m', ctx=Load()), generators=[comprehension(target=Name(id='m', ctx=Store()), iter=Attribute(value=Name(id='result', ctx=Load()), attr='matches', ctx=Load()), ifs=[UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='_scan_scope', ctx=Load()), attr='_excluded_rel', ctx=Load()), args=[Call(func=Attribute(value=Subscript(value=Name(id='m', ctx=Load()), slice=Constant(value='path'), ctx=Load()), attr='lstrip', ctx=Load()), args=[Constant(value='/')], keywords=[]), Name(id='scope', ctx=Load())], keywords=[]))], is_async=0)])",
+      "rendered": "[m for m in result.matches if not _scan_scope._excluded_rel(m['path'].lstrip('/'), scope)]"
+    },
+    {
+      "line_start": 203,
+      "line_end": 203,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='result', ctx=Load())",
+      "rendered": "result"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Subscript(value=Name(id='entry', ctx=Load()), slice=Constant(value='path'), ctx=Load()), attr='strip', ctx=Load()), args=[Constant(value='/')], keywords=[])",
+      "rendered": "entry['path'].strip('/')"
+    },
+    {
+      "line_start": 207,
+      "line_end": 207,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='entry', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='is_dir')], keywords=[]))",
+      "rendered": "not entry.get('is_dir')"
+    },
+    {
+      "line_start": 208,
+      "line_end": 208,
+      "column": 19,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Call(func=Name(id='bool', ctx=Load()), args=[Name(id='rel', ctx=Load())], keywords=[]), Call(func=Attribute(value=Name(id='_scan_scope', ctx=Load()), attr='_excluded_rel', ctx=Load()), args=[Name(id='rel', ctx=Load()), Name(id='scope', ctx=Load())], keywords=[])])",
+      "rendered": "bool(rel) and _scan_scope._excluded_rel(rel, scope)"
+    },
+    {
+      "line_start": 209,
+      "line_end": 209,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_dir_excluded', ctx=Load()), args=[Name(id='rel', ctx=Load()), Name(id='scope', ctx=Load())], keywords=[])",
+      "rendered": "_dir_excluded(rel, scope)"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Name(id='super', ctx=Load()), args=[], keywords=[]), attr='ls', ctx=Load()), args=[Name(id='path', ctx=Load())], keywords=[])",
+      "rendered": "super().ls(path)"
+    },
+    {
+      "line_start": 213,
+      "line_end": 213,
+      "column": 11,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='result', ctx=Load()), attr='entries', ctx=Load())",
+      "rendered": "result.entries"
+    },
+    {
+      "line_start": 214,
+      "line_end": 214,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_scope', ctx=Load()), args=[], keywords=[])",
+      "rendered": "self._scope()"
+    },
+    {
+      "line_start": 215,
+      "line_end": 217,
+      "column": 29,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='e', ctx=Load()), generators=[comprehension(target=Name(id='e', ctx=Store()), iter=Attribute(value=Name(id='result', ctx=Load()), attr='entries', ctx=Load()), ifs=[UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_entry_excluded', ctx=Load()), args=[Name(id='e', ctx=Load()), Name(id='scope', ctx=Load())], keywords=[]))], is_async=0)])",
+      "rendered": "[e for e in result.entries if not self._entry_excluded(e, scope)]"
+    },
+    {
+      "line_start": 218,
+      "line_end": 218,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='result', ctx=Load())",
+      "rendered": "result"
+    },
+    {
+      "line_start": 223,
+      "line_end": 223,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='any', ctx=Load()), args=[GeneratorExp(elt=Compare(left=Call(func=Attribute(value=Name(id='part', ctx=Load()), attr='lower', ctx=Load()), args=[], keywords=[]), ops=[In()], comparators=[Attribute(value=Name(id='_scan_scope', ctx=Load()), attr='_ALWAYS_EXCLUDED_DIRS', ctx=Load())]), generators=[comprehension(target=Name(id='part', ctx=Store()), iter=Call(func=Attribute(value=Name(id='rel', ctx=Load()), attr='split', ctx=Load()), args=[Constant(value='/')], keywords=[]), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "any((part.lower() in _scan_scope._ALWAYS_EXCLUDED_DIRS for part in rel.split('/')))"
+    },
+    {
+      "line_start": 224,
+      "line_end": 224,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 226,
+      "line_end": 226,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_scan_scope', ctx=Load()), attr='_always_allowed', ctx=Load()), args=[BinOp(left=Name(id='rel', ctx=Load()), op=Add(), right=Constant(value='/'))], keywords=[])",
+      "rendered": "_scan_scope._always_allowed(rel + '/')"
+    },
+    {
+      "line_start": 227,
+      "line_end": 227,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 228,
+      "line_end": 228,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Call(func=Name(id='bool', ctx=Load()), args=[Name(id='rel', ctx=Load())], keywords=[]), Compare(left=Name(id='scope', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), Compare(left=Name(id='rel', ctx=Load()), ops=[NotIn()], comparators=[Call(func=Name(id='_in_scope_dirs', ctx=Load()), args=[Name(id='scope', ctx=Load())], keywords=[])])])",
+      "rendered": "bool(rel) and scope is not None and (rel not in _in_scope_dirs(scope))"
+    },
+    {
+      "line_start": 231,
+      "line_end": 231,
+      "column": 30,
+      "kind": "Name",
+      "original_ast": "Name(id='_ScopedReadBackend', ctx=Load())",
+      "rendered": "_ScopedReadBackend"
+    },
+    {
+      "line_start": 231,
+      "line_end": 231,
+      "column": 50,
+      "kind": "Name",
+      "original_ast": "Name(id='LocalShellBackend', ctx=Load())",
+      "rendered": "LocalShellBackend"
+    },
+    {
+      "line_start": 238,
+      "line_end": 238,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_ShellScopedReadBackend', ctx=Load()), args=[], keywords=[keyword(arg='root_dir', value=Name(id='cwd', ctx=Load())), keyword(arg='virtual_mode', value=Constant(value=True)), keyword(arg='inherit_env', value=Constant(value=False))])",
+      "rendered": "_ShellScopedReadBackend(root_dir=cwd, virtual_mode=True, inherit_env=False)"
+    },
+    {
+      "line_start": 239,
+      "line_end": 239,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='CompositeBackend', ctx=Load()), args=[], keywords=[keyword(arg='default', value=Name(id='shell', ctx=Load())), keyword(arg='routes', value=Dict(keys=[Constant(value='/')], values=[Name(id='shell', ctx=Load())]))])",
+      "rendered": "CompositeBackend(default=shell, routes={'/': shell})"
+    },
+    {
+      "line_start": 244,
+      "line_end": 244,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='options', ctx=Load()), Constant(value='allow_shell'), Constant(value=False)], keywords=[])",
+      "rendered": "getattr(options, 'allow_shell', False)"
+    },
+    {
+      "line_start": 245,
+      "line_end": 245,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_shell_composite', ctx=Load()), args=[Attribute(value=Name(id='options', ctx=Load()), attr='cwd', ctx=Load())], keywords=[])",
+      "rendered": "_shell_composite(options.cwd)"
+    },
+    {
+      "line_start": 246,
+      "line_end": 246,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_ScopedReadBackend', ctx=Load()), args=[], keywords=[keyword(arg='root_dir', value=Attribute(value=Name(id='options', ctx=Load()), attr='cwd', ctx=Load())), keyword(arg='virtual_mode', value=Constant(value=True))])",
+      "rendered": "_ScopedReadBackend(root_dir=options.cwd, virtual_mode=True)"
+    },
+    {
+      "line_start": 250,
+      "line_end": 250,
+      "column": 21,
+      "kind": "Constant",
+      "original_ast": "Constant(value='writes into version-control metadata (.git) are refused: {path}')",
+      "rendered": "'writes into version-control metadata (.git) are refused: {path}'"
+    },
+    {
+      "line_start": 253,
+      "line_end": 253,
+      "column": 24,
+      "kind": "Name",
+      "original_ast": "Name(id='_PathJail', ctx=Load())",
+      "rendered": "_PathJail"
+    },
+    {
+      "line_start": 253,
+      "line_end": 253,
+      "column": 35,
+      "kind": "Name",
+      "original_ast": "Name(id='FilesystemBackend', ctx=Load())",
+      "rendered": "FilesystemBackend"
+    },
+    {
+      "line_start": 258,
+      "line_end": 258,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='is_git_metadata', ctx=Load()), args=[Name(id='file_path', ctx=Load())], keywords=[])",
+      "rendered": "is_git_metadata(file_path)"
+    },
+    {
+      "line_start": 259,
+      "line_end": 259,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='WriteResult', ctx=Load()), args=[], keywords=[keyword(arg='error', value=Call(func=Attribute(value=Name(id='_GIT_WRITE_REFUSED', ctx=Load()), attr='format', ctx=Load()), args=[], keywords=[keyword(arg='path', value=Name(id='file_path', ctx=Load()))]))])",
+      "rendered": "WriteResult(error=_GIT_WRITE_REFUSED.format(path=file_path))"
+    },
+    {
+      "line_start": 260,
+      "line_end": 260,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Name(id='super', ctx=Load()), args=[], keywords=[]), attr='write', ctx=Load()), args=[Name(id='file_path', ctx=Load()), Name(id='content', ctx=Load())], keywords=[])",
+      "rendered": "super().write(file_path, content)"
+    },
+    {
+      "line_start": 269,
+      "line_end": 269,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='is_git_metadata', ctx=Load()), args=[Name(id='file_path', ctx=Load())], keywords=[])",
+      "rendered": "is_git_metadata(file_path)"
+    },
+    {
+      "line_start": 270,
+      "line_end": 270,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='EditResult', ctx=Load()), args=[], keywords=[keyword(arg='error', value=Call(func=Attribute(value=Name(id='_GIT_WRITE_REFUSED', ctx=Load()), attr='format', ctx=Load()), args=[], keywords=[keyword(arg='path', value=Name(id='file_path', ctx=Load()))]))])",
+      "rendered": "EditResult(error=_GIT_WRITE_REFUSED.format(path=file_path))"
+    },
+    {
+      "line_start": 271,
+      "line_end": 271,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Name(id='super', ctx=Load()), args=[], keywords=[]), attr='edit', ctx=Load()), args=[Name(id='file_path', ctx=Load()), Name(id='old_string', ctx=Load()), Name(id='new_string', ctx=Load()), Name(id='replace_all', ctx=Load())], keywords=[])",
+      "rendered": "super().edit(file_path, old_string, new_string, replace_all)"
+    },
+    {
+      "line_start": 274,
+      "line_end": 274,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='is_git_metadata', ctx=Load()), args=[Name(id='file_path', ctx=Load())], keywords=[])",
+      "rendered": "is_git_metadata(file_path)"
+    },
+    {
+      "line_start": 275,
+      "line_end": 275,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='DeleteResult', ctx=Load()), args=[], keywords=[keyword(arg='error', value=Call(func=Attribute(value=Name(id='_GIT_WRITE_REFUSED', ctx=Load()), attr='format', ctx=Load()), args=[], keywords=[keyword(arg='path', value=Name(id='file_path', ctx=Load()))]))])",
+      "rendered": "DeleteResult(error=_GIT_WRITE_REFUSED.format(path=file_path))"
+    },
+    {
+      "line_start": 276,
+      "line_end": 276,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Name(id='super', ctx=Load()), args=[], keywords=[]), attr='delete', ctx=Load()), args=[Name(id='file_path', ctx=Load())], keywords=[])",
+      "rendered": "super().delete(file_path)"
+    },
+    {
+      "line_start": 281,
+      "line_end": 281,
+      "column": 18,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Tuple(elts=[Name(id='p', ctx=Load()), Name(id='c', ctx=Load())], ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='p', ctx=Store()), Name(id='c', ctx=Store())], ctx=Store()), iter=Name(id='files', ctx=Load()), ifs=[UnaryOp(op=Not(), operand=Call(func=Name(id='is_git_metadata', ctx=Load()), args=[Name(id='p', ctx=Load())], keywords=[]))], is_async=0)])",
+      "rendered": "[(p, c) for p, c in files if not is_git_metadata(p)]"
+    },
+    {
+      "line_start": 282,
+      "line_end": 282,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='iter', ctx=Load()), args=[IfExp(test=Name(id='allowed', ctx=Load()), body=Call(func=Attribute(value=Call(func=Name(id='super', ctx=Load()), args=[], keywords=[]), attr='upload_files', ctx=Load()), args=[Name(id='allowed', ctx=Load())], keywords=[]), orelse=List(elts=[], ctx=Load()))], keywords=[])",
+      "rendered": "iter(super().upload_files(allowed) if allowed else [])"
+    },
+    {
+      "line_start": 283,
+      "line_end": 287,
+      "column": 15,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=IfExp(test=Call(func=Name(id='is_git_metadata', ctx=Load()), args=[Name(id='p', ctx=Load())], keywords=[]), body=Call(func=Name(id='FileUploadResponse', ctx=Load()), args=[], keywords=[keyword(arg='path', value=Name(id='p', ctx=Load())), keyword(arg='error', value=Call(func=Attribute(value=Name(id='_GIT_WRITE_REFUSED', ctx=Load()), attr='format', ctx=Load()), args=[], keywords=[keyword(arg='path', value=Name(id='p', ctx=Load()))]))]), orelse=Call(func=Name(id='next', ctx=Load()), args=[Name(id='results', ctx=Load())], keywords=[])), generators=[comprehension(target=Tuple(elts=[Name(id='p', ctx=Store()), Name(id='_c', ctx=Store())], ctx=Store()), iter=Name(id='files', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "[FileUploadResponse(path=p, error=_GIT_WRITE_REFUSED.format(path=p)) if is_git_metadata(p) else next(results) for p, _c in files]"
+    },
+    {
+      "line_start": 295,
+      "line_end": 295,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_filesystem_permissions', ctx=Load()), args=[Name(id='options', ctx=Load())], keywords=[])",
+      "rendered": "_filesystem_permissions(options)"
+    },
+    {
+      "line_start": 297,
+      "line_end": 297,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='options', ctx=Load()), Constant(value='permitted_tool_calls'), Constant(value=None)], keywords=[]), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "getattr(options, 'permitted_tool_calls', None) is not None"
+    },
+    {
+      "line_start": 298,
+      "line_end": 298,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_scoped_backend', ctx=Load()), args=[Name(id='options', ctx=Load())], keywords=[])",
+      "rendered": "_scoped_backend(options)"
+    },
+    {
+      "line_start": 300,
+      "line_end": 300,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='options', ctx=Load()), Name(id='OneShotOptions', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(options, OneShotOptions)"
+    },
+    {
+      "line_start": 301,
+      "line_end": 301,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_NoWriteBackend', ctx=Load()), args=[], keywords=[keyword(arg='root_dir', value=Attribute(value=Name(id='options', ctx=Load()), attr='cwd', ctx=Load())), keyword(arg='virtual_mode', value=Constant(value=True))])",
+      "rendered": "_NoWriteBackend(root_dir=options.cwd, virtual_mode=True)"
+    },
+    {
+      "line_start": 303,
+      "line_end": 303,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_StockReadBackend', ctx=Load()), args=[], keywords=[keyword(arg='root_dir', value=Attribute(value=Name(id='options', ctx=Load()), attr='cwd', ctx=Load())), keyword(arg='virtual_mode', value=Constant(value=True))])",
+      "rendered": "_StockReadBackend(root_dir=options.cwd, virtual_mode=True)"
+    },
+    {
+      "line_start": 306,
+      "line_end": 306,
+      "column": 1,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='contextlib', ctx=Load()), attr='contextmanager', ctx=Load())",
+      "rendered": "contextlib.contextmanager"
+    },
+    {
+      "line_start": 309,
+      "line_end": 309,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='seconds', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "seconds is None"
+    },
+    {
+      "line_start": 312,
+      "line_end": 312,
+      "column": 10,
+      "kind": "Name",
+      "original_ast": "Name(id='_deepagents_filesystem', ctx=Load())",
+      "rendered": "_deepagents_filesystem"
+    },
+    {
+      "line_start": 313,
+      "line_end": 313,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='int', ctx=Load()), args=[Name(id='seconds', ctx=Load())], keywords=[])",
+      "rendered": "int(seconds)"
+    },
+    {
+      "line_start": 314,
+      "line_end": 314,
+      "column": 25,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=BinOp(left=Constant(value=2), op=Mult(), right=Name(id='grep_timeout', ctx=Load())), op=Add(), right=Constant(value=5))",
+      "rendered": "2 * grep_timeout + 5"
+    },
+    {
+      "line_start": 315,
+      "line_end": 315,
+      "column": 29,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Attribute(value=Attribute(value=Name(id='mod', ctx=Load()), attr='FilesystemBackend', ctx=Load()), attr='_python_search', ctx=Load()), attr='__kwdefaults__', ctx=Load())",
+      "rendered": "mod.FilesystemBackend._python_search.__kwdefaults__"
+    },
+    {
+      "line_start": 316,
+      "line_end": 321,
+      "column": 16,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Attribute(value=Name(id='mod', ctx=Load()), attr='_DEFAULT_GLOB_TIMEOUT', ctx=Load()), Attribute(value=Name(id='mod', ctx=Load()), attr='DEFAULT_GREP_TIMEOUT', ctx=Load()), Attribute(value=Name(id='mod', ctx=Load()), attr='ASYNC_GREP_TIMEOUT', ctx=Load()), Subscript(value=Name(id='python_search_defaults', ctx=Load()), slice=Constant(value='timeout'), ctx=Load())], ctx=Load())",
+      "rendered": "(mod._DEFAULT_GLOB_TIMEOUT, mod.DEFAULT_GREP_TIMEOUT, mod.ASYNC_GREP_TIMEOUT, python_search_defaults['timeout'])"
+    },
+    {
+      "line_start": 323,
+      "line_end": 323,
+      "column": 36,
+      "kind": "Name",
+      "original_ast": "Name(id='seconds', ctx=Load())",
+      "rendered": "seconds"
+    },
+    {
+      "line_start": 324,
+      "line_end": 324,
+      "column": 35,
+      "kind": "Name",
+      "original_ast": "Name(id='grep_timeout', ctx=Load())",
+      "rendered": "grep_timeout"
+    },
+    {
+      "line_start": 325,
+      "line_end": 325,
+      "column": 33,
+      "kind": "Name",
+      "original_ast": "Name(id='async_grep_timeout', ctx=Load())",
+      "rendered": "async_grep_timeout"
+    },
+    {
+      "line_start": 326,
+      "line_end": 326,
+      "column": 44,
+      "kind": "Name",
+      "original_ast": "Name(id='grep_timeout', ctx=Load())",
+      "rendered": "grep_timeout"
+    },
+    {
+      "line_start": 334,
+      "line_end": 334,
+      "column": 12,
+      "kind": "Name",
+      "original_ast": "Name(id='originals', ctx=Load())",
+      "rendered": "originals"
+    },
+    {
+      "line_start": 339,
+      "line_end": 339,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Compare(left=Name(id='skill_root', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)]), UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='skill_root', ctx=Load()), attr='is_dir', ctx=Load()), args=[], keywords=[]))])",
+      "rendered": "skill_root is None or not skill_root.is_dir()"
+    },
+    {
+      "line_start": 340,
+      "line_end": 340,
+      "column": 15,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 341,
+      "line_end": 341,
+      "column": 17,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Call(func=Attribute(value=Name(id='skill_root', ctx=Load()), attr='resolve', ctx=Load()), args=[], keywords=[]), Call(func=Attribute(value=Name(id='cwd', ctx=Load()), attr='resolve', ctx=Load()), args=[], keywords=[])], ctx=Load())",
+      "rendered": "(skill_root.resolve(), cwd.resolve())"
+    },
+    {
+      "line_start": 342,
+      "line_end": 342,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='root', ctx=Load()), attr='is_relative_to', ctx=Load()), args=[Name(id='base', ctx=Load())], keywords=[]))",
+      "rendered": "not root.is_relative_to(base)"
+    },
+    {
+      "line_start": 343,
+      "line_end": 343,
+      "column": 14,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[Constant(value='skill_root '), FormattedValue(value=Name(id='root', ctx=Load()), conversion=-1), Constant(value=' must live under the session cwd '), FormattedValue(value=Name(id='base', ctx=Load()), conversion=-1)])",
+      "rendered": "source_template_343_14"
+    },
+    {
+      "line_start": 344,
+      "line_end": 344,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ValueError', ctx=Load()), args=[Name(id='msg', ctx=Load())], keywords=[])",
+      "rendered": "ValueError(msg)"
+    },
+    {
+      "line_start": 345,
+      "line_end": 345,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Name(id='root', ctx=Load()), attr='relative_to', ctx=Load()), args=[Name(id='base', ctx=Load())], keywords=[]), attr='as_posix', ctx=Load()), args=[], keywords=[])",
+      "rendered": "root.relative_to(base).as_posix()"
+    },
+    {
+      "line_start": 346,
+      "line_end": 346,
+      "column": 11,
+      "kind": "List",
+      "original_ast": "List(elts=[IfExp(test=Compare(left=Name(id='relative', ctx=Load()), ops=[NotEq()], comparators=[Constant(value='.')]), body=JoinedStr(values=[Constant(value='/'), FormattedValue(value=Name(id='relative', ctx=Load()), conversion=-1)]), orelse=Constant(value='/'))], ctx=Load())",
+      "rendered": "[source_template_346_12 if relative != '.' else '/']"
+    }
+  ],
+  "calls": [
+    {
+      "line": 71,
+      "end_line": 71,
+      "callee": "lru_cache",
+      "enclosing": "_in_scope_dirs",
+      "expression": "lru_cache(maxsize=8)"
+    },
+    {
+      "line": 75,
+      "end_line": 75,
+      "callee": "set",
+      "enclosing": "_in_scope_dirs",
+      "expression": "set()"
+    },
+    {
+      "line": 80,
+      "end_line": 80,
+      "callee": "frozenset",
+      "enclosing": "_in_scope_dirs",
+      "expression": "frozenset(dirs)"
+    },
+    {
+      "line": 223,
+      "end_line": 223,
+      "callee": "any",
+      "enclosing": "_dir_excluded",
+      "expression": "any(part.lower() in _scan_scope._ALWAYS_EXCLUDED_DIRS for part in rel.split(\"/\"))"
+    },
+    {
+      "line": 226,
+      "end_line": 226,
+      "callee": "_scan_scope._always_allowed",
+      "enclosing": "_dir_excluded",
+      "expression": "_scan_scope._always_allowed(rel + \"/\")"
+    },
+    {
+      "line": 238,
+      "end_line": 238,
+      "callee": "_ShellScopedReadBackend",
+      "enclosing": "_shell_composite",
+      "expression": "_ShellScopedReadBackend(root_dir=cwd, virtual_mode=True, inherit_env=False)"
+    },
+    {
+      "line": 239,
+      "end_line": 239,
+      "callee": "CompositeBackend",
+      "enclosing": "_shell_composite",
+      "expression": "CompositeBackend(default=shell, routes={\"/\": shell})"
+    },
+    {
+      "line": 244,
+      "end_line": 244,
+      "callee": "getattr",
+      "enclosing": "_scoped_backend",
+      "expression": "getattr(options, \"allow_shell\", False)"
+    },
+    {
+      "line": 246,
+      "end_line": 246,
+      "callee": "_ScopedReadBackend",
+      "enclosing": "_scoped_backend",
+      "expression": "_ScopedReadBackend(root_dir=options.cwd, virtual_mode=True)"
+    },
+    {
+      "line": 295,
+      "end_line": 295,
+      "callee": "_filesystem_permissions",
+      "enclosing": "_session_backend",
+      "expression": "_filesystem_permissions(options)"
+    },
+    {
+      "line": 300,
+      "end_line": 300,
+      "callee": "isinstance",
+      "enclosing": "_session_backend",
+      "expression": "isinstance(options, OneShotOptions)"
+    },
+    {
+      "line": 303,
+      "end_line": 303,
+      "callee": "_StockReadBackend",
+      "enclosing": "_session_backend",
+      "expression": "_StockReadBackend(root_dir=options.cwd, virtual_mode=True)"
+    },
+    {
+      "line": 313,
+      "end_line": 313,
+      "callee": "int",
+      "enclosing": "patched_read_timeouts",
+      "expression": "int(seconds)"
+    },
+    {
+      "line": 345,
+      "end_line": 345,
+      "callee": "root.relative_to(base).as_posix",
+      "enclosing": "_skill_sources",
+      "expression": "root.relative_to(base).as_posix()"
+    },
+    {
+      "line": 62,
+      "end_line": 62,
+      "callee": "options.cwd.resolve",
+      "enclosing": "_filesystem_permissions",
+      "expression": "options.cwd.resolve()"
+    },
+    {
+      "line": 78,
+      "end_line": 78,
+      "callee": "range",
+      "enclosing": "_in_scope_dirs",
+      "expression": "range(1, len(parts) + 1)"
+    },
+    {
+      "line": 92,
+      "end_line": 92,
+      "callee": "WriteResult",
+      "enclosing": "_NoWriteBackend.write",
+      "expression": "WriteResult(error=_WRITE_REFUSED.format(path=file_path))"
+    },
+    {
+      "line": 101,
+      "end_line": 101,
+      "callee": "EditResult",
+      "enclosing": "_NoWriteBackend.edit",
+      "expression": "EditResult(error=_WRITE_REFUSED.format(path=file_path))"
+    },
+    {
+      "line": 104,
+      "end_line": 104,
+      "callee": "DeleteResult",
+      "enclosing": "_NoWriteBackend.delete",
+      "expression": "DeleteResult(error=_WRITE_REFUSED.format(path=file_path))"
+    },
+    {
+      "line": 127,
+      "end_line": 127,
+      "callee": "(self.cwd / vpath.lstrip('/')).resolve",
+      "enclosing": "_PathJail._resolve_path",
+      "expression": "(self.cwd / vpath.lstrip(\"/\")).resolve()"
+    },
+    {
+      "line": 133,
+      "end_line": 133,
+      "callee": "_raise_if_symlink_loop",
+      "enclosing": "_PathJail._resolve_path",
+      "expression": "_raise_if_symlink_loop(full)"
+    },
+    {
+      "line": 143,
+      "end_line": 143,
+      "callee": "_scan_scope._scope_for",
+      "enclosing": "_ScopedReadBackend._scope",
+      "expression": "_scan_scope._scope_for(self.cwd)"
+    },
+    {
+      "line": 154,
+      "end_line": 154,
+      "callee": "self._rel_of",
+      "enclosing": "_ScopedReadBackend.read",
+      "expression": "self._rel_of(file_path)"
+    },
+    {
+      "line": 158,
+      "end_line": 158,
+      "callee": "super().read",
+      "enclosing": "_ScopedReadBackend.read",
+      "expression": "super().read(file_path, offset, limit)"
+    },
+    {
+      "line": 169,
+      "end_line": 169,
+      "callee": "self._scope",
+      "enclosing": "_ScopedReadBackend.grep",
+      "expression": "self._scope()"
+    },
+    {
+      "line": 182,
+      "end_line": 184,
+      "callee": "super().grep",
+      "enclosing": "_ScopedReadBackend.grep",
+      "expression": "super().grep(\n            pattern, path, glob, max_count=max_count, context_lines=context_lines\n        )"
+    },
+    {
+      "line": 195,
+      "end_line": 195,
+      "callee": "super().glob",
+      "enclosing": "_ScopedReadBackend.glob",
+      "expression": "super().glob(pattern, path)"
+    },
+    {
+      "line": 206,
+      "end_line": 206,
+      "callee": "entry['path'].strip",
+      "enclosing": "_ScopedReadBackend._entry_excluded",
+      "expression": "entry[\"path\"].strip(\"/\")"
+    },
+    {
+      "line": 209,
+      "end_line": 209,
+      "callee": "_dir_excluded",
+      "enclosing": "_ScopedReadBackend._entry_excluded",
+      "expression": "_dir_excluded(rel, scope)"
+    },
+    {
+      "line": 212,
+      "end_line": 212,
+      "callee": "super().ls",
+      "enclosing": "_ScopedReadBackend.ls",
+      "expression": "super().ls(path)"
+    },
+    {
+      "line": 228,
+      "end_line": 228,
+      "callee": "bool",
+      "enclosing": "_dir_excluded",
+      "expression": "bool(rel)"
+    },
+    {
+      "line": 245,
+      "end_line": 245,
+      "callee": "_shell_composite",
+      "enclosing": "_scoped_backend",
+      "expression": "_shell_composite(options.cwd)"
+    },
+    {
+      "line": 258,
+      "end_line": 258,
+      "callee": "is_git_metadata",
+      "enclosing": "_StockReadBackend.write",
+      "expression": "is_git_metadata(file_path)"
+    },
+    {
+      "line": 260,
+      "end_line": 260,
+      "callee": "super().write",
+      "enclosing": "_StockReadBackend.write",
+      "expression": "super().write(file_path, content)"
+    },
+    {
+      "line": 269,
+      "end_line": 269,
+      "callee": "is_git_metadata",
+      "enclosing": "_StockReadBackend.edit",
+      "expression": "is_git_metadata(file_path)"
+    },
+    {
+      "line": 271,
+      "end_line": 271,
+      "callee": "super().edit",
+      "enclosing": "_StockReadBackend.edit",
+      "expression": "super().edit(file_path, old_string, new_string, replace_all)"
+    },
+    {
+      "line": 274,
+      "end_line": 274,
+      "callee": "is_git_metadata",
+      "enclosing": "_StockReadBackend.delete",
+      "expression": "is_git_metadata(file_path)"
+    },
+    {
+      "line": 276,
+      "end_line": 276,
+      "callee": "super().delete",
+      "enclosing": "_StockReadBackend.delete",
+      "expression": "super().delete(file_path)"
+    },
+    {
+      "line": 282,
+      "end_line": 282,
+      "callee": "iter",
+      "enclosing": "_StockReadBackend.upload_files",
+      "expression": "iter(super().upload_files(allowed) if allowed else [])"
+    },
+    {
+      "line": 297,
+      "end_line": 297,
+      "callee": "getattr",
+      "enclosing": "_session_backend",
+      "expression": "getattr(options, \"permitted_tool_calls\", None)"
+    },
+    {
+      "line": 298,
+      "end_line": 298,
+      "callee": "_scoped_backend",
+      "enclosing": "_session_backend",
+      "expression": "_scoped_backend(options)"
+    },
+    {
+      "line": 301,
+      "end_line": 301,
+      "callee": "_NoWriteBackend",
+      "enclosing": "_session_backend",
+      "expression": "_NoWriteBackend(root_dir=options.cwd, virtual_mode=True)"
+    },
+    {
+      "line": 341,
+      "end_line": 341,
+      "callee": "skill_root.resolve",
+      "enclosing": "_skill_sources",
+      "expression": "skill_root.resolve()"
+    },
+    {
+      "line": 341,
+      "end_line": 341,
+      "callee": "cwd.resolve",
+      "enclosing": "_skill_sources",
+      "expression": "cwd.resolve()"
+    },
+    {
+      "line": 342,
+      "end_line": 342,
+      "callee": "root.is_relative_to",
+      "enclosing": "_skill_sources",
+      "expression": "root.is_relative_to(base)"
+    },
+    {
+      "line": 344,
+      "end_line": 344,
+      "callee": "ValueError",
+      "enclosing": "_skill_sources",
+      "expression": "ValueError(msg)"
+    },
+    {
+      "line": 64,
+      "end_line": 64,
+      "callee": "Path(raw).resolve",
+      "enclosing": "_filesystem_permissions",
+      "expression": "Path(raw).resolve()"
+    },
+    {
+      "line": 77,
+      "end_line": 77,
+      "callee": "rel.split",
+      "enclosing": "_in_scope_dirs",
+      "expression": "rel.split(\"/\")"
+    },
+    {
+      "line": 79,
+      "end_line": 79,
+      "callee": "dirs.add",
+      "enclosing": "_in_scope_dirs",
+      "expression": "dirs.add(\"/\".join(parts[:depth]))"
+    },
+    {
+      "line": 110,
+      "end_line": 110,
+      "callee": "FileUploadResponse",
+      "enclosing": "_NoWriteBackend.upload_files",
+      "expression": "FileUploadResponse(path=path, error=_WRITE_REFUSED.format(path=path))"
+    },
+    {
+      "line": 120,
+      "end_line": 120,
+      "callee": "super()._resolve_path",
+      "enclosing": "_PathJail._resolve_path",
+      "expression": "super()._resolve_path(key)"
+    },
+    {
+      "line": 121,
+      "end_line": 121,
+      "callee": "key.startswith",
+      "enclosing": "_PathJail._resolve_path",
+      "expression": "key.startswith(\"/\")"
+    },
+    {
+      "line": 124,
+      "end_line": 124,
+      "callee": "key.startswith",
+      "enclosing": "_PathJail._resolve_path",
+      "expression": "key.startswith(\"~\")"
+    },
+    {
+      "line": 125,
+      "end_line": 125,
+      "callee": "COUNTERS.bump",
+      "enclosing": "_PathJail._resolve_path",
+      "expression": "COUNTERS.bump(\"deepagents_path_jail_refused\")"
+    },
+    {
+      "line": 126,
+      "end_line": 126,
+      "callee": "PermissionError",
+      "enclosing": "_PathJail._resolve_path",
+      "expression": "PermissionError(_JAIL_ERROR.format(path=key))"
+    },
+    {
+      "line": 129,
+      "end_line": 129,
+      "callee": "full.relative_to",
+      "enclosing": "_PathJail._resolve_path",
+      "expression": "full.relative_to(self.cwd)"
+    },
+    {
+      "line": 149,
+      "end_line": 149,
+      "callee": "self._resolve_path(file_path).relative_to(self.cwd).as_posix",
+      "enclosing": "_ScopedReadBackend._rel_of",
+      "expression": "self._resolve_path(file_path).relative_to(self.cwd).as_posix()"
+    },
+    {
+      "line": 156,
+      "end_line": 156,
+      "callee": "_scan_scope._excluded_rel",
+      "enclosing": "_ScopedReadBackend.read",
+      "expression": "_scan_scope._excluded_rel(rel, self._scope())"
+    },
+    {
+      "line": 157,
+      "end_line": 157,
+      "callee": "ReadResult",
+      "enclosing": "_ScopedReadBackend.read",
+      "expression": "ReadResult(error=_scan_scope._SCOPE_ERROR.format(path=file_path))"
+    },
+    {
+      "line": 172,
+      "end_line": 172,
+      "callee": "self._rel_of",
+      "enclosing": "_ScopedReadBackend.grep",
+      "expression": "self._rel_of(path)"
+    },
+    {
+      "line": 197,
+      "end_line": 197,
+      "callee": "self._scope",
+      "enclosing": "_ScopedReadBackend.glob",
+      "expression": "self._scope()"
+    },
+    {
+      "line": 207,
+      "end_line": 207,
+      "callee": "entry.get",
+      "enclosing": "_ScopedReadBackend._entry_excluded",
+      "expression": "entry.get(\"is_dir\")"
+    },
+    {
+      "line": 214,
+      "end_line": 214,
+      "callee": "self._scope",
+      "enclosing": "_ScopedReadBackend.ls",
+      "expression": "self._scope()"
+    },
+    {
+      "line": 228,
+      "end_line": 228,
+      "callee": "_in_scope_dirs",
+      "enclosing": "_dir_excluded",
+      "expression": "_in_scope_dirs(scope)"
+    },
+    {
+      "line": 259,
+      "end_line": 259,
+      "callee": "WriteResult",
+      "enclosing": "_StockReadBackend.write",
+      "expression": "WriteResult(error=_GIT_WRITE_REFUSED.format(path=file_path))"
+    },
+    {
+      "line": 270,
+      "end_line": 270,
+      "callee": "EditResult",
+      "enclosing": "_StockReadBackend.edit",
+      "expression": "EditResult(error=_GIT_WRITE_REFUSED.format(path=file_path))"
+    },
+    {
+      "line": 275,
+      "end_line": 275,
+      "callee": "DeleteResult",
+      "enclosing": "_StockReadBackend.delete",
+      "expression": "DeleteResult(error=_GIT_WRITE_REFUSED.format(path=file_path))"
+    },
+    {
+      "line": 339,
+      "end_line": 339,
+      "callee": "skill_root.is_dir",
+      "enclosing": "_skill_sources",
+      "expression": "skill_root.is_dir()"
+    },
+    {
+      "line": 345,
+      "end_line": 345,
+      "callee": "root.relative_to",
+      "enclosing": "_skill_sources",
+      "expression": "root.relative_to(base)"
+    },
+    {
+      "line": 66,
+      "end_line": 66,
+      "callee": "ValueError",
+      "enclosing": "_filesystem_permissions",
+      "expression": "ValueError(f\"writable path escapes harness cwd: {raw}\")"
+    },
+    {
+      "line": 78,
+      "end_line": 78,
+      "callee": "len",
+      "enclosing": "_in_scope_dirs",
+      "expression": "len(parts)"
+    },
+    {
+      "line": 79,
+      "end_line": 79,
+      "callee": "'/'.join",
+      "enclosing": "_in_scope_dirs",
+      "expression": "\"/\".join(parts[:depth])"
+    },
+    {
+      "line": 92,
+      "end_line": 92,
+      "callee": "_WRITE_REFUSED.format",
+      "enclosing": "_NoWriteBackend.write",
+      "expression": "_WRITE_REFUSED.format(path=file_path)"
+    },
+    {
+      "line": 101,
+      "end_line": 101,
+      "callee": "_WRITE_REFUSED.format",
+      "enclosing": "_NoWriteBackend.edit",
+      "expression": "_WRITE_REFUSED.format(path=file_path)"
+    },
+    {
+      "line": 104,
+      "end_line": 104,
+      "callee": "_WRITE_REFUSED.format",
+      "enclosing": "_NoWriteBackend.delete",
+      "expression": "_WRITE_REFUSED.format(path=file_path)"
+    },
+    {
+      "line": 126,
+      "end_line": 126,
+      "callee": "_JAIL_ERROR.format",
+      "enclosing": "_PathJail._resolve_path",
+      "expression": "_JAIL_ERROR.format(path=key)"
+    },
+    {
+      "line": 131,
+      "end_line": 131,
+      "callee": "COUNTERS.bump",
+      "enclosing": "_PathJail._resolve_path",
+      "expression": "COUNTERS.bump(\"deepagents_path_jail_refused\")"
+    },
+    {
+      "line": 132,
+      "end_line": 132,
+      "callee": "PermissionError",
+      "enclosing": "_PathJail._resolve_path",
+      "expression": "PermissionError(_JAIL_ERROR.format(path=key))"
+    },
+    {
+      "line": 156,
+      "end_line": 156,
+      "callee": "self._scope",
+      "enclosing": "_ScopedReadBackend.read",
+      "expression": "self._scope()"
+    },
+    {
+      "line": 158,
+      "end_line": 158,
+      "callee": "super",
+      "enclosing": "_ScopedReadBackend.read",
+      "expression": "super()"
+    },
+    {
+      "line": 176,
+      "end_line": 176,
+      "callee": "(self.cwd / rel).is_file",
+      "enclosing": "_ScopedReadBackend.grep",
+      "expression": "(self.cwd / rel).is_file()"
+    },
+    {
+      "line": 177,
+      "end_line": 177,
+      "callee": "_scan_scope._excluded_rel",
+      "enclosing": "_ScopedReadBackend.grep",
+      "expression": "_scan_scope._excluded_rel(rel, scope)"
+    },
+    {
+      "line": 179,
+      "end_line": 181,
+      "callee": "GrepResult",
+      "enclosing": "_ScopedReadBackend.grep",
+      "expression": "GrepResult(\n                    error=_scan_scope._SCOPE_ERROR.format(path=path), matches=[]\n                )"
+    },
+    {
+      "line": 182,
+      "end_line": 182,
+      "callee": "super",
+      "enclosing": "_ScopedReadBackend.grep",
+      "expression": "super()"
+    },
+    {
+      "line": 195,
+      "end_line": 195,
+      "callee": "super",
+      "enclosing": "_ScopedReadBackend.glob",
+      "expression": "super()"
+    },
+    {
+      "line": 208,
+      "end_line": 208,
+      "callee": "bool",
+      "enclosing": "_ScopedReadBackend._entry_excluded",
+      "expression": "bool(rel)"
+    },
+    {
+      "line": 208,
+      "end_line": 208,
+      "callee": "_scan_scope._excluded_rel",
+      "enclosing": "_ScopedReadBackend._entry_excluded",
+      "expression": "_scan_scope._excluded_rel(rel, scope)"
+    },
+    {
+      "line": 212,
+      "end_line": 212,
+      "callee": "super",
+      "enclosing": "_ScopedReadBackend.ls",
+      "expression": "super()"
+    },
+    {
+      "line": 223,
+      "end_line": 223,
+      "callee": "part.lower",
+      "enclosing": "_dir_excluded",
+      "expression": "part.lower()"
+    },
+    {
+      "line": 223,
+      "end_line": 223,
+      "callee": "rel.split",
+      "enclosing": "_dir_excluded",
+      "expression": "rel.split(\"/\")"
+    },
+    {
+      "line": 260,
+      "end_line": 260,
+      "callee": "super",
+      "enclosing": "_StockReadBackend.write",
+      "expression": "super()"
+    },
+    {
+      "line": 271,
+      "end_line": 271,
+      "callee": "super",
+      "enclosing": "_StockReadBackend.edit",
+      "expression": "super()"
+    },
+    {
+      "line": 276,
+      "end_line": 276,
+      "callee": "super",
+      "enclosing": "_StockReadBackend.delete",
+      "expression": "super()"
+    },
+    {
+      "line": 282,
+      "end_line": 282,
+      "callee": "super().upload_files",
+      "enclosing": "_StockReadBackend.upload_files",
+      "expression": "super().upload_files(allowed)"
+    },
+    {
+      "line": 285,
+      "end_line": 285,
+      "callee": "is_git_metadata",
+      "enclosing": "_StockReadBackend.upload_files",
+      "expression": "is_git_metadata(p)"
+    },
+    {
+      "line": 284,
+      "end_line": 284,
+      "callee": "FileUploadResponse",
+      "enclosing": "_StockReadBackend.upload_files",
+      "expression": "FileUploadResponse(path=p, error=_GIT_WRITE_REFUSED.format(path=p))"
+    },
+    {
+      "line": 285,
+      "end_line": 285,
+      "callee": "next",
+      "enclosing": "_StockReadBackend.upload_files",
+      "expression": "next(results)"
+    },
+    {
+      "line": 64,
+      "end_line": 64,
+      "callee": "Path",
+      "enclosing": "_filesystem_permissions",
+      "expression": "Path(raw)"
+    },
+    {
+      "line": 110,
+      "end_line": 110,
+      "callee": "_WRITE_REFUSED.format",
+      "enclosing": "_NoWriteBackend.upload_files",
+      "expression": "_WRITE_REFUSED.format(path=path)"
+    },
+    {
+      "line": 120,
+      "end_line": 120,
+      "callee": "super",
+      "enclosing": "_PathJail._resolve_path",
+      "expression": "super()"
+    },
+    {
+      "line": 124,
+      "end_line": 124,
+      "callee": "PurePosixPath",
+      "enclosing": "_PathJail._resolve_path",
+      "expression": "PurePosixPath(vpath)"
+    },
+    {
+      "line": 127,
+      "end_line": 127,
+      "callee": "vpath.lstrip",
+      "enclosing": "_PathJail._resolve_path",
+      "expression": "vpath.lstrip(\"/\")"
+    },
+    {
+      "line": 132,
+      "end_line": 132,
+      "callee": "_JAIL_ERROR.format",
+      "enclosing": "_PathJail._resolve_path",
+      "expression": "_JAIL_ERROR.format(path=key)"
+    },
+    {
+      "line": 149,
+      "end_line": 149,
+      "callee": "self._resolve_path(file_path).relative_to",
+      "enclosing": "_ScopedReadBackend._rel_of",
+      "expression": "self._resolve_path(file_path).relative_to(self.cwd)"
+    },
+    {
+      "line": 157,
+      "end_line": 157,
+      "callee": "_scan_scope._SCOPE_ERROR.format",
+      "enclosing": "_ScopedReadBackend.read",
+      "expression": "_scan_scope._SCOPE_ERROR.format(path=file_path)"
+    },
+    {
+      "line": 259,
+      "end_line": 259,
+      "callee": "_GIT_WRITE_REFUSED.format",
+      "enclosing": "_StockReadBackend.write",
+      "expression": "_GIT_WRITE_REFUSED.format(path=file_path)"
+    },
+    {
+      "line": 270,
+      "end_line": 270,
+      "callee": "_GIT_WRITE_REFUSED.format",
+      "enclosing": "_StockReadBackend.edit",
+      "expression": "_GIT_WRITE_REFUSED.format(path=file_path)"
+    },
+    {
+      "line": 275,
+      "end_line": 275,
+      "callee": "_GIT_WRITE_REFUSED.format",
+      "enclosing": "_StockReadBackend.delete",
+      "expression": "_GIT_WRITE_REFUSED.format(path=file_path)"
+    },
+    {
+      "line": 281,
+      "end_line": 281,
+      "callee": "is_git_metadata",
+      "enclosing": "_StockReadBackend.upload_files",
+      "expression": "is_git_metadata(p)"
+    },
+    {
+      "line": 180,
+      "end_line": 180,
+      "callee": "_scan_scope._SCOPE_ERROR.format",
+      "enclosing": "_ScopedReadBackend.grep",
+      "expression": "_scan_scope._SCOPE_ERROR.format(path=path)"
+    },
+    {
+      "line": 190,
+      "end_line": 190,
+      "callee": "_scan_scope._excluded_rel",
+      "enclosing": "_ScopedReadBackend.grep",
+      "expression": "_scan_scope._excluded_rel(m[\"path\"].lstrip(\"/\"), scope)"
+    },
+    {
+      "line": 201,
+      "end_line": 201,
+      "callee": "_scan_scope._excluded_rel",
+      "enclosing": "_ScopedReadBackend.glob",
+      "expression": "_scan_scope._excluded_rel(m[\"path\"].lstrip(\"/\"), scope)"
+    },
+    {
+      "line": 216,
+      "end_line": 216,
+      "callee": "self._entry_excluded",
+      "enclosing": "_ScopedReadBackend.ls",
+      "expression": "self._entry_excluded(e, scope)"
+    },
+    {
+      "line": 282,
+      "end_line": 282,
+      "callee": "super",
+      "enclosing": "_StockReadBackend.upload_files",
+      "expression": "super()"
+    },
+    {
+      "line": 284,
+      "end_line": 284,
+      "callee": "_GIT_WRITE_REFUSED.format",
+      "enclosing": "_StockReadBackend.upload_files",
+      "expression": "_GIT_WRITE_REFUSED.format(path=p)"
+    },
+    {
+      "line": 149,
+      "end_line": 149,
+      "callee": "self._resolve_path",
+      "enclosing": "_ScopedReadBackend._rel_of",
+      "expression": "self._resolve_path(file_path)"
+    },
+    {
+      "line": 190,
+      "end_line": 190,
+      "callee": "m['path'].lstrip",
+      "enclosing": "_ScopedReadBackend.grep",
+      "expression": "m[\"path\"].lstrip(\"/\")"
+    },
+    {
+      "line": 201,
+      "end_line": 201,
+      "callee": "m['path'].lstrip",
+      "enclosing": "_ScopedReadBackend.glob",
+      "expression": "m[\"path\"].lstrip(\"/\")"
+    }
+  ],
+  "imports": [
+    {
+      "line": 17,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "import contextlib",
+      "targets": [
+        "contextlib"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "from functools import lru_cache",
+      "targets": [
+        "functools",
+        "functools.lru_cache"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "from pathlib import Path, PurePosixPath",
+      "targets": [
+        "pathlib",
+        "pathlib.Path",
+        "pathlib.PurePosixPath"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 23,
+      "source_expression": "from deepagents.backends import FilesystemBackend",
+      "targets": [
+        "deepagents.backends",
+        "deepagents.backends.FilesystemBackend"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 24,
+      "source_expression": "from deepagents.backends import filesystem as _deepagents_filesystem",
+      "targets": [
+        "deepagents.backends",
+        "deepagents.backends.filesystem"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 25,
+      "source_expression": "from deepagents.backends.composite import CompositeBackend",
+      "targets": [
+        "deepagents.backends.composite",
+        "deepagents.backends.composite.CompositeBackend"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 26,
+      "source_expression": "from deepagents.backends.filesystem import _raise_if_symlink_loop",
+      "targets": [
+        "deepagents.backends.filesystem",
+        "deepagents.backends.filesystem._raise_if_symlink_loop"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 27,
+      "source_expression": "from deepagents.backends.local_shell import LocalShellBackend",
+      "targets": [
+        "deepagents.backends.local_shell",
+        "deepagents.backends.local_shell.LocalShellBackend"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 28,
+      "source_expression": "from deepagents.backends.protocol import BackendProtocol, DeleteResult, EditResult, FileInfo, FileUploadResponse, GlobResult, GrepResult, LsResult, ReadResult, WriteResult",
+      "targets": [
+        "deepagents.backends.protocol",
+        "deepagents.backends.protocol.BackendProtocol",
+        "deepagents.backends.protocol.DeleteResult",
+        "deepagents.backends.protocol.EditResult",
+        "deepagents.backends.protocol.FileInfo",
+        "deepagents.backends.protocol.FileUploadResponse",
+        "deepagents.backends.protocol.GlobResult",
+        "deepagents.backends.protocol.GrepResult",
+        "deepagents.backends.protocol.LsResult",
+        "deepagents.backends.protocol.ReadResult",
+        "deepagents.backends.protocol.WriteResult"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 40,
+      "source_expression": "from deepagents.middleware.filesystem import FilesystemPermission",
+      "targets": [
+        "deepagents.middleware.filesystem",
+        "deepagents.middleware.filesystem.FilesystemPermission"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 43,
+      "source_expression": "from vvaharness.backends.harness.deepagents.models import GIT_INTERNALS_DENY, READ_ONLY_PERMISSIONS",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.models",
+        "vvaharness.backends.harness.deepagents.models.GIT_INTERNALS_DENY",
+        "vvaharness.backends.harness.deepagents.models.READ_ONLY_PERMISSIONS"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/models.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 47,
+      "source_expression": "from vvaharness.backends.harness.models import OneShotOptions, StreamingOptions",
+      "targets": [
+        "vvaharness.backends.harness.models",
+        "vvaharness.backends.harness.models.OneShotOptions",
+        "vvaharness.backends.harness.models.StreamingOptions"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/models.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 48,
+      "source_expression": "from vvaharness.backends.llm import tools as _scan_scope",
+      "targets": [
+        "vvaharness.backends.llm",
+        "vvaharness.backends.llm.tools"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/llm/__init__.py",
+        "vvaharness/backends/llm/tools.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 49,
+      "source_expression": "from vvaharness.util.counters import COUNTERS",
+      "targets": [
+        "vvaharness.util.counters",
+        "vvaharness.util.counters.COUNTERS"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/counters.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 50,
+      "source_expression": "from vvaharness.util.git_paths import is_git_metadata",
+      "targets": [
+        "vvaharness.util.git_paths",
+        "vvaharness.util.git_paths.is_git_metadata"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/git_paths.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

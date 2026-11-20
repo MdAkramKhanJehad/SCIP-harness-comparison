@@ -1,0 +1,2921 @@
+{
+  "source": "vvaharness/backends/harness/deepagents/usage.py",
+  "sha256": "448da5e8dbf5de97318d9f5d9175058d32edb1a4f60e226fe6354edb7a80f23c",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Recover token usage for DeepAgents sessions.\"\"\"\n\n# aggregate_usage_metadata UNDER-COUNTS subagent turns; fresh input = input_tokens - read - creation\n\nfrom __future__ import annotations\n\nfrom collections.abc import Mapping, Sequence\nfrom dataclasses import dataclass\nfrom typing import Final\n\nfrom langchain_core.messages import AIMessage, BaseMessage\n\nfrom vvaharness.util.tokens import TokenUsage\nfrom vvaharness.util.warn_once import warn_once\n\n\nclass SessionUsage(TokenUsage, total=False):\n    \"\"\"Session-level usage: ``TokenUsage`` totals plus a per-persona breakdown.\"\"\"\n\n    calls: int\n    turns: int\n    subagents: dict[str, TokenUsage]\n\n\ndef _as_int(value: object) -> int:\n    if isinstance(value, bool) or not isinstance(value, int):\n        return 0\n    return value\n\n\n#: TTL cache-write keys langchain-anthropic nests under input_token_details on a breakdown\n_EPHEMERAL_CACHE_KEYS: Final = (\"ephemeral_5m_input_tokens\", \"ephemeral_1h_input_tokens\")\n\n#: Warn-once registry: an exclusive-convention gateway violates EVERY record, treated each time\n_EXCLUSIVE_USAGE_WARNED: set[str] = set()\n\n\ndef _cache_counts(meta: Mapping[str, object]) -> tuple[int, int]:\n    \"\"\"Return ``(cache_read, cache_creation)`` from a ``usage_metadata`` dict.\"\"\"\n    details = meta.get(\"input_token_details\")\n    if not isinstance(details, Mapping):\n        return 0, 0\n    ephemeral = sum(_as_int(details.get(key)) for key in _EPHEMERAL_CACHE_KEYS)\n    cache_creation = ephemeral if ephemeral > 0 else _as_int(details.get(\"cache_creation\"))\n    return _as_int(details.get(\"cache_read\")), cache_creation\n\n\ndef _raw_cache_creation(raw: Mapping[str, object] | None) -> int:\n    \"\"\"Cache-write count from a provider-raw ``usage`` dict (``response_metadata``).\"\"\"\n    if raw is None:\n        return 0\n    creation = _as_int(raw.get(\"cache_creation_input_tokens\"))\n    if not creation:\n        # Flat key absent or zero: the TTL'd breakdown may still nest the write count\n        nested = raw.get(\"cache_creation\")\n        if isinstance(nested, Mapping):\n            creation = sum(_as_int(nested.get(key)) for key in _EPHEMERAL_CACHE_KEYS)\n    return creation\n\n\n@dataclass\nclass _Counts:\n    \"\"\"Running sums in the normalized fresh-input shape.\"\"\"\n\n    input_tokens: int = 0\n    output_tokens: int = 0\n    cache_read: int = 0\n    cache_creation: int = 0\n    calls: int = 0\n\n    def add(\n        self, meta: Mapping[str, object],\n        raw_usage: Mapping[str, object] | None = None,\n    ) -> None:\n        cache_read, cache_creation = _cache_counts(meta)\n        if cache_creation == 0:\n            # Some gateways omit the detail key but the provider-raw usage dict still carries it\n            cache_creation = _raw_cache_creation(raw_usage)\n        total_input = _as_int(meta.get(\"input_tokens\"))\n        cached = cache_read + cache_creation\n        if total_input < cached:\n            # input_tokens includes cache, so cached > input = an exclusive gateway: treat as fresh\n            warn_once(\n                _EXCLUSIVE_USAGE_WARNED,\n                \"exclusive-usage-record\",\n                f\"  [deepagents] WARN: usage record reports more cached input \"\n                f\"(read {cache_read} + write {cache_creation}) than total \"\n                f\"input ({total_input}); treating input_tokens as fresh-only \"\n                f\"— the gateway appears to report cache counts outside \"\n                f\"input_tokens\",\n            )\n            fresh = total_input\n        else:\n            fresh = total_input - cached\n        self.input_tokens += fresh\n        self.output_tokens += _as_int(meta.get(\"output_tokens\"))\n        self.cache_read += cache_read\n        self.cache_creation += cache_creation\n        self.calls += 1\n\n    def as_usage(self) -> TokenUsage:\n        return TokenUsage(\n            input_tokens=self.input_tokens,\n            output_tokens=self.output_tokens,\n            cache_read_input_tokens=self.cache_read,\n            cache_creation_input_tokens=self.cache_creation,\n        )\n\n\ndef _unpack_event(\n    event: tuple[object, ...] | Mapping[str, object],\n) -> tuple[tuple[str, ...], Mapping[str, object] | None]:\n    \"\"\"Split a stream event into ``(namespace, payload)``; payload None if malformed.\"\"\"\n    if not isinstance(event, tuple):\n        return (), event\n    try:\n        raw_ns, payload = event\n    except ValueError:\n        return (), None\n    namespace = (\n        tuple(str(part) for part in raw_ns)\n        if isinstance(raw_ns, (list, tuple))\n        else ()\n    )\n    return namespace, payload if isinstance(payload, Mapping) else None\n\n\nclass UsageAccumulator:\n    \"\"\"Accumulate usage across streamed graph events and the final state.\"\"\"\n\n    def __init__(self) -> None:\n        \"\"\"Start with empty counters and no seen message ids.\"\"\"\n        self._seen_ids: set[str] = set()\n        self._total: _Counts = _Counts()\n        self._subagents: dict[str, _Counts] = {}\n        self._ns_to_agent: dict[tuple[str, ...], str] = {}\n\n    def add_event(\n        self, event: tuple[object, ...] | Mapping[str, object]\n    ) -> None:\n        \"\"\"Consume one ``stream_mode='updates'`` event.\"\"\"\n        namespace, payload = _unpack_event(event)\n        if payload is None:\n            return\n        for update in payload.values():\n            self._add_update(update, namespace)\n\n    def _add_update(self, update: object, namespace: tuple[str, ...]) -> None:\n        if not isinstance(update, Mapping):\n            return\n        msgs = update.get(\"messages\")\n        if not isinstance(msgs, Sequence):\n            return\n        for msg in msgs:\n            if isinstance(msg, BaseMessage):\n                self.add_message(msg, namespace=namespace)\n\n    def _is_duplicate(self, message_id: object) -> bool:\n        if not isinstance(message_id, str):\n            return False\n        if message_id in self._seen_ids:\n            return True\n        self._seen_ids.add(message_id)\n        return False\n\n    def add_message(\n        self, message: BaseMessage, namespace: tuple[str, ...] = ()\n    ) -> None:\n        \"\"\"Count one message's usage, attributed to *namespace*'s persona.\"\"\"\n        if not isinstance(message, AIMessage):\n            return\n        name = message.name\n        if namespace and isinstance(name, str) and name:\n            self._ns_to_agent[namespace] = name\n        meta = message.usage_metadata\n        if meta is None or self._is_duplicate(message.id):\n            return\n        raw = message.response_metadata.get(\"usage\")\n        raw_usage = raw if isinstance(raw, Mapping) else None\n        self._total.add(meta, raw_usage)\n        if namespace:\n            agent = self._agent_label(namespace, name)\n            self._subagents.setdefault(agent, _Counts()).add(meta, raw_usage)\n\n    def _agent_label(self, namespace: tuple[str, ...], name: str | None) -> str:\n        if isinstance(name, str) and name:\n            return name\n        learned = self._ns_to_agent.get(namespace)\n        if learned is not None:\n            return learned\n        # Namespace elements are \"node_name:task_id\"; the node name is stable.\n        return namespace[0].split(\":\", 1)[0]\n\n    def snapshot(self) -> SessionUsage | None:\n        \"\"\"Return a ``TOKENS.add``-compatible usage, or None if no usage seen.\"\"\"\n        # Callers MUST pass TOKENS.add(usage, turns=usage.get(\"turns\")); it never reads turns itself\n        if self._total.calls == 0:\n            return None\n        usage = SessionUsage(**self._total.as_usage())\n        usage[\"calls\"] = self._total.calls\n        usage[\"turns\"] = self._total.calls\n        if self._subagents:\n            usage[\"subagents\"] = {\n                agent: counts.as_usage()\n                for agent, counts in sorted(self._subagents.items())\n            }\n        return usage\n\n\ndef aggregate_usage_metadata(messages: Sequence[object]) -> SessionUsage | None:\n    \"\"\"Sum ``usage_metadata`` across *messages*; None when no message carried usage.\"\"\"\n    accumulator = UsageAccumulator()\n    for message in messages:\n        if isinstance(message, BaseMessage):\n            accumulator.add_message(message)\n    return accumulator.snapshot()\n\n\n__all__ = [\"SessionUsage\", \"UsageAccumulator\", \"aggregate_usage_metadata\"]\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/backends/harness/deepagents/usage.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "Recover token usage for DeepAgents sessions.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_32_4": {
+      "source": "vvaharness/backends/harness/deepagents/usage.py",
+      "line_start": 32,
+      "line_end": 32,
+      "value": "Session-level usage: ``TokenUsage`` totals plus a per-persona breakdown.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_53_4": {
+      "source": "vvaharness/backends/harness/deepagents/usage.py",
+      "line_start": 53,
+      "line_end": 53,
+      "value": "Return ``(cache_read, cache_creation)`` from a ``usage_metadata`` dict.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_63_4": {
+      "source": "vvaharness/backends/harness/deepagents/usage.py",
+      "line_start": 63,
+      "line_end": 63,
+      "value": "Cache-write count from a provider-raw ``usage`` dict (``response_metadata``).",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_77_4": {
+      "source": "vvaharness/backends/harness/deepagents/usage.py",
+      "line_start": 77,
+      "line_end": 77,
+      "value": "Running sums in the normalized fresh-input shape.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_100_16": {
+      "source": "vvaharness/backends/harness/deepagents/usage.py",
+      "line_start": 100,
+      "line_end": 104,
+      "source_expression": "f\"  [deepagents] WARN: usage record reports more cached input \"\n                f\"(read {cache_read} + write {cache_creation}) than total \"\n                f\"input ({total_input}); treating input_tokens as fresh-only \"\n                f\"— the gateway appears to report cache counts outside \"\n                f\"input_tokens\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_127_4": {
+      "source": "vvaharness/backends/harness/deepagents/usage.py",
+      "line_start": 127,
+      "line_end": 127,
+      "value": "Split a stream event into ``(namespace, payload)``; payload None if malformed.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_143_4": {
+      "source": "vvaharness/backends/harness/deepagents/usage.py",
+      "line_start": 143,
+      "line_end": 143,
+      "value": "Accumulate usage across streamed graph events and the final state.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_146_8": {
+      "source": "vvaharness/backends/harness/deepagents/usage.py",
+      "line_start": 146,
+      "line_end": 146,
+      "value": "Start with empty counters and no seen message ids.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_155_8": {
+      "source": "vvaharness/backends/harness/deepagents/usage.py",
+      "line_start": 155,
+      "line_end": 155,
+      "value": "Consume one ``stream_mode='updates'`` event.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_183_8": {
+      "source": "vvaharness/backends/harness/deepagents/usage.py",
+      "line_start": 183,
+      "line_end": 183,
+      "value": "Count one message's usage, attributed to *namespace*'s persona.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_209_8": {
+      "source": "vvaharness/backends/harness/deepagents/usage.py",
+      "line_start": 209,
+      "line_end": 209,
+      "value": "Return a ``TOKENS.add``-compatible usage, or None if no usage seen.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_225_4": {
+      "source": "vvaharness/backends/harness/deepagents/usage.py",
+      "line_start": 225,
+      "line_end": 225,
+      "value": "Sum ``usage_metadata`` across *messages*; None when no message carried usage.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "Recover token usage for DeepAgents sessions.",
+      "context": "literal"
+    },
+    {
+      "line_start": 32,
+      "line_end": 32,
+      "column": 4,
+      "value": "Session-level usage: ``TokenUsage`` totals plus a per-persona breakdown.",
+      "context": "literal"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 32,
+      "value": "ephemeral_5m_input_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 61,
+      "value": "ephemeral_1h_input_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 4,
+      "value": "Return ``(cache_read, cache_creation)`` from a ``usage_metadata`` dict.",
+      "context": "literal"
+    },
+    {
+      "line_start": 63,
+      "line_end": 63,
+      "column": 4,
+      "value": "Cache-write count from a provider-raw ``usage`` dict (``response_metadata``).",
+      "context": "literal"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 4,
+      "value": "Running sums in the normalized fresh-input shape.",
+      "context": "literal"
+    },
+    {
+      "line_start": 127,
+      "line_end": 127,
+      "column": 4,
+      "value": "Split a stream event into ``(namespace, payload)``; payload None if malformed.",
+      "context": "literal"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 4,
+      "value": "Accumulate usage across streamed graph events and the final state.",
+      "context": "literal"
+    },
+    {
+      "line_start": 225,
+      "line_end": 225,
+      "column": 4,
+      "value": "Sum ``usage_metadata`` across *messages*; None when no message carried usage.",
+      "context": "literal"
+    },
+    {
+      "line_start": 233,
+      "line_end": 233,
+      "column": 11,
+      "value": "SessionUsage",
+      "context": "literal"
+    },
+    {
+      "line_start": 233,
+      "line_end": 233,
+      "column": 27,
+      "value": "UsageAccumulator",
+      "context": "literal"
+    },
+    {
+      "line_start": 233,
+      "line_end": 233,
+      "column": 47,
+      "value": "aggregate_usage_metadata",
+      "context": "literal"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 23,
+      "value": "input_token_details",
+      "context": "literal"
+    },
+    {
+      "line_start": 146,
+      "line_end": 146,
+      "column": 8,
+      "value": "Start with empty counters and no seen message ids.",
+      "context": "literal"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 8,
+      "value": "Consume one ``stream_mode='updates'`` event.",
+      "context": "literal"
+    },
+    {
+      "line_start": 183,
+      "line_end": 183,
+      "column": 8,
+      "value": "Count one message's usage, attributed to *namespace*'s persona.",
+      "context": "literal"
+    },
+    {
+      "line_start": 209,
+      "line_end": 209,
+      "column": 8,
+      "value": "Return a ``TOKENS.add``-compatible usage, or None if no usage seen.",
+      "context": "literal"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 31,
+      "value": "cache_creation_input_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 25,
+      "value": "cache_creation",
+      "context": "literal"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 26,
+      "value": "messages",
+      "context": "literal"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 44,
+      "value": "usage",
+      "context": "literal"
+    },
+    {
+      "line_start": 214,
+      "line_end": 214,
+      "column": 14,
+      "value": "calls",
+      "context": "literal"
+    },
+    {
+      "line_start": 215,
+      "line_end": 215,
+      "column": 14,
+      "value": "turns",
+      "context": "literal"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 73,
+      "value": "cache_creation",
+      "context": "literal"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 31,
+      "value": "cache_read",
+      "context": "literal"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 39,
+      "value": "input_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 16,
+      "value": "exclusive-usage-record",
+      "context": "literal"
+    },
+    {
+      "line_start": 110,
+      "line_end": 110,
+      "column": 47,
+      "value": "output_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 34,
+      "value": ":",
+      "context": "literal"
+    },
+    {
+      "line_start": 217,
+      "line_end": 217,
+      "column": 18,
+      "value": "subagents",
+      "context": "literal"
+    },
+    {
+      "line_start": 100,
+      "line_end": 101,
+      "column": 18,
+      "value": "  [deepagents] WARN: usage record reports more cached input (read ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 36,
+      "value": " + write ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 101,
+      "line_end": 102,
+      "column": 61,
+      "value": ") than total input (",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 102,
+      "line_end": 104,
+      "column": 38,
+      "value": "); treating input_tokens as fresh-only — the gateway appears to report cache counts outside input_tokens",
+      "context": "f-string segment"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 17,
+      "text": "# aggregate_usage_metadata UNDER-COUNTS subagent turns; fresh input = input_tokens - read - creation"
+    },
+    {
+      "line": 45,
+      "text": "#: TTL cache-write keys langchain-anthropic nests under input_token_details on a breakdown"
+    },
+    {
+      "line": 48,
+      "text": "#: Warn-once registry: an exclusive-convention gateway violates EVERY record, treated each time"
+    },
+    {
+      "line": 68,
+      "text": "# Flat key absent or zero: the TTL'd breakdown may still nest the write count"
+    },
+    {
+      "line": 91,
+      "text": "# Some gateways omit the detail key but the provider-raw usage dict still carries it"
+    },
+    {
+      "line": 96,
+      "text": "# input_tokens includes cache, so cached > input = an exclusive gateway: treat as fresh"
+    },
+    {
+      "line": 205,
+      "text": "# Namespace elements are \"node_name:task_id\"; the node name is stable."
+    },
+    {
+      "line": 210,
+      "text": "# Callers MUST pass TOKENS.add(usage, turns=usage.get(\"turns\")); it never reads turns itself"
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 23,
+      "line_end": 23,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 27,
+      "line_end": 27,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 28,
+      "line_end": 28,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 31,
+      "line_end": 36,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 5
+    },
+    {
+      "kind": "Expr",
+      "line_start": 32,
+      "line_end": 32,
+      "column": 4,
+      "owner": "SessionUsage",
+      "representation_line": 10
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 34,
+      "line_end": 34,
+      "column": 4,
+      "owner": "SessionUsage",
+      "representation_line": 10
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 35,
+      "line_end": 35,
+      "column": 4,
+      "owner": "SessionUsage",
+      "representation_line": 10
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 36,
+      "line_end": 36,
+      "column": 4,
+      "owner": "SessionUsage",
+      "representation_line": 10
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 39,
+      "line_end": 42,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 12
+    },
+    {
+      "kind": "If",
+      "line_start": 40,
+      "line_end": 41,
+      "column": 4,
+      "owner": "_as_int",
+      "representation_line": 17
+    },
+    {
+      "kind": "Return",
+      "line_start": 41,
+      "line_end": 41,
+      "column": 8,
+      "owner": "_as_int",
+      "representation_line": 19
+    },
+    {
+      "kind": "Return",
+      "line_start": 42,
+      "line_end": 42,
+      "column": 4,
+      "owner": "_as_int",
+      "representation_line": 22
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 46,
+      "line_end": 46,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 27
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 49,
+      "line_end": 49,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 27
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 52,
+      "line_end": 59,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 28
+    },
+    {
+      "kind": "Expr",
+      "line_start": 53,
+      "line_end": 53,
+      "column": 4,
+      "owner": "_cache_counts",
+      "representation_line": 34
+    },
+    {
+      "kind": "Assign",
+      "line_start": 54,
+      "line_end": 54,
+      "column": 4,
+      "owner": "_cache_counts",
+      "representation_line": 34
+    },
+    {
+      "kind": "If",
+      "line_start": 55,
+      "line_end": 56,
+      "column": 4,
+      "owner": "_cache_counts",
+      "representation_line": 35
+    },
+    {
+      "kind": "Return",
+      "line_start": 56,
+      "line_end": 56,
+      "column": 8,
+      "owner": "_cache_counts",
+      "representation_line": 37
+    },
+    {
+      "kind": "Assign",
+      "line_start": 57,
+      "line_end": 57,
+      "column": 4,
+      "owner": "_cache_counts",
+      "representation_line": 41
+    },
+    {
+      "kind": "Assign",
+      "line_start": 58,
+      "line_end": 58,
+      "column": 4,
+      "owner": "_cache_counts",
+      "representation_line": 41
+    },
+    {
+      "kind": "Return",
+      "line_start": 59,
+      "line_end": 59,
+      "column": 4,
+      "owner": "_cache_counts",
+      "representation_line": 42
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 62,
+      "line_end": 72,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 46
+    },
+    {
+      "kind": "Expr",
+      "line_start": 63,
+      "line_end": 63,
+      "column": 4,
+      "owner": "_raw_cache_creation",
+      "representation_line": 52
+    },
+    {
+      "kind": "If",
+      "line_start": 64,
+      "line_end": 65,
+      "column": 4,
+      "owner": "_raw_cache_creation",
+      "representation_line": 53
+    },
+    {
+      "kind": "Return",
+      "line_start": 65,
+      "line_end": 65,
+      "column": 8,
+      "owner": "_raw_cache_creation",
+      "representation_line": 55
+    },
+    {
+      "kind": "Assign",
+      "line_start": 66,
+      "line_end": 66,
+      "column": 4,
+      "owner": "_raw_cache_creation",
+      "representation_line": 59
+    },
+    {
+      "kind": "If",
+      "line_start": 67,
+      "line_end": 71,
+      "column": 4,
+      "owner": "_raw_cache_creation",
+      "representation_line": 60
+    },
+    {
+      "kind": "Assign",
+      "line_start": 69,
+      "line_end": 69,
+      "column": 8,
+      "owner": "_raw_cache_creation",
+      "representation_line": 63
+    },
+    {
+      "kind": "If",
+      "line_start": 70,
+      "line_end": 71,
+      "column": 8,
+      "owner": "_raw_cache_creation",
+      "representation_line": 64
+    },
+    {
+      "kind": "Assign",
+      "line_start": 71,
+      "line_end": 71,
+      "column": 12,
+      "owner": "_raw_cache_creation",
+      "representation_line": 67
+    },
+    {
+      "kind": "Return",
+      "line_start": 72,
+      "line_end": 72,
+      "column": 4,
+      "owner": "_raw_cache_creation",
+      "representation_line": 70
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 76,
+      "line_end": 121,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 74
+    },
+    {
+      "kind": "Expr",
+      "line_start": 77,
+      "line_end": 77,
+      "column": 4,
+      "owner": "_Counts",
+      "representation_line": 82
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 79,
+      "line_end": 79,
+      "column": 4,
+      "owner": "_Counts",
+      "representation_line": 82
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 80,
+      "line_end": 80,
+      "column": 4,
+      "owner": "_Counts",
+      "representation_line": 82
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 81,
+      "line_end": 81,
+      "column": 4,
+      "owner": "_Counts",
+      "representation_line": 82
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 82,
+      "line_end": 82,
+      "column": 4,
+      "owner": "_Counts",
+      "representation_line": 82
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 83,
+      "line_end": 83,
+      "column": 4,
+      "owner": "_Counts",
+      "representation_line": 84
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 85,
+      "line_end": 113,
+      "column": 4,
+      "owner": "_Counts",
+      "representation_line": 85
+    },
+    {
+      "kind": "Assign",
+      "line_start": 89,
+      "line_end": 89,
+      "column": 8,
+      "owner": "_Counts.add",
+      "representation_line": 91
+    },
+    {
+      "kind": "If",
+      "line_start": 90,
+      "line_end": 92,
+      "column": 8,
+      "owner": "_Counts.add",
+      "representation_line": 92
+    },
+    {
+      "kind": "Assign",
+      "line_start": 92,
+      "line_end": 92,
+      "column": 12,
+      "owner": "_Counts.add",
+      "representation_line": 95
+    },
+    {
+      "kind": "Assign",
+      "line_start": 93,
+      "line_end": 93,
+      "column": 8,
+      "owner": "_Counts.add",
+      "representation_line": 98
+    },
+    {
+      "kind": "Assign",
+      "line_start": 94,
+      "line_end": 94,
+      "column": 8,
+      "owner": "_Counts.add",
+      "representation_line": 98
+    },
+    {
+      "kind": "If",
+      "line_start": 95,
+      "line_end": 108,
+      "column": 8,
+      "owner": "_Counts.add",
+      "representation_line": 99
+    },
+    {
+      "kind": "Expr",
+      "line_start": 97,
+      "line_end": 105,
+      "column": 12,
+      "owner": "_Counts.add",
+      "representation_line": 102
+    },
+    {
+      "kind": "Assign",
+      "line_start": 106,
+      "line_end": 106,
+      "column": 12,
+      "owner": "_Counts.add",
+      "representation_line": 102
+    },
+    {
+      "kind": "Assign",
+      "line_start": 108,
+      "line_end": 108,
+      "column": 12,
+      "owner": "_Counts.add",
+      "representation_line": 106
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 109,
+      "line_end": 109,
+      "column": 8,
+      "owner": "_Counts.add",
+      "representation_line": 109
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 110,
+      "line_end": 110,
+      "column": 8,
+      "owner": "_Counts.add",
+      "representation_line": 109
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 111,
+      "line_end": 111,
+      "column": 8,
+      "owner": "_Counts.add",
+      "representation_line": 109
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 112,
+      "line_end": 112,
+      "column": 8,
+      "owner": "_Counts.add",
+      "representation_line": 109
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 113,
+      "line_end": 113,
+      "column": 8,
+      "owner": "_Counts.add",
+      "representation_line": 109
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 115,
+      "line_end": 121,
+      "column": 4,
+      "owner": "_Counts",
+      "representation_line": 112
+    },
+    {
+      "kind": "Return",
+      "line_start": 116,
+      "line_end": 121,
+      "column": 8,
+      "owner": "_Counts.as_usage",
+      "representation_line": 117
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 124,
+      "line_end": 139,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 123
+    },
+    {
+      "kind": "Expr",
+      "line_start": 127,
+      "line_end": 127,
+      "column": 4,
+      "owner": "_unpack_event",
+      "representation_line": 129
+    },
+    {
+      "kind": "If",
+      "line_start": 128,
+      "line_end": 129,
+      "column": 4,
+      "owner": "_unpack_event",
+      "representation_line": 130
+    },
+    {
+      "kind": "Return",
+      "line_start": 129,
+      "line_end": 129,
+      "column": 8,
+      "owner": "_unpack_event",
+      "representation_line": 132
+    },
+    {
+      "kind": "Try",
+      "line_start": 130,
+      "line_end": 133,
+      "column": 4,
+      "owner": "_unpack_event",
+      "representation_line": 135
+    },
+    {
+      "kind": "Assign",
+      "line_start": 131,
+      "line_end": 131,
+      "column": 8,
+      "owner": "_unpack_event",
+      "representation_line": 138
+    },
+    {
+      "kind": "Return",
+      "line_start": 133,
+      "line_end": 133,
+      "column": 8,
+      "owner": "_unpack_event",
+      "representation_line": 142
+    },
+    {
+      "kind": "Assign",
+      "line_start": 134,
+      "line_end": 138,
+      "column": 4,
+      "owner": "_unpack_event",
+      "representation_line": 146
+    },
+    {
+      "kind": "Return",
+      "line_start": 139,
+      "line_end": 139,
+      "column": 4,
+      "owner": "_unpack_event",
+      "representation_line": 147
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 142,
+      "line_end": 221,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 151
+    },
+    {
+      "kind": "Expr",
+      "line_start": 143,
+      "line_end": 143,
+      "column": 4,
+      "owner": "UsageAccumulator",
+      "representation_line": 156
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 145,
+      "line_end": 150,
+      "column": 4,
+      "owner": "UsageAccumulator",
+      "representation_line": 157
+    },
+    {
+      "kind": "Expr",
+      "line_start": 146,
+      "line_end": 146,
+      "column": 8,
+      "owner": "UsageAccumulator.__init__",
+      "representation_line": 163
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 147,
+      "line_end": 147,
+      "column": 8,
+      "owner": "UsageAccumulator.__init__",
+      "representation_line": 163
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 148,
+      "line_end": 148,
+      "column": 8,
+      "owner": "UsageAccumulator.__init__",
+      "representation_line": 163
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 149,
+      "line_end": 149,
+      "column": 8,
+      "owner": "UsageAccumulator.__init__",
+      "representation_line": 163
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 150,
+      "line_end": 150,
+      "column": 8,
+      "owner": "UsageAccumulator.__init__",
+      "representation_line": 163
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 152,
+      "line_end": 160,
+      "column": 4,
+      "owner": "UsageAccumulator",
+      "representation_line": 166
+    },
+    {
+      "kind": "Expr",
+      "line_start": 155,
+      "line_end": 155,
+      "column": 8,
+      "owner": "UsageAccumulator.add_event",
+      "representation_line": 172
+    },
+    {
+      "kind": "Assign",
+      "line_start": 156,
+      "line_end": 156,
+      "column": 8,
+      "owner": "UsageAccumulator.add_event",
+      "representation_line": 172
+    },
+    {
+      "kind": "If",
+      "line_start": 157,
+      "line_end": 158,
+      "column": 8,
+      "owner": "UsageAccumulator.add_event",
+      "representation_line": 173
+    },
+    {
+      "kind": "Return",
+      "line_start": 158,
+      "line_end": 158,
+      "column": 12,
+      "owner": "UsageAccumulator.add_event",
+      "representation_line": 175
+    },
+    {
+      "kind": "For",
+      "line_start": 159,
+      "line_end": 160,
+      "column": 8,
+      "owner": "UsageAccumulator.add_event",
+      "representation_line": 178
+    },
+    {
+      "kind": "Expr",
+      "line_start": 160,
+      "line_end": 160,
+      "column": 12,
+      "owner": "UsageAccumulator.add_event",
+      "representation_line": 181
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 162,
+      "line_end": 170,
+      "column": 4,
+      "owner": "UsageAccumulator",
+      "representation_line": 185
+    },
+    {
+      "kind": "If",
+      "line_start": 163,
+      "line_end": 164,
+      "column": 8,
+      "owner": "UsageAccumulator._add_update",
+      "representation_line": 190
+    },
+    {
+      "kind": "Return",
+      "line_start": 164,
+      "line_end": 164,
+      "column": 12,
+      "owner": "UsageAccumulator._add_update",
+      "representation_line": 192
+    },
+    {
+      "kind": "Assign",
+      "line_start": 165,
+      "line_end": 165,
+      "column": 8,
+      "owner": "UsageAccumulator._add_update",
+      "representation_line": 196
+    },
+    {
+      "kind": "If",
+      "line_start": 166,
+      "line_end": 167,
+      "column": 8,
+      "owner": "UsageAccumulator._add_update",
+      "representation_line": 197
+    },
+    {
+      "kind": "Return",
+      "line_start": 167,
+      "line_end": 167,
+      "column": 12,
+      "owner": "UsageAccumulator._add_update",
+      "representation_line": 199
+    },
+    {
+      "kind": "For",
+      "line_start": 168,
+      "line_end": 170,
+      "column": 8,
+      "owner": "UsageAccumulator._add_update",
+      "representation_line": 202
+    },
+    {
+      "kind": "If",
+      "line_start": 169,
+      "line_end": 170,
+      "column": 12,
+      "owner": "UsageAccumulator._add_update",
+      "representation_line": 204
+    },
+    {
+      "kind": "Expr",
+      "line_start": 170,
+      "line_end": 170,
+      "column": 16,
+      "owner": "UsageAccumulator._add_update",
+      "representation_line": 207
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 172,
+      "line_end": 178,
+      "column": 4,
+      "owner": "UsageAccumulator",
+      "representation_line": 212
+    },
+    {
+      "kind": "If",
+      "line_start": 173,
+      "line_end": 174,
+      "column": 8,
+      "owner": "UsageAccumulator._is_duplicate",
+      "representation_line": 217
+    },
+    {
+      "kind": "Return",
+      "line_start": 174,
+      "line_end": 174,
+      "column": 12,
+      "owner": "UsageAccumulator._is_duplicate",
+      "representation_line": 219
+    },
+    {
+      "kind": "If",
+      "line_start": 175,
+      "line_end": 176,
+      "column": 8,
+      "owner": "UsageAccumulator._is_duplicate",
+      "representation_line": 222
+    },
+    {
+      "kind": "Return",
+      "line_start": 176,
+      "line_end": 176,
+      "column": 12,
+      "owner": "UsageAccumulator._is_duplicate",
+      "representation_line": 224
+    },
+    {
+      "kind": "Expr",
+      "line_start": 177,
+      "line_end": 177,
+      "column": 8,
+      "owner": "UsageAccumulator._is_duplicate",
+      "representation_line": 228
+    },
+    {
+      "kind": "Return",
+      "line_start": 178,
+      "line_end": 178,
+      "column": 8,
+      "owner": "UsageAccumulator._is_duplicate",
+      "representation_line": 229
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 180,
+      "line_end": 197,
+      "column": 4,
+      "owner": "UsageAccumulator",
+      "representation_line": 233
+    },
+    {
+      "kind": "Expr",
+      "line_start": 183,
+      "line_end": 183,
+      "column": 8,
+      "owner": "UsageAccumulator.add_message",
+      "representation_line": 239
+    },
+    {
+      "kind": "If",
+      "line_start": 184,
+      "line_end": 185,
+      "column": 8,
+      "owner": "UsageAccumulator.add_message",
+      "representation_line": 240
+    },
+    {
+      "kind": "Return",
+      "line_start": 185,
+      "line_end": 185,
+      "column": 12,
+      "owner": "UsageAccumulator.add_message",
+      "representation_line": 242
+    },
+    {
+      "kind": "Assign",
+      "line_start": 186,
+      "line_end": 186,
+      "column": 8,
+      "owner": "UsageAccumulator.add_message",
+      "representation_line": 246
+    },
+    {
+      "kind": "If",
+      "line_start": 187,
+      "line_end": 188,
+      "column": 8,
+      "owner": "UsageAccumulator.add_message",
+      "representation_line": 247
+    },
+    {
+      "kind": "Assign",
+      "line_start": 188,
+      "line_end": 188,
+      "column": 12,
+      "owner": "UsageAccumulator.add_message",
+      "representation_line": 250
+    },
+    {
+      "kind": "Assign",
+      "line_start": 189,
+      "line_end": 189,
+      "column": 8,
+      "owner": "UsageAccumulator.add_message",
+      "representation_line": 253
+    },
+    {
+      "kind": "If",
+      "line_start": 190,
+      "line_end": 191,
+      "column": 8,
+      "owner": "UsageAccumulator.add_message",
+      "representation_line": 254
+    },
+    {
+      "kind": "Return",
+      "line_start": 191,
+      "line_end": 191,
+      "column": 12,
+      "owner": "UsageAccumulator.add_message",
+      "representation_line": 256
+    },
+    {
+      "kind": "Assign",
+      "line_start": 192,
+      "line_end": 192,
+      "column": 8,
+      "owner": "UsageAccumulator.add_message",
+      "representation_line": 260
+    },
+    {
+      "kind": "Assign",
+      "line_start": 193,
+      "line_end": 193,
+      "column": 8,
+      "owner": "UsageAccumulator.add_message",
+      "representation_line": 260
+    },
+    {
+      "kind": "Expr",
+      "line_start": 194,
+      "line_end": 194,
+      "column": 8,
+      "owner": "UsageAccumulator.add_message",
+      "representation_line": 260
+    },
+    {
+      "kind": "If",
+      "line_start": 195,
+      "line_end": 197,
+      "column": 8,
+      "owner": "UsageAccumulator.add_message",
+      "representation_line": 261
+    },
+    {
+      "kind": "Assign",
+      "line_start": 196,
+      "line_end": 196,
+      "column": 12,
+      "owner": "UsageAccumulator.add_message",
+      "representation_line": 264
+    },
+    {
+      "kind": "Expr",
+      "line_start": 197,
+      "line_end": 197,
+      "column": 12,
+      "owner": "UsageAccumulator.add_message",
+      "representation_line": 264
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 199,
+      "line_end": 206,
+      "column": 4,
+      "owner": "UsageAccumulator",
+      "representation_line": 268
+    },
+    {
+      "kind": "If",
+      "line_start": 200,
+      "line_end": 201,
+      "column": 8,
+      "owner": "UsageAccumulator._agent_label",
+      "representation_line": 273
+    },
+    {
+      "kind": "Return",
+      "line_start": 201,
+      "line_end": 201,
+      "column": 12,
+      "owner": "UsageAccumulator._agent_label",
+      "representation_line": 275
+    },
+    {
+      "kind": "Assign",
+      "line_start": 202,
+      "line_end": 202,
+      "column": 8,
+      "owner": "UsageAccumulator._agent_label",
+      "representation_line": 279
+    },
+    {
+      "kind": "If",
+      "line_start": 203,
+      "line_end": 204,
+      "column": 8,
+      "owner": "UsageAccumulator._agent_label",
+      "representation_line": 280
+    },
+    {
+      "kind": "Return",
+      "line_start": 204,
+      "line_end": 204,
+      "column": 12,
+      "owner": "UsageAccumulator._agent_label",
+      "representation_line": 282
+    },
+    {
+      "kind": "Return",
+      "line_start": 206,
+      "line_end": 206,
+      "column": 8,
+      "owner": "UsageAccumulator._agent_label",
+      "representation_line": 285
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 208,
+      "line_end": 221,
+      "column": 4,
+      "owner": "UsageAccumulator",
+      "representation_line": 289
+    },
+    {
+      "kind": "Expr",
+      "line_start": 209,
+      "line_end": 209,
+      "column": 8,
+      "owner": "UsageAccumulator.snapshot",
+      "representation_line": 295
+    },
+    {
+      "kind": "If",
+      "line_start": 211,
+      "line_end": 212,
+      "column": 8,
+      "owner": "UsageAccumulator.snapshot",
+      "representation_line": 296
+    },
+    {
+      "kind": "Return",
+      "line_start": 212,
+      "line_end": 212,
+      "column": 12,
+      "owner": "UsageAccumulator.snapshot",
+      "representation_line": 298
+    },
+    {
+      "kind": "Assign",
+      "line_start": 213,
+      "line_end": 213,
+      "column": 8,
+      "owner": "UsageAccumulator.snapshot",
+      "representation_line": 302
+    },
+    {
+      "kind": "Assign",
+      "line_start": 214,
+      "line_end": 214,
+      "column": 8,
+      "owner": "UsageAccumulator.snapshot",
+      "representation_line": 302
+    },
+    {
+      "kind": "Assign",
+      "line_start": 215,
+      "line_end": 215,
+      "column": 8,
+      "owner": "UsageAccumulator.snapshot",
+      "representation_line": 302
+    },
+    {
+      "kind": "If",
+      "line_start": 216,
+      "line_end": 220,
+      "column": 8,
+      "owner": "UsageAccumulator.snapshot",
+      "representation_line": 303
+    },
+    {
+      "kind": "Assign",
+      "line_start": 217,
+      "line_end": 220,
+      "column": 12,
+      "owner": "UsageAccumulator.snapshot",
+      "representation_line": 306
+    },
+    {
+      "kind": "Return",
+      "line_start": 221,
+      "line_end": 221,
+      "column": 8,
+      "owner": "UsageAccumulator.snapshot",
+      "representation_line": 308
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 224,
+      "line_end": 230,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 313
+    },
+    {
+      "kind": "Expr",
+      "line_start": 225,
+      "line_end": 225,
+      "column": 4,
+      "owner": "aggregate_usage_metadata",
+      "representation_line": 319
+    },
+    {
+      "kind": "Assign",
+      "line_start": 226,
+      "line_end": 226,
+      "column": 4,
+      "owner": "aggregate_usage_metadata",
+      "representation_line": 319
+    },
+    {
+      "kind": "For",
+      "line_start": 227,
+      "line_end": 229,
+      "column": 4,
+      "owner": "aggregate_usage_metadata",
+      "representation_line": 320
+    },
+    {
+      "kind": "If",
+      "line_start": 228,
+      "line_end": 229,
+      "column": 8,
+      "owner": "aggregate_usage_metadata",
+      "representation_line": 322
+    },
+    {
+      "kind": "Expr",
+      "line_start": 229,
+      "line_end": 229,
+      "column": 12,
+      "owner": "aggregate_usage_metadata",
+      "representation_line": 325
+    },
+    {
+      "kind": "Return",
+      "line_start": 230,
+      "line_end": 230,
+      "column": 4,
+      "owner": "aggregate_usage_metadata",
+      "representation_line": 328
+    },
+    {
+      "kind": "Assign",
+      "line_start": 233,
+      "line_end": 233,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 333
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 31,
+      "line_end": 31,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='TokenUsage', ctx=Load())",
+      "rendered": "TokenUsage"
+    },
+    {
+      "line_start": 31,
+      "line_end": 31,
+      "column": 31,
+      "kind": "keyword",
+      "original_ast": "keyword(arg='total', value=Constant(value=False))",
+      "rendered": "total=False"
+    },
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='value', ctx=Load()), Name(id='bool', ctx=Load())], keywords=[]), UnaryOp(op=Not(), operand=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='value', ctx=Load()), Name(id='int', ctx=Load())], keywords=[]))])",
+      "rendered": "isinstance(value, bool) or not isinstance(value, int)"
+    },
+    {
+      "line_start": 41,
+      "line_end": 41,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='value', ctx=Load())",
+      "rendered": "value"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 31,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value='ephemeral_5m_input_tokens'), Constant(value='ephemeral_1h_input_tokens')], ctx=Load())",
+      "rendered": "('ephemeral_5m_input_tokens', 'ephemeral_1h_input_tokens')"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 36,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='meta', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='input_token_details')], keywords=[])",
+      "rendered": "meta.get('input_token_details')"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='details', ctx=Load()), Name(id='Mapping', ctx=Load())], keywords=[]))",
+      "rendered": "not isinstance(details, Mapping)"
+    },
+    {
+      "line_start": 56,
+      "line_end": 56,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value=0), Constant(value=0)], ctx=Load())",
+      "rendered": "(0, 0)"
+    },
+    {
+      "line_start": 57,
+      "line_end": 57,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sum', ctx=Load()), args=[GeneratorExp(elt=Call(func=Name(id='_as_int', ctx=Load()), args=[Call(func=Attribute(value=Name(id='details', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='key', ctx=Load())], keywords=[])], keywords=[]), generators=[comprehension(target=Name(id='key', ctx=Store()), iter=Name(id='_EPHEMERAL_CACHE_KEYS', ctx=Load()), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "sum((_as_int(details.get(key)) for key in _EPHEMERAL_CACHE_KEYS))"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 21,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=Name(id='ephemeral', ctx=Load()), ops=[Gt()], comparators=[Constant(value=0)]), body=Name(id='ephemeral', ctx=Load()), orelse=Call(func=Name(id='_as_int', ctx=Load()), args=[Call(func=Attribute(value=Name(id='details', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='cache_creation')], keywords=[])], keywords=[]))",
+      "rendered": "ephemeral if ephemeral > 0 else _as_int(details.get('cache_creation'))"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Call(func=Name(id='_as_int', ctx=Load()), args=[Call(func=Attribute(value=Name(id='details', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='cache_read')], keywords=[])], keywords=[]), Name(id='cache_creation', ctx=Load())], ctx=Load())",
+      "rendered": "(_as_int(details.get('cache_read')), cache_creation)"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='raw', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "raw is None"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_as_int', ctx=Load()), args=[Call(func=Attribute(value=Name(id='raw', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='cache_creation_input_tokens')], keywords=[])], keywords=[])",
+      "rendered": "_as_int(raw.get('cache_creation_input_tokens'))"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='creation', ctx=Load()))",
+      "rendered": "not creation"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='raw', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='cache_creation')], keywords=[])",
+      "rendered": "raw.get('cache_creation')"
+    },
+    {
+      "line_start": 70,
+      "line_end": 70,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='nested', ctx=Load()), Name(id='Mapping', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(nested, Mapping)"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sum', ctx=Load()), args=[GeneratorExp(elt=Call(func=Name(id='_as_int', ctx=Load()), args=[Call(func=Attribute(value=Name(id='nested', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='key', ctx=Load())], keywords=[])], keywords=[]), generators=[comprehension(target=Name(id='key', ctx=Store()), iter=Name(id='_EPHEMERAL_CACHE_KEYS', ctx=Load()), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "sum((_as_int(nested.get(key)) for key in _EPHEMERAL_CACHE_KEYS))"
+    },
+    {
+      "line_start": 72,
+      "line_end": 72,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='creation', ctx=Load())",
+      "rendered": "creation"
+    },
+    {
+      "line_start": 75,
+      "line_end": 75,
+      "column": 1,
+      "kind": "Name",
+      "original_ast": "Name(id='dataclass', ctx=Load())",
+      "rendered": "dataclass"
+    },
+    {
+      "line_start": 79,
+      "line_end": 79,
+      "column": 24,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 25,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 22,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 26,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 83,
+      "line_end": 83,
+      "column": 17,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 89,
+      "line_end": 89,
+      "column": 37,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_cache_counts', ctx=Load()), args=[Name(id='meta', ctx=Load())], keywords=[])",
+      "rendered": "_cache_counts(meta)"
+    },
+    {
+      "line_start": 90,
+      "line_end": 90,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='cache_creation', ctx=Load()), ops=[Eq()], comparators=[Constant(value=0)])",
+      "rendered": "cache_creation == 0"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 29,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_raw_cache_creation', ctx=Load()), args=[Name(id='raw_usage', ctx=Load())], keywords=[])",
+      "rendered": "_raw_cache_creation(raw_usage)"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_as_int', ctx=Load()), args=[Call(func=Attribute(value=Name(id='meta', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='input_tokens')], keywords=[])], keywords=[])",
+      "rendered": "_as_int(meta.get('input_tokens'))"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 17,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Name(id='cache_read', ctx=Load()), op=Add(), right=Name(id='cache_creation', ctx=Load()))",
+      "rendered": "cache_read + cache_creation"
+    },
+    {
+      "line_start": 95,
+      "line_end": 95,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='total_input', ctx=Load()), ops=[Lt()], comparators=[Name(id='cached', ctx=Load())])",
+      "rendered": "total_input < cached"
+    },
+    {
+      "line_start": 97,
+      "line_end": 105,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='warn_once', ctx=Load()), args=[Name(id='_EXCLUSIVE_USAGE_WARNED', ctx=Load()), Constant(value='exclusive-usage-record'), JoinedStr(values=[Constant(value='  [deepagents] WARN: usage record reports more cached input (read '), FormattedValue(value=Name(id='cache_read', ctx=Load()), conversion=-1), Constant(value=' + write '), FormattedValue(value=Name(id='cache_creation', ctx=Load()), conversion=-1), Constant(value=') than total input ('), FormattedValue(value=Name(id='total_input', ctx=Load()), conversion=-1), Constant(value='); treating input_tokens as fresh-only — the gateway appears to report cache counts outside input_tokens')])], keywords=[])",
+      "rendered": "warn_once(_EXCLUSIVE_USAGE_WARNED, 'exclusive-usage-record', source_template_100_16)"
+    },
+    {
+      "line_start": 106,
+      "line_end": 106,
+      "column": 20,
+      "kind": "Name",
+      "original_ast": "Name(id='total_input', ctx=Load())",
+      "rendered": "total_input"
+    },
+    {
+      "line_start": 108,
+      "line_end": 108,
+      "column": 20,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Name(id='total_input', ctx=Load()), op=Sub(), right=Name(id='cached', ctx=Load()))",
+      "rendered": "total_input - cached"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Attribute(value=Name(id='self', ctx=Load()), attr='input_tokens', ctx=Store()), op=Add(), value=Name(id='fresh', ctx=Load()))",
+      "rendered": "self.input_tokens += fresh"
+    },
+    {
+      "line_start": 110,
+      "line_end": 110,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Attribute(value=Name(id='self', ctx=Load()), attr='output_tokens', ctx=Store()), op=Add(), value=Call(func=Name(id='_as_int', ctx=Load()), args=[Call(func=Attribute(value=Name(id='meta', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='output_tokens')], keywords=[])], keywords=[]))",
+      "rendered": "self.output_tokens += _as_int(meta.get('output_tokens'))"
+    },
+    {
+      "line_start": 111,
+      "line_end": 111,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Attribute(value=Name(id='self', ctx=Load()), attr='cache_read', ctx=Store()), op=Add(), value=Name(id='cache_read', ctx=Load()))",
+      "rendered": "self.cache_read += cache_read"
+    },
+    {
+      "line_start": 112,
+      "line_end": 112,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Attribute(value=Name(id='self', ctx=Load()), attr='cache_creation', ctx=Store()), op=Add(), value=Name(id='cache_creation', ctx=Load()))",
+      "rendered": "self.cache_creation += cache_creation"
+    },
+    {
+      "line_start": 113,
+      "line_end": 113,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Attribute(value=Name(id='self', ctx=Load()), attr='calls', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "self.calls += 1"
+    },
+    {
+      "line_start": 116,
+      "line_end": 121,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='TokenUsage', ctx=Load()), args=[], keywords=[keyword(arg='input_tokens', value=Attribute(value=Name(id='self', ctx=Load()), attr='input_tokens', ctx=Load())), keyword(arg='output_tokens', value=Attribute(value=Name(id='self', ctx=Load()), attr='output_tokens', ctx=Load())), keyword(arg='cache_read_input_tokens', value=Attribute(value=Name(id='self', ctx=Load()), attr='cache_read', ctx=Load())), keyword(arg='cache_creation_input_tokens', value=Attribute(value=Name(id='self', ctx=Load()), attr='cache_creation', ctx=Load()))])",
+      "rendered": "TokenUsage(input_tokens=self.input_tokens, output_tokens=self.output_tokens, cache_read_input_tokens=self.cache_read, cache_creation_input_tokens=self.cache_creation)"
+    },
+    {
+      "line_start": 128,
+      "line_end": 128,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='event', ctx=Load()), Name(id='tuple', ctx=Load())], keywords=[]))",
+      "rendered": "not isinstance(event, tuple)"
+    },
+    {
+      "line_start": 129,
+      "line_end": 129,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Tuple(elts=[], ctx=Load()), Name(id='event', ctx=Load())], ctx=Load())",
+      "rendered": "((), event)"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 26,
+      "kind": "Name",
+      "original_ast": "Name(id='event', ctx=Load())",
+      "rendered": "event"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='ValueError', ctx=Load())",
+      "rendered": "ValueError"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Tuple(elts=[], ctx=Load()), Constant(value=None)], ctx=Load())",
+      "rendered": "((), None)"
+    },
+    {
+      "line_start": 135,
+      "line_end": 137,
+      "column": 8,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='raw_ns', ctx=Load()), Tuple(elts=[Name(id='list', ctx=Load()), Name(id='tuple', ctx=Load())], ctx=Load())], keywords=[]), body=Call(func=Name(id='tuple', ctx=Load()), args=[GeneratorExp(elt=Call(func=Name(id='str', ctx=Load()), args=[Name(id='part', ctx=Load())], keywords=[]), generators=[comprehension(target=Name(id='part', ctx=Store()), iter=Name(id='raw_ns', ctx=Load()), ifs=[], is_async=0)])], keywords=[]), orelse=Tuple(elts=[], ctx=Load()))",
+      "rendered": "tuple((str(part) for part in raw_ns)) if isinstance(raw_ns, (list, tuple)) else ()"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='namespace', ctx=Load()), IfExp(test=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='payload', ctx=Load()), Name(id='Mapping', ctx=Load())], keywords=[]), body=Name(id='payload', ctx=Load()), orelse=Constant(value=None))], ctx=Load())",
+      "rendered": "(namespace, payload if isinstance(payload, Mapping) else None)"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 35,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 148,
+      "line_end": 148,
+      "column": 31,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_Counts', ctx=Load()), args=[], keywords=[])",
+      "rendered": "_Counts()"
+    },
+    {
+      "line_start": 149,
+      "line_end": 149,
+      "column": 46,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 56,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 156,
+      "line_end": 156,
+      "column": 29,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_unpack_event', ctx=Load()), args=[Name(id='event', ctx=Load())], keywords=[])",
+      "rendered": "_unpack_event(event)"
+    },
+    {
+      "line_start": 157,
+      "line_end": 157,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='payload', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "payload is None"
+    },
+    {
+      "line_start": 159,
+      "line_end": 159,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='payload', ctx=Load()), attr='values', ctx=Load()), args=[], keywords=[])",
+      "rendered": "payload.values()"
+    },
+    {
+      "line_start": 160,
+      "line_end": 160,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_add_update', ctx=Load()), args=[Name(id='update', ctx=Load()), Name(id='namespace', ctx=Load())], keywords=[])",
+      "rendered": "self._add_update(update, namespace)"
+    },
+    {
+      "line_start": 163,
+      "line_end": 163,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='update', ctx=Load()), Name(id='Mapping', ctx=Load())], keywords=[]))",
+      "rendered": "not isinstance(update, Mapping)"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='update', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='messages')], keywords=[])",
+      "rendered": "update.get('messages')"
+    },
+    {
+      "line_start": 166,
+      "line_end": 166,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='msgs', ctx=Load()), Name(id='Sequence', ctx=Load())], keywords=[]))",
+      "rendered": "not isinstance(msgs, Sequence)"
+    },
+    {
+      "line_start": 168,
+      "line_end": 168,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='msgs', ctx=Load())",
+      "rendered": "msgs"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='msg', ctx=Load()), Name(id='BaseMessage', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(msg, BaseMessage)"
+    },
+    {
+      "line_start": 170,
+      "line_end": 170,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='add_message', ctx=Load()), args=[Name(id='msg', ctx=Load())], keywords=[keyword(arg='namespace', value=Name(id='namespace', ctx=Load()))])",
+      "rendered": "self.add_message(msg, namespace=namespace)"
+    },
+    {
+      "line_start": 173,
+      "line_end": 173,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='message_id', ctx=Load()), Name(id='str', ctx=Load())], keywords=[]))",
+      "rendered": "not isinstance(message_id, str)"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='message_id', ctx=Load()), ops=[In()], comparators=[Attribute(value=Name(id='self', ctx=Load()), attr='_seen_ids', ctx=Load())])",
+      "rendered": "message_id in self._seen_ids"
+    },
+    {
+      "line_start": 176,
+      "line_end": 176,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_seen_ids', ctx=Load()), attr='add', ctx=Load()), args=[Name(id='message_id', ctx=Load())], keywords=[])",
+      "rendered": "self._seen_ids.add(message_id)"
+    },
+    {
+      "line_start": 178,
+      "line_end": 178,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 184,
+      "line_end": 184,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='message', ctx=Load()), Name(id='AIMessage', ctx=Load())], keywords=[]))",
+      "rendered": "not isinstance(message, AIMessage)"
+    },
+    {
+      "line_start": 186,
+      "line_end": 186,
+      "column": 15,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='message', ctx=Load()), attr='name', ctx=Load())",
+      "rendered": "message.name"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Name(id='namespace', ctx=Load()), Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='name', ctx=Load()), Name(id='str', ctx=Load())], keywords=[]), Name(id='name', ctx=Load())])",
+      "rendered": "namespace and isinstance(name, str) and name"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 43,
+      "kind": "Name",
+      "original_ast": "Name(id='name', ctx=Load())",
+      "rendered": "name"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 15,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='message', ctx=Load()), attr='usage_metadata', ctx=Load())",
+      "rendered": "message.usage_metadata"
+    },
+    {
+      "line_start": 190,
+      "line_end": 190,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Compare(left=Name(id='meta', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)]), Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_is_duplicate', ctx=Load()), args=[Attribute(value=Name(id='message', ctx=Load()), attr='id', ctx=Load())], keywords=[])])",
+      "rendered": "meta is None or self._is_duplicate(message.id)"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='message', ctx=Load()), attr='response_metadata', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='usage')], keywords=[])",
+      "rendered": "message.response_metadata.get('usage')"
+    },
+    {
+      "line_start": 193,
+      "line_end": 193,
+      "column": 20,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='raw', ctx=Load()), Name(id='Mapping', ctx=Load())], keywords=[]), body=Name(id='raw', ctx=Load()), orelse=Constant(value=None))",
+      "rendered": "raw if isinstance(raw, Mapping) else None"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_total', ctx=Load()), attr='add', ctx=Load()), args=[Name(id='meta', ctx=Load()), Name(id='raw_usage', ctx=Load())], keywords=[])",
+      "rendered": "self._total.add(meta, raw_usage)"
+    },
+    {
+      "line_start": 195,
+      "line_end": 195,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='namespace', ctx=Load())",
+      "rendered": "namespace"
+    },
+    {
+      "line_start": 196,
+      "line_end": 196,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_agent_label', ctx=Load()), args=[Name(id='namespace', ctx=Load()), Name(id='name', ctx=Load())], keywords=[])",
+      "rendered": "self._agent_label(namespace, name)"
+    },
+    {
+      "line_start": 197,
+      "line_end": 197,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_subagents', ctx=Load()), attr='setdefault', ctx=Load()), args=[Name(id='agent', ctx=Load()), Call(func=Name(id='_Counts', ctx=Load()), args=[], keywords=[])], keywords=[]), attr='add', ctx=Load()), args=[Name(id='meta', ctx=Load()), Name(id='raw_usage', ctx=Load())], keywords=[])",
+      "rendered": "self._subagents.setdefault(agent, _Counts()).add(meta, raw_usage)"
+    },
+    {
+      "line_start": 200,
+      "line_end": 200,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='name', ctx=Load()), Name(id='str', ctx=Load())], keywords=[]), Name(id='name', ctx=Load())])",
+      "rendered": "isinstance(name, str) and name"
+    },
+    {
+      "line_start": 201,
+      "line_end": 201,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='name', ctx=Load())",
+      "rendered": "name"
+    },
+    {
+      "line_start": 202,
+      "line_end": 202,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_ns_to_agent', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='namespace', ctx=Load())], keywords=[])",
+      "rendered": "self._ns_to_agent.get(namespace)"
+    },
+    {
+      "line_start": 203,
+      "line_end": 203,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='learned', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "learned is not None"
+    },
+    {
+      "line_start": 204,
+      "line_end": 204,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='learned', ctx=Load())",
+      "rendered": "learned"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 15,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Call(func=Attribute(value=Subscript(value=Name(id='namespace', ctx=Load()), slice=Constant(value=0), ctx=Load()), attr='split', ctx=Load()), args=[Constant(value=':'), Constant(value=1)], keywords=[]), slice=Constant(value=0), ctx=Load())",
+      "rendered": "namespace[0].split(':', 1)[0]"
+    },
+    {
+      "line_start": 211,
+      "line_end": 211,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_total', ctx=Load()), attr='calls', ctx=Load()), ops=[Eq()], comparators=[Constant(value=0)])",
+      "rendered": "self._total.calls == 0"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 213,
+      "line_end": 213,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='SessionUsage', ctx=Load()), args=[], keywords=[keyword(value=Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_total', ctx=Load()), attr='as_usage', ctx=Load()), args=[], keywords=[]))])",
+      "rendered": "SessionUsage(**self._total.as_usage())"
+    },
+    {
+      "line_start": 214,
+      "line_end": 214,
+      "column": 25,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_total', ctx=Load()), attr='calls', ctx=Load())",
+      "rendered": "self._total.calls"
+    },
+    {
+      "line_start": 215,
+      "line_end": 215,
+      "column": 25,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_total', ctx=Load()), attr='calls', ctx=Load())",
+      "rendered": "self._total.calls"
+    },
+    {
+      "line_start": 216,
+      "line_end": 216,
+      "column": 11,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_subagents', ctx=Load())",
+      "rendered": "self._subagents"
+    },
+    {
+      "line_start": 217,
+      "line_end": 220,
+      "column": 33,
+      "kind": "DictComp",
+      "original_ast": "DictComp(key=Name(id='agent', ctx=Load()), value=Call(func=Attribute(value=Name(id='counts', ctx=Load()), attr='as_usage', ctx=Load()), args=[], keywords=[]), generators=[comprehension(target=Tuple(elts=[Name(id='agent', ctx=Store()), Name(id='counts', ctx=Store())], ctx=Store()), iter=Call(func=Name(id='sorted', ctx=Load()), args=[Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_subagents', ctx=Load()), attr='items', ctx=Load()), args=[], keywords=[])], keywords=[]), ifs=[], is_async=0)])",
+      "rendered": "{agent: counts.as_usage() for agent, counts in sorted(self._subagents.items())}"
+    },
+    {
+      "line_start": 221,
+      "line_end": 221,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='usage', ctx=Load())",
+      "rendered": "usage"
+    },
+    {
+      "line_start": 226,
+      "line_end": 226,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='UsageAccumulator', ctx=Load()), args=[], keywords=[])",
+      "rendered": "UsageAccumulator()"
+    },
+    {
+      "line_start": 227,
+      "line_end": 227,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='messages', ctx=Load())",
+      "rendered": "messages"
+    },
+    {
+      "line_start": 228,
+      "line_end": 228,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='message', ctx=Load()), Name(id='BaseMessage', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(message, BaseMessage)"
+    },
+    {
+      "line_start": 229,
+      "line_end": 229,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='accumulator', ctx=Load()), attr='add_message', ctx=Load()), args=[Name(id='message', ctx=Load())], keywords=[])",
+      "rendered": "accumulator.add_message(message)"
+    },
+    {
+      "line_start": 230,
+      "line_end": 230,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='accumulator', ctx=Load()), attr='snapshot', ctx=Load()), args=[], keywords=[])",
+      "rendered": "accumulator.snapshot()"
+    },
+    {
+      "line_start": 233,
+      "line_end": 233,
+      "column": 10,
+      "kind": "List",
+      "original_ast": "List(elts=[Constant(value='SessionUsage'), Constant(value='UsageAccumulator'), Constant(value='aggregate_usage_metadata')], ctx=Load())",
+      "rendered": "['SessionUsage', 'UsageAccumulator', 'aggregate_usage_metadata']"
+    }
+  ],
+  "calls": [
+    {
+      "line": 49,
+      "end_line": 49,
+      "callee": "set",
+      "enclosing": "module initialization",
+      "expression": "set()"
+    },
+    {
+      "line": 54,
+      "end_line": 54,
+      "callee": "meta.get",
+      "enclosing": "_cache_counts",
+      "expression": "meta.get(\"input_token_details\")"
+    },
+    {
+      "line": 57,
+      "end_line": 57,
+      "callee": "sum",
+      "enclosing": "_cache_counts",
+      "expression": "sum(_as_int(details.get(key)) for key in _EPHEMERAL_CACHE_KEYS)"
+    },
+    {
+      "line": 66,
+      "end_line": 66,
+      "callee": "_as_int",
+      "enclosing": "_raw_cache_creation",
+      "expression": "_as_int(raw.get(\"cache_creation_input_tokens\"))"
+    },
+    {
+      "line": 226,
+      "end_line": 226,
+      "callee": "UsageAccumulator",
+      "enclosing": "aggregate_usage_metadata",
+      "expression": "UsageAccumulator()"
+    },
+    {
+      "line": 230,
+      "end_line": 230,
+      "callee": "accumulator.snapshot",
+      "enclosing": "aggregate_usage_metadata",
+      "expression": "accumulator.snapshot()"
+    },
+    {
+      "line": 40,
+      "end_line": 40,
+      "callee": "isinstance",
+      "enclosing": "_as_int",
+      "expression": "isinstance(value, bool)"
+    },
+    {
+      "line": 55,
+      "end_line": 55,
+      "callee": "isinstance",
+      "enclosing": "_cache_counts",
+      "expression": "isinstance(details, Mapping)"
+    },
+    {
+      "line": 58,
+      "end_line": 58,
+      "callee": "_as_int",
+      "enclosing": "_cache_counts",
+      "expression": "_as_int(details.get(\"cache_creation\"))"
+    },
+    {
+      "line": 59,
+      "end_line": 59,
+      "callee": "_as_int",
+      "enclosing": "_cache_counts",
+      "expression": "_as_int(details.get(\"cache_read\"))"
+    },
+    {
+      "line": 66,
+      "end_line": 66,
+      "callee": "raw.get",
+      "enclosing": "_raw_cache_creation",
+      "expression": "raw.get(\"cache_creation_input_tokens\")"
+    },
+    {
+      "line": 69,
+      "end_line": 69,
+      "callee": "raw.get",
+      "enclosing": "_raw_cache_creation",
+      "expression": "raw.get(\"cache_creation\")"
+    },
+    {
+      "line": 70,
+      "end_line": 70,
+      "callee": "isinstance",
+      "enclosing": "_raw_cache_creation",
+      "expression": "isinstance(nested, Mapping)"
+    },
+    {
+      "line": 89,
+      "end_line": 89,
+      "callee": "_cache_counts",
+      "enclosing": "_Counts.add",
+      "expression": "_cache_counts(meta)"
+    },
+    {
+      "line": 93,
+      "end_line": 93,
+      "callee": "_as_int",
+      "enclosing": "_Counts.add",
+      "expression": "_as_int(meta.get(\"input_tokens\"))"
+    },
+    {
+      "line": 110,
+      "end_line": 110,
+      "callee": "_as_int",
+      "enclosing": "_Counts.add",
+      "expression": "_as_int(meta.get(\"output_tokens\"))"
+    },
+    {
+      "line": 116,
+      "end_line": 121,
+      "callee": "TokenUsage",
+      "enclosing": "_Counts.as_usage",
+      "expression": "TokenUsage(\n            input_tokens=self.input_tokens,\n            output_tokens=self.output_tokens,\n            cache_read_input_tokens=self.cache_read,\n            cache_creation_input_tokens=self.cache_creation,\n        )"
+    },
+    {
+      "line": 128,
+      "end_line": 128,
+      "callee": "isinstance",
+      "enclosing": "_unpack_event",
+      "expression": "isinstance(event, tuple)"
+    },
+    {
+      "line": 136,
+      "end_line": 136,
+      "callee": "isinstance",
+      "enclosing": "_unpack_event",
+      "expression": "isinstance(raw_ns, (list, tuple))"
+    },
+    {
+      "line": 135,
+      "end_line": 135,
+      "callee": "tuple",
+      "enclosing": "_unpack_event",
+      "expression": "tuple(str(part) for part in raw_ns)"
+    },
+    {
+      "line": 147,
+      "end_line": 147,
+      "callee": "set",
+      "enclosing": "UsageAccumulator.__init__",
+      "expression": "set()"
+    },
+    {
+      "line": 148,
+      "end_line": 148,
+      "callee": "_Counts",
+      "enclosing": "UsageAccumulator.__init__",
+      "expression": "_Counts()"
+    },
+    {
+      "line": 156,
+      "end_line": 156,
+      "callee": "_unpack_event",
+      "enclosing": "UsageAccumulator.add_event",
+      "expression": "_unpack_event(event)"
+    },
+    {
+      "line": 159,
+      "end_line": 159,
+      "callee": "payload.values",
+      "enclosing": "UsageAccumulator.add_event",
+      "expression": "payload.values()"
+    },
+    {
+      "line": 165,
+      "end_line": 165,
+      "callee": "update.get",
+      "enclosing": "UsageAccumulator._add_update",
+      "expression": "update.get(\"messages\")"
+    },
+    {
+      "line": 177,
+      "end_line": 177,
+      "callee": "self._seen_ids.add",
+      "enclosing": "UsageAccumulator._is_duplicate",
+      "expression": "self._seen_ids.add(message_id)"
+    },
+    {
+      "line": 192,
+      "end_line": 192,
+      "callee": "message.response_metadata.get",
+      "enclosing": "UsageAccumulator.add_message",
+      "expression": "message.response_metadata.get(\"usage\")"
+    },
+    {
+      "line": 194,
+      "end_line": 194,
+      "callee": "self._total.add",
+      "enclosing": "UsageAccumulator.add_message",
+      "expression": "self._total.add(meta, raw_usage)"
+    },
+    {
+      "line": 202,
+      "end_line": 202,
+      "callee": "self._ns_to_agent.get",
+      "enclosing": "UsageAccumulator._agent_label",
+      "expression": "self._ns_to_agent.get(namespace)"
+    },
+    {
+      "line": 213,
+      "end_line": 213,
+      "callee": "SessionUsage",
+      "enclosing": "UsageAccumulator.snapshot",
+      "expression": "SessionUsage(**self._total.as_usage())"
+    },
+    {
+      "line": 228,
+      "end_line": 228,
+      "callee": "isinstance",
+      "enclosing": "aggregate_usage_metadata",
+      "expression": "isinstance(message, BaseMessage)"
+    },
+    {
+      "line": 40,
+      "end_line": 40,
+      "callee": "isinstance",
+      "enclosing": "_as_int",
+      "expression": "isinstance(value, int)"
+    },
+    {
+      "line": 57,
+      "end_line": 57,
+      "callee": "_as_int",
+      "enclosing": "_cache_counts",
+      "expression": "_as_int(details.get(key))"
+    },
+    {
+      "line": 58,
+      "end_line": 58,
+      "callee": "details.get",
+      "enclosing": "_cache_counts",
+      "expression": "details.get(\"cache_creation\")"
+    },
+    {
+      "line": 59,
+      "end_line": 59,
+      "callee": "details.get",
+      "enclosing": "_cache_counts",
+      "expression": "details.get(\"cache_read\")"
+    },
+    {
+      "line": 71,
+      "end_line": 71,
+      "callee": "sum",
+      "enclosing": "_raw_cache_creation",
+      "expression": "sum(_as_int(nested.get(key)) for key in _EPHEMERAL_CACHE_KEYS)"
+    },
+    {
+      "line": 92,
+      "end_line": 92,
+      "callee": "_raw_cache_creation",
+      "enclosing": "_Counts.add",
+      "expression": "_raw_cache_creation(raw_usage)"
+    },
+    {
+      "line": 93,
+      "end_line": 93,
+      "callee": "meta.get",
+      "enclosing": "_Counts.add",
+      "expression": "meta.get(\"input_tokens\")"
+    },
+    {
+      "line": 97,
+      "end_line": 105,
+      "callee": "warn_once",
+      "enclosing": "_Counts.add",
+      "expression": "warn_once(\n                _EXCLUSIVE_USAGE_WARNED,\n                \"exclusive-usage-record\",\n                f\"  [deepagents] WARN: usage record reports more cached input \"\n                f\"(read {cache_read} + write {cache_creation}) than total \"\n                f\"input ({total_input}); treating input_tokens as fresh-only \"\n                f\"— the gateway appears to report cache counts outside \"\n                f\"input_tokens\",\n            )"
+    },
+    {
+      "line": 110,
+      "end_line": 110,
+      "callee": "meta.get",
+      "enclosing": "_Counts.add",
+      "expression": "meta.get(\"output_tokens\")"
+    },
+    {
+      "line": 139,
+      "end_line": 139,
+      "callee": "isinstance",
+      "enclosing": "_unpack_event",
+      "expression": "isinstance(payload, Mapping)"
+    },
+    {
+      "line": 160,
+      "end_line": 160,
+      "callee": "self._add_update",
+      "enclosing": "UsageAccumulator.add_event",
+      "expression": "self._add_update(update, namespace)"
+    },
+    {
+      "line": 163,
+      "end_line": 163,
+      "callee": "isinstance",
+      "enclosing": "UsageAccumulator._add_update",
+      "expression": "isinstance(update, Mapping)"
+    },
+    {
+      "line": 166,
+      "end_line": 166,
+      "callee": "isinstance",
+      "enclosing": "UsageAccumulator._add_update",
+      "expression": "isinstance(msgs, Sequence)"
+    },
+    {
+      "line": 169,
+      "end_line": 169,
+      "callee": "isinstance",
+      "enclosing": "UsageAccumulator._add_update",
+      "expression": "isinstance(msg, BaseMessage)"
+    },
+    {
+      "line": 173,
+      "end_line": 173,
+      "callee": "isinstance",
+      "enclosing": "UsageAccumulator._is_duplicate",
+      "expression": "isinstance(message_id, str)"
+    },
+    {
+      "line": 184,
+      "end_line": 184,
+      "callee": "isinstance",
+      "enclosing": "UsageAccumulator.add_message",
+      "expression": "isinstance(message, AIMessage)"
+    },
+    {
+      "line": 187,
+      "end_line": 187,
+      "callee": "isinstance",
+      "enclosing": "UsageAccumulator.add_message",
+      "expression": "isinstance(name, str)"
+    },
+    {
+      "line": 190,
+      "end_line": 190,
+      "callee": "self._is_duplicate",
+      "enclosing": "UsageAccumulator.add_message",
+      "expression": "self._is_duplicate(message.id)"
+    },
+    {
+      "line": 193,
+      "end_line": 193,
+      "callee": "isinstance",
+      "enclosing": "UsageAccumulator.add_message",
+      "expression": "isinstance(raw, Mapping)"
+    },
+    {
+      "line": 196,
+      "end_line": 196,
+      "callee": "self._agent_label",
+      "enclosing": "UsageAccumulator.add_message",
+      "expression": "self._agent_label(namespace, name)"
+    },
+    {
+      "line": 197,
+      "end_line": 197,
+      "callee": "self._subagents.setdefault(agent, _Counts()).add",
+      "enclosing": "UsageAccumulator.add_message",
+      "expression": "self._subagents.setdefault(agent, _Counts()).add(meta, raw_usage)"
+    },
+    {
+      "line": 200,
+      "end_line": 200,
+      "callee": "isinstance",
+      "enclosing": "UsageAccumulator._agent_label",
+      "expression": "isinstance(name, str)"
+    },
+    {
+      "line": 206,
+      "end_line": 206,
+      "callee": "namespace[0].split",
+      "enclosing": "UsageAccumulator._agent_label",
+      "expression": "namespace[0].split(\":\", 1)"
+    },
+    {
+      "line": 229,
+      "end_line": 229,
+      "callee": "accumulator.add_message",
+      "enclosing": "aggregate_usage_metadata",
+      "expression": "accumulator.add_message(message)"
+    },
+    {
+      "line": 57,
+      "end_line": 57,
+      "callee": "details.get",
+      "enclosing": "_cache_counts",
+      "expression": "details.get(key)"
+    },
+    {
+      "line": 135,
+      "end_line": 135,
+      "callee": "str",
+      "enclosing": "_unpack_event",
+      "expression": "str(part)"
+    },
+    {
+      "line": 170,
+      "end_line": 170,
+      "callee": "self.add_message",
+      "enclosing": "UsageAccumulator._add_update",
+      "expression": "self.add_message(msg, namespace=namespace)"
+    },
+    {
+      "line": 213,
+      "end_line": 213,
+      "callee": "self._total.as_usage",
+      "enclosing": "UsageAccumulator.snapshot",
+      "expression": "self._total.as_usage()"
+    },
+    {
+      "line": 218,
+      "end_line": 218,
+      "callee": "counts.as_usage",
+      "enclosing": "UsageAccumulator.snapshot",
+      "expression": "counts.as_usage()"
+    },
+    {
+      "line": 71,
+      "end_line": 71,
+      "callee": "_as_int",
+      "enclosing": "_raw_cache_creation",
+      "expression": "_as_int(nested.get(key))"
+    },
+    {
+      "line": 197,
+      "end_line": 197,
+      "callee": "self._subagents.setdefault",
+      "enclosing": "UsageAccumulator.add_message",
+      "expression": "self._subagents.setdefault(agent, _Counts())"
+    },
+    {
+      "line": 219,
+      "end_line": 219,
+      "callee": "sorted",
+      "enclosing": "UsageAccumulator.snapshot",
+      "expression": "sorted(self._subagents.items())"
+    },
+    {
+      "line": 71,
+      "end_line": 71,
+      "callee": "nested.get",
+      "enclosing": "_raw_cache_creation",
+      "expression": "nested.get(key)"
+    },
+    {
+      "line": 197,
+      "end_line": 197,
+      "callee": "_Counts",
+      "enclosing": "UsageAccumulator.add_message",
+      "expression": "_Counts()"
+    },
+    {
+      "line": 219,
+      "end_line": 219,
+      "callee": "self._subagents.items",
+      "enclosing": "UsageAccumulator.snapshot",
+      "expression": "self._subagents.items()"
+    }
+  ],
+  "imports": [
+    {
+      "line": 19,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "from collections.abc import Mapping, Sequence",
+      "targets": [
+        "collections.abc",
+        "collections.abc.Mapping",
+        "collections.abc.Sequence"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "from dataclasses import dataclass",
+      "targets": [
+        "dataclasses",
+        "dataclasses.dataclass"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 23,
+      "source_expression": "from typing import Final",
+      "targets": [
+        "typing",
+        "typing.Final"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 25,
+      "source_expression": "from langchain_core.messages import AIMessage, BaseMessage",
+      "targets": [
+        "langchain_core.messages",
+        "langchain_core.messages.AIMessage",
+        "langchain_core.messages.BaseMessage"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 27,
+      "source_expression": "from vvaharness.util.tokens import TokenUsage",
+      "targets": [
+        "vvaharness.util.tokens",
+        "vvaharness.util.tokens.TokenUsage"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/tokens.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 28,
+      "source_expression": "from vvaharness.util.warn_once import warn_once",
+      "targets": [
+        "vvaharness.util.warn_once",
+        "vvaharness.util.warn_once.warn_once"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/warn_once.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

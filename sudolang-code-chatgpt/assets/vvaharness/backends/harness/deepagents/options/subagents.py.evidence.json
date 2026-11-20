@@ -1,0 +1,2050 @@
+{
+  "source": "vvaharness/backends/harness/deepagents/options/subagents.py",
+  "sha256": "c8bc4e55cb3281d5a69effc7c48cbece7cc3761cb40fdee884f0c1f9ada9b87f",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Subagent tool resolution and native DeepAgents subagent spec construction.\"\"\"\n\nfrom __future__ import annotations\n\nfrom collections.abc import Mapping, Sequence\n\nfrom deepagents.middleware.subagents import (\n    DEFAULT_GENERAL_PURPOSE_DESCRIPTION,\n    DEFAULT_SUBAGENT_PROMPT,\n)\nfrom langchain.agents.middleware.types import AgentMiddleware\nfrom langchain_core.tools import BaseTool\n\nfrom vvaharness.backends.harness.deepagents.exclude_tools import ExcludeTools\nfrom vvaharness.backends.harness.deepagents.force_verdict_only import ForceVerdictOnly\nfrom vvaharness.backends.harness.deepagents.model_call_budget import ModelCallBudget\nfrom vvaharness.backends.harness.deepagents.models import DELETE_TOOL_NAME, SubagentSpec\nfrom vvaharness.backends.harness.deepagents.options.filesystem import _skill_sources\nfrom vvaharness.backends.harness.deepagents.options.graph_builder import (\n    _CONNECTION_RETRY_MIDDLEWARE,\n)\nfrom vvaharness.backends.harness.deepagents.options.model_building import build_model_cached\nfrom vvaharness.backends.harness.deepagents.options.response_format import (\n    _strategy_for,\n    _tool_name_for,\n)\nfrom vvaharness.backends.harness.deepagents.permit_tools import PermitTools\nfrom vvaharness.backends.harness.deepagents.prompt_caching import BlockMarkerPromptCaching\nfrom vvaharness.backends.harness.deepagents.redaction import read_only_middleware\nfrom vvaharness.backends.harness.deepagents.tools import build_tools\nfrom vvaharness.backends.harness.models import (\n    LEGACY_AGENT_TOOL,\n    LOGICAL_TO_NATIVE,\n    MUTATING_TOOLS,\n    NATIVE_IMPLIED_READS,\n    READ_TOOLS,\n    OneShotOptions,\n    StreamingOptions,\n    SubagentDefinition,\n    ToolPolicy,\n)\n\n# DeepAgents auto-adds an ungated builtin under this name; our own spec of that name suppresses it\nGENERAL_PURPOSE_NAME = \"general-purpose\"\n\n\ndef _tool_policy(options: OneShotOptions | StreamingOptions) -> ToolPolicy:\n    \"\"\"Return the effective tool policy, falling back to an empty policy.\"\"\"\n    return options.tool_policy if options.tool_policy is not None else ToolPolicy()\n\n\ndef _build_session_tools(\n    options: StreamingOptions, allowed_tools: tuple[str, ...]\n) -> list[BaseTool]:\n    \"\"\"Build tools via the caller's injected ``tool_builder`` or the generic readers.\"\"\"\n    builder = options.tool_builder or build_tools\n    return builder(options, allowed_tools=allowed_tools)\n\n\ndef _subagent_tools(subagent: SubagentDefinition, options: StreamingOptions) -> tuple[str, ...]:\n    \"\"\"Return the tool allow-list for a subagent, filtered by denied tools.\"\"\"\n    policy = _tool_policy(options)\n    allowed = subagent.tools if subagent.tools is not None else policy.allowed_tools\n    denied = set(subagent.disallowed_tools or policy.disallowed_tools)\n    if not options.allow_writes:\n        denied |= MUTATING_TOOLS\n    return tuple(t for t in allowed if t not in denied)\n\n\ndef _subagent_tool_names(\n    subagent: SubagentDefinition, options: StreamingOptions\n) -> tuple[str, ...]:\n    \"\"\"Resolve a subagent's tool names: allow-list plus fact tools, minus denied tools.\"\"\"\n    granted = tuple(dict.fromkeys([*_subagent_tools(subagent, options), *options.fact_tools]))\n    excluded = {LEGACY_AGENT_TOOL}\n    if not options.allow_writes:\n        excluded |= MUTATING_TOOLS\n    return tuple(t for t in granted if t not in excluded)\n\n\ndef _general_purpose_agent(options: StreamingOptions) -> SubagentDefinition:\n    \"\"\"Shadow the builtin general-purpose subagent with a gated equivalent.\"\"\"\n    read_tools = tuple(t for t in _tool_policy(options).allowed_tools if t in READ_TOOLS)\n    return SubagentDefinition(\n        name=GENERAL_PURPOSE_NAME,\n        description=DEFAULT_GENERAL_PURPOSE_DESCRIPTION,\n        prompt=DEFAULT_SUBAGENT_PROMPT,\n        tools=read_tools,\n    )\n\n\ndef _permitted_for_spec(\n    tool_names: Sequence[str], tools: Sequence[BaseTool]\n) -> frozenset[str]:\n    \"\"\"Executor-permitted names for one sub-agent: its NATIVE tool names, not its logical ones.\"\"\"\n    native = {LOGICAL_TO_NATIVE.get(t, t) for t in tool_names}\n    if native & {LOGICAL_TO_NATIVE[r] for r in READ_TOOLS}:\n        native |= NATIVE_IMPLIED_READS\n    return frozenset(native | {t.name for t in tools})\n\n\ndef _subagent_budget(subagent: SubagentDefinition) -> ModelCallBudget | None:\n    \"\"\"A fresh model-call cap for *subagent* (specs are rebuilt per session), or None for none.\"\"\"\n    limit = subagent.max_model_calls or 0\n    if limit <= 0:\n        return None\n    outcome = (frozenset({_tool_name_for(subagent.response_model)})\n               if subagent.response_model is not None else frozenset())\n    return ModelCallBudget(\n        limit=limit, outcome_tools=outcome,\n        counter=f\"subagent_model_call_budget_final_turn[{subagent.name}]\",\n    )\n\n\ndef _spec_middleware(\n    tool_names: Sequence[str], tools: Sequence[BaseTool], options: object,\n    budget: ModelCallBudget | None = None,\n) -> list[AgentMiddleware]:\n    \"\"\"Middleware for one sub-agent spec: redaction/exclusion, the executor gate, its budget.\"\"\"\n    # Redaction keyed per sub-agent, never on session allow_writes; PermitTools gates this tier too\n    middleware: list[AgentMiddleware]\n    if set(tool_names) & MUTATING_TOOLS:\n        middleware = [ExcludeTools(frozenset({DELETE_TOOL_NAME}))]\n    else:\n        middleware = read_only_middleware()\n    if getattr(options, \"permitted_tool_calls\", None) is not None:\n        middleware.append(PermitTools(_permitted_for_spec(tool_names, tools)))\n    # Budget outermost of the two, so its final turn reaches ForceVerdictOnly tools-withdrawn;\n    # both sit outside the connection retry, so a retried call is not counted twice\n    verdict_only = ForceVerdictOnly() if getattr(options, \"force_verdict_only\", False) else None\n    middleware.extend(m for m in (budget, verdict_only) if m is not None)\n    # Per-spec middleware merges into each sub-agent's stack, so every persona gets the markers\n    middleware.append(\n        BlockMarkerPromptCaching(enabled=bool(getattr(options, \"cache_markers\", True)))\n    )\n    middleware.append(_CONNECTION_RETRY_MIDDLEWARE)\n    return middleware\n\n\ndef get_subagent_specs(\n    options: StreamingOptions,\n    *,\n    agents: Mapping[str, SubagentDefinition] | None = None,\n) -> list[SubagentSpec]:\n    \"\"\"Build native DeepAgents subagent specs, one per configured persona.\"\"\"\n    # Always includes a general-purpose spec so the builtin never dispatches ungated\n    configured: dict[str, SubagentDefinition] = dict(\n        options.agents if agents is None else agents\n    )\n    configured.setdefault(GENERAL_PURPOSE_NAME, _general_purpose_agent(options))\n    specs: list[SubagentSpec] = []\n    for name, subagent in configured.items():\n        tool_names = _subagent_tool_names(subagent, options)\n        tools = _build_session_tools(options, tool_names)\n        # Resolve to configured Chat* instances; bare strings would bypass transport resolution.\n        subagent_model_id = subagent.model or options.model\n        subagent_model = build_model_cached(\n            subagent_model_id,\n            options.env,\n            options.model_provider,\n            use_responses_api=options.use_responses_api,\n            think_in_prompt=options.think_in_prompt,\n        )\n        spec: SubagentSpec = {\n            \"name\": name,\n            \"description\": subagent.description,\n            \"system_prompt\": subagent.prompt,\n            \"model\": subagent_model,\n            \"tools\": tools,\n        }\n        spec[\"middleware\"] = _spec_middleware(\n            tool_names, tools, options, budget=_subagent_budget(subagent)\n        )\n        sources = _skill_sources(getattr(options, \"skill_root\", None), options.cwd)\n        if sources:\n            spec[\"skills\"] = sources\n        if subagent.response_model is not None:\n            spec[\"response_format\"] = _strategy_for(\n                subagent.response_model, subagent_model_id, options.model_provider\n            )\n        specs.append(spec)\n    return specs\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/backends/harness/deepagents/options/subagents.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "Subagent tool resolution and native DeepAgents subagent spec construction.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_62_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/subagents.py",
+      "line_start": 62,
+      "line_end": 62,
+      "value": "Return the effective tool policy, falling back to an empty policy.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_69_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/subagents.py",
+      "line_start": 69,
+      "line_end": 69,
+      "value": "Build tools via the caller's injected ``tool_builder`` or the generic readers.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_75_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/subagents.py",
+      "line_start": 75,
+      "line_end": 75,
+      "value": "Return the tool allow-list for a subagent, filtered by denied tools.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_87_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/subagents.py",
+      "line_start": 87,
+      "line_end": 87,
+      "value": "Resolve a subagent's tool names: allow-list plus fact tools, minus denied tools.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_96_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/subagents.py",
+      "line_start": 96,
+      "line_end": 96,
+      "value": "Shadow the builtin general-purpose subagent with a gated equivalent.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_109_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/subagents.py",
+      "line_start": 109,
+      "line_end": 109,
+      "value": "Executor-permitted names for one sub-agent: its NATIVE tool names, not its logical ones.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_117_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/subagents.py",
+      "line_start": 117,
+      "line_end": 117,
+      "value": "A fresh model-call cap for *subagent* (specs are rebuilt per session), or None for none.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_125_16": {
+      "source": "vvaharness/backends/harness/deepagents/options/subagents.py",
+      "line_start": 125,
+      "line_end": 125,
+      "source_expression": "f\"subagent_model_call_budget_final_turn[{subagent.name}]\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_133_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/subagents.py",
+      "line_start": 133,
+      "line_end": 133,
+      "value": "Middleware for one sub-agent spec: redaction/exclusion, the executor gate, its budget.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_159_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/subagents.py",
+      "line_start": 159,
+      "line_end": 159,
+      "value": "Build native DeepAgents subagent specs, one per configured persona.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "Subagent tool resolution and native DeepAgents subagent spec construction.",
+      "context": "literal"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 23,
+      "value": "general-purpose",
+      "context": "literal"
+    },
+    {
+      "line_start": 62,
+      "line_end": 62,
+      "column": 4,
+      "value": "Return the effective tool policy, falling back to an empty policy.",
+      "context": "literal"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 4,
+      "value": "Build tools via the caller's injected ``tool_builder`` or the generic readers.",
+      "context": "literal"
+    },
+    {
+      "line_start": 75,
+      "line_end": 75,
+      "column": 4,
+      "value": "Return the tool allow-list for a subagent, filtered by denied tools.",
+      "context": "literal"
+    },
+    {
+      "line_start": 87,
+      "line_end": 87,
+      "column": 4,
+      "value": "Resolve a subagent's tool names: allow-list plus fact tools, minus denied tools.",
+      "context": "literal"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 4,
+      "value": "Shadow the builtin general-purpose subagent with a gated equivalent.",
+      "context": "literal"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 4,
+      "value": "Executor-permitted names for one sub-agent: its NATIVE tool names, not its logical ones.",
+      "context": "literal"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 4,
+      "value": "A fresh model-call cap for *subagent* (specs are rebuilt per session), or None for none.",
+      "context": "literal"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 4,
+      "value": "Middleware for one sub-agent spec: redaction/exclusion, the executor gate, its budget.",
+      "context": "literal"
+    },
+    {
+      "line_start": 159,
+      "line_end": 159,
+      "column": 4,
+      "value": "Build native DeepAgents subagent specs, one per configured persona.",
+      "context": "literal"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 24,
+      "value": "permitted_tool_calls",
+      "context": "literal"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 58,
+      "value": "force_verdict_only",
+      "context": "literal"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 12,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 12,
+      "value": "description",
+      "context": "literal"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 12,
+      "value": "system_prompt",
+      "context": "literal"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 12,
+      "value": "model",
+      "context": "literal"
+    },
+    {
+      "line_start": 183,
+      "line_end": 183,
+      "column": 12,
+      "value": "tools",
+      "context": "literal"
+    },
+    {
+      "line_start": 185,
+      "line_end": 185,
+      "column": 13,
+      "value": "middleware",
+      "context": "literal"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 18,
+      "value": "subagent_model_call_budget_final_turn[",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 71,
+      "value": "]",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 50,
+      "value": "skill_root",
+      "context": "literal"
+    },
+    {
+      "line_start": 190,
+      "line_end": 190,
+      "column": 17,
+      "value": "skills",
+      "context": "literal"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 17,
+      "value": "response_format",
+      "context": "literal"
+    },
+    {
+      "line_start": 148,
+      "line_end": 148,
+      "column": 63,
+      "value": "cache_markers",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 57,
+      "text": "# DeepAgents auto-adds an ungated builtin under this name; our own spec of that name suppresses it"
+    },
+    {
+      "line": 134,
+      "text": "# Redaction keyed per sub-agent, never on session allow_writes; PermitTools gates this tier too"
+    },
+    {
+      "line": 142,
+      "text": "# Budget outermost of the two, so its final turn reaches ForceVerdictOnly tools-withdrawn;"
+    },
+    {
+      "line": 143,
+      "text": "# both sit outside the connection retry, so a retried call is not counted twice"
+    },
+    {
+      "line": 146,
+      "text": "# Per-spec middleware merges into each sub-agent's stack, so every persona gets the markers"
+    },
+    {
+      "line": 160,
+      "text": "# Always includes a general-purpose spec so the builtin never dispatches ungated"
+    },
+    {
+      "line": 169,
+      "text": "# Resolve to configured Chat* instances; bare strings would bypass transport resolution."
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 21,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 26,
+      "line_end": 26,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 28,
+      "line_end": 28,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 29,
+      "line_end": 29,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 30,
+      "line_end": 30,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 31,
+      "line_end": 31,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 32,
+      "line_end": 32,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 33,
+      "line_end": 35,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 36,
+      "line_end": 36,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 37,
+      "line_end": 40,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 41,
+      "line_end": 41,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 42,
+      "line_end": 42,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 43,
+      "line_end": 43,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 44,
+      "line_end": 44,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 45,
+      "line_end": 55,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "Assign",
+      "line_start": 58,
+      "line_end": 58,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 61,
+      "line_end": 63,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 9
+    },
+    {
+      "kind": "Expr",
+      "line_start": 62,
+      "line_end": 62,
+      "column": 4,
+      "owner": "_tool_policy",
+      "representation_line": 15
+    },
+    {
+      "kind": "Return",
+      "line_start": 63,
+      "line_end": 63,
+      "column": 4,
+      "owner": "_tool_policy",
+      "representation_line": 16
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 66,
+      "line_end": 71,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 20
+    },
+    {
+      "kind": "Expr",
+      "line_start": 69,
+      "line_end": 69,
+      "column": 4,
+      "owner": "_build_session_tools",
+      "representation_line": 26
+    },
+    {
+      "kind": "Assign",
+      "line_start": 70,
+      "line_end": 70,
+      "column": 4,
+      "owner": "_build_session_tools",
+      "representation_line": 26
+    },
+    {
+      "kind": "Return",
+      "line_start": 71,
+      "line_end": 71,
+      "column": 4,
+      "owner": "_build_session_tools",
+      "representation_line": 27
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 74,
+      "line_end": 81,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 31
+    },
+    {
+      "kind": "Expr",
+      "line_start": 75,
+      "line_end": 75,
+      "column": 4,
+      "owner": "_subagent_tools",
+      "representation_line": 37
+    },
+    {
+      "kind": "Assign",
+      "line_start": 76,
+      "line_end": 76,
+      "column": 4,
+      "owner": "_subagent_tools",
+      "representation_line": 37
+    },
+    {
+      "kind": "Assign",
+      "line_start": 77,
+      "line_end": 77,
+      "column": 4,
+      "owner": "_subagent_tools",
+      "representation_line": 37
+    },
+    {
+      "kind": "Assign",
+      "line_start": 78,
+      "line_end": 78,
+      "column": 4,
+      "owner": "_subagent_tools",
+      "representation_line": 37
+    },
+    {
+      "kind": "If",
+      "line_start": 79,
+      "line_end": 80,
+      "column": 4,
+      "owner": "_subagent_tools",
+      "representation_line": 38
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 80,
+      "line_end": 80,
+      "column": 8,
+      "owner": "_subagent_tools",
+      "representation_line": 41
+    },
+    {
+      "kind": "Return",
+      "line_start": 81,
+      "line_end": 81,
+      "column": 4,
+      "owner": "_subagent_tools",
+      "representation_line": 43
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 84,
+      "line_end": 92,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 47
+    },
+    {
+      "kind": "Expr",
+      "line_start": 87,
+      "line_end": 87,
+      "column": 4,
+      "owner": "_subagent_tool_names",
+      "representation_line": 53
+    },
+    {
+      "kind": "Assign",
+      "line_start": 88,
+      "line_end": 88,
+      "column": 4,
+      "owner": "_subagent_tool_names",
+      "representation_line": 53
+    },
+    {
+      "kind": "Assign",
+      "line_start": 89,
+      "line_end": 89,
+      "column": 4,
+      "owner": "_subagent_tool_names",
+      "representation_line": 53
+    },
+    {
+      "kind": "If",
+      "line_start": 90,
+      "line_end": 91,
+      "column": 4,
+      "owner": "_subagent_tool_names",
+      "representation_line": 54
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 91,
+      "line_end": 91,
+      "column": 8,
+      "owner": "_subagent_tool_names",
+      "representation_line": 57
+    },
+    {
+      "kind": "Return",
+      "line_start": 92,
+      "line_end": 92,
+      "column": 4,
+      "owner": "_subagent_tool_names",
+      "representation_line": 59
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 95,
+      "line_end": 103,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 63
+    },
+    {
+      "kind": "Expr",
+      "line_start": 96,
+      "line_end": 96,
+      "column": 4,
+      "owner": "_general_purpose_agent",
+      "representation_line": 69
+    },
+    {
+      "kind": "Assign",
+      "line_start": 97,
+      "line_end": 97,
+      "column": 4,
+      "owner": "_general_purpose_agent",
+      "representation_line": 69
+    },
+    {
+      "kind": "Return",
+      "line_start": 98,
+      "line_end": 103,
+      "column": 4,
+      "owner": "_general_purpose_agent",
+      "representation_line": 70
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 106,
+      "line_end": 113,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 74
+    },
+    {
+      "kind": "Expr",
+      "line_start": 109,
+      "line_end": 109,
+      "column": 4,
+      "owner": "_permitted_for_spec",
+      "representation_line": 80
+    },
+    {
+      "kind": "Assign",
+      "line_start": 110,
+      "line_end": 110,
+      "column": 4,
+      "owner": "_permitted_for_spec",
+      "representation_line": 80
+    },
+    {
+      "kind": "If",
+      "line_start": 111,
+      "line_end": 112,
+      "column": 4,
+      "owner": "_permitted_for_spec",
+      "representation_line": 81
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 112,
+      "line_end": 112,
+      "column": 8,
+      "owner": "_permitted_for_spec",
+      "representation_line": 84
+    },
+    {
+      "kind": "Return",
+      "line_start": 113,
+      "line_end": 113,
+      "column": 4,
+      "owner": "_permitted_for_spec",
+      "representation_line": 86
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 116,
+      "line_end": 126,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 90
+    },
+    {
+      "kind": "Expr",
+      "line_start": 117,
+      "line_end": 117,
+      "column": 4,
+      "owner": "_subagent_budget",
+      "representation_line": 96
+    },
+    {
+      "kind": "Assign",
+      "line_start": 118,
+      "line_end": 118,
+      "column": 4,
+      "owner": "_subagent_budget",
+      "representation_line": 96
+    },
+    {
+      "kind": "If",
+      "line_start": 119,
+      "line_end": 120,
+      "column": 4,
+      "owner": "_subagent_budget",
+      "representation_line": 97
+    },
+    {
+      "kind": "Return",
+      "line_start": 120,
+      "line_end": 120,
+      "column": 8,
+      "owner": "_subagent_budget",
+      "representation_line": 99
+    },
+    {
+      "kind": "Assign",
+      "line_start": 121,
+      "line_end": 122,
+      "column": 4,
+      "owner": "_subagent_budget",
+      "representation_line": 103
+    },
+    {
+      "kind": "Return",
+      "line_start": 123,
+      "line_end": 126,
+      "column": 4,
+      "owner": "_subagent_budget",
+      "representation_line": 104
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 129,
+      "line_end": 151,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 108
+    },
+    {
+      "kind": "Expr",
+      "line_start": 133,
+      "line_end": 133,
+      "column": 4,
+      "owner": "_spec_middleware",
+      "representation_line": 114
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 135,
+      "line_end": 135,
+      "column": 4,
+      "owner": "_spec_middleware",
+      "representation_line": 114
+    },
+    {
+      "kind": "If",
+      "line_start": 136,
+      "line_end": 139,
+      "column": 4,
+      "owner": "_spec_middleware",
+      "representation_line": 115
+    },
+    {
+      "kind": "Assign",
+      "line_start": 137,
+      "line_end": 137,
+      "column": 8,
+      "owner": "_spec_middleware",
+      "representation_line": 118
+    },
+    {
+      "kind": "Assign",
+      "line_start": 139,
+      "line_end": 139,
+      "column": 8,
+      "owner": "_spec_middleware",
+      "representation_line": 122
+    },
+    {
+      "kind": "If",
+      "line_start": 140,
+      "line_end": 141,
+      "column": 4,
+      "owner": "_spec_middleware",
+      "representation_line": 124
+    },
+    {
+      "kind": "Expr",
+      "line_start": 141,
+      "line_end": 141,
+      "column": 8,
+      "owner": "_spec_middleware",
+      "representation_line": 127
+    },
+    {
+      "kind": "Assign",
+      "line_start": 144,
+      "line_end": 144,
+      "column": 4,
+      "owner": "_spec_middleware",
+      "representation_line": 130
+    },
+    {
+      "kind": "Expr",
+      "line_start": 145,
+      "line_end": 145,
+      "column": 4,
+      "owner": "_spec_middleware",
+      "representation_line": 130
+    },
+    {
+      "kind": "Expr",
+      "line_start": 147,
+      "line_end": 149,
+      "column": 4,
+      "owner": "_spec_middleware",
+      "representation_line": 130
+    },
+    {
+      "kind": "Expr",
+      "line_start": 150,
+      "line_end": 150,
+      "column": 4,
+      "owner": "_spec_middleware",
+      "representation_line": 130
+    },
+    {
+      "kind": "Return",
+      "line_start": 151,
+      "line_end": 151,
+      "column": 4,
+      "owner": "_spec_middleware",
+      "representation_line": 131
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 154,
+      "line_end": 196,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 135
+    },
+    {
+      "kind": "Expr",
+      "line_start": 159,
+      "line_end": 159,
+      "column": 4,
+      "owner": "get_subagent_specs",
+      "representation_line": 141
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 161,
+      "line_end": 163,
+      "column": 4,
+      "owner": "get_subagent_specs",
+      "representation_line": 141
+    },
+    {
+      "kind": "Expr",
+      "line_start": 164,
+      "line_end": 164,
+      "column": 4,
+      "owner": "get_subagent_specs",
+      "representation_line": 141
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 165,
+      "line_end": 165,
+      "column": 4,
+      "owner": "get_subagent_specs",
+      "representation_line": 141
+    },
+    {
+      "kind": "For",
+      "line_start": 166,
+      "line_end": 195,
+      "column": 4,
+      "owner": "get_subagent_specs",
+      "representation_line": 142
+    },
+    {
+      "kind": "Assign",
+      "line_start": 167,
+      "line_end": 167,
+      "column": 8,
+      "owner": "get_subagent_specs",
+      "representation_line": 145
+    },
+    {
+      "kind": "Assign",
+      "line_start": 168,
+      "line_end": 168,
+      "column": 8,
+      "owner": "get_subagent_specs",
+      "representation_line": 145
+    },
+    {
+      "kind": "Assign",
+      "line_start": 170,
+      "line_end": 170,
+      "column": 8,
+      "owner": "get_subagent_specs",
+      "representation_line": 145
+    },
+    {
+      "kind": "Assign",
+      "line_start": 171,
+      "line_end": 177,
+      "column": 8,
+      "owner": "get_subagent_specs",
+      "representation_line": 145
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 178,
+      "line_end": 184,
+      "column": 8,
+      "owner": "get_subagent_specs",
+      "representation_line": 145
+    },
+    {
+      "kind": "Assign",
+      "line_start": 185,
+      "line_end": 187,
+      "column": 8,
+      "owner": "get_subagent_specs",
+      "representation_line": 147
+    },
+    {
+      "kind": "Assign",
+      "line_start": 188,
+      "line_end": 188,
+      "column": 8,
+      "owner": "get_subagent_specs",
+      "representation_line": 147
+    },
+    {
+      "kind": "If",
+      "line_start": 189,
+      "line_end": 190,
+      "column": 8,
+      "owner": "get_subagent_specs",
+      "representation_line": 148
+    },
+    {
+      "kind": "Assign",
+      "line_start": 190,
+      "line_end": 190,
+      "column": 12,
+      "owner": "get_subagent_specs",
+      "representation_line": 151
+    },
+    {
+      "kind": "If",
+      "line_start": 191,
+      "line_end": 194,
+      "column": 8,
+      "owner": "get_subagent_specs",
+      "representation_line": 153
+    },
+    {
+      "kind": "Assign",
+      "line_start": 192,
+      "line_end": 194,
+      "column": 12,
+      "owner": "get_subagent_specs",
+      "representation_line": 156
+    },
+    {
+      "kind": "Expr",
+      "line_start": 195,
+      "line_end": 195,
+      "column": 8,
+      "owner": "get_subagent_specs",
+      "representation_line": 159
+    },
+    {
+      "kind": "Return",
+      "line_start": 196,
+      "line_end": 196,
+      "column": 4,
+      "owner": "get_subagent_specs",
+      "representation_line": 161
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 23,
+      "kind": "Constant",
+      "original_ast": "Constant(value='general-purpose')",
+      "rendered": "'general-purpose'"
+    },
+    {
+      "line_start": 63,
+      "line_end": 63,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=Attribute(value=Name(id='options', ctx=Load()), attr='tool_policy', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), body=Attribute(value=Name(id='options', ctx=Load()), attr='tool_policy', ctx=Load()), orelse=Call(func=Name(id='ToolPolicy', ctx=Load()), args=[], keywords=[]))",
+      "rendered": "options.tool_policy if options.tool_policy is not None else ToolPolicy()"
+    },
+    {
+      "line_start": 70,
+      "line_end": 70,
+      "column": 14,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Attribute(value=Name(id='options', ctx=Load()), attr='tool_builder', ctx=Load()), Name(id='build_tools', ctx=Load())])",
+      "rendered": "options.tool_builder or build_tools"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='builder', ctx=Load()), args=[Name(id='options', ctx=Load())], keywords=[keyword(arg='allowed_tools', value=Name(id='allowed_tools', ctx=Load()))])",
+      "rendered": "builder(options, allowed_tools=allowed_tools)"
+    },
+    {
+      "line_start": 76,
+      "line_end": 76,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_tool_policy', ctx=Load()), args=[Name(id='options', ctx=Load())], keywords=[])",
+      "rendered": "_tool_policy(options)"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 14,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=Attribute(value=Name(id='subagent', ctx=Load()), attr='tools', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), body=Attribute(value=Name(id='subagent', ctx=Load()), attr='tools', ctx=Load()), orelse=Attribute(value=Name(id='policy', ctx=Load()), attr='allowed_tools', ctx=Load()))",
+      "rendered": "subagent.tools if subagent.tools is not None else policy.allowed_tools"
+    },
+    {
+      "line_start": 78,
+      "line_end": 78,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[BoolOp(op=Or(), values=[Attribute(value=Name(id='subagent', ctx=Load()), attr='disallowed_tools', ctx=Load()), Attribute(value=Name(id='policy', ctx=Load()), attr='disallowed_tools', ctx=Load())])], keywords=[])",
+      "rendered": "set(subagent.disallowed_tools or policy.disallowed_tools)"
+    },
+    {
+      "line_start": 79,
+      "line_end": 79,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Attribute(value=Name(id='options', ctx=Load()), attr='allow_writes', ctx=Load()))",
+      "rendered": "not options.allow_writes"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='denied', ctx=Store()), op=BitOr(), value=Name(id='MUTATING_TOOLS', ctx=Load()))",
+      "rendered": "denied |= MUTATING_TOOLS"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='tuple', ctx=Load()), args=[GeneratorExp(elt=Name(id='t', ctx=Load()), generators=[comprehension(target=Name(id='t', ctx=Store()), iter=Name(id='allowed', ctx=Load()), ifs=[Compare(left=Name(id='t', ctx=Load()), ops=[NotIn()], comparators=[Name(id='denied', ctx=Load())])], is_async=0)])], keywords=[])",
+      "rendered": "tuple((t for t in allowed if t not in denied))"
+    },
+    {
+      "line_start": 88,
+      "line_end": 88,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='tuple', ctx=Load()), args=[Call(func=Attribute(value=Name(id='dict', ctx=Load()), attr='fromkeys', ctx=Load()), args=[List(elts=[Starred(value=Call(func=Name(id='_subagent_tools', ctx=Load()), args=[Name(id='subagent', ctx=Load()), Name(id='options', ctx=Load())], keywords=[]), ctx=Load()), Starred(value=Attribute(value=Name(id='options', ctx=Load()), attr='fact_tools', ctx=Load()), ctx=Load())], ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "tuple(dict.fromkeys([*_subagent_tools(subagent, options), *options.fact_tools]))"
+    },
+    {
+      "line_start": 89,
+      "line_end": 89,
+      "column": 15,
+      "kind": "Set",
+      "original_ast": "Set(elts=[Name(id='LEGACY_AGENT_TOOL', ctx=Load())])",
+      "rendered": "{LEGACY_AGENT_TOOL}"
+    },
+    {
+      "line_start": 90,
+      "line_end": 90,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Attribute(value=Name(id='options', ctx=Load()), attr='allow_writes', ctx=Load()))",
+      "rendered": "not options.allow_writes"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='excluded', ctx=Store()), op=BitOr(), value=Name(id='MUTATING_TOOLS', ctx=Load()))",
+      "rendered": "excluded |= MUTATING_TOOLS"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='tuple', ctx=Load()), args=[GeneratorExp(elt=Name(id='t', ctx=Load()), generators=[comprehension(target=Name(id='t', ctx=Store()), iter=Name(id='granted', ctx=Load()), ifs=[Compare(left=Name(id='t', ctx=Load()), ops=[NotIn()], comparators=[Name(id='excluded', ctx=Load())])], is_async=0)])], keywords=[])",
+      "rendered": "tuple((t for t in granted if t not in excluded))"
+    },
+    {
+      "line_start": 97,
+      "line_end": 97,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='tuple', ctx=Load()), args=[GeneratorExp(elt=Name(id='t', ctx=Load()), generators=[comprehension(target=Name(id='t', ctx=Store()), iter=Attribute(value=Call(func=Name(id='_tool_policy', ctx=Load()), args=[Name(id='options', ctx=Load())], keywords=[]), attr='allowed_tools', ctx=Load()), ifs=[Compare(left=Name(id='t', ctx=Load()), ops=[In()], comparators=[Name(id='READ_TOOLS', ctx=Load())])], is_async=0)])], keywords=[])",
+      "rendered": "tuple((t for t in _tool_policy(options).allowed_tools if t in READ_TOOLS))"
+    },
+    {
+      "line_start": 98,
+      "line_end": 103,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='SubagentDefinition', ctx=Load()), args=[], keywords=[keyword(arg='name', value=Name(id='GENERAL_PURPOSE_NAME', ctx=Load())), keyword(arg='description', value=Name(id='DEFAULT_GENERAL_PURPOSE_DESCRIPTION', ctx=Load())), keyword(arg='prompt', value=Name(id='DEFAULT_SUBAGENT_PROMPT', ctx=Load())), keyword(arg='tools', value=Name(id='read_tools', ctx=Load()))])",
+      "rendered": "SubagentDefinition(name=GENERAL_PURPOSE_NAME, description=DEFAULT_GENERAL_PURPOSE_DESCRIPTION, prompt=DEFAULT_SUBAGENT_PROMPT, tools=read_tools)"
+    },
+    {
+      "line_start": 110,
+      "line_end": 110,
+      "column": 13,
+      "kind": "SetComp",
+      "original_ast": "SetComp(elt=Call(func=Attribute(value=Name(id='LOGICAL_TO_NATIVE', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='t', ctx=Load()), Name(id='t', ctx=Load())], keywords=[]), generators=[comprehension(target=Name(id='t', ctx=Store()), iter=Name(id='tool_names', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "{LOGICAL_TO_NATIVE.get(t, t) for t in tool_names}"
+    },
+    {
+      "line_start": 111,
+      "line_end": 111,
+      "column": 7,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Name(id='native', ctx=Load()), op=BitAnd(), right=SetComp(elt=Subscript(value=Name(id='LOGICAL_TO_NATIVE', ctx=Load()), slice=Name(id='r', ctx=Load()), ctx=Load()), generators=[comprehension(target=Name(id='r', ctx=Store()), iter=Name(id='READ_TOOLS', ctx=Load()), ifs=[], is_async=0)]))",
+      "rendered": "native & {LOGICAL_TO_NATIVE[r] for r in READ_TOOLS}"
+    },
+    {
+      "line_start": 112,
+      "line_end": 112,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='native', ctx=Store()), op=BitOr(), value=Name(id='NATIVE_IMPLIED_READS', ctx=Load()))",
+      "rendered": "native |= NATIVE_IMPLIED_READS"
+    },
+    {
+      "line_start": 113,
+      "line_end": 113,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='frozenset', ctx=Load()), args=[BinOp(left=Name(id='native', ctx=Load()), op=BitOr(), right=SetComp(elt=Attribute(value=Name(id='t', ctx=Load()), attr='name', ctx=Load()), generators=[comprehension(target=Name(id='t', ctx=Store()), iter=Name(id='tools', ctx=Load()), ifs=[], is_async=0)]))], keywords=[])",
+      "rendered": "frozenset(native | {t.name for t in tools})"
+    },
+    {
+      "line_start": 118,
+      "line_end": 118,
+      "column": 12,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Attribute(value=Name(id='subagent', ctx=Load()), attr='max_model_calls', ctx=Load()), Constant(value=0)])",
+      "rendered": "subagent.max_model_calls or 0"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='limit', ctx=Load()), ops=[LtE()], comparators=[Constant(value=0)])",
+      "rendered": "limit <= 0"
+    },
+    {
+      "line_start": 120,
+      "line_end": 120,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 121,
+      "line_end": 122,
+      "column": 15,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=Attribute(value=Name(id='subagent', ctx=Load()), attr='response_model', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), body=Call(func=Name(id='frozenset', ctx=Load()), args=[Set(elts=[Call(func=Name(id='_tool_name_for', ctx=Load()), args=[Attribute(value=Name(id='subagent', ctx=Load()), attr='response_model', ctx=Load())], keywords=[])])], keywords=[]), orelse=Call(func=Name(id='frozenset', ctx=Load()), args=[], keywords=[]))",
+      "rendered": "frozenset({_tool_name_for(subagent.response_model)}) if subagent.response_model is not None else frozenset()"
+    },
+    {
+      "line_start": 123,
+      "line_end": 126,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelCallBudget', ctx=Load()), args=[], keywords=[keyword(arg='limit', value=Name(id='limit', ctx=Load())), keyword(arg='outcome_tools', value=Name(id='outcome', ctx=Load())), keyword(arg='counter', value=JoinedStr(values=[Constant(value='subagent_model_call_budget_final_turn['), FormattedValue(value=Attribute(value=Name(id='subagent', ctx=Load()), attr='name', ctx=Load()), conversion=-1), Constant(value=']')]))])",
+      "rendered": "ModelCallBudget(limit=limit, outcome_tools=outcome, counter=source_template_125_16)"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 7,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Name(id='set', ctx=Load()), args=[Name(id='tool_names', ctx=Load())], keywords=[]), op=BitAnd(), right=Name(id='MUTATING_TOOLS', ctx=Load()))",
+      "rendered": "set(tool_names) & MUTATING_TOOLS"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 21,
+      "kind": "List",
+      "original_ast": "List(elts=[Call(func=Name(id='ExcludeTools', ctx=Load()), args=[Call(func=Name(id='frozenset', ctx=Load()), args=[Set(elts=[Name(id='DELETE_TOOL_NAME', ctx=Load())])], keywords=[])], keywords=[])], ctx=Load())",
+      "rendered": "[ExcludeTools(frozenset({DELETE_TOOL_NAME}))]"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='read_only_middleware', ctx=Load()), args=[], keywords=[])",
+      "rendered": "read_only_middleware()"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='options', ctx=Load()), Constant(value='permitted_tool_calls'), Constant(value=None)], keywords=[]), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "getattr(options, 'permitted_tool_calls', None) is not None"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='middleware', ctx=Load()), attr='append', ctx=Load()), args=[Call(func=Name(id='PermitTools', ctx=Load()), args=[Call(func=Name(id='_permitted_for_spec', ctx=Load()), args=[Name(id='tool_names', ctx=Load()), Name(id='tools', ctx=Load())], keywords=[])], keywords=[])], keywords=[])",
+      "rendered": "middleware.append(PermitTools(_permitted_for_spec(tool_names, tools)))"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 19,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='options', ctx=Load()), Constant(value='force_verdict_only'), Constant(value=False)], keywords=[]), body=Call(func=Name(id='ForceVerdictOnly', ctx=Load()), args=[], keywords=[]), orelse=Constant(value=None))",
+      "rendered": "ForceVerdictOnly() if getattr(options, 'force_verdict_only', False) else None"
+    },
+    {
+      "line_start": 145,
+      "line_end": 145,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='middleware', ctx=Load()), attr='extend', ctx=Load()), args=[GeneratorExp(elt=Name(id='m', ctx=Load()), generators=[comprehension(target=Name(id='m', ctx=Store()), iter=Tuple(elts=[Name(id='budget', ctx=Load()), Name(id='verdict_only', ctx=Load())], ctx=Load()), ifs=[Compare(left=Name(id='m', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])], is_async=0)])], keywords=[])",
+      "rendered": "middleware.extend((m for m in (budget, verdict_only) if m is not None))"
+    },
+    {
+      "line_start": 147,
+      "line_end": 149,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='middleware', ctx=Load()), attr='append', ctx=Load()), args=[Call(func=Name(id='BlockMarkerPromptCaching', ctx=Load()), args=[], keywords=[keyword(arg='enabled', value=Call(func=Name(id='bool', ctx=Load()), args=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='options', ctx=Load()), Constant(value='cache_markers'), Constant(value=True)], keywords=[])], keywords=[]))])], keywords=[])",
+      "rendered": "middleware.append(BlockMarkerPromptCaching(enabled=bool(getattr(options, 'cache_markers', True))))"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='middleware', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='_CONNECTION_RETRY_MIDDLEWARE', ctx=Load())], keywords=[])",
+      "rendered": "middleware.append(_CONNECTION_RETRY_MIDDLEWARE)"
+    },
+    {
+      "line_start": 151,
+      "line_end": 151,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='middleware', ctx=Load())",
+      "rendered": "middleware"
+    },
+    {
+      "line_start": 161,
+      "line_end": 163,
+      "column": 48,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dict', ctx=Load()), args=[IfExp(test=Compare(left=Name(id='agents', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)]), body=Attribute(value=Name(id='options', ctx=Load()), attr='agents', ctx=Load()), orelse=Name(id='agents', ctx=Load()))], keywords=[])",
+      "rendered": "dict(options.agents if agents is None else agents)"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='configured', ctx=Load()), attr='setdefault', ctx=Load()), args=[Name(id='GENERAL_PURPOSE_NAME', ctx=Load()), Call(func=Name(id='_general_purpose_agent', ctx=Load()), args=[Name(id='options', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "configured.setdefault(GENERAL_PURPOSE_NAME, _general_purpose_agent(options))"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 32,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 166,
+      "line_end": 166,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='configured', ctx=Load()), attr='items', ctx=Load()), args=[], keywords=[])",
+      "rendered": "configured.items()"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_subagent_tool_names', ctx=Load()), args=[Name(id='subagent', ctx=Load()), Name(id='options', ctx=Load())], keywords=[])",
+      "rendered": "_subagent_tool_names(subagent, options)"
+    },
+    {
+      "line_start": 168,
+      "line_end": 168,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_build_session_tools', ctx=Load()), args=[Name(id='options', ctx=Load()), Name(id='tool_names', ctx=Load())], keywords=[])",
+      "rendered": "_build_session_tools(options, tool_names)"
+    },
+    {
+      "line_start": 170,
+      "line_end": 170,
+      "column": 28,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Attribute(value=Name(id='subagent', ctx=Load()), attr='model', ctx=Load()), Attribute(value=Name(id='options', ctx=Load()), attr='model', ctx=Load())])",
+      "rendered": "subagent.model or options.model"
+    },
+    {
+      "line_start": 171,
+      "line_end": 177,
+      "column": 25,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='build_model_cached', ctx=Load()), args=[Name(id='subagent_model_id', ctx=Load()), Attribute(value=Name(id='options', ctx=Load()), attr='env', ctx=Load()), Attribute(value=Name(id='options', ctx=Load()), attr='model_provider', ctx=Load())], keywords=[keyword(arg='use_responses_api', value=Attribute(value=Name(id='options', ctx=Load()), attr='use_responses_api', ctx=Load())), keyword(arg='think_in_prompt', value=Attribute(value=Name(id='options', ctx=Load()), attr='think_in_prompt', ctx=Load()))])",
+      "rendered": "build_model_cached(subagent_model_id, options.env, options.model_provider, use_responses_api=options.use_responses_api, think_in_prompt=options.think_in_prompt)"
+    },
+    {
+      "line_start": 178,
+      "line_end": 184,
+      "column": 29,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='name'), Constant(value='description'), Constant(value='system_prompt'), Constant(value='model'), Constant(value='tools')], values=[Name(id='name', ctx=Load()), Attribute(value=Name(id='subagent', ctx=Load()), attr='description', ctx=Load()), Attribute(value=Name(id='subagent', ctx=Load()), attr='prompt', ctx=Load()), Name(id='subagent_model', ctx=Load()), Name(id='tools', ctx=Load())])",
+      "rendered": "{'name': name, 'description': subagent.description, 'system_prompt': subagent.prompt, 'model': subagent_model, 'tools': tools}"
+    },
+    {
+      "line_start": 185,
+      "line_end": 187,
+      "column": 29,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_spec_middleware', ctx=Load()), args=[Name(id='tool_names', ctx=Load()), Name(id='tools', ctx=Load()), Name(id='options', ctx=Load())], keywords=[keyword(arg='budget', value=Call(func=Name(id='_subagent_budget', ctx=Load()), args=[Name(id='subagent', ctx=Load())], keywords=[]))])",
+      "rendered": "_spec_middleware(tool_names, tools, options, budget=_subagent_budget(subagent))"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_skill_sources', ctx=Load()), args=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='options', ctx=Load()), Constant(value='skill_root'), Constant(value=None)], keywords=[]), Attribute(value=Name(id='options', ctx=Load()), attr='cwd', ctx=Load())], keywords=[])",
+      "rendered": "_skill_sources(getattr(options, 'skill_root', None), options.cwd)"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='sources', ctx=Load())",
+      "rendered": "sources"
+    },
+    {
+      "line_start": 190,
+      "line_end": 190,
+      "column": 29,
+      "kind": "Name",
+      "original_ast": "Name(id='sources', ctx=Load())",
+      "rendered": "sources"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='subagent', ctx=Load()), attr='response_model', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "subagent.response_model is not None"
+    },
+    {
+      "line_start": 192,
+      "line_end": 194,
+      "column": 38,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_strategy_for', ctx=Load()), args=[Attribute(value=Name(id='subagent', ctx=Load()), attr='response_model', ctx=Load()), Name(id='subagent_model_id', ctx=Load()), Attribute(value=Name(id='options', ctx=Load()), attr='model_provider', ctx=Load())], keywords=[])",
+      "rendered": "_strategy_for(subagent.response_model, subagent_model_id, options.model_provider)"
+    },
+    {
+      "line_start": 195,
+      "line_end": 195,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='specs', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='spec', ctx=Load())], keywords=[])",
+      "rendered": "specs.append(spec)"
+    },
+    {
+      "line_start": 196,
+      "line_end": 196,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='specs', ctx=Load())",
+      "rendered": "specs"
+    }
+  ],
+  "calls": [
+    {
+      "line": 71,
+      "end_line": 71,
+      "callee": "builder",
+      "enclosing": "_build_session_tools",
+      "expression": "builder(options, allowed_tools=allowed_tools)"
+    },
+    {
+      "line": 76,
+      "end_line": 76,
+      "callee": "_tool_policy",
+      "enclosing": "_subagent_tools",
+      "expression": "_tool_policy(options)"
+    },
+    {
+      "line": 78,
+      "end_line": 78,
+      "callee": "set",
+      "enclosing": "_subagent_tools",
+      "expression": "set(subagent.disallowed_tools or policy.disallowed_tools)"
+    },
+    {
+      "line": 81,
+      "end_line": 81,
+      "callee": "tuple",
+      "enclosing": "_subagent_tools",
+      "expression": "tuple(t for t in allowed if t not in denied)"
+    },
+    {
+      "line": 88,
+      "end_line": 88,
+      "callee": "tuple",
+      "enclosing": "_subagent_tool_names",
+      "expression": "tuple(dict.fromkeys([*_subagent_tools(subagent, options), *options.fact_tools]))"
+    },
+    {
+      "line": 92,
+      "end_line": 92,
+      "callee": "tuple",
+      "enclosing": "_subagent_tool_names",
+      "expression": "tuple(t for t in granted if t not in excluded)"
+    },
+    {
+      "line": 97,
+      "end_line": 97,
+      "callee": "tuple",
+      "enclosing": "_general_purpose_agent",
+      "expression": "tuple(t for t in _tool_policy(options).allowed_tools if t in READ_TOOLS)"
+    },
+    {
+      "line": 98,
+      "end_line": 103,
+      "callee": "SubagentDefinition",
+      "enclosing": "_general_purpose_agent",
+      "expression": "SubagentDefinition(\n        name=GENERAL_PURPOSE_NAME,\n        description=DEFAULT_GENERAL_PURPOSE_DESCRIPTION,\n        prompt=DEFAULT_SUBAGENT_PROMPT,\n        tools=read_tools,\n    )"
+    },
+    {
+      "line": 113,
+      "end_line": 113,
+      "callee": "frozenset",
+      "enclosing": "_permitted_for_spec",
+      "expression": "frozenset(native | {t.name for t in tools})"
+    },
+    {
+      "line": 123,
+      "end_line": 126,
+      "callee": "ModelCallBudget",
+      "enclosing": "_subagent_budget",
+      "expression": "ModelCallBudget(\n        limit=limit, outcome_tools=outcome,\n        counter=f\"subagent_model_call_budget_final_turn[{subagent.name}]\",\n    )"
+    },
+    {
+      "line": 145,
+      "end_line": 145,
+      "callee": "middleware.extend",
+      "enclosing": "_spec_middleware",
+      "expression": "middleware.extend(m for m in (budget, verdict_only) if m is not None)"
+    },
+    {
+      "line": 147,
+      "end_line": 149,
+      "callee": "middleware.append",
+      "enclosing": "_spec_middleware",
+      "expression": "middleware.append(\n        BlockMarkerPromptCaching(enabled=bool(getattr(options, \"cache_markers\", True)))\n    )"
+    },
+    {
+      "line": 150,
+      "end_line": 150,
+      "callee": "middleware.append",
+      "enclosing": "_spec_middleware",
+      "expression": "middleware.append(_CONNECTION_RETRY_MIDDLEWARE)"
+    },
+    {
+      "line": 161,
+      "end_line": 163,
+      "callee": "dict",
+      "enclosing": "get_subagent_specs",
+      "expression": "dict(\n        options.agents if agents is None else agents\n    )"
+    },
+    {
+      "line": 164,
+      "end_line": 164,
+      "callee": "configured.setdefault",
+      "enclosing": "get_subagent_specs",
+      "expression": "configured.setdefault(GENERAL_PURPOSE_NAME, _general_purpose_agent(options))"
+    },
+    {
+      "line": 166,
+      "end_line": 166,
+      "callee": "configured.items",
+      "enclosing": "get_subagent_specs",
+      "expression": "configured.items()"
+    },
+    {
+      "line": 63,
+      "end_line": 63,
+      "callee": "ToolPolicy",
+      "enclosing": "_tool_policy",
+      "expression": "ToolPolicy()"
+    },
+    {
+      "line": 88,
+      "end_line": 88,
+      "callee": "dict.fromkeys",
+      "enclosing": "_subagent_tool_names",
+      "expression": "dict.fromkeys([*_subagent_tools(subagent, options), *options.fact_tools])"
+    },
+    {
+      "line": 110,
+      "end_line": 110,
+      "callee": "LOGICAL_TO_NATIVE.get",
+      "enclosing": "_permitted_for_spec",
+      "expression": "LOGICAL_TO_NATIVE.get(t, t)"
+    },
+    {
+      "line": 121,
+      "end_line": 121,
+      "callee": "frozenset",
+      "enclosing": "_subagent_budget",
+      "expression": "frozenset({_tool_name_for(subagent.response_model)})"
+    },
+    {
+      "line": 122,
+      "end_line": 122,
+      "callee": "frozenset",
+      "enclosing": "_subagent_budget",
+      "expression": "frozenset()"
+    },
+    {
+      "line": 136,
+      "end_line": 136,
+      "callee": "set",
+      "enclosing": "_spec_middleware",
+      "expression": "set(tool_names)"
+    },
+    {
+      "line": 139,
+      "end_line": 139,
+      "callee": "read_only_middleware",
+      "enclosing": "_spec_middleware",
+      "expression": "read_only_middleware()"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "getattr",
+      "enclosing": "_spec_middleware",
+      "expression": "getattr(options, \"permitted_tool_calls\", None)"
+    },
+    {
+      "line": 141,
+      "end_line": 141,
+      "callee": "middleware.append",
+      "enclosing": "_spec_middleware",
+      "expression": "middleware.append(PermitTools(_permitted_for_spec(tool_names, tools)))"
+    },
+    {
+      "line": 144,
+      "end_line": 144,
+      "callee": "getattr",
+      "enclosing": "_spec_middleware",
+      "expression": "getattr(options, \"force_verdict_only\", False)"
+    },
+    {
+      "line": 144,
+      "end_line": 144,
+      "callee": "ForceVerdictOnly",
+      "enclosing": "_spec_middleware",
+      "expression": "ForceVerdictOnly()"
+    },
+    {
+      "line": 148,
+      "end_line": 148,
+      "callee": "BlockMarkerPromptCaching",
+      "enclosing": "_spec_middleware",
+      "expression": "BlockMarkerPromptCaching(enabled=bool(getattr(options, \"cache_markers\", True)))"
+    },
+    {
+      "line": 164,
+      "end_line": 164,
+      "callee": "_general_purpose_agent",
+      "enclosing": "get_subagent_specs",
+      "expression": "_general_purpose_agent(options)"
+    },
+    {
+      "line": 167,
+      "end_line": 167,
+      "callee": "_subagent_tool_names",
+      "enclosing": "get_subagent_specs",
+      "expression": "_subagent_tool_names(subagent, options)"
+    },
+    {
+      "line": 168,
+      "end_line": 168,
+      "callee": "_build_session_tools",
+      "enclosing": "get_subagent_specs",
+      "expression": "_build_session_tools(options, tool_names)"
+    },
+    {
+      "line": 171,
+      "end_line": 177,
+      "callee": "build_model_cached",
+      "enclosing": "get_subagent_specs",
+      "expression": "build_model_cached(\n            subagent_model_id,\n            options.env,\n            options.model_provider,\n            use_responses_api=options.use_responses_api,\n            think_in_prompt=options.think_in_prompt,\n        )"
+    },
+    {
+      "line": 185,
+      "end_line": 187,
+      "callee": "_spec_middleware",
+      "enclosing": "get_subagent_specs",
+      "expression": "_spec_middleware(\n            tool_names, tools, options, budget=_subagent_budget(subagent)\n        )"
+    },
+    {
+      "line": 188,
+      "end_line": 188,
+      "callee": "_skill_sources",
+      "enclosing": "get_subagent_specs",
+      "expression": "_skill_sources(getattr(options, \"skill_root\", None), options.cwd)"
+    },
+    {
+      "line": 195,
+      "end_line": 195,
+      "callee": "specs.append",
+      "enclosing": "get_subagent_specs",
+      "expression": "specs.append(spec)"
+    },
+    {
+      "line": 137,
+      "end_line": 137,
+      "callee": "ExcludeTools",
+      "enclosing": "_spec_middleware",
+      "expression": "ExcludeTools(frozenset({DELETE_TOOL_NAME}))"
+    },
+    {
+      "line": 141,
+      "end_line": 141,
+      "callee": "PermitTools",
+      "enclosing": "_spec_middleware",
+      "expression": "PermitTools(_permitted_for_spec(tool_names, tools))"
+    },
+    {
+      "line": 188,
+      "end_line": 188,
+      "callee": "getattr",
+      "enclosing": "get_subagent_specs",
+      "expression": "getattr(options, \"skill_root\", None)"
+    },
+    {
+      "line": 192,
+      "end_line": 194,
+      "callee": "_strategy_for",
+      "enclosing": "get_subagent_specs",
+      "expression": "_strategy_for(\n                subagent.response_model, subagent_model_id, options.model_provider\n            )"
+    },
+    {
+      "line": 121,
+      "end_line": 121,
+      "callee": "_tool_name_for",
+      "enclosing": "_subagent_budget",
+      "expression": "_tool_name_for(subagent.response_model)"
+    },
+    {
+      "line": 137,
+      "end_line": 137,
+      "callee": "frozenset",
+      "enclosing": "_spec_middleware",
+      "expression": "frozenset({DELETE_TOOL_NAME})"
+    },
+    {
+      "line": 141,
+      "end_line": 141,
+      "callee": "_permitted_for_spec",
+      "enclosing": "_spec_middleware",
+      "expression": "_permitted_for_spec(tool_names, tools)"
+    },
+    {
+      "line": 148,
+      "end_line": 148,
+      "callee": "bool",
+      "enclosing": "_spec_middleware",
+      "expression": "bool(getattr(options, \"cache_markers\", True))"
+    },
+    {
+      "line": 186,
+      "end_line": 186,
+      "callee": "_subagent_budget",
+      "enclosing": "get_subagent_specs",
+      "expression": "_subagent_budget(subagent)"
+    },
+    {
+      "line": 88,
+      "end_line": 88,
+      "callee": "_subagent_tools",
+      "enclosing": "_subagent_tool_names",
+      "expression": "_subagent_tools(subagent, options)"
+    },
+    {
+      "line": 97,
+      "end_line": 97,
+      "callee": "_tool_policy",
+      "enclosing": "_general_purpose_agent",
+      "expression": "_tool_policy(options)"
+    },
+    {
+      "line": 148,
+      "end_line": 148,
+      "callee": "getattr",
+      "enclosing": "_spec_middleware",
+      "expression": "getattr(options, \"cache_markers\", True)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 17,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "from collections.abc import Mapping, Sequence",
+      "targets": [
+        "collections.abc",
+        "collections.abc.Mapping",
+        "collections.abc.Sequence"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "from deepagents.middleware.subagents import DEFAULT_GENERAL_PURPOSE_DESCRIPTION, DEFAULT_SUBAGENT_PROMPT",
+      "targets": [
+        "deepagents.middleware.subagents",
+        "deepagents.middleware.subagents.DEFAULT_GENERAL_PURPOSE_DESCRIPTION",
+        "deepagents.middleware.subagents.DEFAULT_SUBAGENT_PROMPT"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 25,
+      "source_expression": "from langchain.agents.middleware.types import AgentMiddleware",
+      "targets": [
+        "langchain.agents.middleware.types",
+        "langchain.agents.middleware.types.AgentMiddleware"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 26,
+      "source_expression": "from langchain_core.tools import BaseTool",
+      "targets": [
+        "langchain_core.tools",
+        "langchain_core.tools.BaseTool"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 28,
+      "source_expression": "from vvaharness.backends.harness.deepagents.exclude_tools import ExcludeTools",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.exclude_tools",
+        "vvaharness.backends.harness.deepagents.exclude_tools.ExcludeTools"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/exclude_tools.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 29,
+      "source_expression": "from vvaharness.backends.harness.deepagents.force_verdict_only import ForceVerdictOnly",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.force_verdict_only",
+        "vvaharness.backends.harness.deepagents.force_verdict_only.ForceVerdictOnly"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/force_verdict_only.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 30,
+      "source_expression": "from vvaharness.backends.harness.deepagents.model_call_budget import ModelCallBudget",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.model_call_budget",
+        "vvaharness.backends.harness.deepagents.model_call_budget.ModelCallBudget"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/model_call_budget.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 31,
+      "source_expression": "from vvaharness.backends.harness.deepagents.models import DELETE_TOOL_NAME, SubagentSpec",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.models",
+        "vvaharness.backends.harness.deepagents.models.DELETE_TOOL_NAME",
+        "vvaharness.backends.harness.deepagents.models.SubagentSpec"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/models.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 32,
+      "source_expression": "from vvaharness.backends.harness.deepagents.options.filesystem import _skill_sources",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.options.filesystem",
+        "vvaharness.backends.harness.deepagents.options.filesystem._skill_sources"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/options/filesystem.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 33,
+      "source_expression": "from vvaharness.backends.harness.deepagents.options.graph_builder import _CONNECTION_RETRY_MIDDLEWARE",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.options.graph_builder",
+        "vvaharness.backends.harness.deepagents.options.graph_builder._CONNECTION_RETRY_MIDDLEWARE"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/options/graph_builder.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 36,
+      "source_expression": "from vvaharness.backends.harness.deepagents.options.model_building import build_model_cached",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.options.model_building",
+        "vvaharness.backends.harness.deepagents.options.model_building.build_model_cached"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/options/model_building.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 37,
+      "source_expression": "from vvaharness.backends.harness.deepagents.options.response_format import _strategy_for, _tool_name_for",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.options.response_format",
+        "vvaharness.backends.harness.deepagents.options.response_format._strategy_for",
+        "vvaharness.backends.harness.deepagents.options.response_format._tool_name_for"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/options/response_format.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 41,
+      "source_expression": "from vvaharness.backends.harness.deepagents.permit_tools import PermitTools",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.permit_tools",
+        "vvaharness.backends.harness.deepagents.permit_tools.PermitTools"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/permit_tools.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 42,
+      "source_expression": "from vvaharness.backends.harness.deepagents.prompt_caching import BlockMarkerPromptCaching",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.prompt_caching",
+        "vvaharness.backends.harness.deepagents.prompt_caching.BlockMarkerPromptCaching"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/prompt_caching.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 43,
+      "source_expression": "from vvaharness.backends.harness.deepagents.redaction import read_only_middleware",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.redaction",
+        "vvaharness.backends.harness.deepagents.redaction.read_only_middleware"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/redaction.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 44,
+      "source_expression": "from vvaharness.backends.harness.deepagents.tools import build_tools",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.tools",
+        "vvaharness.backends.harness.deepagents.tools.build_tools"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/tools.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 45,
+      "source_expression": "from vvaharness.backends.harness.models import LEGACY_AGENT_TOOL, LOGICAL_TO_NATIVE, MUTATING_TOOLS, NATIVE_IMPLIED_READS, READ_TOOLS, OneShotOptions, StreamingOptions, SubagentDefinition, ToolPolicy",
+      "targets": [
+        "vvaharness.backends.harness.models",
+        "vvaharness.backends.harness.models.LEGACY_AGENT_TOOL",
+        "vvaharness.backends.harness.models.LOGICAL_TO_NATIVE",
+        "vvaharness.backends.harness.models.MUTATING_TOOLS",
+        "vvaharness.backends.harness.models.NATIVE_IMPLIED_READS",
+        "vvaharness.backends.harness.models.READ_TOOLS",
+        "vvaharness.backends.harness.models.OneShotOptions",
+        "vvaharness.backends.harness.models.StreamingOptions",
+        "vvaharness.backends.harness.models.SubagentDefinition",
+        "vvaharness.backends.harness.models.ToolPolicy"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/models.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

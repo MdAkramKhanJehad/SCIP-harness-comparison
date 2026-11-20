@@ -1,0 +1,111 @@
+# vvaharness/remediation_agent/plugin_runner/handoff.py
+
+The code-side contract for the DeepAgents orchestrator's dispatches to the `fixer` subagent (fix mode only). `FixerDispatchGuard` wraps every `task` tool call: it refuses dispatches that are not to the fixer, malformed, or beyond the retry budget; it appends the authoritative finding context to an accepted dispatch; and it reads the fixer's structured result to decide whether one retry is allowed. This is the termination logic of the fixer loop.
+
+Source: `vvaharness/remediation_agent/plugin_runner/handoff.py` (lines 1-245)
+Executor: code (wraps model tool calls)
+Called from: `plugin_runner/__init__.sudo` _invoke_deepagents (parent_middleware, fix mode)
+
+// src: vvaharness/remediation_agent/plugin_runner/handoff.py:33-40
+_TASK_TOOL = "task"
+_FIXER = "fixer"
+_REQUIRED_SECTIONS = ["VULNERABILITY CONTEXT:", "TARGET FILES:", "EDIT INSTRUCTIONS:", "SUCCESS CRITERIA:"]
+
+// src: vvaharness/remediation_agent/plugin_runner/handoff.py:43-53 — one guard per remediation session
+FixerDispatchGuard {
+  State {
+    _finding_context   // the full per-finding user prompt
+    _primary_file = ""
+    _attempts = 0   // executed dispatches
+    _retry_allowed = false
+    _terminal = false
+    _malformed_rejections = 0
+  }
+
+  // src: handoff.py:147-193 — the same logic for synchronous and asynchronous tool execution
+  fn wrap_tool_call(request, handler):executor=code {
+    if (request.tool_call.name != "task") return handler(request)   // other tools pass untouched
+    prepared = _prepare(request)
+    if (prepared is a refusal ToolMessage) return prepared   // the dispatch is not executed; the model sees the refusal text
+    try result = handler(prepared);
+    catch error => {
+      _record_transient()   // one bounded retry is intentional
+      return _refusal(request, "transient fixer tool error (<error type>); " + (if (_retry_allowed) "retry once" else "retry exhausted"))
+    }
+    _observe(result)
+    return result
+  }
+
+  // src: handoff.py:64-112
+  fn _prepare(request):executor=code {
+    args = request.tool_call.args
+    require args is a mapping => { _terminal = true; return _refusal("task arguments were not an object; return Not Fixed") }
+    require args.subagent_type == "fixer" => { _terminal = true; return _refusal("S10 permits only subagent_type='fixer'") }
+    require !_terminal => return _refusal("the fixer already returned a completed result; do not retry")
+    require !(_attempts > 0 && !_retry_allowed) => return _refusal("a retry is allowed only after an explicit transient tool error")
+
+    problem = _invalid_spec(args.description, _primary_file)
+    if (problem) {
+      // a malformed dispatch is not a verdict: one corrected re-dispatch is allowed
+      _malformed_rejections += 1
+      if (_malformed_rejections >= 2) {
+        _terminal = true
+        return _refusal("incomplete edit specification ($problem); no further attempts permitted; return Not Fixed")
+      }
+      return _refusal("incomplete edit specification ($problem); one corrected re-dispatch is permitted")
+    }
+
+    _attempts += 1
+    _retry_allowed = false
+    // src: handoff.py:101-112 — the fixer cannot see the orchestrator's conversation; the code appends the finding itself
+    enriched = "<description, right-trimmed>\n\n=== AUTHORITATIVE SAST FINDING CONTEXT ===\n<_finding_context, trimmed>\n=== END AUTHORITATIVE CONTEXT ==="
+    console "[remediation] dispatching complete fixer specification (attempt $_attempts/2, <length> chars)"
+    return request with args.description = enriched
+  }
+
+  // src: handoff.py:114-133 — read the fixer's reply after an executed dispatch
+  fn _observe(result):executor=code {
+    message = _result_message(result)   // the ToolMessage, or the last ToolMessage inside a Command update
+    if (message == null) { _terminal = true; return }
+    if (message.status == "error") { _record_transient(); return }
+    parsed = _fixer_result(message.content)   // FixerResult validated from JSON; null on any parse or validation error (models/fixer.sudo)
+    if (parsed != null && parsed.status == "tool_error" && parsed.retryable) { _record_transient(); return }
+    // applied, already_applied, not_applied, malformed, and non-retryable tool_error are all terminal
+    _terminal = true
+    if (parsed == null) warn "fixer returned an invalid result; no retry permitted"
+    else if (parsed.status != "applied") warn FIXER_STATUS_NO_RETRY(status=parsed.status)
+  }
+
+  // src: handoff.py:135-145 — at most two executed dispatches per session
+  fn _record_transient():executor=code {
+    if (_attempts < 2) { _retry_allowed = true; warn "fixer reported a transient tool error — one retry is permitted" }
+    else { _terminal = true; warn "fixer transient retry exhausted — return Not Fixed" }
+  }
+
+  // src: handoff.py:55-62
+  fn _refusal(request, detail) = ToolMessage(content="Fixer dispatch was not executed: $detail", name="task", status="error")   // also logged as FIXER_DISPATCH_REFUSED
+}
+
+// src: vvaharness/remediation_agent/plugin_runner/handoff.py:196-223
+fn _invalid_spec(description, primary_file):executor=code {
+  require description is a non-blank string => return "missing description"
+  folded = casefold(description)
+  missing = _REQUIRED_SECTIONS where casefold(section) not in folded
+  require !missing => return "missing section(s): <missing joined by ', '>"
+  positions = first index of each marker in folded
+  require positions are in ascending order => return "required sections are out of order"
+  for each section { body = text between this marker and the next (or the end), trimmed; require body => return "section <section> is empty" }
+  require !primary_file || casefold(primary_file) in casefold(body of "TARGET FILES:") => return "TARGET FILES does not name <primary_file>"
+  for each section in ["VULNERABILITY CONTEXT:", "EDIT INSTRUCTIONS:", "SUCCESS CRITERIA:"] {
+    require length(body of section) >= 12 => return "section <section> is not substantive"
+  }
+  return ""
+  // The TARGET FILES section is checked to NAME the primary file; nothing checks that the fixer's edits stay within the declared files (policy.patch_content.undeclared_edited_files exists for that but is never called; grep)
+}
+
+// Termination summary (derived from the state machine above):
+// - at most 2 executed dispatches (_attempts), the second only after a transient error;
+// - at most 2 malformed dispatches are refused before the guard turns terminal (the first refusal permits one re-dispatch);
+// - any non-fixer dispatch or non-object arguments turns the guard terminal at once;
+// - the session itself ends when the orchestrator returns its verdict, or at the turn, model-call, budget or wall-clock limits set in plugin_runner/__init__.sudo.
+// preserved: a refused dispatch returns an error ToolMessage to the orchestrator but does not end the session; the orchestrator may keep calling other tools until its own limits

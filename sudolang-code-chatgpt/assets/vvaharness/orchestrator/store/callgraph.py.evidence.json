@@ -1,0 +1,1918 @@
+{
+  "source": "vvaharness/orchestrator/store/callgraph.py",
+  "sha256": "095d4fe821c649e698d8c48bd2dfa854c25330d61262c91eba22c51783923934",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\"\"\"Per-run entry-point and sink snapshots: the graph rows written and read back.\"\"\"\nfrom __future__ import annotations\n\nimport hashlib\nimport json\n\nfrom vvaharness.orchestrator.store._db import connect\n\n\ndef _qnode(file_path: str, function_name: str) -> str:\n    file_part = (file_path or \"\").replace(\"\\\\\", \"/\")\n    fn_part = function_name or \"\"\n    return f\"{file_part}::{fn_part}\" if file_part or fn_part else \"\"\n\n\ndef _split_qnode(qnode: str) -> tuple[str, str]:\n    # Split on the LAST \"::\" to match the canonical q_split in s1_preprocess, or a hydrated graph points at the wrong file for a name that itself contains \"::\" (C++, C#).\n    if \"::\" not in qnode:\n        return \"\", qnode\n    f, _, n = qnode.rpartition(\"::\")\n    return f, n\n\n\ndef _graph_rows(obj) -> list[dict] | None:\n    \"\"\"Build one node row per qnode named by ``obj.entry_points``/``obj.unsafe_sinks`` — an entry/sink index, no...\"\"\"\n    entry_points = list(getattr(obj, \"entry_points\", ()) or ())\n    unsafe_sinks = list(getattr(obj, \"unsafe_sinks\", ()) or ())\n    if not (entry_points or unsafe_sinks):\n        return None\n\n    entry_meta: dict[str, tuple[str, int]] = {}\n    for ep in entry_points:\n        qn = _qnode(getattr(ep, \"file\", \"\"), getattr(ep, \"function\", \"\"))\n        if qn:\n            entry_meta[qn] = (\n                (getattr(ep, \"kind\", \"\") or \"\"),\n                1 if bool(getattr(ep, \"reachable_from_unauth\", False)) else 0,\n            )\n\n    sink_meta: dict[str, int] = {}\n    for sink in unsafe_sinks:\n        qn = _qnode(getattr(sink, \"file\", \"\"), getattr(sink, \"function\", \"\"))\n        if qn:\n            line = int(getattr(sink, \"line\", 0) or 0)\n            prev = sink_meta.get(qn)\n            sink_meta[qn] = line if prev is None or (line and line < prev) else prev\n\n    node_rows: list[dict] = []\n    for qn in sorted(set(entry_meta) | set(sink_meta)):\n        file_path, function_name = _split_qnode(qn)\n        entry_kind, unauth = entry_meta.get(qn, (\"\", 0))\n        sink_line = sink_meta.get(qn, 0)\n        node_rows.append({\n            \"qnode\": qn,\n            \"file_path\": file_path,\n            \"function_name\": function_name,\n            \"is_entry_point\": 1 if qn in entry_meta else 0,\n            \"entry_kind\": entry_kind,\n            \"reachable_from_unauth\": unauth,\n            \"is_sink\": 1 if qn in sink_meta else 0,\n            \"sink_line\": sink_line,\n        })\n\n    return node_rows\n\n\ndef save_callgraph(run_id: str, step: str, obj) -> str | None:\n    \"\"\"Persist ``obj``'s entry-point/sink qnode index and bind the current step to it, storing rows rather than a single BLOB so large graphs remain queryable.\"\"\"\n    node_rows = _graph_rows(obj)\n    if node_rows is None:\n        return None\n    payload = json.dumps({\n        \"nodes\": node_rows,\n    }, sort_keys=True, separators=(\",\", \":\")).encode()\n    graph_id = hashlib.sha256(payload).hexdigest()[:32]\n\n    con = connect()\n    try:\n        with con:\n            con.execute(\"INSERT OR IGNORE INTO runs(run_id, repo_root) VALUES (?, '')\",\n                        (run_id,))\n            con.execute(\"UPDATE runs SET updated_at = datetime('now') WHERE run_id = ?\",\n                        (run_id,))\n            exists = con.execute(\n                \"SELECT 1 FROM callgraph_snapshots WHERE run_id=? AND graph_id=?\",\n                (run_id, graph_id),\n            ).fetchone()\n            if exists is None:\n                con.execute(\n                    \"INSERT INTO callgraph_snapshots\"\n                    \"(run_id, graph_id, node_count, edge_count, entry_point_count, sink_count) \"\n                    \"VALUES (?, ?, ?, ?, ?, ?)\",\n                    (\n                        run_id,\n                        graph_id,\n                        len(node_rows),\n                        0,\n                        sum(r[\"is_entry_point\"] for r in node_rows),\n                        sum(r[\"is_sink\"] for r in node_rows),\n                    ),\n                )\n                con.executemany(\n                    \"INSERT INTO callgraph_nodes\"\n                    \"(run_id, graph_id, qnode, file_path, function_name, start_line, end_line, \"\n                    \" is_entry_point, entry_kind, reachable_from_unauth, is_sink, sink_line) \"\n                    \"VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?)\",\n                    [(\n                        run_id,\n                        graph_id,\n                        row[\"qnode\"],\n                        row[\"file_path\"],\n                        row[\"function_name\"],\n                        row[\"is_entry_point\"],\n                        row[\"entry_kind\"],\n                        row[\"reachable_from_unauth\"],\n                        row[\"is_sink\"],\n                        row[\"sink_line\"],\n                    ) for row in node_rows],\n                )\n            con.execute(\n                \"INSERT OR REPLACE INTO callgraph_stage_refs(run_id, step, graph_id) VALUES (?, ?, ?)\",\n                (run_id, step, graph_id),\n            )\n        return graph_id\n    finally:\n        con.close()\n\n\ndef load_callgraph(run_id: str, step: str) -> dict | None:\n    \"\"\"Load the entry-point/sink qnode index bound to ``(run_id, step)`` as isolated ``call_graph`` nodes (no edges — this store never had any), or ``None`` when the step has no bound graph.\"\"\"\n    con = connect()\n    try:\n        ref = con.execute(\n            \"SELECT graph_id FROM callgraph_stage_refs WHERE run_id=? AND step=?\",\n            (run_id, step),\n        ).fetchone()\n        if ref is None:\n            return None\n        graph_id = ref[0]\n        node_rows = con.execute(\n            \"SELECT qnode FROM callgraph_nodes WHERE run_id=? AND graph_id=?\",\n            (run_id, graph_id),\n        ).fetchall()\n    finally:\n        con.close()\n\n    return {\n        \"graph_id\": graph_id,\n        \"call_graph\": {qn: [] for (qn,) in node_rows},\n        \"node_count\": len(node_rows),\n    }\n",
+  "literals": {
+    "source_literal_14_0": {
+      "source": "vvaharness/orchestrator/store/callgraph.py",
+      "line_start": 14,
+      "line_end": 14,
+      "value": "Per-run entry-point and sink snapshots: the graph rows written and read back.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_26_11": {
+      "source": "vvaharness/orchestrator/store/callgraph.py",
+      "line_start": 26,
+      "line_end": 26,
+      "source_expression": "f\"{file_part}::{fn_part}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_38_4": {
+      "source": "vvaharness/orchestrator/store/callgraph.py",
+      "line_start": 38,
+      "line_end": 38,
+      "value": "Build one node row per qnode named by ``obj.entry_points``/``obj.unsafe_sinks`` — an entry/sink index, no...",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_81_4": {
+      "source": "vvaharness/orchestrator/store/callgraph.py",
+      "line_start": 81,
+      "line_end": 81,
+      "value": "Persist ``obj``'s entry-point/sink qnode index and bind the current step to it, storing rows rather than a single BLOB so large graphs remain queryable.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_103_20": {
+      "source": "vvaharness/orchestrator/store/callgraph.py",
+      "line_start": 103,
+      "line_end": 105,
+      "value": "INSERT INTO callgraph_snapshots(run_id, graph_id, node_count, edge_count, entry_point_count, sink_count) VALUES (?, ?, ?, ?, ?, ?)",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_116_20": {
+      "source": "vvaharness/orchestrator/store/callgraph.py",
+      "line_start": 116,
+      "line_end": 119,
+      "value": "INSERT INTO callgraph_nodes(run_id, graph_id, qnode, file_path, function_name, start_line, end_line,  is_entry_point, entry_kind, reachable_from_unauth, is_sink, sink_line) VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?)",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_143_4": {
+      "source": "vvaharness/orchestrator/store/callgraph.py",
+      "line_start": 143,
+      "line_end": 143,
+      "value": "Load the entry-point/sink qnode index bound to ``(run_id, step)`` as isolated ``call_graph`` nodes (no edges — this store never had any), or ``None`` when the step has no bound graph.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 14,
+      "line_end": 14,
+      "column": 0,
+      "value": "Per-run entry-point and sink snapshots: the graph rows written and read back.",
+      "context": "literal"
+    },
+    {
+      "line_start": 38,
+      "line_end": 38,
+      "column": 4,
+      "value": "Build one node row per qnode named by ``obj.entry_points``/``obj.unsafe_sinks`` — an entry/sink index, no...",
+      "context": "literal"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 4,
+      "value": "Persist ``obj``'s entry-point/sink qnode index and bind the current step to it, storing rows rather than a single BLOB so large graphs remain queryable.",
+      "context": "literal"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 4,
+      "value": "Load the entry-point/sink qnode index bound to ``(run_id, step)`` as isolated ``call_graph`` nodes (no edges — this store never had any), or ``None`` when the step has no bound graph.",
+      "context": "literal"
+    },
+    {
+      "line_start": 24,
+      "line_end": 24,
+      "column": 42,
+      "value": "\\",
+      "context": "literal"
+    },
+    {
+      "line_start": 24,
+      "line_end": 24,
+      "column": 48,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 25,
+      "line_end": 25,
+      "column": 31,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 26,
+      "line_end": 26,
+      "column": 66,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 31,
+      "line_end": 31,
+      "column": 7,
+      "value": "::",
+      "context": "literal"
+    },
+    {
+      "line_start": 33,
+      "line_end": 33,
+      "column": 31,
+      "value": "::",
+      "context": "literal"
+    },
+    {
+      "line_start": 161,
+      "line_end": 161,
+      "column": 8,
+      "value": "graph_id",
+      "context": "literal"
+    },
+    {
+      "line_start": 162,
+      "line_end": 162,
+      "column": 8,
+      "value": "call_graph",
+      "context": "literal"
+    },
+    {
+      "line_start": 163,
+      "line_end": 163,
+      "column": 8,
+      "value": "node_count",
+      "context": "literal"
+    },
+    {
+      "line_start": 26,
+      "line_end": 26,
+      "column": 24,
+      "value": "::",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 32,
+      "line_end": 32,
+      "column": 15,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 24,
+      "line_end": 24,
+      "column": 30,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 39,
+      "line_end": 39,
+      "column": 37,
+      "value": "entry_points",
+      "context": "literal"
+    },
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 37,
+      "value": "unsafe_sinks",
+      "context": "literal"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 32,
+      "value": "file",
+      "context": "literal"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 40,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 57,
+      "value": "function",
+      "context": "literal"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 69,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 34,
+      "value": "file",
+      "context": "literal"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 42,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 61,
+      "value": "function",
+      "context": "literal"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 73,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 49,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 12,
+      "value": "qnode",
+      "context": "literal"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 12,
+      "value": "file_path",
+      "context": "literal"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 12,
+      "value": "function_name",
+      "context": "literal"
+    },
+    {
+      "line_start": 70,
+      "line_end": 70,
+      "column": 12,
+      "value": "is_entry_point",
+      "context": "literal"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 12,
+      "value": "entry_kind",
+      "context": "literal"
+    },
+    {
+      "line_start": 72,
+      "line_end": 72,
+      "column": 12,
+      "value": "reachable_from_unauth",
+      "context": "literal"
+    },
+    {
+      "line_start": 73,
+      "line_end": 73,
+      "column": 12,
+      "value": "is_sink",
+      "context": "literal"
+    },
+    {
+      "line_start": 74,
+      "line_end": 74,
+      "column": 12,
+      "value": "sink_line",
+      "context": "literal"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 24,
+      "value": "INSERT OR IGNORE INTO runs(run_id, repo_root) VALUES (?, '')",
+      "context": "literal"
+    },
+    {
+      "line_start": 95,
+      "line_end": 95,
+      "column": 24,
+      "value": "UPDATE runs SET updated_at = datetime('now') WHERE run_id = ?",
+      "context": "literal"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 16,
+      "value": "INSERT OR REPLACE INTO callgraph_stage_refs(run_id, step, graph_id) VALUES (?, ?, ?)",
+      "context": "literal"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 44,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 8,
+      "value": "nodes",
+      "context": "literal"
+    },
+    {
+      "line_start": 103,
+      "line_end": 105,
+      "column": 20,
+      "value": "INSERT INTO callgraph_snapshots(run_id, graph_id, node_count, edge_count, entry_point_count, sink_count) VALUES (?, ?, ?, ?, ?, ?)",
+      "context": "literal"
+    },
+    {
+      "line_start": 116,
+      "line_end": 119,
+      "column": 20,
+      "value": "INSERT INTO callgraph_nodes(run_id, graph_id, qnode, file_path, function_name, start_line, end_line,  is_entry_point, entry_kind, reachable_from_unauth, is_sink, sink_line) VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?)",
+      "context": "literal"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 12,
+      "value": "SELECT graph_id FROM callgraph_stage_refs WHERE run_id=? AND step=?",
+      "context": "literal"
+    },
+    {
+      "line_start": 154,
+      "line_end": 154,
+      "column": 12,
+      "value": "SELECT qnode FROM callgraph_nodes WHERE run_id=? AND graph_id=?",
+      "context": "literal"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 29,
+      "value": "kind",
+      "context": "literal"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 37,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 57,
+      "line_end": 57,
+      "column": 37,
+      "value": "line",
+      "context": "literal"
+    },
+    {
+      "line_start": 87,
+      "line_end": 87,
+      "column": 35,
+      "value": ",",
+      "context": "literal"
+    },
+    {
+      "line_start": 87,
+      "line_end": 87,
+      "column": 40,
+      "value": ":",
+      "context": "literal"
+    },
+    {
+      "line_start": 98,
+      "line_end": 98,
+      "column": 16,
+      "value": "SELECT 1 FROM callgraph_snapshots WHERE run_id=? AND graph_id=?",
+      "context": "literal"
+    },
+    {
+      "line_start": 50,
+      "line_end": 50,
+      "column": 38,
+      "value": "reachable_from_unauth",
+      "context": "literal"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 28,
+      "value": "qnode",
+      "context": "literal"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 28,
+      "value": "file_path",
+      "context": "literal"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 28,
+      "value": "function_name",
+      "context": "literal"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 28,
+      "value": "is_entry_point",
+      "context": "literal"
+    },
+    {
+      "line_start": 127,
+      "line_end": 127,
+      "column": 28,
+      "value": "entry_kind",
+      "context": "literal"
+    },
+    {
+      "line_start": 128,
+      "line_end": 128,
+      "column": 28,
+      "value": "reachable_from_unauth",
+      "context": "literal"
+    },
+    {
+      "line_start": 129,
+      "line_end": 129,
+      "column": 28,
+      "value": "is_sink",
+      "context": "literal"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 28,
+      "value": "sink_line",
+      "context": "literal"
+    },
+    {
+      "line_start": 111,
+      "line_end": 111,
+      "column": 30,
+      "value": "is_entry_point",
+      "context": "literal"
+    },
+    {
+      "line_start": 112,
+      "line_end": 112,
+      "column": 30,
+      "value": "is_sink",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 30,
+      "text": "# Split on the LAST \"::\" to match the canonical q_split in s1_preprocess, or a hydrated graph points at the wrong file for a name that itself contains \"::\" (C++, C#)."
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 14,
+      "line_end": 14,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 18,
+      "line_end": 18,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 23,
+      "line_end": 26,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 3
+    },
+    {
+      "kind": "Assign",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 4,
+      "owner": "_qnode",
+      "representation_line": 9
+    },
+    {
+      "kind": "Assign",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 4,
+      "owner": "_qnode",
+      "representation_line": 9
+    },
+    {
+      "kind": "Return",
+      "line_start": 26,
+      "line_end": 26,
+      "column": 4,
+      "owner": "_qnode",
+      "representation_line": 10
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 29,
+      "line_end": 34,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 14
+    },
+    {
+      "kind": "If",
+      "line_start": 31,
+      "line_end": 32,
+      "column": 4,
+      "owner": "_split_qnode",
+      "representation_line": 19
+    },
+    {
+      "kind": "Return",
+      "line_start": 32,
+      "line_end": 32,
+      "column": 8,
+      "owner": "_split_qnode",
+      "representation_line": 21
+    },
+    {
+      "kind": "Assign",
+      "line_start": 33,
+      "line_end": 33,
+      "column": 4,
+      "owner": "_split_qnode",
+      "representation_line": 25
+    },
+    {
+      "kind": "Return",
+      "line_start": 34,
+      "line_end": 34,
+      "column": 4,
+      "owner": "_split_qnode",
+      "representation_line": 26
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 37,
+      "line_end": 77,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 30
+    },
+    {
+      "kind": "Expr",
+      "line_start": 38,
+      "line_end": 38,
+      "column": 4,
+      "owner": "_graph_rows",
+      "representation_line": 36
+    },
+    {
+      "kind": "Assign",
+      "line_start": 39,
+      "line_end": 39,
+      "column": 4,
+      "owner": "_graph_rows",
+      "representation_line": 36
+    },
+    {
+      "kind": "Assign",
+      "line_start": 40,
+      "line_end": 40,
+      "column": 4,
+      "owner": "_graph_rows",
+      "representation_line": 36
+    },
+    {
+      "kind": "If",
+      "line_start": 41,
+      "line_end": 42,
+      "column": 4,
+      "owner": "_graph_rows",
+      "representation_line": 37
+    },
+    {
+      "kind": "Return",
+      "line_start": 42,
+      "line_end": 42,
+      "column": 8,
+      "owner": "_graph_rows",
+      "representation_line": 39
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 44,
+      "line_end": 44,
+      "column": 4,
+      "owner": "_graph_rows",
+      "representation_line": 43
+    },
+    {
+      "kind": "For",
+      "line_start": 45,
+      "line_end": 51,
+      "column": 4,
+      "owner": "_graph_rows",
+      "representation_line": 44
+    },
+    {
+      "kind": "Assign",
+      "line_start": 46,
+      "line_end": 46,
+      "column": 8,
+      "owner": "_graph_rows",
+      "representation_line": 47
+    },
+    {
+      "kind": "If",
+      "line_start": 47,
+      "line_end": 51,
+      "column": 8,
+      "owner": "_graph_rows",
+      "representation_line": 48
+    },
+    {
+      "kind": "Assign",
+      "line_start": 48,
+      "line_end": 51,
+      "column": 12,
+      "owner": "_graph_rows",
+      "representation_line": 51
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 53,
+      "line_end": 53,
+      "column": 4,
+      "owner": "_graph_rows",
+      "representation_line": 55
+    },
+    {
+      "kind": "For",
+      "line_start": 54,
+      "line_end": 59,
+      "column": 4,
+      "owner": "_graph_rows",
+      "representation_line": 56
+    },
+    {
+      "kind": "Assign",
+      "line_start": 55,
+      "line_end": 55,
+      "column": 8,
+      "owner": "_graph_rows",
+      "representation_line": 59
+    },
+    {
+      "kind": "If",
+      "line_start": 56,
+      "line_end": 59,
+      "column": 8,
+      "owner": "_graph_rows",
+      "representation_line": 60
+    },
+    {
+      "kind": "Assign",
+      "line_start": 57,
+      "line_end": 57,
+      "column": 12,
+      "owner": "_graph_rows",
+      "representation_line": 63
+    },
+    {
+      "kind": "Assign",
+      "line_start": 58,
+      "line_end": 58,
+      "column": 12,
+      "owner": "_graph_rows",
+      "representation_line": 63
+    },
+    {
+      "kind": "Assign",
+      "line_start": 59,
+      "line_end": 59,
+      "column": 12,
+      "owner": "_graph_rows",
+      "representation_line": 63
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 61,
+      "line_end": 61,
+      "column": 4,
+      "owner": "_graph_rows",
+      "representation_line": 67
+    },
+    {
+      "kind": "For",
+      "line_start": 62,
+      "line_end": 75,
+      "column": 4,
+      "owner": "_graph_rows",
+      "representation_line": 68
+    },
+    {
+      "kind": "Assign",
+      "line_start": 63,
+      "line_end": 63,
+      "column": 8,
+      "owner": "_graph_rows",
+      "representation_line": 71
+    },
+    {
+      "kind": "Assign",
+      "line_start": 64,
+      "line_end": 64,
+      "column": 8,
+      "owner": "_graph_rows",
+      "representation_line": 71
+    },
+    {
+      "kind": "Assign",
+      "line_start": 65,
+      "line_end": 65,
+      "column": 8,
+      "owner": "_graph_rows",
+      "representation_line": 71
+    },
+    {
+      "kind": "Expr",
+      "line_start": 66,
+      "line_end": 75,
+      "column": 8,
+      "owner": "_graph_rows",
+      "representation_line": 71
+    },
+    {
+      "kind": "Return",
+      "line_start": 77,
+      "line_end": 77,
+      "column": 4,
+      "owner": "_graph_rows",
+      "representation_line": 73
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 80,
+      "line_end": 139,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 77
+    },
+    {
+      "kind": "Expr",
+      "line_start": 81,
+      "line_end": 81,
+      "column": 4,
+      "owner": "save_callgraph",
+      "representation_line": 83
+    },
+    {
+      "kind": "Assign",
+      "line_start": 82,
+      "line_end": 82,
+      "column": 4,
+      "owner": "save_callgraph",
+      "representation_line": 83
+    },
+    {
+      "kind": "If",
+      "line_start": 83,
+      "line_end": 84,
+      "column": 4,
+      "owner": "save_callgraph",
+      "representation_line": 84
+    },
+    {
+      "kind": "Return",
+      "line_start": 84,
+      "line_end": 84,
+      "column": 8,
+      "owner": "save_callgraph",
+      "representation_line": 86
+    },
+    {
+      "kind": "Assign",
+      "line_start": 85,
+      "line_end": 87,
+      "column": 4,
+      "owner": "save_callgraph",
+      "representation_line": 90
+    },
+    {
+      "kind": "Assign",
+      "line_start": 88,
+      "line_end": 88,
+      "column": 4,
+      "owner": "save_callgraph",
+      "representation_line": 90
+    },
+    {
+      "kind": "Assign",
+      "line_start": 90,
+      "line_end": 90,
+      "column": 4,
+      "owner": "save_callgraph",
+      "representation_line": 90
+    },
+    {
+      "kind": "Try",
+      "line_start": 91,
+      "line_end": 139,
+      "column": 4,
+      "owner": "save_callgraph",
+      "representation_line": 91
+    },
+    {
+      "kind": "With",
+      "line_start": 92,
+      "line_end": 136,
+      "column": 8,
+      "owner": "save_callgraph",
+      "representation_line": 93
+    },
+    {
+      "kind": "Expr",
+      "line_start": 93,
+      "line_end": 94,
+      "column": 12,
+      "owner": "save_callgraph",
+      "representation_line": 96
+    },
+    {
+      "kind": "Expr",
+      "line_start": 95,
+      "line_end": 96,
+      "column": 12,
+      "owner": "save_callgraph",
+      "representation_line": 96
+    },
+    {
+      "kind": "Assign",
+      "line_start": 97,
+      "line_end": 100,
+      "column": 12,
+      "owner": "save_callgraph",
+      "representation_line": 96
+    },
+    {
+      "kind": "If",
+      "line_start": 101,
+      "line_end": 132,
+      "column": 12,
+      "owner": "save_callgraph",
+      "representation_line": 97
+    },
+    {
+      "kind": "Expr",
+      "line_start": 102,
+      "line_end": 114,
+      "column": 16,
+      "owner": "save_callgraph",
+      "representation_line": 100
+    },
+    {
+      "kind": "Expr",
+      "line_start": 115,
+      "line_end": 132,
+      "column": 16,
+      "owner": "save_callgraph",
+      "representation_line": 100
+    },
+    {
+      "kind": "Expr",
+      "line_start": 133,
+      "line_end": 136,
+      "column": 12,
+      "owner": "save_callgraph",
+      "representation_line": 103
+    },
+    {
+      "kind": "Return",
+      "line_start": 137,
+      "line_end": 137,
+      "column": 8,
+      "owner": "save_callgraph",
+      "representation_line": 106
+    },
+    {
+      "kind": "Expr",
+      "line_start": 139,
+      "line_end": 139,
+      "column": 8,
+      "owner": "save_callgraph",
+      "representation_line": 111
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 142,
+      "line_end": 164,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 115
+    },
+    {
+      "kind": "Expr",
+      "line_start": 143,
+      "line_end": 143,
+      "column": 4,
+      "owner": "load_callgraph",
+      "representation_line": 121
+    },
+    {
+      "kind": "Assign",
+      "line_start": 144,
+      "line_end": 144,
+      "column": 4,
+      "owner": "load_callgraph",
+      "representation_line": 121
+    },
+    {
+      "kind": "Try",
+      "line_start": 145,
+      "line_end": 158,
+      "column": 4,
+      "owner": "load_callgraph",
+      "representation_line": 122
+    },
+    {
+      "kind": "Assign",
+      "line_start": 146,
+      "line_end": 149,
+      "column": 8,
+      "owner": "load_callgraph",
+      "representation_line": 125
+    },
+    {
+      "kind": "If",
+      "line_start": 150,
+      "line_end": 151,
+      "column": 8,
+      "owner": "load_callgraph",
+      "representation_line": 126
+    },
+    {
+      "kind": "Return",
+      "line_start": 151,
+      "line_end": 151,
+      "column": 12,
+      "owner": "load_callgraph",
+      "representation_line": 128
+    },
+    {
+      "kind": "Assign",
+      "line_start": 152,
+      "line_end": 152,
+      "column": 8,
+      "owner": "load_callgraph",
+      "representation_line": 132
+    },
+    {
+      "kind": "Assign",
+      "line_start": 153,
+      "line_end": 156,
+      "column": 8,
+      "owner": "load_callgraph",
+      "representation_line": 132
+    },
+    {
+      "kind": "Expr",
+      "line_start": 158,
+      "line_end": 158,
+      "column": 8,
+      "owner": "load_callgraph",
+      "representation_line": 136
+    },
+    {
+      "kind": "Return",
+      "line_start": 160,
+      "line_end": 164,
+      "column": 4,
+      "owner": "load_callgraph",
+      "representation_line": 138
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 24,
+      "line_end": 24,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=BoolOp(op=Or(), values=[Name(id='file_path', ctx=Load()), Constant(value='')]), attr='replace', ctx=Load()), args=[Constant(value='\\\\'), Constant(value='/')], keywords=[])",
+      "rendered": "(file_path or '').replace('\\\\', '/')"
+    },
+    {
+      "line_start": 25,
+      "line_end": 25,
+      "column": 14,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Name(id='function_name', ctx=Load()), Constant(value='')])",
+      "rendered": "function_name or ''"
+    },
+    {
+      "line_start": 26,
+      "line_end": 26,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=BoolOp(op=Or(), values=[Name(id='file_part', ctx=Load()), Name(id='fn_part', ctx=Load())]), body=JoinedStr(values=[FormattedValue(value=Name(id='file_part', ctx=Load()), conversion=-1), Constant(value='::'), FormattedValue(value=Name(id='fn_part', ctx=Load()), conversion=-1)]), orelse=Constant(value=''))",
+      "rendered": "source_template_26_11 if file_part or fn_part else ''"
+    },
+    {
+      "line_start": 31,
+      "line_end": 31,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Constant(value='::'), ops=[NotIn()], comparators=[Name(id='qnode', ctx=Load())])",
+      "rendered": "'::' not in qnode"
+    },
+    {
+      "line_start": 32,
+      "line_end": 32,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value=''), Name(id='qnode', ctx=Load())], ctx=Load())",
+      "rendered": "('', qnode)"
+    },
+    {
+      "line_start": 33,
+      "line_end": 33,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='qnode', ctx=Load()), attr='rpartition', ctx=Load()), args=[Constant(value='::')], keywords=[])",
+      "rendered": "qnode.rpartition('::')"
+    },
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='f', ctx=Load()), Name(id='n', ctx=Load())], ctx=Load())",
+      "rendered": "(f, n)"
+    },
+    {
+      "line_start": 39,
+      "line_end": 39,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='list', ctx=Load()), args=[BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='obj', ctx=Load()), Constant(value='entry_points'), Tuple(elts=[], ctx=Load())], keywords=[]), Tuple(elts=[], ctx=Load())])], keywords=[])",
+      "rendered": "list(getattr(obj, 'entry_points', ()) or ())"
+    },
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='list', ctx=Load()), args=[BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='obj', ctx=Load()), Constant(value='unsafe_sinks'), Tuple(elts=[], ctx=Load())], keywords=[]), Tuple(elts=[], ctx=Load())])], keywords=[])",
+      "rendered": "list(getattr(obj, 'unsafe_sinks', ()) or ())"
+    },
+    {
+      "line_start": 41,
+      "line_end": 41,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=BoolOp(op=Or(), values=[Name(id='entry_points', ctx=Load()), Name(id='unsafe_sinks', ctx=Load())]))",
+      "rendered": "not (entry_points or unsafe_sinks)"
+    },
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 44,
+      "line_end": 44,
+      "column": 45,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 14,
+      "kind": "Name",
+      "original_ast": "Name(id='entry_points', ctx=Load())",
+      "rendered": "entry_points"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_qnode', ctx=Load()), args=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='ep', ctx=Load()), Constant(value='file'), Constant(value='')], keywords=[]), Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='ep', ctx=Load()), Constant(value='function'), Constant(value='')], keywords=[])], keywords=[])",
+      "rendered": "_qnode(getattr(ep, 'file', ''), getattr(ep, 'function', ''))"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='qn', ctx=Load())",
+      "rendered": "qn"
+    },
+    {
+      "line_start": 48,
+      "line_end": 51,
+      "column": 29,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='ep', ctx=Load()), Constant(value='kind'), Constant(value='')], keywords=[]), Constant(value='')]), IfExp(test=Call(func=Name(id='bool', ctx=Load()), args=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='ep', ctx=Load()), Constant(value='reachable_from_unauth'), Constant(value=False)], keywords=[])], keywords=[]), body=Constant(value=1), orelse=Constant(value=0))], ctx=Load())",
+      "rendered": "(getattr(ep, 'kind', '') or '', 1 if bool(getattr(ep, 'reachable_from_unauth', False)) else 0)"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 32,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 16,
+      "kind": "Name",
+      "original_ast": "Name(id='unsafe_sinks', ctx=Load())",
+      "rendered": "unsafe_sinks"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_qnode', ctx=Load()), args=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='sink', ctx=Load()), Constant(value='file'), Constant(value='')], keywords=[]), Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='sink', ctx=Load()), Constant(value='function'), Constant(value='')], keywords=[])], keywords=[])",
+      "rendered": "_qnode(getattr(sink, 'file', ''), getattr(sink, 'function', ''))"
+    },
+    {
+      "line_start": 56,
+      "line_end": 56,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='qn', ctx=Load())",
+      "rendered": "qn"
+    },
+    {
+      "line_start": 57,
+      "line_end": 57,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='int', ctx=Load()), args=[BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='sink', ctx=Load()), Constant(value='line'), Constant(value=0)], keywords=[]), Constant(value=0)])], keywords=[])",
+      "rendered": "int(getattr(sink, 'line', 0) or 0)"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='sink_meta', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='qn', ctx=Load())], keywords=[])",
+      "rendered": "sink_meta.get(qn)"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 28,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=BoolOp(op=Or(), values=[Compare(left=Name(id='prev', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)]), BoolOp(op=And(), values=[Name(id='line', ctx=Load()), Compare(left=Name(id='line', ctx=Load()), ops=[Lt()], comparators=[Name(id='prev', ctx=Load())])])]), body=Name(id='line', ctx=Load()), orelse=Name(id='prev', ctx=Load()))",
+      "rendered": "line if prev is None or (line and line < prev) else prev"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 28,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 62,
+      "line_end": 62,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[BinOp(left=Call(func=Name(id='set', ctx=Load()), args=[Name(id='entry_meta', ctx=Load())], keywords=[]), op=BitOr(), right=Call(func=Name(id='set', ctx=Load()), args=[Name(id='sink_meta', ctx=Load())], keywords=[]))], keywords=[])",
+      "rendered": "sorted(set(entry_meta) | set(sink_meta))"
+    },
+    {
+      "line_start": 63,
+      "line_end": 63,
+      "column": 35,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_split_qnode', ctx=Load()), args=[Name(id='qn', ctx=Load())], keywords=[])",
+      "rendered": "_split_qnode(qn)"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 29,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='entry_meta', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='qn', ctx=Load()), Tuple(elts=[Constant(value=''), Constant(value=0)], ctx=Load())], keywords=[])",
+      "rendered": "entry_meta.get(qn, ('', 0))"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='sink_meta', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='qn', ctx=Load()), Constant(value=0)], keywords=[])",
+      "rendered": "sink_meta.get(qn, 0)"
+    },
+    {
+      "line_start": 66,
+      "line_end": 75,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='node_rows', ctx=Load()), attr='append', ctx=Load()), args=[Dict(keys=[Constant(value='qnode'), Constant(value='file_path'), Constant(value='function_name'), Constant(value='is_entry_point'), Constant(value='entry_kind'), Constant(value='reachable_from_unauth'), Constant(value='is_sink'), Constant(value='sink_line')], values=[Name(id='qn', ctx=Load()), Name(id='file_path', ctx=Load()), Name(id='function_name', ctx=Load()), IfExp(test=Compare(left=Name(id='qn', ctx=Load()), ops=[In()], comparators=[Name(id='entry_meta', ctx=Load())]), body=Constant(value=1), orelse=Constant(value=0)), Name(id='entry_kind', ctx=Load()), Name(id='unauth', ctx=Load()), IfExp(test=Compare(left=Name(id='qn', ctx=Load()), ops=[In()], comparators=[Name(id='sink_meta', ctx=Load())]), body=Constant(value=1), orelse=Constant(value=0)), Name(id='sink_line', ctx=Load())])], keywords=[])",
+      "rendered": "node_rows.append({'qnode': qn, 'file_path': file_path, 'function_name': function_name, 'is_entry_point': 1 if qn in entry_meta else 0, 'entry_kind': entry_kind, 'reachable_from_unauth': unauth, 'is_sink': 1 if qn in sink_meta else 0, 'sink_line': sink_line})"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='node_rows', ctx=Load())",
+      "rendered": "node_rows"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_graph_rows', ctx=Load()), args=[Name(id='obj', ctx=Load())], keywords=[])",
+      "rendered": "_graph_rows(obj)"
+    },
+    {
+      "line_start": 83,
+      "line_end": 83,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='node_rows', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "node_rows is None"
+    },
+    {
+      "line_start": 84,
+      "line_end": 84,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 85,
+      "line_end": 87,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Name(id='json', ctx=Load()), attr='dumps', ctx=Load()), args=[Dict(keys=[Constant(value='nodes')], values=[Name(id='node_rows', ctx=Load())])], keywords=[keyword(arg='sort_keys', value=Constant(value=True)), keyword(arg='separators', value=Tuple(elts=[Constant(value=','), Constant(value=':')], ctx=Load()))]), attr='encode', ctx=Load()), args=[], keywords=[])",
+      "rendered": "json.dumps({'nodes': node_rows}, sort_keys=True, separators=(',', ':')).encode()"
+    },
+    {
+      "line_start": 88,
+      "line_end": 88,
+      "column": 15,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Call(func=Attribute(value=Call(func=Attribute(value=Name(id='hashlib', ctx=Load()), attr='sha256', ctx=Load()), args=[Name(id='payload', ctx=Load())], keywords=[]), attr='hexdigest', ctx=Load()), args=[], keywords=[]), slice=Slice(upper=Constant(value=32)), ctx=Load())",
+      "rendered": "hashlib.sha256(payload).hexdigest()[:32]"
+    },
+    {
+      "line_start": 90,
+      "line_end": 90,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='connect', ctx=Load()), args=[], keywords=[])",
+      "rendered": "connect()"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 13,
+      "kind": "Name",
+      "original_ast": "Name(id='con', ctx=Load())",
+      "rendered": "con"
+    },
+    {
+      "line_start": 93,
+      "line_end": 94,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value=\"INSERT OR IGNORE INTO runs(run_id, repo_root) VALUES (?, '')\"), Tuple(elts=[Name(id='run_id', ctx=Load())], ctx=Load())], keywords=[])",
+      "rendered": "con.execute(\"INSERT OR IGNORE INTO runs(run_id, repo_root) VALUES (?, '')\", (run_id,))"
+    },
+    {
+      "line_start": 95,
+      "line_end": 96,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value=\"UPDATE runs SET updated_at = datetime('now') WHERE run_id = ?\"), Tuple(elts=[Name(id='run_id', ctx=Load())], ctx=Load())], keywords=[])",
+      "rendered": "con.execute(\"UPDATE runs SET updated_at = datetime('now') WHERE run_id = ?\", (run_id,))"
+    },
+    {
+      "line_start": 97,
+      "line_end": 100,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value='SELECT 1 FROM callgraph_snapshots WHERE run_id=? AND graph_id=?'), Tuple(elts=[Name(id='run_id', ctx=Load()), Name(id='graph_id', ctx=Load())], ctx=Load())], keywords=[]), attr='fetchone', ctx=Load()), args=[], keywords=[])",
+      "rendered": "con.execute('SELECT 1 FROM callgraph_snapshots WHERE run_id=? AND graph_id=?', (run_id, graph_id)).fetchone()"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='exists', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "exists is None"
+    },
+    {
+      "line_start": 102,
+      "line_end": 114,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value='INSERT INTO callgraph_snapshots(run_id, graph_id, node_count, edge_count, entry_point_count, sink_count) VALUES (?, ?, ?, ?, ?, ?)'), Tuple(elts=[Name(id='run_id', ctx=Load()), Name(id='graph_id', ctx=Load()), Call(func=Name(id='len', ctx=Load()), args=[Name(id='node_rows', ctx=Load())], keywords=[]), Constant(value=0), Call(func=Name(id='sum', ctx=Load()), args=[GeneratorExp(elt=Subscript(value=Name(id='r', ctx=Load()), slice=Constant(value='is_entry_point'), ctx=Load()), generators=[comprehension(target=Name(id='r', ctx=Store()), iter=Name(id='node_rows', ctx=Load()), ifs=[], is_async=0)])], keywords=[]), Call(func=Name(id='sum', ctx=Load()), args=[GeneratorExp(elt=Subscript(value=Name(id='r', ctx=Load()), slice=Constant(value='is_sink'), ctx=Load()), generators=[comprehension(target=Name(id='r', ctx=Store()), iter=Name(id='node_rows', ctx=Load()), ifs=[], is_async=0)])], keywords=[])], ctx=Load())], keywords=[])",
+      "rendered": "con.execute(source_literal_103_20, (run_id, graph_id, len(node_rows), 0, sum((r['is_entry_point'] for r in node_rows)), sum((r['is_sink'] for r in node_rows))))"
+    },
+    {
+      "line_start": 115,
+      "line_end": 132,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='executemany', ctx=Load()), args=[Constant(value='INSERT INTO callgraph_nodes(run_id, graph_id, qnode, file_path, function_name, start_line, end_line,  is_entry_point, entry_kind, reachable_from_unauth, is_sink, sink_line) VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?)'), ListComp(elt=Tuple(elts=[Name(id='run_id', ctx=Load()), Name(id='graph_id', ctx=Load()), Subscript(value=Name(id='row', ctx=Load()), slice=Constant(value='qnode'), ctx=Load()), Subscript(value=Name(id='row', ctx=Load()), slice=Constant(value='file_path'), ctx=Load()), Subscript(value=Name(id='row', ctx=Load()), slice=Constant(value='function_name'), ctx=Load()), Subscript(value=Name(id='row', ctx=Load()), slice=Constant(value='is_entry_point'), ctx=Load()), Subscript(value=Name(id='row', ctx=Load()), slice=Constant(value='entry_kind'), ctx=Load()), Subscript(value=Name(id='row', ctx=Load()), slice=Constant(value='reachable_from_unauth'), ctx=Load()), Subscript(value=Name(id='row', ctx=Load()), slice=Constant(value='is_sink'), ctx=Load()), Subscript(value=Name(id='row', ctx=Load()), slice=Constant(value='sink_line'), ctx=Load())], ctx=Load()), generators=[comprehension(target=Name(id='row', ctx=Store()), iter=Name(id='node_rows', ctx=Load()), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "con.executemany(source_literal_116_20, [(run_id, graph_id, row['qnode'], row['file_path'], row['function_name'], row['is_entry_point'], row['entry_kind'], row['reachable_from_unauth'], row['is_sink'], row['sink_line']) for row in node_rows])"
+    },
+    {
+      "line_start": 133,
+      "line_end": 136,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value='INSERT OR REPLACE INTO callgraph_stage_refs(run_id, step, graph_id) VALUES (?, ?, ?)'), Tuple(elts=[Name(id='run_id', ctx=Load()), Name(id='step', ctx=Load()), Name(id='graph_id', ctx=Load())], ctx=Load())], keywords=[])",
+      "rendered": "con.execute('INSERT OR REPLACE INTO callgraph_stage_refs(run_id, step, graph_id) VALUES (?, ?, ?)', (run_id, step, graph_id))"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='graph_id', ctx=Load())",
+      "rendered": "graph_id"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='close', ctx=Load()), args=[], keywords=[])",
+      "rendered": "con.close()"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='connect', ctx=Load()), args=[], keywords=[])",
+      "rendered": "connect()"
+    },
+    {
+      "line_start": 146,
+      "line_end": 149,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value='SELECT graph_id FROM callgraph_stage_refs WHERE run_id=? AND step=?'), Tuple(elts=[Name(id='run_id', ctx=Load()), Name(id='step', ctx=Load())], ctx=Load())], keywords=[]), attr='fetchone', ctx=Load()), args=[], keywords=[])",
+      "rendered": "con.execute('SELECT graph_id FROM callgraph_stage_refs WHERE run_id=? AND step=?', (run_id, step)).fetchone()"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='ref', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "ref is None"
+    },
+    {
+      "line_start": 151,
+      "line_end": 151,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 152,
+      "line_end": 152,
+      "column": 19,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Name(id='ref', ctx=Load()), slice=Constant(value=0), ctx=Load())",
+      "rendered": "ref[0]"
+    },
+    {
+      "line_start": 153,
+      "line_end": 156,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value='SELECT qnode FROM callgraph_nodes WHERE run_id=? AND graph_id=?'), Tuple(elts=[Name(id='run_id', ctx=Load()), Name(id='graph_id', ctx=Load())], ctx=Load())], keywords=[]), attr='fetchall', ctx=Load()), args=[], keywords=[])",
+      "rendered": "con.execute('SELECT qnode FROM callgraph_nodes WHERE run_id=? AND graph_id=?', (run_id, graph_id)).fetchall()"
+    },
+    {
+      "line_start": 158,
+      "line_end": 158,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='close', ctx=Load()), args=[], keywords=[])",
+      "rendered": "con.close()"
+    },
+    {
+      "line_start": 160,
+      "line_end": 164,
+      "column": 11,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='graph_id'), Constant(value='call_graph'), Constant(value='node_count')], values=[Name(id='graph_id', ctx=Load()), DictComp(key=Name(id='qn', ctx=Load()), value=List(elts=[], ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='qn', ctx=Store())], ctx=Store()), iter=Name(id='node_rows', ctx=Load()), ifs=[], is_async=0)]), Call(func=Name(id='len', ctx=Load()), args=[Name(id='node_rows', ctx=Load())], keywords=[])])",
+      "rendered": "{'graph_id': graph_id, 'call_graph': {qn: [] for qn, in node_rows}, 'node_count': len(node_rows)}"
+    }
+  ],
+  "calls": [
+    {
+      "line": 24,
+      "end_line": 24,
+      "callee": "(file_path or '').replace",
+      "enclosing": "_qnode",
+      "expression": "(file_path or \"\").replace(\"\\\\\", \"/\")"
+    },
+    {
+      "line": 33,
+      "end_line": 33,
+      "callee": "qnode.rpartition",
+      "enclosing": "_split_qnode",
+      "expression": "qnode.rpartition(\"::\")"
+    },
+    {
+      "line": 39,
+      "end_line": 39,
+      "callee": "list",
+      "enclosing": "_graph_rows",
+      "expression": "list(getattr(obj, \"entry_points\", ()) or ())"
+    },
+    {
+      "line": 40,
+      "end_line": 40,
+      "callee": "list",
+      "enclosing": "_graph_rows",
+      "expression": "list(getattr(obj, \"unsafe_sinks\", ()) or ())"
+    },
+    {
+      "line": 62,
+      "end_line": 62,
+      "callee": "sorted",
+      "enclosing": "_graph_rows",
+      "expression": "sorted(set(entry_meta) | set(sink_meta))"
+    },
+    {
+      "line": 82,
+      "end_line": 82,
+      "callee": "_graph_rows",
+      "enclosing": "save_callgraph",
+      "expression": "_graph_rows(obj)"
+    },
+    {
+      "line": 85,
+      "end_line": 87,
+      "callee": "json.dumps({'nodes': node_rows}, sort_keys=True, separators=(',', ':')).encode",
+      "enclosing": "save_callgraph",
+      "expression": "json.dumps({\n        \"nodes\": node_rows,\n    }, sort_keys=True, separators=(\",\", \":\")).encode()"
+    },
+    {
+      "line": 90,
+      "end_line": 90,
+      "callee": "connect",
+      "enclosing": "save_callgraph",
+      "expression": "connect()"
+    },
+    {
+      "line": 144,
+      "end_line": 144,
+      "callee": "connect",
+      "enclosing": "load_callgraph",
+      "expression": "connect()"
+    },
+    {
+      "line": 46,
+      "end_line": 46,
+      "callee": "_qnode",
+      "enclosing": "_graph_rows",
+      "expression": "_qnode(getattr(ep, \"file\", \"\"), getattr(ep, \"function\", \"\"))"
+    },
+    {
+      "line": 55,
+      "end_line": 55,
+      "callee": "_qnode",
+      "enclosing": "_graph_rows",
+      "expression": "_qnode(getattr(sink, \"file\", \"\"), getattr(sink, \"function\", \"\"))"
+    },
+    {
+      "line": 63,
+      "end_line": 63,
+      "callee": "_split_qnode",
+      "enclosing": "_graph_rows",
+      "expression": "_split_qnode(qn)"
+    },
+    {
+      "line": 64,
+      "end_line": 64,
+      "callee": "entry_meta.get",
+      "enclosing": "_graph_rows",
+      "expression": "entry_meta.get(qn, (\"\", 0))"
+    },
+    {
+      "line": 65,
+      "end_line": 65,
+      "callee": "sink_meta.get",
+      "enclosing": "_graph_rows",
+      "expression": "sink_meta.get(qn, 0)"
+    },
+    {
+      "line": 66,
+      "end_line": 75,
+      "callee": "node_rows.append",
+      "enclosing": "_graph_rows",
+      "expression": "node_rows.append({\n            \"qnode\": qn,\n            \"file_path\": file_path,\n            \"function_name\": function_name,\n            \"is_entry_point\": 1 if qn in entry_meta else 0,\n            \"entry_kind\": entry_kind,\n            \"reachable_from_unauth\": unauth,\n            \"is_sink\": 1 if qn in sink_meta else 0,\n            \"sink_line\": sink_line,\n        })"
+    },
+    {
+      "line": 88,
+      "end_line": 88,
+      "callee": "hashlib.sha256(payload).hexdigest",
+      "enclosing": "save_callgraph",
+      "expression": "hashlib.sha256(payload).hexdigest()"
+    },
+    {
+      "line": 139,
+      "end_line": 139,
+      "callee": "con.close",
+      "enclosing": "save_callgraph",
+      "expression": "con.close()"
+    },
+    {
+      "line": 146,
+      "end_line": 149,
+      "callee": "con.execute('SELECT graph_id FROM callgraph_stage_refs WHERE run_id=? AND step=?', (run_id, step)).fetchone",
+      "enclosing": "load_callgraph",
+      "expression": "con.execute(\n            \"SELECT graph_id FROM callgraph_stage_refs WHERE run_id=? AND step=?\",\n            (run_id, step),\n        ).fetchone()"
+    },
+    {
+      "line": 153,
+      "end_line": 156,
+      "callee": "con.execute('SELECT qnode FROM callgraph_nodes WHERE run_id=? AND graph_id=?', (run_id, graph_id)).fetchall",
+      "enclosing": "load_callgraph",
+      "expression": "con.execute(\n            \"SELECT qnode FROM callgraph_nodes WHERE run_id=? AND graph_id=?\",\n            (run_id, graph_id),\n        ).fetchall()"
+    },
+    {
+      "line": 158,
+      "end_line": 158,
+      "callee": "con.close",
+      "enclosing": "load_callgraph",
+      "expression": "con.close()"
+    },
+    {
+      "line": 163,
+      "end_line": 163,
+      "callee": "len",
+      "enclosing": "load_callgraph",
+      "expression": "len(node_rows)"
+    },
+    {
+      "line": 39,
+      "end_line": 39,
+      "callee": "getattr",
+      "enclosing": "_graph_rows",
+      "expression": "getattr(obj, \"entry_points\", ())"
+    },
+    {
+      "line": 40,
+      "end_line": 40,
+      "callee": "getattr",
+      "enclosing": "_graph_rows",
+      "expression": "getattr(obj, \"unsafe_sinks\", ())"
+    },
+    {
+      "line": 46,
+      "end_line": 46,
+      "callee": "getattr",
+      "enclosing": "_graph_rows",
+      "expression": "getattr(ep, \"file\", \"\")"
+    },
+    {
+      "line": 46,
+      "end_line": 46,
+      "callee": "getattr",
+      "enclosing": "_graph_rows",
+      "expression": "getattr(ep, \"function\", \"\")"
+    },
+    {
+      "line": 55,
+      "end_line": 55,
+      "callee": "getattr",
+      "enclosing": "_graph_rows",
+      "expression": "getattr(sink, \"file\", \"\")"
+    },
+    {
+      "line": 55,
+      "end_line": 55,
+      "callee": "getattr",
+      "enclosing": "_graph_rows",
+      "expression": "getattr(sink, \"function\", \"\")"
+    },
+    {
+      "line": 57,
+      "end_line": 57,
+      "callee": "int",
+      "enclosing": "_graph_rows",
+      "expression": "int(getattr(sink, \"line\", 0) or 0)"
+    },
+    {
+      "line": 58,
+      "end_line": 58,
+      "callee": "sink_meta.get",
+      "enclosing": "_graph_rows",
+      "expression": "sink_meta.get(qn)"
+    },
+    {
+      "line": 62,
+      "end_line": 62,
+      "callee": "set",
+      "enclosing": "_graph_rows",
+      "expression": "set(entry_meta)"
+    },
+    {
+      "line": 62,
+      "end_line": 62,
+      "callee": "set",
+      "enclosing": "_graph_rows",
+      "expression": "set(sink_meta)"
+    },
+    {
+      "line": 85,
+      "end_line": 87,
+      "callee": "json.dumps",
+      "enclosing": "save_callgraph",
+      "expression": "json.dumps({\n        \"nodes\": node_rows,\n    }, sort_keys=True, separators=(\",\", \":\"))"
+    },
+    {
+      "line": 93,
+      "end_line": 94,
+      "callee": "con.execute",
+      "enclosing": "save_callgraph",
+      "expression": "con.execute(\"INSERT OR IGNORE INTO runs(run_id, repo_root) VALUES (?, '')\",\n                        (run_id,))"
+    },
+    {
+      "line": 95,
+      "end_line": 96,
+      "callee": "con.execute",
+      "enclosing": "save_callgraph",
+      "expression": "con.execute(\"UPDATE runs SET updated_at = datetime('now') WHERE run_id = ?\",\n                        (run_id,))"
+    },
+    {
+      "line": 97,
+      "end_line": 100,
+      "callee": "con.execute('SELECT 1 FROM callgraph_snapshots WHERE run_id=? AND graph_id=?', (run_id, graph_id)).fetchone",
+      "enclosing": "save_callgraph",
+      "expression": "con.execute(\n                \"SELECT 1 FROM callgraph_snapshots WHERE run_id=? AND graph_id=?\",\n                (run_id, graph_id),\n            ).fetchone()"
+    },
+    {
+      "line": 133,
+      "end_line": 136,
+      "callee": "con.execute",
+      "enclosing": "save_callgraph",
+      "expression": "con.execute(\n                \"INSERT OR REPLACE INTO callgraph_stage_refs(run_id, step, graph_id) VALUES (?, ?, ?)\",\n                (run_id, step, graph_id),\n            )"
+    },
+    {
+      "line": 88,
+      "end_line": 88,
+      "callee": "hashlib.sha256",
+      "enclosing": "save_callgraph",
+      "expression": "hashlib.sha256(payload)"
+    },
+    {
+      "line": 102,
+      "end_line": 114,
+      "callee": "con.execute",
+      "enclosing": "save_callgraph",
+      "expression": "con.execute(\n                    \"INSERT INTO callgraph_snapshots\"\n                    \"(run_id, graph_id, node_count, edge_count, entry_point_count, sink_count) \"\n                    \"VALUES (?, ?, ?, ?, ?, ?)\",\n                    (\n                        run_id,\n                        graph_id,\n                        len(node_rows),\n                        0,\n                        sum(r[\"is_entry_point\"] for r in node_rows),\n                        sum(r[\"is_sink\"] for r in node_rows),\n                    ),\n                )"
+    },
+    {
+      "line": 115,
+      "end_line": 132,
+      "callee": "con.executemany",
+      "enclosing": "save_callgraph",
+      "expression": "con.executemany(\n                    \"INSERT INTO callgraph_nodes\"\n                    \"(run_id, graph_id, qnode, file_path, function_name, start_line, end_line, \"\n                    \" is_entry_point, entry_kind, reachable_from_unauth, is_sink, sink_line) \"\n                    \"VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?)\",\n                    [(\n                        run_id,\n                        graph_id,\n                        row[\"qnode\"],\n                        row[\"file_path\"],\n                        row[\"function_name\"],\n                        row[\"is_entry_point\"],\n                        row[\"entry_kind\"],\n                        row[\"reachable_from_unauth\"],\n                        row[\"is_sink\"],\n                        row[\"sink_line\"],\n                    ) for row in node_rows],\n                )"
+    },
+    {
+      "line": 146,
+      "end_line": 149,
+      "callee": "con.execute",
+      "enclosing": "load_callgraph",
+      "expression": "con.execute(\n            \"SELECT graph_id FROM callgraph_stage_refs WHERE run_id=? AND step=?\",\n            (run_id, step),\n        )"
+    },
+    {
+      "line": 153,
+      "end_line": 156,
+      "callee": "con.execute",
+      "enclosing": "load_callgraph",
+      "expression": "con.execute(\n            \"SELECT qnode FROM callgraph_nodes WHERE run_id=? AND graph_id=?\",\n            (run_id, graph_id),\n        )"
+    },
+    {
+      "line": 49,
+      "end_line": 49,
+      "callee": "getattr",
+      "enclosing": "_graph_rows",
+      "expression": "getattr(ep, \"kind\", \"\")"
+    },
+    {
+      "line": 50,
+      "end_line": 50,
+      "callee": "bool",
+      "enclosing": "_graph_rows",
+      "expression": "bool(getattr(ep, \"reachable_from_unauth\", False))"
+    },
+    {
+      "line": 57,
+      "end_line": 57,
+      "callee": "getattr",
+      "enclosing": "_graph_rows",
+      "expression": "getattr(sink, \"line\", 0)"
+    },
+    {
+      "line": 97,
+      "end_line": 100,
+      "callee": "con.execute",
+      "enclosing": "save_callgraph",
+      "expression": "con.execute(\n                \"SELECT 1 FROM callgraph_snapshots WHERE run_id=? AND graph_id=?\",\n                (run_id, graph_id),\n            )"
+    },
+    {
+      "line": 50,
+      "end_line": 50,
+      "callee": "getattr",
+      "enclosing": "_graph_rows",
+      "expression": "getattr(ep, \"reachable_from_unauth\", False)"
+    },
+    {
+      "line": 109,
+      "end_line": 109,
+      "callee": "len",
+      "enclosing": "save_callgraph",
+      "expression": "len(node_rows)"
+    },
+    {
+      "line": 111,
+      "end_line": 111,
+      "callee": "sum",
+      "enclosing": "save_callgraph",
+      "expression": "sum(r[\"is_entry_point\"] for r in node_rows)"
+    },
+    {
+      "line": 112,
+      "end_line": 112,
+      "callee": "sum",
+      "enclosing": "save_callgraph",
+      "expression": "sum(r[\"is_sink\"] for r in node_rows)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 15,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 17,
+      "source_expression": "import hashlib",
+      "targets": [
+        "hashlib"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 18,
+      "source_expression": "import json",
+      "targets": [
+        "json"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "from vvaharness.orchestrator.store._db import connect",
+      "targets": [
+        "vvaharness.orchestrator.store._db",
+        "vvaharness.orchestrator.store._db.connect"
+      ],
+      "local_source_paths": [
+        "vvaharness/orchestrator/store/_db.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

@@ -1,0 +1,266 @@
+# vvaharness/backends/harness/deepagents/client.py
+
+`DeepAgentHarness`, the DeepAgents / LangGraph implementation of the harness contract: a one-shot call (`run_oneshot`), a streaming agent session (`run_streaming`), and a resume of a held session with one more user turn (`resume_streaming`). Around each call it runs a recovery ladder that learns per-model facts for the rest of the process and retries: (1) a model that rejects forced tool choice is learned and the call re-run unforced; (2) a rejected reasoning-effort field or tier is stepped down and the call re-run; (3) a persistent server error (5xx) gets one direct resend at the next lower effort tier; (4) a failed first Responses API call falls back once to Chat Completions. A streaming session can be bounded by a wall-clock timeout.
+
+Source: `vvaharness/backends/harness/deepagents/client.py` (lines 1-662)
+Executor: mixed (the compiled graph makes the model calls; this file builds, runs, classifies failures and retries)
+Called from: harness registry (`vvaharness/backends/harness/registry.sudo`) for the deepagents route; used by validation sessions and `vvaharness/backends/llm/deepagents.sudo`
+
+// src: vvaharness/backends/harness/deepagents/client.py:91-108
+_EPHEMERAL_CACHE_CONTROL = { type: "ephemeral" }
+_HTTP_BAD_REQUEST = 400
+_RESPONSES_PROVEN_MODELS = TRANSPORT_MEMORY.responses_proven   // same set object as the openai route: models that completed a Responses API call this process
+_RESPONSES_FALLBACK_COUNTER = "deepagents_responses_fallback"
+_THOUGHT_SIGNATURE_MARKER = "thought_signature"   // Gemini 400 for a replay missing thought_signature
+
+// src: vvaharness/backends/harness/deepagents/client.py:483-515
+fn run_oneshot(prompt, options):executor=mixed {
+  sent_tier = _sent_effort_tier(options)   // the effort value actually sent; bounds the effort retry to one re-entry per rejection
+  [graph, config] = build_oneshot_options(options)   // see options/oneshot.sudo
+  content = _marked_content(prompt, options.cache_prefix)
+  responses_active = _responses_active(options)
+  try {
+    state = graph.ainvoke({ messages: [HumanMessage(content)] }, config)   // callModel({ role: caller's, route: "deepagents", output: options.response model })
+  }
+  catch exc => {
+    if (sent_tier != null && (effort_cls = classify_effort_rejection(exc)) != null) {
+      if (_tools_off_exhausted(options.model, sent_tier, effort_cls)) {
+        EFFORT_REJECTIONS.tiers.add(_tiers_key(options.model, REASONING_OFF, _effort_transport(options)))
+        throw RuntimeError("DeepAgents call failed: model ${options.model} rejects reasoning_effort alongside tools at every value, including 'none'.")
+      }
+      _step_down_reasoning_effort(options.model, sent_tier, effort_cls, exc, transport=_effort_transport(options))
+      return run_oneshot(prompt, options)   // re-entry; the learned rejection changes what is sent
+    }
+    return _recover_oneshot_exception(this, prompt, options, sent_tier, exc)
+  }
+  if (responses_active) _RESPONSES_PROVEN_MODELS.add(options.model)
+  return translate.translate_final_state(state, oneshot=true)
+}
+
+// src: vvaharness/backends/harness/deepagents/client.py:289-318
+fn _recover_oneshot_exception(harness, prompt, options, sent_tier, exc):executor=code {
+  // Order: forced tool choice fallback, then server-error probe, then Responses-to-Chat fallback
+  if ((unforced = _rejecting_models(exc, options)) is non-empty) {
+    tool_choice_rejection.learn_tool_choice_unsupported(...unforced)
+    return harness.run_oneshot(prompt, options)   // bounded: learning flips the strategy, so re-entry cannot come back here
+  }
+  if (sent_tier != null && _is_persistent_server_error(exc)) {
+    probed_result = _probe_server_error_oneshot(options, _marked_content(prompt, options.cache_prefix), sent_tier, exc)
+    if (probed_result != null) return probed_result
+  }
+  require _should_fall_back(exc, options) => throw exc
+  _learn_chat_completions_only(options.model)
+  try return harness.run_oneshot(prompt, options);   // one retry on Chat Completions
+  catch second_exc => {
+    _CHAT_COMPLETIONS_ONLY_MODELS.discard(options.model)   // unlearn: an outage must not mislabel the model
+    if (_is_missing_thought_signature(second_exc)) throw second_exc
+    throw exc   // the original error
+  }
+}
+
+// src: vvaharness/backends/harness/deepagents/client.py:552-662
+fn run_streaming(prompt, options):executor=mixed {
+  sent_tier = _sent_effort_tier(options)
+  [graph, config] = build_streaming_agent(options)   // see options/streaming.sudo
+  session_id = options.session_id or new random hex id   // a pinned id must be the resumable thread id
+  seen_tool_ids = {}; ns_to_agent = {}; usage_acc = UsageAccumulator()
+  responses_active = _responses_active(options)
+  try {
+    emit(HarnessSessionInit(session_id))
+    stream = graph.astream({ messages: [HumanMessage(_marked_content(prompt, options.cache_prefix))] }, config, stream_mode="updates", subgraphs=true)
+    // callModel({ role: caller's, route: "deepagents", tools: options' tools and subagents, limits: options.timeout, recursion limit in config })
+    for each event in _bounded_astream_events(stream, options.timeout, options.graph_name, options.effort) {
+      usage_acc.add_event(event)
+      for each message in translate_stream_events(event, seen_tool_ids, ns_to_agent), emit(message)
+    }
+    if (responses_active) _RESPONSES_PROVEN_MODELS.add(options.model)
+    emit(make_terminal_result(_final_state(graph, config), session_id, stream_usage=usage_acc.snapshot()))
+  }
+  catch error => {
+    if (error is a HarnessError) throw error   // includes CallTimeoutError from the bounded stream
+    // src: client.py:597-601 — learned tool_choice or effort rejection: one fresh re-run
+    if (_relearned_for_rerun(error, options, sent_tier, usage_acc)) {
+      _bank_partial_usage(usage_acc)
+      emit every message of run_streaming(prompt, options); return
+    }
+    // src: client.py:602-613 — persistent server error: one resend at the next lower tier
+    probed = if (sent_tier != null && _is_persistent_server_error(error)) _probe_lower_tier_once(options.model, sent_tier) else null
+    if (probed != null) {
+      _bank_partial_usage(usage_acc)
+      emit every message of _probe_server_error_streaming(prompt, options, probed, _StreamProbeContext(sent_tier, error, session_id, seen_tool_ids, ns_to_agent)); return
+    }
+    // src: client.py:614-643 — one fallback to Chat Completions
+    if (_should_fall_back(error, options)) {
+      _learn_chat_completions_only(options.model); _bank_partial_usage(usage_acc)
+      try { emit every message of run_streaming(prompt, options) }
+      catch second_error => {
+        _CHAT_COMPLETIONS_ONLY_MODELS.discard(options.model)
+        if (_is_missing_thought_signature(second_error)) throw HarnessProcessError("DeepAgents stream failed: ${type of second_error}", exit_code=1, stderr=second_error.stderr or text, recursion_limited = second_error is GraphRecursionError)
+        throw HarnessProcessError("DeepAgents stream failed: ${type of error}", exit_code=1, stderr=text of error, recursion_limited = error is GraphRecursionError)
+      }
+      return
+    }
+    // src: client.py:644-660
+    recursion_limited = error is GraphRecursionError
+    if (recursion_limited) {
+      emit(make_terminal_result(_final_state(graph, config), session_id, stream_usage=usage_acc.snapshot()))   // so consumers can retry extraction from partial state
+    } else {
+      _bank_partial_usage(usage_acc)
+    }
+    throw HarnessProcessError("DeepAgents stream failed: ${type of error}", exit_code=1, stderr=text of error, recursion_limited)
+    // preserved: on a recursion limit the generator yields a terminal result AND then raises; consumers check recursion_limited first
+  }
+}
+
+// src: vvaharness/backends/harness/deepagents/client.py:517-550
+fn resume_streaming(instruction, options):executor=mixed {
+  // Not a re-ask: LangGraph loads the checkpointed messages for this thread and appends one user turn. The caller withdraws tools by passing permitted_tool_calls, so the only move left is the outcome report.
+  held = resumable(options.session_id)   // options/streaming.sudo
+  require held != null => throw SessionNotResumableError("session ${options.session_id} is no longer resumable: its compiled graph, and with it the checkpointed conversation, has been released")
+  [graph, config] = held
+  stream graph.astream({ messages: [HumanMessage(instruction)] }, config, stream_mode="updates", subgraphs=true), translating and emitting as in run_streaming
+  emit(make_terminal_result(_final_state(graph, config), options.session_id, stream_usage=usage_acc.snapshot()))
+  // No timeout bound and no recovery ladder on this path
+}
+
+// src: vvaharness/backends/harness/deepagents/client.py:116-148
+fn _bounded_astream_events(stream, timeout, graph_name, effort):executor=code {
+  if (!timeout) { yield every event; return }   // null or <= 0: unbounded
+  deadline = now + timeout   // one deadline for the whole stream; only awaits are bounded, never a yield to the caller
+  loop {
+    try event = next event before deadline;
+    catch end of stream => return
+    catch TimeoutError => {
+      if (our deadline did not expire) throw   // a timeout raised inside the session
+      throw call_timeout_error(stage=graph_name, route="deepagents", budget_s=timeout, effort, cause_text="deepagents session exceeded ${timeout}s")
+      // No interrupt or grace drain: DeepAgents has no subprocess, so cancelling from outside is safe
+    }
+    yield event
+  }
+}
+
+// src: vvaharness/backends/harness/deepagents/client.py:151-164
+fn _sent_effort_tier(options):executor=code {
+  if (routes_to_anthropic(options.model, options.model_provider)) return null   // that leg sends its own effort field and never reads EFFORT_REJECTIONS
+  resolved_transport = resolve_use_responses_api(options.model, options.model_provider, options.use_responses_api)
+  return _openai_effort_kwargs(options.model, options.effort, think_in_prompt=options.think_in_prompt, resolved_transport).reasoning_effort
+}
+
+// src: vvaharness/backends/harness/deepagents/client.py:167-174
+fn _tools_off_exhausted(model_id, sent_tier, cls):executor=code {
+  // Fail fast once a model already forced to reasoning_effort "none" is rejected again
+  return model_id in EFFORT_REJECTIONS.tools_off && (cls == "tools_conflict" || sent_tier == REASONING_OFF)
+}
+
+// src: vvaharness/backends/harness/deepagents/client.py:177-202
+fn _step_down_reasoning_effort(model_id, sent_tier, cls, exc, transport):executor=code {
+  match (cls) {
+    case "field" => { EFFORT_REJECTIONS.field.add(model_id); COUNTERS.bump("llm_effort_field_dropped") }   // next: no effort field
+    case "tools_conflict" => { EFFORT_REJECTIONS.tools_off.add(model_id); COUNTERS.bump("llm_effort_tools_off") }   // next: REASONING_OFF
+    default => { step_down(model_id, sent_tier, exc, transport); COUNTERS.bump("llm_effort_tier_stepped_down") }   // per-transport memory; see backends/llm/models.sudo
+  }
+  warn once per "$model_id:$sent_tier": "WARN [deepagents]: model '$model_id' rejected reasoning_effort=$sent_tier — retrying at $next_value"
+}
+
+// src: vvaharness/backends/harness/deepagents/client.py:205-212
+fn _is_persistent_server_error(exc):executor=code {
+  return any link of exception_chain(exc) has status_code in SERVER_ERROR_STATUS   // 429 deliberately excluded: a lower tier cannot clear a rate limit
+}
+
+// src: vvaharness/backends/harness/deepagents/client.py:215-243
+fn _effort_transport(options):executor=code {
+  return if (resolve_use_responses_api(...)) TRANSPORT_RESPONSES else TRANSPORT_CHAT_COMPLETIONS   // includes a pinned Responses call
+}
+fn _responses_active(options):executor=code {
+  return resolve_use_responses_api(...) == true && options.use_responses_api == null   // Responses by DEFAULT, not by configuration pin
+}
+// src: client.py:226-235
+fn _probe_lower_tier_once(model_id, sent_tier):executor=code {
+  if (sent_tier == REASONING_OFF) return null   // no lower reasoning rung
+  nxt = next_effort_tier(sent_tier)
+  if (nxt == null || !EFFORT_REJECTIONS.probe_once([model_id, sent_tier])) return null   // each (model, tier) is probed once per process
+  return nxt
+}
+
+// src: vvaharness/backends/harness/deepagents/client.py:246-260
+fn _record_server_error_recovery(options, sent_tier, probed, probed_options):executor=code {
+  learned = EFFORT_REJECTIONS.recovered_twice([options.model, sent_tier])
+  if (learned) EFFORT_REJECTIONS.tiers.add(_tiers_key(options.model, sent_tier, _effort_transport(options)))   // after two recoveries the tier is retired for the run
+  COUNTERS.bump("llm_effort_tier_stepped_down_on_server_error")
+  warn once: "WARN [deepagents]: model '${options.model}' returned a server error at reasoning_effort=$sent_tier; resent at $probed ${if (learned) "for the rest of this run" else "for this session"}."
+  if (_responses_active(probed_options)) _RESPONSES_PROVEN_MODELS.add(options.model)
+}
+
+// src: vvaharness/backends/harness/deepagents/client.py:263-286
+fn _probe_server_error_oneshot(options, content, sent_tier, exc):executor=mixed {
+  probed = _probe_lower_tier_once(options.model, sent_tier)
+  if (probed == null) return null
+  probed_options = options with effort = probed
+  try probed_state = build_oneshot_options(probed_options).graph.ainvoke({ messages: [HumanMessage(content)] });   // a direct resend, not a recursive run_oneshot: never a second rung
+  catch => throw exc   // an outage, not a tier problem: raise the first error, record nothing
+  _record_server_error_recovery(options, sent_tier, probed, probed_options)
+  return translate_final_state(probed_state, oneshot=true)
+}
+
+// src: vvaharness/backends/harness/deepagents/client.py:321-362
+_StreamProbeContext { sent_tier; error; session_id; seen_tool_ids; ns_to_agent }
+fn _probe_server_error_streaming(prompt, options, probed, ctx):executor=mixed {
+  // Same as the one-shot probe, streamed with its own usage accumulator; on any failure re-raise ctx.error; on success record the recovery and emit a terminal result
+}
+
+// src: vvaharness/backends/harness/deepagents/client.py:365-374
+fn _is_missing_thought_signature(exc):executor=code {
+  return (any link has status 400 and "thought_signature" in lower(message)) || ("400" in exc.stderr && "thought_signature" in lower(exc.stderr))
+}
+
+// src: vvaharness/backends/harness/deepagents/client.py:377-395
+fn _forcing_candidates(options):executor=code {
+  // The parent model and every subagent's model (default: parent's), deduplicated in order, that are still sent forced tool choice: not in _FORCED_TOOL_CHOICE_UNSUPPORTED_MODELS and routed to Anthropic
+}
+fn _rejecting_models(exc, options):executor=code {
+  candidates = _forcing_candidates(options)
+  if (candidates is empty || !is_tool_choice_unsupported_rejection(exc)) return []
+  model = rejected_model(exc)
+  return if (model in candidates) [model] else candidates   // when the request's model is lost, every candidate is learned
+}
+
+// src: vvaharness/backends/harness/deepagents/client.py:398-419
+fn _relearned_for_rerun(error, options, sent_tier, usage_acc):executor=code {
+  if ((unforced = _rejecting_models(error, options)) is non-empty) { learn_tool_choice_unsupported(...unforced); return true }
+  if (sent_tier == null || (effort_cls = classify_effort_rejection(error)) == null) return false
+  if (_tools_off_exhausted(options.model, sent_tier, effort_cls)) {
+    EFFORT_REJECTIONS.tiers.add(_tiers_key(options.model, REASONING_OFF, _effort_transport(options)))
+    _bank_partial_usage(usage_acc)
+    throw HarnessProcessError("DeepAgents stream failed: model ${options.model} rejects reasoning_effort alongside tools at every value, including 'none'.", exit_code=1, stderr=text of error)
+  }
+  _step_down_reasoning_effort(options.model, sent_tier, effort_cls, error, transport=_effort_transport(options))
+  return true
+}
+
+// src: vvaharness/backends/harness/deepagents/client.py:422-431
+fn _should_fall_back(exc, options):executor=code {
+  if (is_model_refusal_rejection(exc) || is_connection_failure(exc) || !_responses_active(options)) return false   // a refusal never falls back: that would resend flagged content
+  if (options.model not in _RESPONSES_PROVEN_MODELS) return true   // unproven: fall back on any error
+  return is_responses_shape_rejection(exc)   // proven: only on a shape rejection, so a 5xx cannot flip it
+}
+
+// src: vvaharness/backends/harness/deepagents/client.py:434-443
+fn _learn_chat_completions_only(model_id):executor=code {
+  _CHAT_COMPLETIONS_ONLY_MODELS.add(model_id); COUNTERS.bump(_RESPONSES_FALLBACK_COUNTER)
+  warn once per model: "WARN [deepagents]: model '$model_id' failed its first Responses API call — retrying on Chat Completions"
+}
+
+// src: vvaharness/backends/harness/deepagents/client.py:446-451
+fn _bank_partial_usage(usage_acc):executor=code {
+  // A failed attempt's streamed usage is added to TOKENS before a retry (the retry is a fresh session, so no double count)
+}
+
+// src: vvaharness/backends/harness/deepagents/client.py:454-466
+fn _marked_content(prompt, cache_prefix):executor=code {
+  if (!cache_prefix) return prompt
+  return [ { type: "text", text: cache_prefix, cache_control: { type: "ephemeral" } }, { type: "text", text: prompt } ]
+  // The fourth of Anthropic's four cache breakpoints (middleware spends system, tools, tail); never add a fifth
+}
+
+// src: vvaharness/backends/harness/deepagents/client.py:469-477
+fn _final_state(graph, config):executor=code { /* the graph's terminal state values, or {} when it has no initialised state */ }

@@ -1,0 +1,1867 @@
+{
+  "source": "vvaharness/remediation_agent/discovery.py",
+  "sha256": "49729706ad9625c4093c39aa3c1f8fc69a959f799f1c42c3646a8ed00630e6cd",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Locates the scan report and selects findings for the ``remediate`` command.\"\"\"\n\nfrom __future__ import annotations\n\nfrom dataclasses import dataclass\nfrom pathlib import Path\n\nfrom vvaharness.models import FinalReport\nfrom vvaharness.models.case import FindingCase\nfrom vvaharness.models.vocab import CaseState\nfrom vvaharness.orchestrator.artifacts import artifact_dir\nfrom vvaharness.orchestrator.checkpoints import run_id_for\nfrom vvaharness.orchestrator.findings_json import (\n    findings_json_path,\n    read_findings_json,\n)\nfrom vvaharness.remediation_agent.report_parser import (\n    REMEDIATION_DIR_NAME,\n    SCAN_DIR_NAME,\n    find_scan_dir,\n    latest_report,\n    parse_findings,\n)\nfrom vvaharness.remediation_agent.select import (\n    drop_non_main_channel,\n    select_top_logged,\n)\nfrom vvaharness.remediation_agent.target import RemediationTarget\nfrom vvaharness.util import console\n\n__all__ = [\"Findings\", \"Layout\", \"completed_case_ids\", \"cvss_score_of\",\n           \"load_findings\", \"locate_report\", \"prepare_layout\"]\n\nCHECKPOINTS_DIR_NAME = \"checkpoints\"\n\n\ndef _mtime(path: Path) -> float | None:\n    \"\"\"The artifact's mtime, or None (no cutoff) when it cannot be read.\"\"\"\n    try:\n        return path.stat().st_mtime\n    except OSError:\n        return None\n\n\ndef locate_report(repo_path: Path) -> tuple[Path | None, int]:\n    \"\"\"Find the newest scan report under ``<repo>/security-scan/``, returning ``(None, exit_code)`` with the error already printed on failure.\"\"\"\n    scan_dir = find_scan_dir(repo_path)\n    if scan_dir is None:\n        console.mark(\"fail\", f\"no '{SCAN_DIR_NAME}' folder found under {repo_path} — run \"\n              f\"`vvaharness scan --repo {repo_path}` first.\", indent=2)\n        return None, 1\n\n    report = latest_report(scan_dir)\n    if report is None:\n        console.mark(\"fail\", f\"no scan report (*_report.md) found in {scan_dir} — run \"\n              f\"`vvaharness scan --repo {repo_path}` first.\", indent=2)\n        return None, 1\n    return report, 0\n\n\ndef cvss_score_of(target: RemediationTarget) -> float | None:\n    \"\"\"Numeric CVSS base score accessor for ``--top N`` selection, or ``None`` when the report carried only a vector / bare severity band.\"\"\"\n    return target.finding.cvss_score\n\n\n@dataclass(frozen=True)\nclass Findings:\n    \"\"\"What a report yielded: the findings this run will work on (``selected``), and every one it had (``discovered``, still needed for checkpoint pruning).\"\"\"\n\n    selected: list[RemediationTarget]\n    discovered: list[RemediationTarget]\n\n\ndef completed_case_ids(repo_path: Path, *,\n                       since: float | None = None) -> set[str]:\n    \"\"\"Case ids under ``<repo>/security-remediation/`` whose fix currently stands (remediated/validated).\"\"\"\n    done: set[str] = set()\n    for case_path in sorted(\n            (repo_path / REMEDIATION_DIR_NAME).glob(\"*/finding_case.json\")):\n        try:\n            if since is not None and case_path.stat().st_mtime < since:\n                continue\n            case = FindingCase.model_validate_json(\n                case_path.read_text(encoding=\"utf-8\"))\n        except (OSError, ValueError):\n            continue\n        if case.state in (CaseState.REMEDIATED, CaseState.VALIDATED):\n            done.add(case.case_id)\n    done.discard(\"\")\n    return done\n\n\ndef _targets_from_typed(report: FinalReport,\n                        done: set[str]) -> list[RemediationTarget]:\n    \"\"\"Adapter: the typed report's findings as remediation targets.\"\"\"\n    # Ordinals precede the posture drop, matching to_markdown ### N.; posture leaves discovered too\n    targets = []\n    for i, rf in enumerate(report.findings, 1):\n        f = rf.finding\n        f.severity = rf.severity\n        t = RemediationTarget(finding=f, index=i)\n        t.done = t.case_id in done\n        targets.append(t)\n    return drop_non_main_channel(targets, log_prefix=\"[Remediation Agent]\")\n\n\ndef load_findings(repo_path: Path, report: Path, top: int | None) -> Findings:\n    \"\"\"Targets for *repo_path*, narrowed to the N highest-CVSS when ``top`` is set.\"\"\"\n    # Invalid findings.json raises InvalidFindingsJSON, no silent MD fallback; mtime gates done\n    typed = read_findings_json(repo_path)\n    done = completed_case_ids(\n        repo_path,\n        since=_mtime(findings_json_path(repo_path) if typed is not None\n                     else report))\n    if typed is not None:\n        console.write(\"  [Remediation Agent] source: findings.json (typed scan result)\")\n        discovered = _targets_from_typed(typed, done)\n    else:\n        console.write(\"  [Remediation Agent] source: legacy Markdown parse \"\n                      \"(this checkout has no findings.json — older scan)\")\n        discovered = parse_findings(report.read_text(encoding=\"utf-8\"))\n        for t in discovered:\n            t.done = t.done or t.case_id in done\n    selected = select_top_logged(discovered, top, score_of=cvss_score_of,\n                                 log_prefix=\"[Remediation Agent]\")\n    return Findings(selected=selected, discovered=discovered)\n\n\n@dataclass(frozen=True)\nclass Layout:\n    \"\"\"Resolved per-repo output + checkpoint locations for one remediation run.\"\"\"\n    rem_dir: Path\n    ckpt_dir: Path\n    run_id: str\n\n\ndef prepare_layout(repo_path: Path) -> Layout:\n    \"\"\"Resolve (and create) the per-repo remediation output dir, reusing the scan pipeline's ``<repo>/checkpoints`` folder rather than a private one.\n\n    Raises ``UnsafeArtifactDir`` (via ``artifact_dir``) rather than following a\n    committed symlink that would redirect remediation artefacts outside the repo.\n    \"\"\"\n    rem_dir = artifact_dir(repo_path, REMEDIATION_DIR_NAME)\n    rem_dir.mkdir(exist_ok=True)\n    return Layout(\n        rem_dir=rem_dir,\n        ckpt_dir=repo_path / CHECKPOINTS_DIR_NAME,\n        run_id=run_id_for(repo_path),\n    )\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/remediation_agent/discovery.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "Locates the scan report and selects findings for the ``remediate`` command.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_52_4": {
+      "source": "vvaharness/remediation_agent/discovery.py",
+      "line_start": 52,
+      "line_end": 52,
+      "value": "The artifact's mtime, or None (no cutoff) when it cannot be read.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_60_4": {
+      "source": "vvaharness/remediation_agent/discovery.py",
+      "line_start": 60,
+      "line_end": 60,
+      "value": "Find the newest scan report under ``<repo>/security-scan/``, returning ``(None, exit_code)`` with the error already printed on failure.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_63_29": {
+      "source": "vvaharness/remediation_agent/discovery.py",
+      "line_start": 63,
+      "line_end": 64,
+      "source_expression": "f\"no '{SCAN_DIR_NAME}' folder found under {repo_path} — run \"\n              f\"`vvaharness scan --repo {repo_path}` first.\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_69_29": {
+      "source": "vvaharness/remediation_agent/discovery.py",
+      "line_start": 69,
+      "line_end": 70,
+      "source_expression": "f\"no scan report (*_report.md) found in {scan_dir} — run \"\n              f\"`vvaharness scan --repo {repo_path}` first.\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_76_4": {
+      "source": "vvaharness/remediation_agent/discovery.py",
+      "line_start": 76,
+      "line_end": 76,
+      "value": "Numeric CVSS base score accessor for ``--top N`` selection, or ``None`` when the report carried only a vector / bare severity band.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_82_4": {
+      "source": "vvaharness/remediation_agent/discovery.py",
+      "line_start": 82,
+      "line_end": 82,
+      "value": "What a report yielded: the findings this run will work on (``selected``), and every one it had (``discovered``, still needed for checkpoint pruning).",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_90_4": {
+      "source": "vvaharness/remediation_agent/discovery.py",
+      "line_start": 90,
+      "line_end": 90,
+      "value": "Case ids under ``<repo>/security-remediation/`` whose fix currently stands (remediated/validated).",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_109_4": {
+      "source": "vvaharness/remediation_agent/discovery.py",
+      "line_start": 109,
+      "line_end": 109,
+      "value": "Adapter: the typed report's findings as remediation targets.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_122_4": {
+      "source": "vvaharness/remediation_agent/discovery.py",
+      "line_start": 122,
+      "line_end": 122,
+      "value": "Targets for *repo_path*, narrowed to the N highest-CVSS when ``top`` is set.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_145_4": {
+      "source": "vvaharness/remediation_agent/discovery.py",
+      "line_start": 145,
+      "line_end": 145,
+      "value": "Resolved per-repo output + checkpoint locations for one remediation run.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_152_4": {
+      "source": "vvaharness/remediation_agent/discovery.py",
+      "line_start": 152,
+      "line_end": 156,
+      "value": "Resolve (and create) the per-repo remediation output dir, reusing the scan pipeline's ``<repo>/checkpoints`` folder rather than a private one.\n\n    Raises ``UnsafeArtifactDir`` (via ``artifact_dir``) rather than following a\n    committed symlink that would redirect remediation artefacts outside the repo.\n    ",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "Locates the scan report and selects findings for the ``remediate`` command.",
+      "context": "literal"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 23,
+      "value": "checkpoints",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 11,
+      "value": "Findings",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 23,
+      "value": "Layout",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 33,
+      "value": "completed_case_ids",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 55,
+      "value": "cvss_score_of",
+      "context": "literal"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 11,
+      "value": "load_findings",
+      "context": "literal"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 28,
+      "value": "locate_report",
+      "context": "literal"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 45,
+      "value": "prepare_layout",
+      "context": "literal"
+    },
+    {
+      "line_start": 52,
+      "line_end": 52,
+      "column": 4,
+      "value": "The artifact's mtime, or None (no cutoff) when it cannot be read.",
+      "context": "literal"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 4,
+      "value": "Find the newest scan report under ``<repo>/security-scan/``, returning ``(None, exit_code)`` with the error already printed on failure.",
+      "context": "literal"
+    },
+    {
+      "line_start": 76,
+      "line_end": 76,
+      "column": 4,
+      "value": "Numeric CVSS base score accessor for ``--top N`` selection, or ``None`` when the report carried only a vector / bare severity band.",
+      "context": "literal"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 4,
+      "value": "What a report yielded: the findings this run will work on (``selected``), and every one it had (``discovered``, still needed for checkpoint pruning).",
+      "context": "literal"
+    },
+    {
+      "line_start": 90,
+      "line_end": 90,
+      "column": 4,
+      "value": "Case ids under ``<repo>/security-remediation/`` whose fix currently stands (remediated/validated).",
+      "context": "literal"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 4,
+      "value": "Adapter: the typed report's findings as remediation targets.",
+      "context": "literal"
+    },
+    {
+      "line_start": 122,
+      "line_end": 122,
+      "column": 4,
+      "value": "Targets for *repo_path*, narrowed to the N highest-CVSS when ``top`` is set.",
+      "context": "literal"
+    },
+    {
+      "line_start": 145,
+      "line_end": 145,
+      "column": 4,
+      "value": "Resolved per-repo output + checkpoint locations for one remediation run.",
+      "context": "literal"
+    },
+    {
+      "line_start": 152,
+      "line_end": 156,
+      "column": 4,
+      "value": "Resolve (and create) the per-repo remediation output dir, reusing the scan pipeline's ``<repo>/checkpoints`` folder rather than a private one.\n\n    Raises ``UnsafeArtifactDir`` (via ``artifact_dir``) rather than following a\n    committed symlink that would redirect remediation artefacts outside the repo.\n    ",
+      "context": "literal"
+    },
+    {
+      "line_start": 103,
+      "line_end": 103,
+      "column": 17,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 63,
+      "line_end": 63,
+      "column": 21,
+      "value": "fail",
+      "context": "literal"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 21,
+      "value": "fail",
+      "context": "literal"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 52,
+      "value": "*/finding_case.json",
+      "context": "literal"
+    },
+    {
+      "line_start": 118,
+      "line_end": 118,
+      "column": 53,
+      "value": "[Remediation Agent]",
+      "context": "literal"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 22,
+      "value": "  [Remediation Agent] source: findings.json (typed scan result)",
+      "context": "literal"
+    },
+    {
+      "line_start": 133,
+      "line_end": 134,
+      "column": 22,
+      "value": "  [Remediation Agent] source: legacy Markdown parse (this checkout has no findings.json — older scan)",
+      "context": "literal"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 44,
+      "value": "[Remediation Agent]",
+      "context": "literal"
+    },
+    {
+      "line_start": 63,
+      "line_end": 63,
+      "column": 31,
+      "value": "no '",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 63,
+      "line_end": 63,
+      "column": 50,
+      "value": "' folder found under ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 63,
+      "line_end": 64,
+      "column": 82,
+      "value": " — run `vvaharness scan --repo ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 51,
+      "value": "` first.",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 31,
+      "value": "no scan report (*_report.md) found in ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 69,
+      "line_end": 70,
+      "column": 79,
+      "value": " — run `vvaharness scan --repo ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 70,
+      "line_end": 70,
+      "column": 51,
+      "value": "` first.",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 62,
+      "value": "utf-8",
+      "context": "literal"
+    },
+    {
+      "line_start": 98,
+      "line_end": 98,
+      "column": 45,
+      "value": "utf-8",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 110,
+      "text": "# Ordinals precede the posture drop, matching to_markdown ### N.; posture leaves discovered too"
+    },
+    {
+      "line": 123,
+      "text": "# Invalid findings.json raises InvalidFindingsJSON, no silent MD fallback; mtime gates done"
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 23,
+      "line_end": 23,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 26,
+      "line_end": 26,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 27,
+      "line_end": 30,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 31,
+      "line_end": 37,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 38,
+      "line_end": 41,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 42,
+      "line_end": 42,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 43,
+      "line_end": 43,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 45,
+      "line_end": 46,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 48,
+      "line_end": 48,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 51,
+      "line_end": 56,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 9
+    },
+    {
+      "kind": "Expr",
+      "line_start": 52,
+      "line_end": 52,
+      "column": 4,
+      "owner": "_mtime",
+      "representation_line": 15
+    },
+    {
+      "kind": "Try",
+      "line_start": 53,
+      "line_end": 56,
+      "column": 4,
+      "owner": "_mtime",
+      "representation_line": 16
+    },
+    {
+      "kind": "Return",
+      "line_start": 54,
+      "line_end": 54,
+      "column": 8,
+      "owner": "_mtime",
+      "representation_line": 18
+    },
+    {
+      "kind": "Return",
+      "line_start": 56,
+      "line_end": 56,
+      "column": 8,
+      "owner": "_mtime",
+      "representation_line": 23
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 59,
+      "line_end": 72,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 28
+    },
+    {
+      "kind": "Expr",
+      "line_start": 60,
+      "line_end": 60,
+      "column": 4,
+      "owner": "locate_report",
+      "representation_line": 34
+    },
+    {
+      "kind": "Assign",
+      "line_start": 61,
+      "line_end": 61,
+      "column": 4,
+      "owner": "locate_report",
+      "representation_line": 34
+    },
+    {
+      "kind": "If",
+      "line_start": 62,
+      "line_end": 65,
+      "column": 4,
+      "owner": "locate_report",
+      "representation_line": 35
+    },
+    {
+      "kind": "Expr",
+      "line_start": 63,
+      "line_end": 64,
+      "column": 8,
+      "owner": "locate_report",
+      "representation_line": 38
+    },
+    {
+      "kind": "Return",
+      "line_start": 65,
+      "line_end": 65,
+      "column": 8,
+      "owner": "locate_report",
+      "representation_line": 39
+    },
+    {
+      "kind": "Assign",
+      "line_start": 67,
+      "line_end": 67,
+      "column": 4,
+      "owner": "locate_report",
+      "representation_line": 43
+    },
+    {
+      "kind": "If",
+      "line_start": 68,
+      "line_end": 71,
+      "column": 4,
+      "owner": "locate_report",
+      "representation_line": 44
+    },
+    {
+      "kind": "Expr",
+      "line_start": 69,
+      "line_end": 70,
+      "column": 8,
+      "owner": "locate_report",
+      "representation_line": 47
+    },
+    {
+      "kind": "Return",
+      "line_start": 71,
+      "line_end": 71,
+      "column": 8,
+      "owner": "locate_report",
+      "representation_line": 48
+    },
+    {
+      "kind": "Return",
+      "line_start": 72,
+      "line_end": 72,
+      "column": 4,
+      "owner": "locate_report",
+      "representation_line": 51
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 75,
+      "line_end": 77,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 55
+    },
+    {
+      "kind": "Expr",
+      "line_start": 76,
+      "line_end": 76,
+      "column": 4,
+      "owner": "cvss_score_of",
+      "representation_line": 61
+    },
+    {
+      "kind": "Return",
+      "line_start": 77,
+      "line_end": 77,
+      "column": 4,
+      "owner": "cvss_score_of",
+      "representation_line": 62
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 81,
+      "line_end": 85,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 66
+    },
+    {
+      "kind": "Expr",
+      "line_start": 82,
+      "line_end": 82,
+      "column": 4,
+      "owner": "Findings",
+      "representation_line": 74
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 84,
+      "line_end": 84,
+      "column": 4,
+      "owner": "Findings",
+      "representation_line": 74
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 85,
+      "line_end": 85,
+      "column": 4,
+      "owner": "Findings",
+      "representation_line": 74
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 88,
+      "line_end": 104,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 77
+    },
+    {
+      "kind": "Expr",
+      "line_start": 90,
+      "line_end": 90,
+      "column": 4,
+      "owner": "completed_case_ids",
+      "representation_line": 83
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 91,
+      "line_end": 91,
+      "column": 4,
+      "owner": "completed_case_ids",
+      "representation_line": 83
+    },
+    {
+      "kind": "For",
+      "line_start": 92,
+      "line_end": 102,
+      "column": 4,
+      "owner": "completed_case_ids",
+      "representation_line": 84
+    },
+    {
+      "kind": "Try",
+      "line_start": 94,
+      "line_end": 100,
+      "column": 8,
+      "owner": "completed_case_ids",
+      "representation_line": 86
+    },
+    {
+      "kind": "If",
+      "line_start": 95,
+      "line_end": 96,
+      "column": 12,
+      "owner": "completed_case_ids",
+      "representation_line": 88
+    },
+    {
+      "kind": "Continue",
+      "line_start": 96,
+      "line_end": 96,
+      "column": 16,
+      "owner": "completed_case_ids",
+      "representation_line": 90
+    },
+    {
+      "kind": "Assign",
+      "line_start": 97,
+      "line_end": 98,
+      "column": 12,
+      "owner": "completed_case_ids",
+      "representation_line": 94
+    },
+    {
+      "kind": "Continue",
+      "line_start": 100,
+      "line_end": 100,
+      "column": 12,
+      "owner": "completed_case_ids",
+      "representation_line": 98
+    },
+    {
+      "kind": "If",
+      "line_start": 101,
+      "line_end": 102,
+      "column": 8,
+      "owner": "completed_case_ids",
+      "representation_line": 101
+    },
+    {
+      "kind": "Expr",
+      "line_start": 102,
+      "line_end": 102,
+      "column": 12,
+      "owner": "completed_case_ids",
+      "representation_line": 104
+    },
+    {
+      "kind": "Expr",
+      "line_start": 103,
+      "line_end": 103,
+      "column": 4,
+      "owner": "completed_case_ids",
+      "representation_line": 108
+    },
+    {
+      "kind": "Return",
+      "line_start": 104,
+      "line_end": 104,
+      "column": 4,
+      "owner": "completed_case_ids",
+      "representation_line": 109
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 107,
+      "line_end": 118,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 113
+    },
+    {
+      "kind": "Expr",
+      "line_start": 109,
+      "line_end": 109,
+      "column": 4,
+      "owner": "_targets_from_typed",
+      "representation_line": 119
+    },
+    {
+      "kind": "Assign",
+      "line_start": 111,
+      "line_end": 111,
+      "column": 4,
+      "owner": "_targets_from_typed",
+      "representation_line": 119
+    },
+    {
+      "kind": "For",
+      "line_start": 112,
+      "line_end": 117,
+      "column": 4,
+      "owner": "_targets_from_typed",
+      "representation_line": 120
+    },
+    {
+      "kind": "Assign",
+      "line_start": 113,
+      "line_end": 113,
+      "column": 8,
+      "owner": "_targets_from_typed",
+      "representation_line": 123
+    },
+    {
+      "kind": "Assign",
+      "line_start": 114,
+      "line_end": 114,
+      "column": 8,
+      "owner": "_targets_from_typed",
+      "representation_line": 123
+    },
+    {
+      "kind": "Assign",
+      "line_start": 115,
+      "line_end": 115,
+      "column": 8,
+      "owner": "_targets_from_typed",
+      "representation_line": 123
+    },
+    {
+      "kind": "Assign",
+      "line_start": 116,
+      "line_end": 116,
+      "column": 8,
+      "owner": "_targets_from_typed",
+      "representation_line": 123
+    },
+    {
+      "kind": "Expr",
+      "line_start": 117,
+      "line_end": 117,
+      "column": 8,
+      "owner": "_targets_from_typed",
+      "representation_line": 123
+    },
+    {
+      "kind": "Return",
+      "line_start": 118,
+      "line_end": 118,
+      "column": 4,
+      "owner": "_targets_from_typed",
+      "representation_line": 125
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 121,
+      "line_end": 140,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 129
+    },
+    {
+      "kind": "Expr",
+      "line_start": 122,
+      "line_end": 122,
+      "column": 4,
+      "owner": "load_findings",
+      "representation_line": 135
+    },
+    {
+      "kind": "Assign",
+      "line_start": 124,
+      "line_end": 124,
+      "column": 4,
+      "owner": "load_findings",
+      "representation_line": 135
+    },
+    {
+      "kind": "Assign",
+      "line_start": 125,
+      "line_end": 128,
+      "column": 4,
+      "owner": "load_findings",
+      "representation_line": 135
+    },
+    {
+      "kind": "If",
+      "line_start": 129,
+      "line_end": 137,
+      "column": 4,
+      "owner": "load_findings",
+      "representation_line": 136
+    },
+    {
+      "kind": "Expr",
+      "line_start": 130,
+      "line_end": 130,
+      "column": 8,
+      "owner": "load_findings",
+      "representation_line": 139
+    },
+    {
+      "kind": "Assign",
+      "line_start": 131,
+      "line_end": 131,
+      "column": 8,
+      "owner": "load_findings",
+      "representation_line": 139
+    },
+    {
+      "kind": "Expr",
+      "line_start": 133,
+      "line_end": 134,
+      "column": 8,
+      "owner": "load_findings",
+      "representation_line": 143
+    },
+    {
+      "kind": "Assign",
+      "line_start": 135,
+      "line_end": 135,
+      "column": 8,
+      "owner": "load_findings",
+      "representation_line": 143
+    },
+    {
+      "kind": "For",
+      "line_start": 136,
+      "line_end": 137,
+      "column": 8,
+      "owner": "load_findings",
+      "representation_line": 144
+    },
+    {
+      "kind": "Assign",
+      "line_start": 137,
+      "line_end": 137,
+      "column": 12,
+      "owner": "load_findings",
+      "representation_line": 147
+    },
+    {
+      "kind": "Assign",
+      "line_start": 138,
+      "line_end": 139,
+      "column": 4,
+      "owner": "load_findings",
+      "representation_line": 151
+    },
+    {
+      "kind": "Return",
+      "line_start": 140,
+      "line_end": 140,
+      "column": 4,
+      "owner": "load_findings",
+      "representation_line": 152
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 144,
+      "line_end": 148,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 156
+    },
+    {
+      "kind": "Expr",
+      "line_start": 145,
+      "line_end": 145,
+      "column": 4,
+      "owner": "Layout",
+      "representation_line": 164
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 146,
+      "line_end": 146,
+      "column": 4,
+      "owner": "Layout",
+      "representation_line": 164
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 147,
+      "line_end": 147,
+      "column": 4,
+      "owner": "Layout",
+      "representation_line": 164
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 148,
+      "line_end": 148,
+      "column": 4,
+      "owner": "Layout",
+      "representation_line": 164
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 151,
+      "line_end": 163,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 167
+    },
+    {
+      "kind": "Expr",
+      "line_start": 152,
+      "line_end": 156,
+      "column": 4,
+      "owner": "prepare_layout",
+      "representation_line": 173
+    },
+    {
+      "kind": "Assign",
+      "line_start": 157,
+      "line_end": 157,
+      "column": 4,
+      "owner": "prepare_layout",
+      "representation_line": 173
+    },
+    {
+      "kind": "Expr",
+      "line_start": 158,
+      "line_end": 158,
+      "column": 4,
+      "owner": "prepare_layout",
+      "representation_line": 173
+    },
+    {
+      "kind": "Return",
+      "line_start": 159,
+      "line_end": 163,
+      "column": 4,
+      "owner": "prepare_layout",
+      "representation_line": 174
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 45,
+      "line_end": 46,
+      "column": 10,
+      "kind": "List",
+      "original_ast": "List(elts=[Constant(value='Findings'), Constant(value='Layout'), Constant(value='completed_case_ids'), Constant(value='cvss_score_of'), Constant(value='load_findings'), Constant(value='locate_report'), Constant(value='prepare_layout')], ctx=Load())",
+      "rendered": "['Findings', 'Layout', 'completed_case_ids', 'cvss_score_of', 'load_findings', 'locate_report', 'prepare_layout']"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 23,
+      "kind": "Constant",
+      "original_ast": "Constant(value='checkpoints')",
+      "rendered": "'checkpoints'"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 15,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Call(func=Attribute(value=Name(id='path', ctx=Load()), attr='stat', ctx=Load()), args=[], keywords=[]), attr='st_mtime', ctx=Load())",
+      "rendered": "path.stat().st_mtime"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='OSError', ctx=Load())",
+      "rendered": "OSError"
+    },
+    {
+      "line_start": 56,
+      "line_end": 56,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='find_scan_dir', ctx=Load()), args=[Name(id='repo_path', ctx=Load())], keywords=[])",
+      "rendered": "find_scan_dir(repo_path)"
+    },
+    {
+      "line_start": 62,
+      "line_end": 62,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='scan_dir', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "scan_dir is None"
+    },
+    {
+      "line_start": 63,
+      "line_end": 64,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='mark', ctx=Load()), args=[Constant(value='fail'), JoinedStr(values=[Constant(value=\"no '\"), FormattedValue(value=Name(id='SCAN_DIR_NAME', ctx=Load()), conversion=-1), Constant(value=\"' folder found under \"), FormattedValue(value=Name(id='repo_path', ctx=Load()), conversion=-1), Constant(value=' — run `vvaharness scan --repo '), FormattedValue(value=Name(id='repo_path', ctx=Load()), conversion=-1), Constant(value='` first.')])], keywords=[keyword(arg='indent', value=Constant(value=2))])",
+      "rendered": "console.mark('fail', source_template_63_29, indent=2)"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value=None), Constant(value=1)], ctx=Load())",
+      "rendered": "(None, 1)"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='latest_report', ctx=Load()), args=[Name(id='scan_dir', ctx=Load())], keywords=[])",
+      "rendered": "latest_report(scan_dir)"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='report', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "report is None"
+    },
+    {
+      "line_start": 69,
+      "line_end": 70,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='mark', ctx=Load()), args=[Constant(value='fail'), JoinedStr(values=[Constant(value='no scan report (*_report.md) found in '), FormattedValue(value=Name(id='scan_dir', ctx=Load()), conversion=-1), Constant(value=' — run `vvaharness scan --repo '), FormattedValue(value=Name(id='repo_path', ctx=Load()), conversion=-1), Constant(value='` first.')])], keywords=[keyword(arg='indent', value=Constant(value=2))])",
+      "rendered": "console.mark('fail', source_template_69_29, indent=2)"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value=None), Constant(value=1)], ctx=Load())",
+      "rendered": "(None, 1)"
+    },
+    {
+      "line_start": 72,
+      "line_end": 72,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='report', ctx=Load()), Constant(value=0)], ctx=Load())",
+      "rendered": "(report, 0)"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 11,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Attribute(value=Name(id='target', ctx=Load()), attr='finding', ctx=Load()), attr='cvss_score', ctx=Load())",
+      "rendered": "target.finding.cvss_score"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 1,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dataclass', ctx=Load()), args=[], keywords=[keyword(arg='frozen', value=Constant(value=True))])",
+      "rendered": "dataclass(frozen=True)"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 92,
+      "line_end": 93,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[Call(func=Attribute(value=BinOp(left=Name(id='repo_path', ctx=Load()), op=Div(), right=Name(id='REMEDIATION_DIR_NAME', ctx=Load())), attr='glob', ctx=Load()), args=[Constant(value='*/finding_case.json')], keywords=[])], keywords=[])",
+      "rendered": "sorted((repo_path / REMEDIATION_DIR_NAME).glob('*/finding_case.json'))"
+    },
+    {
+      "line_start": 95,
+      "line_end": 95,
+      "column": 15,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='since', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), Compare(left=Attribute(value=Call(func=Attribute(value=Name(id='case_path', ctx=Load()), attr='stat', ctx=Load()), args=[], keywords=[]), attr='st_mtime', ctx=Load()), ops=[Lt()], comparators=[Name(id='since', ctx=Load())])])",
+      "rendered": "since is not None and case_path.stat().st_mtime < since"
+    },
+    {
+      "line_start": 97,
+      "line_end": 98,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='FindingCase', ctx=Load()), attr='model_validate_json', ctx=Load()), args=[Call(func=Attribute(value=Name(id='case_path', ctx=Load()), attr='read_text', ctx=Load()), args=[], keywords=[keyword(arg='encoding', value=Constant(value='utf-8'))])], keywords=[])",
+      "rendered": "FindingCase.model_validate_json(case_path.read_text(encoding='utf-8'))"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='OSError', ctx=Load()), Name(id='ValueError', ctx=Load())], ctx=Load())",
+      "rendered": "(OSError, ValueError)"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='case', ctx=Load()), attr='state', ctx=Load()), ops=[In()], comparators=[Tuple(elts=[Attribute(value=Name(id='CaseState', ctx=Load()), attr='REMEDIATED', ctx=Load()), Attribute(value=Name(id='CaseState', ctx=Load()), attr='VALIDATED', ctx=Load())], ctx=Load())])",
+      "rendered": "case.state in (CaseState.REMEDIATED, CaseState.VALIDATED)"
+    },
+    {
+      "line_start": 102,
+      "line_end": 102,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='done', ctx=Load()), attr='add', ctx=Load()), args=[Attribute(value=Name(id='case', ctx=Load()), attr='case_id', ctx=Load())], keywords=[])",
+      "rendered": "done.add(case.case_id)"
+    },
+    {
+      "line_start": 103,
+      "line_end": 103,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='done', ctx=Load()), attr='discard', ctx=Load()), args=[Constant(value='')], keywords=[])",
+      "rendered": "done.discard('')"
+    },
+    {
+      "line_start": 104,
+      "line_end": 104,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='done', ctx=Load())",
+      "rendered": "done"
+    },
+    {
+      "line_start": 111,
+      "line_end": 111,
+      "column": 14,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 112,
+      "line_end": 112,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='enumerate', ctx=Load()), args=[Attribute(value=Name(id='report', ctx=Load()), attr='findings', ctx=Load()), Constant(value=1)], keywords=[])",
+      "rendered": "enumerate(report.findings, 1)"
+    },
+    {
+      "line_start": 113,
+      "line_end": 113,
+      "column": 12,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='rf', ctx=Load()), attr='finding', ctx=Load())",
+      "rendered": "rf.finding"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 21,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='rf', ctx=Load()), attr='severity', ctx=Load())",
+      "rendered": "rf.severity"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='RemediationTarget', ctx=Load()), args=[], keywords=[keyword(arg='finding', value=Name(id='f', ctx=Load())), keyword(arg='index', value=Name(id='i', ctx=Load()))])",
+      "rendered": "RemediationTarget(finding=f, index=i)"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 17,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='t', ctx=Load()), attr='case_id', ctx=Load()), ops=[In()], comparators=[Name(id='done', ctx=Load())])",
+      "rendered": "t.case_id in done"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='targets', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='t', ctx=Load())], keywords=[])",
+      "rendered": "targets.append(t)"
+    },
+    {
+      "line_start": 118,
+      "line_end": 118,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='drop_non_main_channel', ctx=Load()), args=[Name(id='targets', ctx=Load())], keywords=[keyword(arg='log_prefix', value=Constant(value='[Remediation Agent]'))])",
+      "rendered": "drop_non_main_channel(targets, log_prefix='[Remediation Agent]')"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='read_findings_json', ctx=Load()), args=[Name(id='repo_path', ctx=Load())], keywords=[])",
+      "rendered": "read_findings_json(repo_path)"
+    },
+    {
+      "line_start": 125,
+      "line_end": 128,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='completed_case_ids', ctx=Load()), args=[Name(id='repo_path', ctx=Load())], keywords=[keyword(arg='since', value=Call(func=Name(id='_mtime', ctx=Load()), args=[IfExp(test=Compare(left=Name(id='typed', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), body=Call(func=Name(id='findings_json_path', ctx=Load()), args=[Name(id='repo_path', ctx=Load())], keywords=[]), orelse=Name(id='report', ctx=Load()))], keywords=[]))])",
+      "rendered": "completed_case_ids(repo_path, since=_mtime(findings_json_path(repo_path) if typed is not None else report))"
+    },
+    {
+      "line_start": 129,
+      "line_end": 129,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='typed', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "typed is not None"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[Constant(value='  [Remediation Agent] source: findings.json (typed scan result)')], keywords=[])",
+      "rendered": "console.write('  [Remediation Agent] source: findings.json (typed scan result)')"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_targets_from_typed', ctx=Load()), args=[Name(id='typed', ctx=Load()), Name(id='done', ctx=Load())], keywords=[])",
+      "rendered": "_targets_from_typed(typed, done)"
+    },
+    {
+      "line_start": 133,
+      "line_end": 134,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[Constant(value='  [Remediation Agent] source: legacy Markdown parse (this checkout has no findings.json — older scan)')], keywords=[])",
+      "rendered": "console.write('  [Remediation Agent] source: legacy Markdown parse (this checkout has no findings.json — older scan)')"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='parse_findings', ctx=Load()), args=[Call(func=Attribute(value=Name(id='report', ctx=Load()), attr='read_text', ctx=Load()), args=[], keywords=[keyword(arg='encoding', value=Constant(value='utf-8'))])], keywords=[])",
+      "rendered": "parse_findings(report.read_text(encoding='utf-8'))"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 17,
+      "kind": "Name",
+      "original_ast": "Name(id='discovered', ctx=Load())",
+      "rendered": "discovered"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 21,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Attribute(value=Name(id='t', ctx=Load()), attr='done', ctx=Load()), Compare(left=Attribute(value=Name(id='t', ctx=Load()), attr='case_id', ctx=Load()), ops=[In()], comparators=[Name(id='done', ctx=Load())])])",
+      "rendered": "t.done or t.case_id in done"
+    },
+    {
+      "line_start": 138,
+      "line_end": 139,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='select_top_logged', ctx=Load()), args=[Name(id='discovered', ctx=Load()), Name(id='top', ctx=Load())], keywords=[keyword(arg='score_of', value=Name(id='cvss_score_of', ctx=Load())), keyword(arg='log_prefix', value=Constant(value='[Remediation Agent]'))])",
+      "rendered": "select_top_logged(discovered, top, score_of=cvss_score_of, log_prefix='[Remediation Agent]')"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='Findings', ctx=Load()), args=[], keywords=[keyword(arg='selected', value=Name(id='selected', ctx=Load())), keyword(arg='discovered', value=Name(id='discovered', ctx=Load()))])",
+      "rendered": "Findings(selected=selected, discovered=discovered)"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 1,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dataclass', ctx=Load()), args=[], keywords=[keyword(arg='frozen', value=Constant(value=True))])",
+      "rendered": "dataclass(frozen=True)"
+    },
+    {
+      "line_start": 157,
+      "line_end": 157,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='artifact_dir', ctx=Load()), args=[Name(id='repo_path', ctx=Load()), Name(id='REMEDIATION_DIR_NAME', ctx=Load())], keywords=[])",
+      "rendered": "artifact_dir(repo_path, REMEDIATION_DIR_NAME)"
+    },
+    {
+      "line_start": 158,
+      "line_end": 158,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='rem_dir', ctx=Load()), attr='mkdir', ctx=Load()), args=[], keywords=[keyword(arg='exist_ok', value=Constant(value=True))])",
+      "rendered": "rem_dir.mkdir(exist_ok=True)"
+    },
+    {
+      "line_start": 159,
+      "line_end": 163,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='Layout', ctx=Load()), args=[], keywords=[keyword(arg='rem_dir', value=Name(id='rem_dir', ctx=Load())), keyword(arg='ckpt_dir', value=BinOp(left=Name(id='repo_path', ctx=Load()), op=Div(), right=Name(id='CHECKPOINTS_DIR_NAME', ctx=Load()))), keyword(arg='run_id', value=Call(func=Name(id='run_id_for', ctx=Load()), args=[Name(id='repo_path', ctx=Load())], keywords=[]))])",
+      "rendered": "Layout(rem_dir=rem_dir, ckpt_dir=repo_path / CHECKPOINTS_DIR_NAME, run_id=run_id_for(repo_path))"
+    }
+  ],
+  "calls": [
+    {
+      "line": 80,
+      "end_line": 80,
+      "callee": "dataclass",
+      "enclosing": "Findings",
+      "expression": "dataclass(frozen=True)"
+    },
+    {
+      "line": 143,
+      "end_line": 143,
+      "callee": "dataclass",
+      "enclosing": "Layout",
+      "expression": "dataclass(frozen=True)"
+    },
+    {
+      "line": 61,
+      "end_line": 61,
+      "callee": "find_scan_dir",
+      "enclosing": "locate_report",
+      "expression": "find_scan_dir(repo_path)"
+    },
+    {
+      "line": 67,
+      "end_line": 67,
+      "callee": "latest_report",
+      "enclosing": "locate_report",
+      "expression": "latest_report(scan_dir)"
+    },
+    {
+      "line": 91,
+      "end_line": 91,
+      "callee": "set",
+      "enclosing": "completed_case_ids",
+      "expression": "set()"
+    },
+    {
+      "line": 92,
+      "end_line": 93,
+      "callee": "sorted",
+      "enclosing": "completed_case_ids",
+      "expression": "sorted(\n            (repo_path / REMEDIATION_DIR_NAME).glob(\"*/finding_case.json\"))"
+    },
+    {
+      "line": 103,
+      "end_line": 103,
+      "callee": "done.discard",
+      "enclosing": "completed_case_ids",
+      "expression": "done.discard(\"\")"
+    },
+    {
+      "line": 112,
+      "end_line": 112,
+      "callee": "enumerate",
+      "enclosing": "_targets_from_typed",
+      "expression": "enumerate(report.findings, 1)"
+    },
+    {
+      "line": 118,
+      "end_line": 118,
+      "callee": "drop_non_main_channel",
+      "enclosing": "_targets_from_typed",
+      "expression": "drop_non_main_channel(targets, log_prefix=\"[Remediation Agent]\")"
+    },
+    {
+      "line": 124,
+      "end_line": 124,
+      "callee": "read_findings_json",
+      "enclosing": "load_findings",
+      "expression": "read_findings_json(repo_path)"
+    },
+    {
+      "line": 125,
+      "end_line": 128,
+      "callee": "completed_case_ids",
+      "enclosing": "load_findings",
+      "expression": "completed_case_ids(\n        repo_path,\n        since=_mtime(findings_json_path(repo_path) if typed is not None\n                     else report))"
+    },
+    {
+      "line": 138,
+      "end_line": 139,
+      "callee": "select_top_logged",
+      "enclosing": "load_findings",
+      "expression": "select_top_logged(discovered, top, score_of=cvss_score_of,\n                                 log_prefix=\"[Remediation Agent]\")"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "Findings",
+      "enclosing": "load_findings",
+      "expression": "Findings(selected=selected, discovered=discovered)"
+    },
+    {
+      "line": 157,
+      "end_line": 157,
+      "callee": "artifact_dir",
+      "enclosing": "prepare_layout",
+      "expression": "artifact_dir(repo_path, REMEDIATION_DIR_NAME)"
+    },
+    {
+      "line": 158,
+      "end_line": 158,
+      "callee": "rem_dir.mkdir",
+      "enclosing": "prepare_layout",
+      "expression": "rem_dir.mkdir(exist_ok=True)"
+    },
+    {
+      "line": 159,
+      "end_line": 163,
+      "callee": "Layout",
+      "enclosing": "prepare_layout",
+      "expression": "Layout(\n        rem_dir=rem_dir,\n        ckpt_dir=repo_path / CHECKPOINTS_DIR_NAME,\n        run_id=run_id_for(repo_path),\n    )"
+    },
+    {
+      "line": 63,
+      "end_line": 64,
+      "callee": "console.mark",
+      "enclosing": "locate_report",
+      "expression": "console.mark(\"fail\", f\"no '{SCAN_DIR_NAME}' folder found under {repo_path} — run \"\n              f\"`vvaharness scan --repo {repo_path}` first.\", indent=2)"
+    },
+    {
+      "line": 69,
+      "end_line": 70,
+      "callee": "console.mark",
+      "enclosing": "locate_report",
+      "expression": "console.mark(\"fail\", f\"no scan report (*_report.md) found in {scan_dir} — run \"\n              f\"`vvaharness scan --repo {repo_path}` first.\", indent=2)"
+    },
+    {
+      "line": 93,
+      "end_line": 93,
+      "callee": "(repo_path / REMEDIATION_DIR_NAME).glob",
+      "enclosing": "completed_case_ids",
+      "expression": "(repo_path / REMEDIATION_DIR_NAME).glob(\"*/finding_case.json\")"
+    },
+    {
+      "line": 115,
+      "end_line": 115,
+      "callee": "RemediationTarget",
+      "enclosing": "_targets_from_typed",
+      "expression": "RemediationTarget(finding=f, index=i)"
+    },
+    {
+      "line": 117,
+      "end_line": 117,
+      "callee": "targets.append",
+      "enclosing": "_targets_from_typed",
+      "expression": "targets.append(t)"
+    },
+    {
+      "line": 130,
+      "end_line": 130,
+      "callee": "console.write",
+      "enclosing": "load_findings",
+      "expression": "console.write(\"  [Remediation Agent] source: findings.json (typed scan result)\")"
+    },
+    {
+      "line": 131,
+      "end_line": 131,
+      "callee": "_targets_from_typed",
+      "enclosing": "load_findings",
+      "expression": "_targets_from_typed(typed, done)"
+    },
+    {
+      "line": 133,
+      "end_line": 134,
+      "callee": "console.write",
+      "enclosing": "load_findings",
+      "expression": "console.write(\"  [Remediation Agent] source: legacy Markdown parse \"\n                      \"(this checkout has no findings.json — older scan)\")"
+    },
+    {
+      "line": 135,
+      "end_line": 135,
+      "callee": "parse_findings",
+      "enclosing": "load_findings",
+      "expression": "parse_findings(report.read_text(encoding=\"utf-8\"))"
+    },
+    {
+      "line": 54,
+      "end_line": 54,
+      "callee": "path.stat",
+      "enclosing": "_mtime",
+      "expression": "path.stat()"
+    },
+    {
+      "line": 97,
+      "end_line": 98,
+      "callee": "FindingCase.model_validate_json",
+      "enclosing": "completed_case_ids",
+      "expression": "FindingCase.model_validate_json(\n                case_path.read_text(encoding=\"utf-8\"))"
+    },
+    {
+      "line": 102,
+      "end_line": 102,
+      "callee": "done.add",
+      "enclosing": "completed_case_ids",
+      "expression": "done.add(case.case_id)"
+    },
+    {
+      "line": 127,
+      "end_line": 128,
+      "callee": "_mtime",
+      "enclosing": "load_findings",
+      "expression": "_mtime(findings_json_path(repo_path) if typed is not None\n                     else report)"
+    },
+    {
+      "line": 135,
+      "end_line": 135,
+      "callee": "report.read_text",
+      "enclosing": "load_findings",
+      "expression": "report.read_text(encoding=\"utf-8\")"
+    },
+    {
+      "line": 162,
+      "end_line": 162,
+      "callee": "run_id_for",
+      "enclosing": "prepare_layout",
+      "expression": "run_id_for(repo_path)"
+    },
+    {
+      "line": 98,
+      "end_line": 98,
+      "callee": "case_path.read_text",
+      "enclosing": "completed_case_ids",
+      "expression": "case_path.read_text(encoding=\"utf-8\")"
+    },
+    {
+      "line": 127,
+      "end_line": 127,
+      "callee": "findings_json_path",
+      "enclosing": "load_findings",
+      "expression": "findings_json_path(repo_path)"
+    },
+    {
+      "line": 95,
+      "end_line": 95,
+      "callee": "case_path.stat",
+      "enclosing": "completed_case_ids",
+      "expression": "case_path.stat()"
+    }
+  ],
+  "imports": [
+    {
+      "line": 17,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "from dataclasses import dataclass",
+      "targets": [
+        "dataclasses",
+        "dataclasses.dataclass"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "from pathlib import Path",
+      "targets": [
+        "pathlib",
+        "pathlib.Path"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "from vvaharness.models import FinalReport",
+      "targets": [
+        "vvaharness.models",
+        "vvaharness.models.FinalReport"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 23,
+      "source_expression": "from vvaharness.models.case import FindingCase",
+      "targets": [
+        "vvaharness.models.case",
+        "vvaharness.models.case.FindingCase"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/case.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 24,
+      "source_expression": "from vvaharness.models.vocab import CaseState",
+      "targets": [
+        "vvaharness.models.vocab",
+        "vvaharness.models.vocab.CaseState"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/vocab.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 25,
+      "source_expression": "from vvaharness.orchestrator.artifacts import artifact_dir",
+      "targets": [
+        "vvaharness.orchestrator.artifacts",
+        "vvaharness.orchestrator.artifacts.artifact_dir"
+      ],
+      "local_source_paths": [
+        "vvaharness/orchestrator/artifacts.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 26,
+      "source_expression": "from vvaharness.orchestrator.checkpoints import run_id_for",
+      "targets": [
+        "vvaharness.orchestrator.checkpoints",
+        "vvaharness.orchestrator.checkpoints.run_id_for"
+      ],
+      "local_source_paths": [
+        "vvaharness/orchestrator/checkpoints.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 27,
+      "source_expression": "from vvaharness.orchestrator.findings_json import findings_json_path, read_findings_json",
+      "targets": [
+        "vvaharness.orchestrator.findings_json",
+        "vvaharness.orchestrator.findings_json.findings_json_path",
+        "vvaharness.orchestrator.findings_json.read_findings_json"
+      ],
+      "local_source_paths": [
+        "vvaharness/orchestrator/findings_json.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 31,
+      "source_expression": "from vvaharness.remediation_agent.report_parser import REMEDIATION_DIR_NAME, SCAN_DIR_NAME, find_scan_dir, latest_report, parse_findings",
+      "targets": [
+        "vvaharness.remediation_agent.report_parser",
+        "vvaharness.remediation_agent.report_parser.REMEDIATION_DIR_NAME",
+        "vvaharness.remediation_agent.report_parser.SCAN_DIR_NAME",
+        "vvaharness.remediation_agent.report_parser.find_scan_dir",
+        "vvaharness.remediation_agent.report_parser.latest_report",
+        "vvaharness.remediation_agent.report_parser.parse_findings"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/report_parser/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 38,
+      "source_expression": "from vvaharness.remediation_agent.select import drop_non_main_channel, select_top_logged",
+      "targets": [
+        "vvaharness.remediation_agent.select",
+        "vvaharness.remediation_agent.select.drop_non_main_channel",
+        "vvaharness.remediation_agent.select.select_top_logged"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/select/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 42,
+      "source_expression": "from vvaharness.remediation_agent.target import RemediationTarget",
+      "targets": [
+        "vvaharness.remediation_agent.target",
+        "vvaharness.remediation_agent.target.RemediationTarget"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/target.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 43,
+      "source_expression": "from vvaharness.util import console",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.console"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/console.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

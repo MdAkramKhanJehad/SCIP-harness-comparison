@@ -1,0 +1,2660 @@
+{
+  "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+  "sha256": "4a8fd9b1c518f83d7f39dc6d583497464c4ee5a3c2824f9e55966374ecd9dd56",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Reject a session's structured verdict until every todo on its plan is completed.\"\"\"\n\nfrom __future__ import annotations\n\nimport threading\nfrom collections.abc import Awaitable, Callable\nfrom typing import Any\n\nfrom langchain.agents.middleware.types import (\n    AgentMiddleware,\n    ModelRequest,\n    ModelResponse,\n    ToolCallRequest,\n)\nfrom langchain_core.messages import HumanMessage, ToolMessage\nfrom langgraph.types import Command\n\nfrom vvaharness.util.counters import COUNTERS\nfrom vvaharness.util.warn_once import stage_label, warn_once\n\n_DONE = frozenset({\"completed\"})\n\n_WARNED_RELENTED: set[str] = set()\n\n\ndef _relent_warning(counter: str, max_rejections: int, required: frozenset[str]) -> str:\n    \"\"\"The once-per-(stage family, run) WARN line for the first relent on *counter*.\"\"\"\n    reason = f\"missing {', '.join(sorted(required))}\" if required else \"an unfinished plan\"\n    return (\n        f\"WARN {stage_label(counter)}: the evidence gate rejected a verdict \"\n        f\"{max_rejections} time(s) for {reason}, then relented -- this stage's output \"\n        f\"shipped without that evidence. Count in {counter}_relented. Raise this stage's \"\n        \"rejection limit in the scan config, or review this run's output by hand.\"\n    )\n\n\ndef _todos(state: object) -> list[dict[str, Any]]:\n    \"\"\"The live todo list from agent state, or [] when planning is not in play.\"\"\"\n    try:\n        raw = state.get(\"todos\") if hasattr(state, \"get\") else getattr(state, \"todos\", None)\n    except (AttributeError, TypeError):\n        return []\n    return [t for t in (raw or []) if isinstance(t, dict)]\n\n\ndef _outstanding(todos: list[dict[str, Any]]) -> list[str]:\n    \"\"\"Contents of every todo not yet completed, in order.\"\"\"\n    return [str(t.get(\"content\", \"?\")) for t in todos if t.get(\"status\") not in _DONE]\n\n\ndef _nudge(outstanding: list[str]) -> HumanMessage:\n    \"\"\"The turn handed back to the model in place of its premature verdict.\"\"\"\n    listed = \"\\n\".join(f\"  - {c}\" for c in outstanding)\n    return HumanMessage(content=(\n        f\"HOLD. You tried to report a verdict, but {len(outstanding)} todo(s) on your own plan \"\n        f\"are not completed:\\n{listed}\\n\\n\"\n        \"That verdict is rejected and has not been recorded. Do the outstanding work now — read \"\n        \"the code each todo names (to the END of the file; continue any paginated Read), load the \"\n        \"skill it calls for, grep for the sibling sites, enumerate the places a missing control \"\n        \"belongs. Then mark each todo completed with `write_todos` and report.\\n\\n\"\n        \"If a todo genuinely does not apply, mark it completed and say why in your rationale. Do \"\n        \"not resend the same verdict without new evidence.\"\n    ))\n\n\nclass EvidenceGate(AgentMiddleware):\n    \"\"\"Reject a structured verdict while any todo is still outstanding.\"\"\"\n\n    def __init__(self, *, max_rejections: int = 3,\n                 counter: str = \"evidence_gate_rejected\",\n                 required_tools: frozenset[str] = frozenset(),\n                 require_tool_call: bool = False,\n                 ignored_tools: frozenset[str] = frozenset()) -> None:\n        \"\"\"Reject premature verdicts up to *max_rejections* times, then relent.\"\"\"\n        super().__init__()\n        self._max = max_rejections\n        self._counter = counter\n        self._required = required_tools\n        self._require_tool_call = require_tool_call\n        self._ignored = ignored_tools\n        self._called: set[str] = set()\n        self._rejected = 0\n        self._lock = threading.Lock()\n\n    def wrap_tool_call(\n        self,\n        request: ToolCallRequest,\n        handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],\n    ) -> ToolMessage | Command[Any]:\n        \"\"\"Record which required tools the session has used, then execute.\"\"\"\n        self._called.add(request.tool_call[\"name\"])\n        return handler(request)\n\n    async def awrap_tool_call(\n        self,\n        request: ToolCallRequest,\n        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],\n    ) -> ToolMessage | Command[Any]:\n        \"\"\"Async counterpart of :meth:`wrap_tool_call`.\"\"\"\n        self._called.add(request.tool_call[\"name\"])\n        return await handler(request)\n\n    @property\n    def name(self) -> str:\n        \"\"\"Per-instance name; langchain asserts middleware names are unique per agent.\"\"\"\n        return f\"{self.__class__.__name__}[{self._counter}]\"\n\n    @property\n    def required_tools(self) -> frozenset[str]:\n        \"\"\"The tools a verdict must be backed by, readable by a non-langchain backend.\"\"\"\n        # For sdk/openai/cli, which lack wrap_model_call; after max_rejections it relents to WARN\n        return self._required\n\n    def _claim(self) -> bool:\n        \"\"\"Record a rejection, returning whether the gate may still reject.\"\"\"\n        with self._lock:\n            if self._rejected >= self._max:\n                return False\n            self._rejected += 1\n            return True\n\n    def note_call(self, name: str) -> None:\n        \"\"\"Record a tool call made OUT OF LOOP, on a route with no ``wrap_tool_call`` seam.\"\"\"\n        # The adapter MUST feed this, or hold_for_verdict refuses every sdk/openai/cli submit\n        with self._lock:\n            self._called.add(name)\n\n    def hold_for_verdict(self) -> str | None:\n        \"\"\"The OUT-OF-LOOP form of the verdict rejection, mirroring ``ToolCallBudget.refusal_for``.\"\"\"\n        if not self._required or (self._required & self._called):\n            return None\n        if not self._claim():\n            COUNTERS.bump(f\"{self._counter}_relented\")\n            warn_once(_WARNED_RELENTED, self._counter,\n                      _relent_warning(self._counter, self._max, self._required))\n            return None\n        COUNTERS.bump(self._counter)\n        return (\n            \"Rejected: you have not called any of \"\n            + \", \".join(sorted(self._required))\n            + \" to establish reachability from the call graph before submitting this \"\n            \"verdict. Call one now: GraphImporters(file) for who imports a file, \"\n            \"GraphNeighbors(file, function) for its callers and callees, \"\n            \"GraphCommunityOf(file) for its module, GraphSinksInCommunity(community) for \"\n            \"the other sinks near it. These are deterministic and answer in one call what \"\n            \"a file sweep answers badly. Call one, then resend your verdict with that \"\n            \"evidence.\"\n        )\n\n    def _tool_call_items(self) -> list[str]:\n        \"\"\"One outstanding item when require_tool_call is unmet, else none.\"\"\"\n        if self._require_tool_call and not (self._called - self._ignored):\n            return [\"read the code with a tool before you report\"]\n        return []\n\n    def _premature(self, request: ModelRequest, response: ModelResponse) -> list[str]:\n        \"\"\"Outstanding todos when *response* carries a verdict prematurely, else [].\"\"\"\n        if getattr(response, \"structured_response\", None) is None:\n            return []\n        outstanding = _outstanding(_todos(request.state))\n        if self._required and not (self._required & self._called):\n            outstanding = [*outstanding, (\n                \"establish reachability from the call graph — you have not called any of \"\n                + \", \".join(sorted(self._required))\n                + \". Call one now: GraphImporters(file) for who imports a file, \"\n                \"GraphNeighbors(file, function) for its callers and callees, \"\n                \"GraphCommunityOf(file) for its module, GraphSinksInCommunity(community) for \"\n                \"the other sinks near it. These are deterministic and answer in one call what \"\n                \"a file sweep answers badly\"\n            )]\n        outstanding = [*outstanding, *self._tool_call_items()]\n        if not outstanding:\n            return []\n        if not self._claim():\n            COUNTERS.bump(f\"{self._counter}_relented\")\n            warn_once(_WARNED_RELENTED, self._counter,\n                      _relent_warning(self._counter, self._max, self._required))\n            return []\n        COUNTERS.bump(self._counter)\n        return outstanding\n\n    def _retry_request(self, request: ModelRequest, outstanding: list[str]) -> ModelRequest:\n        \"\"\"*request* with the hold message appended.\"\"\"\n        # Rejected reply deliberately dropped: Anthropic 400s on a tool_use with no tool_result\n        return request.override(messages=[*request.messages, _nudge(outstanding)])\n\n    def wrap_model_call(\n        self,\n        request: ModelRequest,\n        handler: Callable[[ModelRequest], ModelResponse],\n    ) -> ModelResponse:\n        \"\"\"Call the model, re-asking while it reports a verdict on an unworked plan.\"\"\"\n        response = handler(request)\n        while (outstanding := self._premature(request, response)):\n            request = self._retry_request(request, outstanding)\n            response = handler(request)\n        return response\n\n    async def awrap_model_call(\n        self,\n        request: ModelRequest,\n        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],\n    ) -> ModelResponse:\n        \"\"\"Async counterpart of :meth:`wrap_model_call`.\"\"\"\n        response = await handler(request)\n        while (outstanding := self._premature(request, response)):\n            request = self._retry_request(request, outstanding)\n            response = await handler(request)\n        return response\n\n\n__all__ = [\"EvidenceGate\"]\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "Reject a session's structured verdict until every todo on its plan is completed.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_41_4": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 41,
+      "line_end": 41,
+      "value": "The once-per-(stage family, run) WARN line for the first relent on *counter*.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_42_13": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 42,
+      "line_end": 42,
+      "source_expression": "f\"missing {', '.join(sorted(required))}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_44_8": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 44,
+      "line_end": 47,
+      "source_expression": "f\"WARN {stage_label(counter)}: the evidence gate rejected a verdict \"\n        f\"{max_rejections} time(s) for {reason}, then relented -- this stage's output \"\n        f\"shipped without that evidence. Count in {counter}_relented. Raise this stage's \"\n        \"rejection limit in the scan config, or review this run's output by hand.\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_52_4": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 52,
+      "line_end": 52,
+      "value": "The live todo list from agent state, or [] when planning is not in play.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_61_4": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 61,
+      "line_end": 61,
+      "value": "Contents of every todo not yet completed, in order.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_66_4": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 66,
+      "line_end": 66,
+      "value": "The turn handed back to the model in place of its premature verdict.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_67_13": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 67,
+      "line_end": 67,
+      "value": "\n",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_67_23": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 67,
+      "line_end": 67,
+      "source_expression": "f\"  - {c}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_69_8": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 69,
+      "line_end": 76,
+      "source_expression": "f\"HOLD. You tried to report a verdict, but {len(outstanding)} todo(s) on your own plan \"\n        f\"are not completed:\\n{listed}\\n\\n\"\n        \"That verdict is rejected and has not been recorded. Do the outstanding work now — read \"\n        \"the code each todo names (to the END of the file; continue any paginated Read), load the \"\n        \"skill it calls for, grep for the sibling sites, enumerate the places a missing control \"\n        \"belongs. Then mark each todo completed with `write_todos` and report.\\n\\n\"\n        \"If a todo genuinely does not apply, mark it completed and say why in your rationale. Do \"\n        \"not resend the same verdict without new evidence.\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_81_4": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 81,
+      "line_end": 81,
+      "value": "Reject a structured verdict while any todo is still outstanding.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_88_8": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 88,
+      "line_end": 88,
+      "value": "Reject premature verdicts up to *max_rejections* times, then relent.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_104_8": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 104,
+      "line_end": 104,
+      "value": "Record which required tools the session has used, then execute.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_113_8": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 113,
+      "line_end": 113,
+      "value": "Async counterpart of :meth:`wrap_tool_call`.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_119_8": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 119,
+      "line_end": 119,
+      "value": "Per-instance name; langchain asserts middleware names are unique per agent.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_120_15": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 120,
+      "line_end": 120,
+      "source_expression": "f\"{self.__class__.__name__}[{self._counter}]\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_124_8": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 124,
+      "line_end": 124,
+      "value": "The tools a verdict must be backed by, readable by a non-langchain backend.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_129_8": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 129,
+      "line_end": 129,
+      "value": "Record a rejection, returning whether the gate may still reject.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_137_8": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 137,
+      "line_end": 137,
+      "value": "Record a tool call made OUT OF LOOP, on a route with no ``wrap_tool_call`` seam.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_143_8": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 143,
+      "line_end": 143,
+      "value": "The OUT-OF-LOOP form of the verdict rejection, mirroring ``ToolCallBudget.refusal_for``.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_147_26": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 147,
+      "line_end": 147,
+      "source_expression": "f\"{self._counter}_relented\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_155_14": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 155,
+      "line_end": 161,
+      "value": " to establish reachability from the call graph before submitting this verdict. Call one now: GraphImporters(file) for who imports a file, GraphNeighbors(file, function) for its callers and callees, GraphCommunityOf(file) for its module, GraphSinksInCommunity(community) for the other sinks near it. These are deterministic and answer in one call what a file sweep answers badly. Call one, then resend your verdict with that evidence.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_165_8": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 165,
+      "line_end": 165,
+      "value": "One outstanding item when require_tool_call is unmet, else none.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_171_8": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 171,
+      "line_end": 171,
+      "value": "Outstanding todos when *response* carries a verdict prematurely, else [].",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_179_18": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 179,
+      "line_end": 183,
+      "value": ". Call one now: GraphImporters(file) for who imports a file, GraphNeighbors(file, function) for its callers and callees, GraphCommunityOf(file) for its module, GraphSinksInCommunity(community) for the other sinks near it. These are deterministic and answer in one call what a file sweep answers badly",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_189_26": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 189,
+      "line_end": 189,
+      "source_expression": "f\"{self._counter}_relented\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_197_8": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 197,
+      "line_end": 197,
+      "value": "*request* with the hold message appended.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_206_8": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 206,
+      "line_end": 206,
+      "value": "Call the model, re-asking while it reports a verdict on an unworked plan.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_218_8": {
+      "source": "vvaharness/backends/harness/deepagents/evidence_gate.py",
+      "line_start": 218,
+      "line_end": 218,
+      "value": "Async counterpart of :meth:`wrap_model_call`.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "Reject a session's structured verdict until every todo on its plan is completed.",
+      "context": "literal"
+    },
+    {
+      "line_start": 41,
+      "line_end": 41,
+      "column": 4,
+      "value": "The once-per-(stage family, run) WARN line for the first relent on *counter*.",
+      "context": "literal"
+    },
+    {
+      "line_start": 52,
+      "line_end": 52,
+      "column": 4,
+      "value": "The live todo list from agent state, or [] when planning is not in play.",
+      "context": "literal"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 4,
+      "value": "Contents of every todo not yet completed, in order.",
+      "context": "literal"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 4,
+      "value": "The turn handed back to the model in place of its premature verdict.",
+      "context": "literal"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 4,
+      "value": "Reject a structured verdict while any todo is still outstanding.",
+      "context": "literal"
+    },
+    {
+      "line_start": 226,
+      "line_end": 226,
+      "column": 11,
+      "value": "EvidenceGate",
+      "context": "literal"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 19,
+      "value": "completed",
+      "context": "literal"
+    },
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 71,
+      "value": "an unfinished plan",
+      "context": "literal"
+    },
+    {
+      "line_start": 44,
+      "line_end": 44,
+      "column": 10,
+      "value": "WARN ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 44,
+      "line_end": 44,
+      "column": 37,
+      "value": ": the evidence gate rejected a verdict ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 26,
+      "value": " time(s) for ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 45,
+      "line_end": 46,
+      "column": 47,
+      "value": ", then relented -- this stage's output shipped without that evidence. Count in ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 46,
+      "line_end": 47,
+      "column": 59,
+      "value": "_relented. Raise this stage's rejection limit in the scan config, or review this run's output by hand.",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 84,
+      "line_end": 84,
+      "column": 32,
+      "value": "evidence_gate_rejected",
+      "context": "literal"
+    },
+    {
+      "line_start": 88,
+      "line_end": 88,
+      "column": 8,
+      "value": "Reject premature verdicts up to *max_rejections* times, then relent.",
+      "context": "literal"
+    },
+    {
+      "line_start": 104,
+      "line_end": 104,
+      "column": 8,
+      "value": "Record which required tools the session has used, then execute.",
+      "context": "literal"
+    },
+    {
+      "line_start": 113,
+      "line_end": 113,
+      "column": 8,
+      "value": "Async counterpart of :meth:`wrap_tool_call`.",
+      "context": "literal"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 8,
+      "value": "Per-instance name; langchain asserts middleware names are unique per agent.",
+      "context": "literal"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 8,
+      "value": "The tools a verdict must be backed by, readable by a non-langchain backend.",
+      "context": "literal"
+    },
+    {
+      "line_start": 129,
+      "line_end": 129,
+      "column": 8,
+      "value": "Record a rejection, returning whether the gate may still reject.",
+      "context": "literal"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 8,
+      "value": "Record a tool call made OUT OF LOOP, on a route with no ``wrap_tool_call`` seam.",
+      "context": "literal"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 8,
+      "value": "The OUT-OF-LOOP form of the verdict rejection, mirroring ``ToolCallBudget.refusal_for``.",
+      "context": "literal"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 8,
+      "value": "One outstanding item when require_tool_call is unmet, else none.",
+      "context": "literal"
+    },
+    {
+      "line_start": 171,
+      "line_end": 171,
+      "column": 8,
+      "value": "Outstanding todos when *response* carries a verdict prematurely, else [].",
+      "context": "literal"
+    },
+    {
+      "line_start": 197,
+      "line_end": 197,
+      "column": 8,
+      "value": "*request* with the hold message appended.",
+      "context": "literal"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 8,
+      "value": "Call the model, re-asking while it reports a verdict on an unworked plan.",
+      "context": "literal"
+    },
+    {
+      "line_start": 218,
+      "line_end": 218,
+      "column": 8,
+      "value": "Async counterpart of :meth:`wrap_model_call`.",
+      "context": "literal"
+    },
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 15,
+      "value": "missing ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 13,
+      "value": "\n",
+      "context": "literal"
+    },
+    {
+      "line_start": 120,
+      "line_end": 120,
+      "column": 42,
+      "value": "[",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 120,
+      "line_end": 120,
+      "column": 58,
+      "value": "]",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 155,
+      "line_end": 161,
+      "column": 14,
+      "value": " to establish reachability from the call graph before submitting this verdict. Call one now: GraphImporters(file) for who imports a file, GraphNeighbors(file, function) for its callers and callees, GraphCommunityOf(file) for its module, GraphSinksInCommunity(community) for the other sinks near it. These are deterministic and answer in one call what a file sweep answers badly. Call one, then resend your verdict with that evidence.",
+      "context": "literal"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 51,
+      "value": "get",
+      "context": "literal"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 24,
+      "value": "todos",
+      "context": "literal"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 78,
+      "value": "todos",
+      "context": "literal"
+    },
+    {
+      "line_start": 62,
+      "line_end": 62,
+      "column": 22,
+      "value": "content",
+      "context": "literal"
+    },
+    {
+      "line_start": 62,
+      "line_end": 62,
+      "column": 33,
+      "value": "?",
+      "context": "literal"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 25,
+      "value": "  - ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 10,
+      "value": "HOLD. You tried to report a verdict, but ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 69,
+      "line_end": 70,
+      "column": 69,
+      "value": " todo(s) on your own plan are not completed:\n",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 70,
+      "line_end": 76,
+      "column": 38,
+      "value": "\n\nThat verdict is rejected and has not been recorded. Do the outstanding work now — read the code each todo names (to the END of the file; continue any paginated Read), load the skill it calls for, grep for the sibling sites, enumerate the places a missing control belongs. Then mark each todo completed with `write_todos` and report.\n\nIf a todo genuinely does not apply, mark it completed and say why in your rationale. Do not resend the same verdict without new evidence.",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 105,
+      "line_end": 105,
+      "column": 43,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 43,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 153,
+      "line_end": 153,
+      "column": 12,
+      "value": "Rejected: you have not called any of ",
+      "context": "literal"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 20,
+      "value": "read the code with a tool before you report",
+      "context": "literal"
+    },
+    {
+      "line_start": 172,
+      "line_end": 172,
+      "column": 29,
+      "value": "structured_response",
+      "context": "literal"
+    },
+    {
+      "line_start": 62,
+      "line_end": 62,
+      "column": 63,
+      "value": "status",
+      "context": "literal"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 43,
+      "value": "_relented",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 179,
+      "line_end": 183,
+      "column": 18,
+      "value": ". Call one now: GraphImporters(file) for who imports a file, GraphNeighbors(file, function) for its callers and callees, GraphCommunityOf(file) for its module, GraphSinksInCommunity(community) for the other sinks near it. These are deterministic and answer in one call what a file sweep answers badly",
+      "context": "literal"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 43,
+      "value": "_relented",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 24,
+      "value": ", ",
+      "context": "literal"
+    },
+    {
+      "line_start": 154,
+      "line_end": 154,
+      "column": 14,
+      "value": ", ",
+      "context": "literal"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 16,
+      "value": "establish reachability from the call graph — you have not called any of ",
+      "context": "literal"
+    },
+    {
+      "line_start": 178,
+      "line_end": 178,
+      "column": 18,
+      "value": ", ",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 125,
+      "text": "# For sdk/openai/cli, which lack wrap_model_call; after max_rejections it relents to WARN"
+    },
+    {
+      "line": 138,
+      "text": "# The adapter MUST feed this, or hold_for_verdict refuses every sdk/openai/cli submit"
+    },
+    {
+      "line": 198,
+      "text": "# Rejected reply deliberately dropped: Anthropic 400s on a tool_use with no tool_result"
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 23,
+      "line_end": 28,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 29,
+      "line_end": 29,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 30,
+      "line_end": 30,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 32,
+      "line_end": 32,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 33,
+      "line_end": 33,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "Assign",
+      "line_start": 35,
+      "line_end": 35,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 37,
+      "line_end": 37,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 40,
+      "line_end": 48,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 7
+    },
+    {
+      "kind": "Expr",
+      "line_start": 41,
+      "line_end": 41,
+      "column": 4,
+      "owner": "_relent_warning",
+      "representation_line": 13
+    },
+    {
+      "kind": "Assign",
+      "line_start": 42,
+      "line_end": 42,
+      "column": 4,
+      "owner": "_relent_warning",
+      "representation_line": 13
+    },
+    {
+      "kind": "Return",
+      "line_start": 43,
+      "line_end": 48,
+      "column": 4,
+      "owner": "_relent_warning",
+      "representation_line": 14
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 51,
+      "line_end": 57,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 18
+    },
+    {
+      "kind": "Expr",
+      "line_start": 52,
+      "line_end": 52,
+      "column": 4,
+      "owner": "_todos",
+      "representation_line": 24
+    },
+    {
+      "kind": "Try",
+      "line_start": 53,
+      "line_end": 56,
+      "column": 4,
+      "owner": "_todos",
+      "representation_line": 25
+    },
+    {
+      "kind": "Assign",
+      "line_start": 54,
+      "line_end": 54,
+      "column": 8,
+      "owner": "_todos",
+      "representation_line": 28
+    },
+    {
+      "kind": "Return",
+      "line_start": 56,
+      "line_end": 56,
+      "column": 8,
+      "owner": "_todos",
+      "representation_line": 32
+    },
+    {
+      "kind": "Return",
+      "line_start": 57,
+      "line_end": 57,
+      "column": 4,
+      "owner": "_todos",
+      "representation_line": 35
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 60,
+      "line_end": 62,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 39
+    },
+    {
+      "kind": "Expr",
+      "line_start": 61,
+      "line_end": 61,
+      "column": 4,
+      "owner": "_outstanding",
+      "representation_line": 45
+    },
+    {
+      "kind": "Return",
+      "line_start": 62,
+      "line_end": 62,
+      "column": 4,
+      "owner": "_outstanding",
+      "representation_line": 46
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 65,
+      "line_end": 77,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 50
+    },
+    {
+      "kind": "Expr",
+      "line_start": 66,
+      "line_end": 66,
+      "column": 4,
+      "owner": "_nudge",
+      "representation_line": 56
+    },
+    {
+      "kind": "Assign",
+      "line_start": 67,
+      "line_end": 67,
+      "column": 4,
+      "owner": "_nudge",
+      "representation_line": 56
+    },
+    {
+      "kind": "Return",
+      "line_start": 68,
+      "line_end": 77,
+      "column": 4,
+      "owner": "_nudge",
+      "representation_line": 57
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 80,
+      "line_end": 223,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 61
+    },
+    {
+      "kind": "Expr",
+      "line_start": 81,
+      "line_end": 81,
+      "column": 4,
+      "owner": "EvidenceGate",
+      "representation_line": 66
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 83,
+      "line_end": 97,
+      "column": 4,
+      "owner": "EvidenceGate",
+      "representation_line": 67
+    },
+    {
+      "kind": "Expr",
+      "line_start": 88,
+      "line_end": 88,
+      "column": 8,
+      "owner": "EvidenceGate.__init__",
+      "representation_line": 73
+    },
+    {
+      "kind": "Expr",
+      "line_start": 89,
+      "line_end": 89,
+      "column": 8,
+      "owner": "EvidenceGate.__init__",
+      "representation_line": 73
+    },
+    {
+      "kind": "Assign",
+      "line_start": 90,
+      "line_end": 90,
+      "column": 8,
+      "owner": "EvidenceGate.__init__",
+      "representation_line": 73
+    },
+    {
+      "kind": "Assign",
+      "line_start": 91,
+      "line_end": 91,
+      "column": 8,
+      "owner": "EvidenceGate.__init__",
+      "representation_line": 73
+    },
+    {
+      "kind": "Assign",
+      "line_start": 92,
+      "line_end": 92,
+      "column": 8,
+      "owner": "EvidenceGate.__init__",
+      "representation_line": 73
+    },
+    {
+      "kind": "Assign",
+      "line_start": 93,
+      "line_end": 93,
+      "column": 8,
+      "owner": "EvidenceGate.__init__",
+      "representation_line": 75
+    },
+    {
+      "kind": "Assign",
+      "line_start": 94,
+      "line_end": 94,
+      "column": 8,
+      "owner": "EvidenceGate.__init__",
+      "representation_line": 75
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 95,
+      "line_end": 95,
+      "column": 8,
+      "owner": "EvidenceGate.__init__",
+      "representation_line": 75
+    },
+    {
+      "kind": "Assign",
+      "line_start": 96,
+      "line_end": 96,
+      "column": 8,
+      "owner": "EvidenceGate.__init__",
+      "representation_line": 75
+    },
+    {
+      "kind": "Assign",
+      "line_start": 97,
+      "line_end": 97,
+      "column": 8,
+      "owner": "EvidenceGate.__init__",
+      "representation_line": 75
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 99,
+      "line_end": 106,
+      "column": 4,
+      "owner": "EvidenceGate",
+      "representation_line": 78
+    },
+    {
+      "kind": "Expr",
+      "line_start": 104,
+      "line_end": 104,
+      "column": 8,
+      "owner": "EvidenceGate.wrap_tool_call",
+      "representation_line": 84
+    },
+    {
+      "kind": "Expr",
+      "line_start": 105,
+      "line_end": 105,
+      "column": 8,
+      "owner": "EvidenceGate.wrap_tool_call",
+      "representation_line": 84
+    },
+    {
+      "kind": "Return",
+      "line_start": 106,
+      "line_end": 106,
+      "column": 8,
+      "owner": "EvidenceGate.wrap_tool_call",
+      "representation_line": 85
+    },
+    {
+      "kind": "AsyncFunctionDef",
+      "line_start": 108,
+      "line_end": 115,
+      "column": 4,
+      "owner": "EvidenceGate",
+      "representation_line": 89
+    },
+    {
+      "kind": "Expr",
+      "line_start": 113,
+      "line_end": 113,
+      "column": 8,
+      "owner": "EvidenceGate.awrap_tool_call",
+      "representation_line": 96
+    },
+    {
+      "kind": "Expr",
+      "line_start": 114,
+      "line_end": 114,
+      "column": 8,
+      "owner": "EvidenceGate.awrap_tool_call",
+      "representation_line": 96
+    },
+    {
+      "kind": "Return",
+      "line_start": 115,
+      "line_end": 115,
+      "column": 8,
+      "owner": "EvidenceGate.awrap_tool_call",
+      "representation_line": 97
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 118,
+      "line_end": 120,
+      "column": 4,
+      "owner": "EvidenceGate",
+      "representation_line": 101
+    },
+    {
+      "kind": "Expr",
+      "line_start": 119,
+      "line_end": 119,
+      "column": 8,
+      "owner": "EvidenceGate.name",
+      "representation_line": 110
+    },
+    {
+      "kind": "Return",
+      "line_start": 120,
+      "line_end": 120,
+      "column": 8,
+      "owner": "EvidenceGate.name",
+      "representation_line": 111
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 123,
+      "line_end": 126,
+      "column": 4,
+      "owner": "EvidenceGate",
+      "representation_line": 116
+    },
+    {
+      "kind": "Expr",
+      "line_start": 124,
+      "line_end": 124,
+      "column": 8,
+      "owner": "EvidenceGate.required_tools",
+      "representation_line": 125
+    },
+    {
+      "kind": "Return",
+      "line_start": 126,
+      "line_end": 126,
+      "column": 8,
+      "owner": "EvidenceGate.required_tools",
+      "representation_line": 126
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 128,
+      "line_end": 134,
+      "column": 4,
+      "owner": "EvidenceGate",
+      "representation_line": 131
+    },
+    {
+      "kind": "Expr",
+      "line_start": 129,
+      "line_end": 129,
+      "column": 8,
+      "owner": "EvidenceGate._claim",
+      "representation_line": 137
+    },
+    {
+      "kind": "With",
+      "line_start": 130,
+      "line_end": 134,
+      "column": 8,
+      "owner": "EvidenceGate._claim",
+      "representation_line": 138
+    },
+    {
+      "kind": "If",
+      "line_start": 131,
+      "line_end": 132,
+      "column": 12,
+      "owner": "EvidenceGate._claim",
+      "representation_line": 140
+    },
+    {
+      "kind": "Return",
+      "line_start": 132,
+      "line_end": 132,
+      "column": 16,
+      "owner": "EvidenceGate._claim",
+      "representation_line": 142
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 133,
+      "line_end": 133,
+      "column": 12,
+      "owner": "EvidenceGate._claim",
+      "representation_line": 146
+    },
+    {
+      "kind": "Return",
+      "line_start": 134,
+      "line_end": 134,
+      "column": 12,
+      "owner": "EvidenceGate._claim",
+      "representation_line": 147
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 136,
+      "line_end": 140,
+      "column": 4,
+      "owner": "EvidenceGate",
+      "representation_line": 153
+    },
+    {
+      "kind": "Expr",
+      "line_start": 137,
+      "line_end": 137,
+      "column": 8,
+      "owner": "EvidenceGate.note_call",
+      "representation_line": 159
+    },
+    {
+      "kind": "With",
+      "line_start": 139,
+      "line_end": 140,
+      "column": 8,
+      "owner": "EvidenceGate.note_call",
+      "representation_line": 160
+    },
+    {
+      "kind": "Expr",
+      "line_start": 140,
+      "line_end": 140,
+      "column": 12,
+      "owner": "EvidenceGate.note_call",
+      "representation_line": 163
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 142,
+      "line_end": 162,
+      "column": 4,
+      "owner": "EvidenceGate",
+      "representation_line": 168
+    },
+    {
+      "kind": "Expr",
+      "line_start": 143,
+      "line_end": 143,
+      "column": 8,
+      "owner": "EvidenceGate.hold_for_verdict",
+      "representation_line": 174
+    },
+    {
+      "kind": "If",
+      "line_start": 144,
+      "line_end": 145,
+      "column": 8,
+      "owner": "EvidenceGate.hold_for_verdict",
+      "representation_line": 175
+    },
+    {
+      "kind": "Return",
+      "line_start": 145,
+      "line_end": 145,
+      "column": 12,
+      "owner": "EvidenceGate.hold_for_verdict",
+      "representation_line": 177
+    },
+    {
+      "kind": "If",
+      "line_start": 146,
+      "line_end": 150,
+      "column": 8,
+      "owner": "EvidenceGate.hold_for_verdict",
+      "representation_line": 180
+    },
+    {
+      "kind": "Expr",
+      "line_start": 147,
+      "line_end": 147,
+      "column": 12,
+      "owner": "EvidenceGate.hold_for_verdict",
+      "representation_line": 183
+    },
+    {
+      "kind": "Expr",
+      "line_start": 148,
+      "line_end": 149,
+      "column": 12,
+      "owner": "EvidenceGate.hold_for_verdict",
+      "representation_line": 183
+    },
+    {
+      "kind": "Return",
+      "line_start": 150,
+      "line_end": 150,
+      "column": 12,
+      "owner": "EvidenceGate.hold_for_verdict",
+      "representation_line": 184
+    },
+    {
+      "kind": "Expr",
+      "line_start": 151,
+      "line_end": 151,
+      "column": 8,
+      "owner": "EvidenceGate.hold_for_verdict",
+      "representation_line": 188
+    },
+    {
+      "kind": "Return",
+      "line_start": 152,
+      "line_end": 162,
+      "column": 8,
+      "owner": "EvidenceGate.hold_for_verdict",
+      "representation_line": 189
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 164,
+      "line_end": 168,
+      "column": 4,
+      "owner": "EvidenceGate",
+      "representation_line": 193
+    },
+    {
+      "kind": "Expr",
+      "line_start": 165,
+      "line_end": 165,
+      "column": 8,
+      "owner": "EvidenceGate._tool_call_items",
+      "representation_line": 199
+    },
+    {
+      "kind": "If",
+      "line_start": 166,
+      "line_end": 167,
+      "column": 8,
+      "owner": "EvidenceGate._tool_call_items",
+      "representation_line": 200
+    },
+    {
+      "kind": "Return",
+      "line_start": 167,
+      "line_end": 167,
+      "column": 12,
+      "owner": "EvidenceGate._tool_call_items",
+      "representation_line": 202
+    },
+    {
+      "kind": "Return",
+      "line_start": 168,
+      "line_end": 168,
+      "column": 8,
+      "owner": "EvidenceGate._tool_call_items",
+      "representation_line": 205
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 170,
+      "line_end": 194,
+      "column": 4,
+      "owner": "EvidenceGate",
+      "representation_line": 209
+    },
+    {
+      "kind": "Expr",
+      "line_start": 171,
+      "line_end": 171,
+      "column": 8,
+      "owner": "EvidenceGate._premature",
+      "representation_line": 215
+    },
+    {
+      "kind": "If",
+      "line_start": 172,
+      "line_end": 173,
+      "column": 8,
+      "owner": "EvidenceGate._premature",
+      "representation_line": 216
+    },
+    {
+      "kind": "Return",
+      "line_start": 173,
+      "line_end": 173,
+      "column": 12,
+      "owner": "EvidenceGate._premature",
+      "representation_line": 218
+    },
+    {
+      "kind": "Assign",
+      "line_start": 174,
+      "line_end": 174,
+      "column": 8,
+      "owner": "EvidenceGate._premature",
+      "representation_line": 222
+    },
+    {
+      "kind": "If",
+      "line_start": 175,
+      "line_end": 184,
+      "column": 8,
+      "owner": "EvidenceGate._premature",
+      "representation_line": 223
+    },
+    {
+      "kind": "Assign",
+      "line_start": 176,
+      "line_end": 184,
+      "column": 12,
+      "owner": "EvidenceGate._premature",
+      "representation_line": 226
+    },
+    {
+      "kind": "Assign",
+      "line_start": 185,
+      "line_end": 185,
+      "column": 8,
+      "owner": "EvidenceGate._premature",
+      "representation_line": 229
+    },
+    {
+      "kind": "If",
+      "line_start": 186,
+      "line_end": 187,
+      "column": 8,
+      "owner": "EvidenceGate._premature",
+      "representation_line": 230
+    },
+    {
+      "kind": "Return",
+      "line_start": 187,
+      "line_end": 187,
+      "column": 12,
+      "owner": "EvidenceGate._premature",
+      "representation_line": 232
+    },
+    {
+      "kind": "If",
+      "line_start": 188,
+      "line_end": 192,
+      "column": 8,
+      "owner": "EvidenceGate._premature",
+      "representation_line": 235
+    },
+    {
+      "kind": "Expr",
+      "line_start": 189,
+      "line_end": 189,
+      "column": 12,
+      "owner": "EvidenceGate._premature",
+      "representation_line": 238
+    },
+    {
+      "kind": "Expr",
+      "line_start": 190,
+      "line_end": 191,
+      "column": 12,
+      "owner": "EvidenceGate._premature",
+      "representation_line": 238
+    },
+    {
+      "kind": "Return",
+      "line_start": 192,
+      "line_end": 192,
+      "column": 12,
+      "owner": "EvidenceGate._premature",
+      "representation_line": 239
+    },
+    {
+      "kind": "Expr",
+      "line_start": 193,
+      "line_end": 193,
+      "column": 8,
+      "owner": "EvidenceGate._premature",
+      "representation_line": 243
+    },
+    {
+      "kind": "Return",
+      "line_start": 194,
+      "line_end": 194,
+      "column": 8,
+      "owner": "EvidenceGate._premature",
+      "representation_line": 244
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 196,
+      "line_end": 199,
+      "column": 4,
+      "owner": "EvidenceGate",
+      "representation_line": 248
+    },
+    {
+      "kind": "Expr",
+      "line_start": 197,
+      "line_end": 197,
+      "column": 8,
+      "owner": "EvidenceGate._retry_request",
+      "representation_line": 254
+    },
+    {
+      "kind": "Return",
+      "line_start": 199,
+      "line_end": 199,
+      "column": 8,
+      "owner": "EvidenceGate._retry_request",
+      "representation_line": 255
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 201,
+      "line_end": 211,
+      "column": 4,
+      "owner": "EvidenceGate",
+      "representation_line": 259
+    },
+    {
+      "kind": "Expr",
+      "line_start": 206,
+      "line_end": 206,
+      "column": 8,
+      "owner": "EvidenceGate.wrap_model_call",
+      "representation_line": 265
+    },
+    {
+      "kind": "Assign",
+      "line_start": 207,
+      "line_end": 207,
+      "column": 8,
+      "owner": "EvidenceGate.wrap_model_call",
+      "representation_line": 265
+    },
+    {
+      "kind": "While",
+      "line_start": 208,
+      "line_end": 210,
+      "column": 8,
+      "owner": "EvidenceGate.wrap_model_call",
+      "representation_line": 266
+    },
+    {
+      "kind": "Assign",
+      "line_start": 209,
+      "line_end": 209,
+      "column": 12,
+      "owner": "EvidenceGate.wrap_model_call",
+      "representation_line": 269
+    },
+    {
+      "kind": "Assign",
+      "line_start": 210,
+      "line_end": 210,
+      "column": 12,
+      "owner": "EvidenceGate.wrap_model_call",
+      "representation_line": 269
+    },
+    {
+      "kind": "Return",
+      "line_start": 211,
+      "line_end": 211,
+      "column": 8,
+      "owner": "EvidenceGate.wrap_model_call",
+      "representation_line": 271
+    },
+    {
+      "kind": "AsyncFunctionDef",
+      "line_start": 213,
+      "line_end": 223,
+      "column": 4,
+      "owner": "EvidenceGate",
+      "representation_line": 275
+    },
+    {
+      "kind": "Expr",
+      "line_start": 218,
+      "line_end": 218,
+      "column": 8,
+      "owner": "EvidenceGate.awrap_model_call",
+      "representation_line": 282
+    },
+    {
+      "kind": "Assign",
+      "line_start": 219,
+      "line_end": 219,
+      "column": 8,
+      "owner": "EvidenceGate.awrap_model_call",
+      "representation_line": 282
+    },
+    {
+      "kind": "While",
+      "line_start": 220,
+      "line_end": 222,
+      "column": 8,
+      "owner": "EvidenceGate.awrap_model_call",
+      "representation_line": 283
+    },
+    {
+      "kind": "Assign",
+      "line_start": 221,
+      "line_end": 221,
+      "column": 12,
+      "owner": "EvidenceGate.awrap_model_call",
+      "representation_line": 286
+    },
+    {
+      "kind": "Assign",
+      "line_start": 222,
+      "line_end": 222,
+      "column": 12,
+      "owner": "EvidenceGate.awrap_model_call",
+      "representation_line": 286
+    },
+    {
+      "kind": "Return",
+      "line_start": 223,
+      "line_end": 223,
+      "column": 8,
+      "owner": "EvidenceGate.awrap_model_call",
+      "representation_line": 288
+    },
+    {
+      "kind": "Assign",
+      "line_start": 226,
+      "line_end": 226,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 294
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='frozenset', ctx=Load()), args=[Set(elts=[Constant(value='completed')])], keywords=[])",
+      "rendered": "frozenset({'completed'})"
+    },
+    {
+      "line_start": 37,
+      "line_end": 37,
+      "column": 29,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 13,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='required', ctx=Load()), body=JoinedStr(values=[Constant(value='missing '), FormattedValue(value=Call(func=Attribute(value=Constant(value=', '), attr='join', ctx=Load()), args=[Call(func=Name(id='sorted', ctx=Load()), args=[Name(id='required', ctx=Load())], keywords=[])], keywords=[]), conversion=-1)]), orelse=Constant(value='an unfinished plan'))",
+      "rendered": "source_template_42_13 if required else 'an unfinished plan'"
+    },
+    {
+      "line_start": 44,
+      "line_end": 47,
+      "column": 8,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[Constant(value='WARN '), FormattedValue(value=Call(func=Name(id='stage_label', ctx=Load()), args=[Name(id='counter', ctx=Load())], keywords=[]), conversion=-1), Constant(value=': the evidence gate rejected a verdict '), FormattedValue(value=Name(id='max_rejections', ctx=Load()), conversion=-1), Constant(value=' time(s) for '), FormattedValue(value=Name(id='reason', ctx=Load()), conversion=-1), Constant(value=\", then relented -- this stage's output shipped without that evidence. Count in \"), FormattedValue(value=Name(id='counter', ctx=Load()), conversion=-1), Constant(value=\"_relented. Raise this stage's rejection limit in the scan config, or review this run's output by hand.\")])",
+      "rendered": "source_template_44_8"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 14,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Name(id='hasattr', ctx=Load()), args=[Name(id='state', ctx=Load()), Constant(value='get')], keywords=[]), body=Call(func=Attribute(value=Name(id='state', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='todos')], keywords=[]), orelse=Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='state', ctx=Load()), Constant(value='todos'), Constant(value=None)], keywords=[]))",
+      "rendered": "state.get('todos') if hasattr(state, 'get') else getattr(state, 'todos', None)"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='AttributeError', ctx=Load()), Name(id='TypeError', ctx=Load())], ctx=Load())",
+      "rendered": "(AttributeError, TypeError)"
+    },
+    {
+      "line_start": 56,
+      "line_end": 56,
+      "column": 15,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 57,
+      "line_end": 57,
+      "column": 11,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='t', ctx=Load()), generators=[comprehension(target=Name(id='t', ctx=Store()), iter=BoolOp(op=Or(), values=[Name(id='raw', ctx=Load()), List(elts=[], ctx=Load())]), ifs=[Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='t', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[])], is_async=0)])",
+      "rendered": "[t for t in raw or [] if isinstance(t, dict)]"
+    },
+    {
+      "line_start": 62,
+      "line_end": 62,
+      "column": 11,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Call(func=Name(id='str', ctx=Load()), args=[Call(func=Attribute(value=Name(id='t', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='content'), Constant(value='?')], keywords=[])], keywords=[]), generators=[comprehension(target=Name(id='t', ctx=Store()), iter=Name(id='todos', ctx=Load()), ifs=[Compare(left=Call(func=Attribute(value=Name(id='t', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='status')], keywords=[]), ops=[NotIn()], comparators=[Name(id='_DONE', ctx=Load())])], is_async=0)])",
+      "rendered": "[str(t.get('content', '?')) for t in todos if t.get('status') not in _DONE]"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Constant(value='\\n'), attr='join', ctx=Load()), args=[GeneratorExp(elt=JoinedStr(values=[Constant(value='  - '), FormattedValue(value=Name(id='c', ctx=Load()), conversion=-1)]), generators=[comprehension(target=Name(id='c', ctx=Store()), iter=Name(id='outstanding', ctx=Load()), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "source_literal_67_13.join((source_template_67_23 for c in outstanding))"
+    },
+    {
+      "line_start": 68,
+      "line_end": 77,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='HumanMessage', ctx=Load()), args=[], keywords=[keyword(arg='content', value=JoinedStr(values=[Constant(value='HOLD. You tried to report a verdict, but '), FormattedValue(value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='outstanding', ctx=Load())], keywords=[]), conversion=-1), Constant(value=' todo(s) on your own plan are not completed:\\n'), FormattedValue(value=Name(id='listed', ctx=Load()), conversion=-1), Constant(value='\\n\\nThat verdict is rejected and has not been recorded. Do the outstanding work now — read the code each todo names (to the END of the file; continue any paginated Read), load the skill it calls for, grep for the sibling sites, enumerate the places a missing control belongs. Then mark each todo completed with `write_todos` and report.\\n\\nIf a todo genuinely does not apply, mark it completed and say why in your rationale. Do not resend the same verdict without new evidence.')]))])",
+      "rendered": "HumanMessage(content=source_template_69_8)"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='AgentMiddleware', ctx=Load())",
+      "rendered": "AgentMiddleware"
+    },
+    {
+      "line_start": 89,
+      "line_end": 89,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Name(id='super', ctx=Load()), args=[], keywords=[]), attr='__init__', ctx=Load()), args=[], keywords=[])",
+      "rendered": "super().__init__()"
+    },
+    {
+      "line_start": 90,
+      "line_end": 90,
+      "column": 20,
+      "kind": "Name",
+      "original_ast": "Name(id='max_rejections', ctx=Load())",
+      "rendered": "max_rejections"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 24,
+      "kind": "Name",
+      "original_ast": "Name(id='counter', ctx=Load())",
+      "rendered": "counter"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 25,
+      "kind": "Name",
+      "original_ast": "Name(id='required_tools', ctx=Load())",
+      "rendered": "required_tools"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 34,
+      "kind": "Name",
+      "original_ast": "Name(id='require_tool_call', ctx=Load())",
+      "rendered": "require_tool_call"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 24,
+      "kind": "Name",
+      "original_ast": "Name(id='ignored_tools', ctx=Load())",
+      "rendered": "ignored_tools"
+    },
+    {
+      "line_start": 95,
+      "line_end": 95,
+      "column": 33,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 25,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 97,
+      "line_end": 97,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='threading', ctx=Load()), attr='Lock', ctx=Load()), args=[], keywords=[])",
+      "rendered": "threading.Lock()"
+    },
+    {
+      "line_start": 105,
+      "line_end": 105,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_called', ctx=Load()), attr='add', ctx=Load()), args=[Subscript(value=Attribute(value=Name(id='request', ctx=Load()), attr='tool_call', ctx=Load()), slice=Constant(value='name'), ctx=Load())], keywords=[])",
+      "rendered": "self._called.add(request.tool_call['name'])"
+    },
+    {
+      "line_start": 106,
+      "line_end": 106,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='handler', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[])",
+      "rendered": "handler(request)"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_called', ctx=Load()), attr='add', ctx=Load()), args=[Subscript(value=Attribute(value=Name(id='request', ctx=Load()), attr='tool_call', ctx=Load()), slice=Constant(value='name'), ctx=Load())], keywords=[])",
+      "rendered": "self._called.add(request.tool_call['name'])"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 15,
+      "kind": "Await",
+      "original_ast": "Await(value=Call(func=Name(id='handler', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[]))",
+      "rendered": "await handler(request)"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 5,
+      "kind": "Name",
+      "original_ast": "Name(id='property', ctx=Load())",
+      "rendered": "property"
+    },
+    {
+      "line_start": 120,
+      "line_end": 120,
+      "column": 15,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[FormattedValue(value=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='__class__', ctx=Load()), attr='__name__', ctx=Load()), conversion=-1), Constant(value='['), FormattedValue(value=Attribute(value=Name(id='self', ctx=Load()), attr='_counter', ctx=Load()), conversion=-1), Constant(value=']')])",
+      "rendered": "source_template_120_15"
+    },
+    {
+      "line_start": 122,
+      "line_end": 122,
+      "column": 5,
+      "kind": "Name",
+      "original_ast": "Name(id='property', ctx=Load())",
+      "rendered": "property"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 15,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_required', ctx=Load())",
+      "rendered": "self._required"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_lock', ctx=Load())",
+      "rendered": "self._lock"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='self', ctx=Load()), attr='_rejected', ctx=Load()), ops=[GtE()], comparators=[Attribute(value=Name(id='self', ctx=Load()), attr='_max', ctx=Load())])",
+      "rendered": "self._rejected >= self._max"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 23,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Attribute(value=Name(id='self', ctx=Load()), attr='_rejected', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "self._rejected += 1"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_lock', ctx=Load())",
+      "rendered": "self._lock"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_called', ctx=Load()), attr='add', ctx=Load()), args=[Name(id='name', ctx=Load())], keywords=[])",
+      "rendered": "self._called.add(name)"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[UnaryOp(op=Not(), operand=Attribute(value=Name(id='self', ctx=Load()), attr='_required', ctx=Load())), BinOp(left=Attribute(value=Name(id='self', ctx=Load()), attr='_required', ctx=Load()), op=BitAnd(), right=Attribute(value=Name(id='self', ctx=Load()), attr='_called', ctx=Load()))])",
+      "rendered": "not self._required or self._required & self._called"
+    },
+    {
+      "line_start": 145,
+      "line_end": 145,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 146,
+      "line_end": 146,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_claim', ctx=Load()), args=[], keywords=[]))",
+      "rendered": "not self._claim()"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[JoinedStr(values=[FormattedValue(value=Attribute(value=Name(id='self', ctx=Load()), attr='_counter', ctx=Load()), conversion=-1), Constant(value='_relented')])], keywords=[])",
+      "rendered": "COUNTERS.bump(source_template_147_26)"
+    },
+    {
+      "line_start": 148,
+      "line_end": 149,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='warn_once', ctx=Load()), args=[Name(id='_WARNED_RELENTED', ctx=Load()), Attribute(value=Name(id='self', ctx=Load()), attr='_counter', ctx=Load()), Call(func=Name(id='_relent_warning', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='_counter', ctx=Load()), Attribute(value=Name(id='self', ctx=Load()), attr='_max', ctx=Load()), Attribute(value=Name(id='self', ctx=Load()), attr='_required', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "warn_once(_WARNED_RELENTED, self._counter, _relent_warning(self._counter, self._max, self._required))"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 151,
+      "line_end": 151,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='_counter', ctx=Load())], keywords=[])",
+      "rendered": "COUNTERS.bump(self._counter)"
+    },
+    {
+      "line_start": 153,
+      "line_end": 161,
+      "column": 12,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=BinOp(left=Constant(value='Rejected: you have not called any of '), op=Add(), right=Call(func=Attribute(value=Constant(value=', '), attr='join', ctx=Load()), args=[Call(func=Name(id='sorted', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='_required', ctx=Load())], keywords=[])], keywords=[])), op=Add(), right=Constant(value=' to establish reachability from the call graph before submitting this verdict. Call one now: GraphImporters(file) for who imports a file, GraphNeighbors(file, function) for its callers and callees, GraphCommunityOf(file) for its module, GraphSinksInCommunity(community) for the other sinks near it. These are deterministic and answer in one call what a file sweep answers badly. Call one, then resend your verdict with that evidence.'))",
+      "rendered": "'Rejected: you have not called any of ' + ', '.join(sorted(self._required)) + source_literal_155_14"
+    },
+    {
+      "line_start": 166,
+      "line_end": 166,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Attribute(value=Name(id='self', ctx=Load()), attr='_require_tool_call', ctx=Load()), UnaryOp(op=Not(), operand=BinOp(left=Attribute(value=Name(id='self', ctx=Load()), attr='_called', ctx=Load()), op=Sub(), right=Attribute(value=Name(id='self', ctx=Load()), attr='_ignored', ctx=Load())))])",
+      "rendered": "self._require_tool_call and (not self._called - self._ignored)"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 19,
+      "kind": "List",
+      "original_ast": "List(elts=[Constant(value='read the code with a tool before you report')], ctx=Load())",
+      "rendered": "['read the code with a tool before you report']"
+    },
+    {
+      "line_start": 168,
+      "line_end": 168,
+      "column": 15,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 172,
+      "line_end": 172,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='response', ctx=Load()), Constant(value='structured_response'), Constant(value=None)], keywords=[]), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "getattr(response, 'structured_response', None) is None"
+    },
+    {
+      "line_start": 173,
+      "line_end": 173,
+      "column": 19,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_outstanding', ctx=Load()), args=[Call(func=Name(id='_todos', ctx=Load()), args=[Attribute(value=Name(id='request', ctx=Load()), attr='state', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "_outstanding(_todos(request.state))"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Attribute(value=Name(id='self', ctx=Load()), attr='_required', ctx=Load()), UnaryOp(op=Not(), operand=BinOp(left=Attribute(value=Name(id='self', ctx=Load()), attr='_required', ctx=Load()), op=BitAnd(), right=Attribute(value=Name(id='self', ctx=Load()), attr='_called', ctx=Load())))])",
+      "rendered": "self._required and (not self._required & self._called)"
+    },
+    {
+      "line_start": 176,
+      "line_end": 184,
+      "column": 26,
+      "kind": "List",
+      "original_ast": "List(elts=[Starred(value=Name(id='outstanding', ctx=Load()), ctx=Load()), BinOp(left=BinOp(left=Constant(value='establish reachability from the call graph — you have not called any of '), op=Add(), right=Call(func=Attribute(value=Constant(value=', '), attr='join', ctx=Load()), args=[Call(func=Name(id='sorted', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='_required', ctx=Load())], keywords=[])], keywords=[])), op=Add(), right=Constant(value='. Call one now: GraphImporters(file) for who imports a file, GraphNeighbors(file, function) for its callers and callees, GraphCommunityOf(file) for its module, GraphSinksInCommunity(community) for the other sinks near it. These are deterministic and answer in one call what a file sweep answers badly'))], ctx=Load())",
+      "rendered": "[*outstanding, 'establish reachability from the call graph — you have not called any of ' + ', '.join(sorted(self._required)) + source_literal_179_18]"
+    },
+    {
+      "line_start": 185,
+      "line_end": 185,
+      "column": 22,
+      "kind": "List",
+      "original_ast": "List(elts=[Starred(value=Name(id='outstanding', ctx=Load()), ctx=Load()), Starred(value=Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_tool_call_items', ctx=Load()), args=[], keywords=[]), ctx=Load())], ctx=Load())",
+      "rendered": "[*outstanding, *self._tool_call_items()]"
+    },
+    {
+      "line_start": 186,
+      "line_end": 186,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='outstanding', ctx=Load()))",
+      "rendered": "not outstanding"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 19,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_claim', ctx=Load()), args=[], keywords=[]))",
+      "rendered": "not self._claim()"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[JoinedStr(values=[FormattedValue(value=Attribute(value=Name(id='self', ctx=Load()), attr='_counter', ctx=Load()), conversion=-1), Constant(value='_relented')])], keywords=[])",
+      "rendered": "COUNTERS.bump(source_template_189_26)"
+    },
+    {
+      "line_start": 190,
+      "line_end": 191,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='warn_once', ctx=Load()), args=[Name(id='_WARNED_RELENTED', ctx=Load()), Attribute(value=Name(id='self', ctx=Load()), attr='_counter', ctx=Load()), Call(func=Name(id='_relent_warning', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='_counter', ctx=Load()), Attribute(value=Name(id='self', ctx=Load()), attr='_max', ctx=Load()), Attribute(value=Name(id='self', ctx=Load()), attr='_required', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "warn_once(_WARNED_RELENTED, self._counter, _relent_warning(self._counter, self._max, self._required))"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 19,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 193,
+      "line_end": 193,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='_counter', ctx=Load())], keywords=[])",
+      "rendered": "COUNTERS.bump(self._counter)"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='outstanding', ctx=Load())",
+      "rendered": "outstanding"
+    },
+    {
+      "line_start": 199,
+      "line_end": 199,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='request', ctx=Load()), attr='override', ctx=Load()), args=[], keywords=[keyword(arg='messages', value=List(elts=[Starred(value=Attribute(value=Name(id='request', ctx=Load()), attr='messages', ctx=Load()), ctx=Load()), Call(func=Name(id='_nudge', ctx=Load()), args=[Name(id='outstanding', ctx=Load())], keywords=[])], ctx=Load()))])",
+      "rendered": "request.override(messages=[*request.messages, _nudge(outstanding)])"
+    },
+    {
+      "line_start": 207,
+      "line_end": 207,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='handler', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[])",
+      "rendered": "handler(request)"
+    },
+    {
+      "line_start": 208,
+      "line_end": 208,
+      "column": 15,
+      "kind": "NamedExpr",
+      "original_ast": "NamedExpr(target=Name(id='outstanding', ctx=Store()), value=Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_premature', ctx=Load()), args=[Name(id='request', ctx=Load()), Name(id='response', ctx=Load())], keywords=[]))",
+      "rendered": "(outstanding := self._premature(request, response))"
+    },
+    {
+      "line_start": 209,
+      "line_end": 209,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_retry_request', ctx=Load()), args=[Name(id='request', ctx=Load()), Name(id='outstanding', ctx=Load())], keywords=[])",
+      "rendered": "self._retry_request(request, outstanding)"
+    },
+    {
+      "line_start": 210,
+      "line_end": 210,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='handler', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[])",
+      "rendered": "handler(request)"
+    },
+    {
+      "line_start": 211,
+      "line_end": 211,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='response', ctx=Load())",
+      "rendered": "response"
+    },
+    {
+      "line_start": 219,
+      "line_end": 219,
+      "column": 19,
+      "kind": "Await",
+      "original_ast": "Await(value=Call(func=Name(id='handler', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[]))",
+      "rendered": "await handler(request)"
+    },
+    {
+      "line_start": 220,
+      "line_end": 220,
+      "column": 15,
+      "kind": "NamedExpr",
+      "original_ast": "NamedExpr(target=Name(id='outstanding', ctx=Store()), value=Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_premature', ctx=Load()), args=[Name(id='request', ctx=Load()), Name(id='response', ctx=Load())], keywords=[]))",
+      "rendered": "(outstanding := self._premature(request, response))"
+    },
+    {
+      "line_start": 221,
+      "line_end": 221,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_retry_request', ctx=Load()), args=[Name(id='request', ctx=Load()), Name(id='outstanding', ctx=Load())], keywords=[])",
+      "rendered": "self._retry_request(request, outstanding)"
+    },
+    {
+      "line_start": 222,
+      "line_end": 222,
+      "column": 23,
+      "kind": "Await",
+      "original_ast": "Await(value=Call(func=Name(id='handler', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[]))",
+      "rendered": "await handler(request)"
+    },
+    {
+      "line_start": 223,
+      "line_end": 223,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='response', ctx=Load())",
+      "rendered": "response"
+    },
+    {
+      "line_start": 226,
+      "line_end": 226,
+      "column": 10,
+      "kind": "List",
+      "original_ast": "List(elts=[Constant(value='EvidenceGate')], ctx=Load())",
+      "rendered": "['EvidenceGate']"
+    }
+  ],
+  "calls": [
+    {
+      "line": 35,
+      "end_line": 35,
+      "callee": "frozenset",
+      "enclosing": "module initialization",
+      "expression": "frozenset({\"completed\"})"
+    },
+    {
+      "line": 37,
+      "end_line": 37,
+      "callee": "set",
+      "enclosing": "module initialization",
+      "expression": "set()"
+    },
+    {
+      "line": 67,
+      "end_line": 67,
+      "callee": "'\\n'.join",
+      "enclosing": "_nudge",
+      "expression": "\"\\n\".join(f\"  - {c}\" for c in outstanding)"
+    },
+    {
+      "line": 68,
+      "end_line": 77,
+      "callee": "HumanMessage",
+      "enclosing": "_nudge",
+      "expression": "HumanMessage(content=(\n        f\"HOLD. You tried to report a verdict, but {len(outstanding)} todo(s) on your own plan \"\n        f\"are not completed:\\n{listed}\\n\\n\"\n        \"That verdict is rejected and has not been recorded. Do the outstanding work now — read \"\n        \"the code each todo names (to the END of the file; continue any paginated Read), load the \"\n        \"skill it calls for, grep for the sibling sites, enumerate the places a missing control \"\n        \"belongs. Then mark each todo completed with `write_todos` and report.\\n\\n\"\n        \"If a todo genuinely does not apply, mark it completed and say why in your rationale. Do \"\n        \"not resend the same verdict without new evidence.\"\n    ))"
+    },
+    {
+      "line": 62,
+      "end_line": 62,
+      "callee": "str",
+      "enclosing": "_outstanding",
+      "expression": "str(t.get(\"content\", \"?\"))"
+    },
+    {
+      "line": 85,
+      "end_line": 85,
+      "callee": "frozenset",
+      "enclosing": "EvidenceGate.__init__",
+      "expression": "frozenset()"
+    },
+    {
+      "line": 87,
+      "end_line": 87,
+      "callee": "frozenset",
+      "enclosing": "EvidenceGate.__init__",
+      "expression": "frozenset()"
+    },
+    {
+      "line": 89,
+      "end_line": 89,
+      "callee": "super().__init__",
+      "enclosing": "EvidenceGate.__init__",
+      "expression": "super().__init__()"
+    },
+    {
+      "line": 95,
+      "end_line": 95,
+      "callee": "set",
+      "enclosing": "EvidenceGate.__init__",
+      "expression": "set()"
+    },
+    {
+      "line": 97,
+      "end_line": 97,
+      "callee": "threading.Lock",
+      "enclosing": "EvidenceGate.__init__",
+      "expression": "threading.Lock()"
+    },
+    {
+      "line": 105,
+      "end_line": 105,
+      "callee": "self._called.add",
+      "enclosing": "EvidenceGate.wrap_tool_call",
+      "expression": "self._called.add(request.tool_call[\"name\"])"
+    },
+    {
+      "line": 106,
+      "end_line": 106,
+      "callee": "handler",
+      "enclosing": "EvidenceGate.wrap_tool_call",
+      "expression": "handler(request)"
+    },
+    {
+      "line": 114,
+      "end_line": 114,
+      "callee": "self._called.add",
+      "enclosing": "EvidenceGate.awrap_tool_call",
+      "expression": "self._called.add(request.tool_call[\"name\"])"
+    },
+    {
+      "line": 151,
+      "end_line": 151,
+      "callee": "COUNTERS.bump",
+      "enclosing": "EvidenceGate.hold_for_verdict",
+      "expression": "COUNTERS.bump(self._counter)"
+    },
+    {
+      "line": 174,
+      "end_line": 174,
+      "callee": "_outstanding",
+      "enclosing": "EvidenceGate._premature",
+      "expression": "_outstanding(_todos(request.state))"
+    },
+    {
+      "line": 193,
+      "end_line": 193,
+      "callee": "COUNTERS.bump",
+      "enclosing": "EvidenceGate._premature",
+      "expression": "COUNTERS.bump(self._counter)"
+    },
+    {
+      "line": 199,
+      "end_line": 199,
+      "callee": "request.override",
+      "enclosing": "EvidenceGate._retry_request",
+      "expression": "request.override(messages=[*request.messages, _nudge(outstanding)])"
+    },
+    {
+      "line": 207,
+      "end_line": 207,
+      "callee": "handler",
+      "enclosing": "EvidenceGate.wrap_model_call",
+      "expression": "handler(request)"
+    },
+    {
+      "line": 44,
+      "end_line": 44,
+      "callee": "stage_label",
+      "enclosing": "_relent_warning",
+      "expression": "stage_label(counter)"
+    },
+    {
+      "line": 54,
+      "end_line": 54,
+      "callee": "hasattr",
+      "enclosing": "_todos",
+      "expression": "hasattr(state, \"get\")"
+    },
+    {
+      "line": 54,
+      "end_line": 54,
+      "callee": "state.get",
+      "enclosing": "_todos",
+      "expression": "state.get(\"todos\")"
+    },
+    {
+      "line": 54,
+      "end_line": 54,
+      "callee": "getattr",
+      "enclosing": "_todos",
+      "expression": "getattr(state, \"todos\", None)"
+    },
+    {
+      "line": 57,
+      "end_line": 57,
+      "callee": "isinstance",
+      "enclosing": "_todos",
+      "expression": "isinstance(t, dict)"
+    },
+    {
+      "line": 62,
+      "end_line": 62,
+      "callee": "t.get",
+      "enclosing": "_outstanding",
+      "expression": "t.get(\"content\", \"?\")"
+    },
+    {
+      "line": 115,
+      "end_line": 115,
+      "callee": "handler",
+      "enclosing": "EvidenceGate.awrap_tool_call",
+      "expression": "handler(request)"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "self._called.add",
+      "enclosing": "EvidenceGate.note_call",
+      "expression": "self._called.add(name)"
+    },
+    {
+      "line": 146,
+      "end_line": 146,
+      "callee": "self._claim",
+      "enclosing": "EvidenceGate.hold_for_verdict",
+      "expression": "self._claim()"
+    },
+    {
+      "line": 147,
+      "end_line": 147,
+      "callee": "COUNTERS.bump",
+      "enclosing": "EvidenceGate.hold_for_verdict",
+      "expression": "COUNTERS.bump(f\"{self._counter}_relented\")"
+    },
+    {
+      "line": 148,
+      "end_line": 149,
+      "callee": "warn_once",
+      "enclosing": "EvidenceGate.hold_for_verdict",
+      "expression": "warn_once(_WARNED_RELENTED, self._counter,\n                      _relent_warning(self._counter, self._max, self._required))"
+    },
+    {
+      "line": 172,
+      "end_line": 172,
+      "callee": "getattr",
+      "enclosing": "EvidenceGate._premature",
+      "expression": "getattr(response, \"structured_response\", None)"
+    },
+    {
+      "line": 174,
+      "end_line": 174,
+      "callee": "_todos",
+      "enclosing": "EvidenceGate._premature",
+      "expression": "_todos(request.state)"
+    },
+    {
+      "line": 188,
+      "end_line": 188,
+      "callee": "self._claim",
+      "enclosing": "EvidenceGate._premature",
+      "expression": "self._claim()"
+    },
+    {
+      "line": 189,
+      "end_line": 189,
+      "callee": "COUNTERS.bump",
+      "enclosing": "EvidenceGate._premature",
+      "expression": "COUNTERS.bump(f\"{self._counter}_relented\")"
+    },
+    {
+      "line": 190,
+      "end_line": 191,
+      "callee": "warn_once",
+      "enclosing": "EvidenceGate._premature",
+      "expression": "warn_once(_WARNED_RELENTED, self._counter,\n                      _relent_warning(self._counter, self._max, self._required))"
+    },
+    {
+      "line": 208,
+      "end_line": 208,
+      "callee": "self._premature",
+      "enclosing": "EvidenceGate.wrap_model_call",
+      "expression": "self._premature(request, response)"
+    },
+    {
+      "line": 209,
+      "end_line": 209,
+      "callee": "self._retry_request",
+      "enclosing": "EvidenceGate.wrap_model_call",
+      "expression": "self._retry_request(request, outstanding)"
+    },
+    {
+      "line": 210,
+      "end_line": 210,
+      "callee": "handler",
+      "enclosing": "EvidenceGate.wrap_model_call",
+      "expression": "handler(request)"
+    },
+    {
+      "line": 219,
+      "end_line": 219,
+      "callee": "handler",
+      "enclosing": "EvidenceGate.awrap_model_call",
+      "expression": "handler(request)"
+    },
+    {
+      "line": 220,
+      "end_line": 220,
+      "callee": "self._premature",
+      "enclosing": "EvidenceGate.awrap_model_call",
+      "expression": "self._premature(request, response)"
+    },
+    {
+      "line": 221,
+      "end_line": 221,
+      "callee": "self._retry_request",
+      "enclosing": "EvidenceGate.awrap_model_call",
+      "expression": "self._retry_request(request, outstanding)"
+    },
+    {
+      "line": 42,
+      "end_line": 42,
+      "callee": "', '.join",
+      "enclosing": "_relent_warning",
+      "expression": "', '.join(sorted(required))"
+    },
+    {
+      "line": 62,
+      "end_line": 62,
+      "callee": "t.get",
+      "enclosing": "_outstanding",
+      "expression": "t.get(\"status\")"
+    },
+    {
+      "line": 89,
+      "end_line": 89,
+      "callee": "super",
+      "enclosing": "EvidenceGate.__init__",
+      "expression": "super()"
+    },
+    {
+      "line": 149,
+      "end_line": 149,
+      "callee": "_relent_warning",
+      "enclosing": "EvidenceGate.hold_for_verdict",
+      "expression": "_relent_warning(self._counter, self._max, self._required)"
+    },
+    {
+      "line": 154,
+      "end_line": 154,
+      "callee": "', '.join",
+      "enclosing": "EvidenceGate.hold_for_verdict",
+      "expression": "\", \".join(sorted(self._required))"
+    },
+    {
+      "line": 185,
+      "end_line": 185,
+      "callee": "self._tool_call_items",
+      "enclosing": "EvidenceGate._premature",
+      "expression": "self._tool_call_items()"
+    },
+    {
+      "line": 191,
+      "end_line": 191,
+      "callee": "_relent_warning",
+      "enclosing": "EvidenceGate._premature",
+      "expression": "_relent_warning(self._counter, self._max, self._required)"
+    },
+    {
+      "line": 222,
+      "end_line": 222,
+      "callee": "handler",
+      "enclosing": "EvidenceGate.awrap_model_call",
+      "expression": "handler(request)"
+    },
+    {
+      "line": 42,
+      "end_line": 42,
+      "callee": "sorted",
+      "enclosing": "_relent_warning",
+      "expression": "sorted(required)"
+    },
+    {
+      "line": 69,
+      "end_line": 69,
+      "callee": "len",
+      "enclosing": "_nudge",
+      "expression": "len(outstanding)"
+    },
+    {
+      "line": 154,
+      "end_line": 154,
+      "callee": "sorted",
+      "enclosing": "EvidenceGate.hold_for_verdict",
+      "expression": "sorted(self._required)"
+    },
+    {
+      "line": 199,
+      "end_line": 199,
+      "callee": "_nudge",
+      "enclosing": "EvidenceGate._retry_request",
+      "expression": "_nudge(outstanding)"
+    },
+    {
+      "line": 178,
+      "end_line": 178,
+      "callee": "', '.join",
+      "enclosing": "EvidenceGate._premature",
+      "expression": "\", \".join(sorted(self._required))"
+    },
+    {
+      "line": 178,
+      "end_line": 178,
+      "callee": "sorted",
+      "enclosing": "EvidenceGate._premature",
+      "expression": "sorted(self._required)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 17,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "import threading",
+      "targets": [
+        "threading"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "from collections.abc import Awaitable, Callable",
+      "targets": [
+        "collections.abc",
+        "collections.abc.Awaitable",
+        "collections.abc.Callable"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "from typing import Any",
+      "targets": [
+        "typing",
+        "typing.Any"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 23,
+      "source_expression": "from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, ModelResponse, ToolCallRequest",
+      "targets": [
+        "langchain.agents.middleware.types",
+        "langchain.agents.middleware.types.AgentMiddleware",
+        "langchain.agents.middleware.types.ModelRequest",
+        "langchain.agents.middleware.types.ModelResponse",
+        "langchain.agents.middleware.types.ToolCallRequest"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 29,
+      "source_expression": "from langchain_core.messages import HumanMessage, ToolMessage",
+      "targets": [
+        "langchain_core.messages",
+        "langchain_core.messages.HumanMessage",
+        "langchain_core.messages.ToolMessage"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 30,
+      "source_expression": "from langgraph.types import Command",
+      "targets": [
+        "langgraph.types",
+        "langgraph.types.Command"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 32,
+      "source_expression": "from vvaharness.util.counters import COUNTERS",
+      "targets": [
+        "vvaharness.util.counters",
+        "vvaharness.util.counters.COUNTERS"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/counters.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 33,
+      "source_expression": "from vvaharness.util.warn_once import stage_label, warn_once",
+      "targets": [
+        "vvaharness.util.warn_once",
+        "vvaharness.util.warn_once.stage_label",
+        "vvaharness.util.warn_once.warn_once"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/warn_once.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

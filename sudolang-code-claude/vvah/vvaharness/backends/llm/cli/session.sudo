@@ -1,0 +1,235 @@
+# vvaharness/backends/llm/cli/session.py
+
+`agentic()` for the `claude` command-line route: a tool-using `claude` session in the scanned repository, with the confinement flags that keep the repository from steering it, a turn watchdog for builds without `--max-turns`, wall-clock salvage by resuming the killed session, the doubled-budget truncation retry, the pending-sub-agent retry, and the pinned-session registry a stage uses to resume its own timed-out session.
+
+Source: `vvaharness/backends/llm/cli/session.py` (lines 1-561)
+Executor: mixed
+Called from: `registry.sudo` `agentic` (when the role resolves to `via: cli` without bridged tools); `resume_agentic` and `release_pinned_session` are called by the stage session code (for example `resume_or_replay`, outside this batch)
+
+// src: vvaharness/backends/llm/cli/session.py:56-93
+State {
+  _WARNED_CAPS: set   // each missing-flag degradation is warned once per process
+  _PINNED_CLI: map of stage session id -> _CliPin { cmd, model, cwd, env, json_schema, tier, exited: Event }, guarded by _PINNED_CLI_LOCK
+  _RESUME_EXIT_GRACE_S = 5
+  _READ_DENY_DIRS = (".git", ".hg", ".svn", "checkpoints", "security-scan")   // a deliberate literal copy of tools._ALWAYS_EXCLUDED_DIRS
+  _GIT_WRITE_DENY_RULES = for each spelling d in git_dir_spellings(), each tool in ["Edit", "Write"], each where in ["./", "**/"], each tail in ["", "/**"]: "$tool($where$d$tail)"   // a .git/config write is remote code execution; the CLI rule matcher is case-sensitive, so every spelling is listed
+  _AGENTIC_TIMEOUT = 3600   // fallback wall clock only
+}
+
+// src: vvaharness/backends/llm/cli/session.py:96-140
+_TurnWatchdog {
+  // Armed only when a turn cap was asked for and the CLI cannot enforce --max-turns
+  cap; by_message = false; seen = 0; tripped = false
+  _trip_at = if (by_message) cap + 1 else cap
+  _counts(evt) {
+    // Every assistant event counts (over-counts on purpose); with by_message, only a new message.id counts
+    msg_id = evt.message.id if by_message else null
+    if (msg_id is not a string) return true
+    if (msg_id already seen) return false
+    remember msg_id; return true
+  }
+  __call__(line) {
+    if (tripped) return false
+    evt = JSON of line, else return false
+    if (evt.type != "assistant" || !_counts(evt)) return false
+    seen += 1
+    if (seen >= _trip_at) { tripped = true; return true }   // true makes process._run_streaming kill the tree
+    return false
+  }
+}
+
+// Default instruction for the turn-watchdog and wall-clock salvage resumes; a stage-deadline resume passes its own
+// prompt-src: vvaharness/backends/llm/cli/session.py:145-149
+_FINAL_ANSWER_INSTRUCTION {
+  Constraints {
+    "Your turn limit was reached. Give your final answer now, in the exact format the original instructions asked for, using only what you already have. Do not use any tool."
+  }
+}
+
+// src: vvaharness/backends/llm/cli/session.py:323-561
+fn agentic(user_prompt, model, system_prompt?, allowed_tools?, cwd, max_budget_usd?, max_tokens?, permission_mode="auto", max_turns?, timeout?, tag?, stream_cb?, json_schema?, disallowed_tools?, permission_prompts?, extra_tools?, extra_dispatch?, effort?, session_id=""):executor=mixed {
+  require !extra_tools => throw NotImplementedError("claude_cli.agentic cannot carry a caller-supplied tool ... Route to via: sdk or via: openai ...")
+  // preserved: extra_dispatch is accepted and ignored without a check
+  require cancel._ABORT is not set => throw RuntimeError("aborted by user (Ctrl-C)")
+
+  // src: session.py:356-384 — command line
+  cmd = [...discovery._CLAUDE_CMD, "-p", "--model", model, ...env._effort_argv(effort)]
+  if (system_prompt) cmd += ["--system-prompt", system_prompt]   // replaces the CLI's own system prompt, deliberately not appended
+  if (allowed_tools) cmd += ["--allowedTools", ...allowed_tools]   // as given; Bash is never force-added
+  if (json_schema) {
+    if (discovery._cli_capabilities().json_schema) cmd += ["--json-schema", JSON(json_schema)]   // the CLI adds a StructuredOutput tool to the set
+    else warn once "... the agentic reply is not schema-validated and the caller must salvage it from free text."
+  }
+  cmd += _confinement_argv(allowed_tools, disallowed_tools, permission_prompts)
+  if (max_budget_usd && discovery._cli_capabilities().max_budget) cmd += ["--max-budget-usd", string(max_budget_usd)]
+  native_turn_cap = max_turns && discovery._cli_capabilities().max_turns
+  if (native_turn_cap) cmd += ["--max-turns", string(max_turns)]
+  cmd += ["--permission-mode", discovery._safe_permission_mode(permission_mode)]
+  cmd += ["--output-format", "stream-json", "--verbose"]
+
+  // src: session.py:386-392 — limits
+  tier = env._effective_effort(effort)
+  raw_wall_clock = if (timeout) integer(timeout) else _AGENTIC_TIMEOUT   // 3600 seconds
+  wall_clock = effort_scaled_seconds(raw_wall_clock, tier, kind=ClockKind.SESSION)   // SESSION factors: low/medium/high 1.0, xhigh 1.1, max 1.5
+  watchdog_cap = if (max_turns && !native_turn_cap) max_turns else null
+  by_message = allowed_tools != null && _bare_tool_names(allowed_tools) is empty   // only an explicit zero-tool session counts turns by message id
+
+  pending_attempt = 0; trunc_retried = 0; timeout_retried = false; pin_released = false
+  call_env = env._call_env(max_tokens, effort)
+
+  loop {
+    cli_session_id = new uuid4   // fresh every attempt; _run_with_retry may rotate it again in place
+    attempt_cmd = [...cmd, "--session-id", cli_session_id]
+    watchdog = if (watchdog_cap) _TurnWatchdog(watchdog_cap, by_message) else null
+    if (session_id && !pin_released) {
+      _PINNED_CLI[session_id] = _CliPin(cmd=attempt_cmd, model, cwd, env=call_env, json_schema, tier, exited=new Event) under the lock   // the live list, so a rotated id is visible to a concurrent resume
+    }
+
+    attempt_start = now; timed_out = null
+    // model invocation:
+    // callModel({ role: caller, route: "cli", system: system_prompt, prompt: user_prompt, tools: allowed_tools as confined by _confinement_argv (CLI default read tools when none named; zero tools for an explicit empty list), limits: { wall_clock_seconds: wall_clock, max_turns (native flag or watchdog), max_tokens, max_budget_usd }, output: json_schema || free text })
+    try result = retry._run_with_retry(attempt_cmd, label="agentic($model) [tag]", input=user_prompt, cwd, timeout=wall_clock, timeout_retries=0, env=call_env, heartbeat_label=(null when stream_cb or watchdog), stream_cb, should_stop=watchdog)
+    catch subprocess.TimeoutExpired as e => timed_out = e
+    constraint OnEveryExit {
+      // src: session.py:445-454 — after every attempt, however it ended
+      if (session_id) { if (_PINNED_CLI has session_id) set its exited event else pin_released = true }   // a released pin is never re-created
+    }
+    session_id_live = value after "--session-id" in attempt_cmd   // whichever id actually ran
+
+    // src: session.py:456-478 — wall clock exceeded
+    if (timed_out != null) {
+      if (session_id) {
+        // The stage owns the resume: no in-route salvage and no second attempt, so two processes never write one transcript
+        throw call_timeout_error(stage=tag || "", route="cli", budget_s=wall_clock, effort=tier, cause_text="claude subprocess exceeded ${wall_clock}s")
+      }
+      salvaged = _recover_timed_out_session(session_id=session_id_live, model, cwd, wall_clock, tag, env=call_env, json_schema)
+      if (salvaged != null) return retry._accept_reply(salvaged, trunc_retried)
+      if (!timeout_retried) { timeout_retried = true; continue }   // one full second session
+      throw call_timeout_error(stage=tag || "", route="cli", budget_s=wall_clock, effort=tier, cause_text=...)
+    }
+    note_budget_use(now - attempt_start, wall_clock, tier)
+
+    // src: session.py:481-507 — turn watchdog stop, checked before the return code (its kill exits non-zero)
+    if (watchdog != null && process._was_stopped(result)) {
+      COUNTERS.bump("cli_turn_watchdog_stops")
+      if (session_id && pin exists) clear its exited event   // the resume is a second process on this session; blocks a concurrent stage resume
+      try final = _finalize_via_resume(session_id_live, model, cwd, timeout=min(300, wall_clock), tag, env=call_env, json_schema)
+      constraint OnEveryExit { if (session_id && pin exists) set its exited event }
+      if (final) return retry._accept_reply(final, trunc_retried)
+      streamed = envelope._parse_envelope(result.stdout).text   // resume failed: fall back to the streamed text
+      warn CLI_RESUME_FAILED
+      return retry._accept_reply(streamed, trunc_retried)
+      // preserved: the killed session's own token usage is never banked on this branch (only the resume's usage is), and the streamed fallback text is not checked for a refusal
+    }
+
+    // src: session.py:509-527 — failed exit
+    if (result.returncode != 0) {
+      envelope._raise_if_refused_exit(result.stdout, tag)
+      cap = retry._truncation_cap(result)
+      require cap != null => throw RuntimeError(discovery._format_cli_error("claude CLI agentic failed", attempt_cmd, result))
+      requested = trunc_retried || max_tokens || cap
+      retry_at = if (trunc_retried) null else truncation_retry_max(requested, cap=MODEL_MAX_OUTPUT_TOKENS)   // doubled, capped at 64000
+      if (retry_at != null) {
+        retry._log_truncation_retry(tag, requested, retry_at, label="cli")
+        call_env = copy of call_env with CLAUDE_CODE_MAX_OUTPUT_TOKENS = string(retry_at)
+        trunc_retried = retry_at
+        continue
+      }
+      throw retry._truncation_error(requested, retried=trunc_retried, tag, retry_at)
+    }
+    // preserved: unlike oneshot.prompt, a zero exit whose terminal stop_reason is "max_tokens" is not retried here; it is accepted as the reply
+
+    // src: session.py:529-539 — success; no continuation stitching (it would concatenate the whole transcript)
+    { text, usage, turns, usd, stop_reason, model_usage } = envelope._parse_envelope(result.stdout)
+    envelope._note_unparsed_cache_keys(usage)
+    TOKENS.add(usage, usd, turns)
+    retry._log_usage(usage, stop_reason, model_usage)
+    envelope._raise_if_refused(stop_reason, tag, stdout=result.stdout)
+    if (!retry._is_pending_result(text)) return retry._accept_reply(text, trunc_retried)
+    // the response-quality gate for this route runs in registry.agentic
+
+    // src: session.py:541-561 — a pending background-sub-agent placeholder is re-sent up to 3 times
+    pending_attempt += 1
+    require pending_attempt <= _PENDING_MAX_RETRIES => throw RuntimeError("claude CLI agentic returned an unfinished background-subagent state after 3 retries; refusing to continue with partial output. last_result=<redacted first 200 characters>")
+    wait = _PENDING_BACKOFF[min(pending_attempt - 1, 2)]   // 5, 15, 30 seconds
+    sleep wait in steps of at most 5 seconds; require cancel._ABORT is not set before each step => throw RuntimeError("aborted by user (Ctrl-C)")
+    // then the loop starts a whole new session with the same prompt
+  }
+}
+
+// src: vvaharness/backends/llm/cli/session.py:261-268
+fn _bare_tool_names(allowed_tools):executor=code {
+  return distinct names with any "(spec)" scoping removed, in order   // a permission rule reused as an availability name
+}
+
+// src: vvaharness/backends/llm/cli/session.py:271-320
+fn _confinement_argv(allowed_tools, disallowed_tools, permission_prompts):executor=code {
+  // Every flag is probe-gated: when the CLI lacks it, the flag is omitted and a one-time warning names what is lost; the session still runs
+  caps = discovery._cli_capabilities()
+  argv = []
+  _gate(cap, flags, lost) { if (caps[cap]) argv += flags else warn once "this `claude` build does not advertise --<cap>; $lost" }
+
+  native = _bare_tool_names(allowed_tools)
+  if (native) _gate("tools", ["--tools", join(native, ",")], "tool availability is NOT restricted to the allowlist — ... (Bash/Edit/Write included) ...")   // --tools is the actual jail
+  else if (allowed_tools != null) _gate("tools", ["--tools", ""], "tool availability is NOT confined to zero tools — ...")   // an explicit empty list means zero tools
+  deny = [...disallowed_tools, ...("Read(./$d/**)" for each d in _READ_DENY_DIRS), ..._GIT_WRITE_DENY_RULES]
+  if (deny) _gate("disallowed_tools", ["--disallowedTools", ...deny], "cannot deny ... explicitly.")   // always non-empty in practice
+  if (permission_prompts) _gate("permission_prompts", ["--permission-prompts", permission_prompts], "an action that would raise a permission prompt is not auto-denied.")
+  if (env._cfg.restricted (default true)) _gate("restricted", ["--restricted"], "the file tools are NOT confined to the working directory — ...")
+  _gate("setting_sources", ["--setting-sources", "user"], "the SCANNED repository's .claude/settings.json and .claude/commands are loaded into this session.")
+  _gate("strict_mcp_config", ["--strict-mcp-config"], "the SCANNED repository's .mcp.json servers can be started on this host.")
+  _gate("disable_slash_commands", ["--disable-slash-commands"], "skills and slash commands remain loaded as prompt-injection surface.")
+  return argv
+  // Read() deny rules only: Grep can still match inside .git (noted in the source at session.py:298)
+}
+
+// src: vvaharness/backends/llm/cli/session.py:152-190
+fn _finalize_via_resume(session_id, model, cwd, timeout, tag, env?, json_schema?, instruction=_FINAL_ANSWER_INSTRUCTION, fail_detail?):executor=mixed {
+  cmd = [...discovery._CLAUDE_CMD, "-p", "--resume", session_id, "--model", model, "--tools", "", "--output-format", "json"]
+  if (json_schema && discovery._cli_capabilities().json_schema) cmd += ["--json-schema", JSON(json_schema)]   // without it a resume answers in free text
+  cmd += _confinement_argv(allowed_tools=null, disallowed_tools=null, permission_prompts=null)
+  // model invocation, no retry wrapper:
+  // callModel({ role: caller, route: "cli", prompt: instruction, tools: [], limits: { wall_clock_seconds: timeout }, output: json_schema || free text })
+  try result = process._run(cmd, input=instruction, cwd, timeout, env)
+  catch any error => { fail_detail.cause = error type name; return null }
+  if (result.returncode != 0) {
+    envelope._raise_if_refused_exit(result.stdout, tag)   // a refused resume raises, never degrades to partial text
+    fail_detail.rc = returncode; fail_detail.stderr = stderr
+    return null
+  }
+  parsed = envelope._parse_envelope(result.stdout)
+  envelope._note_unparsed_cache_keys(parsed.usage); TOKENS.add(parsed.usage, usd, turns)
+  envelope._raise_if_refused(parsed.stop_reason, tag, stdout=result.stdout)
+  return parsed.text || null
+}
+
+// src: vvaharness/backends/llm/cli/session.py:193-212
+fn _recover_timed_out_session(session_id, model, cwd, wall_clock, tag, env?, json_schema?):executor=mixed {
+  final = _finalize_via_resume(session_id, model, cwd, timeout=min(300, wall_clock), tag, env, json_schema)
+  if (final == null) return null
+  COUNTERS.bump("cli_timeout_finalized")
+  errlog.log(tag || "cli", tag || "timeout", "VVAH-E008 warning: session exceeded ${wall_clock}s; final answer recovered by resuming the session", recovered=true)
+  return final
+}
+
+// src: vvaharness/backends/llm/cli/session.py:215-218
+fn release_pinned_session(stage_id):executor=code { remove stage_id from _PINNED_CLI under the lock }
+
+// src: vvaharness/backends/llm/cli/session.py:231-258
+fn resume_agentic(session_id, instruction, timeout, tag):executor=mixed {
+  pin = _PINNED_CLI[session_id] under the lock
+  require pin != null => throw SessionNotResumableError("cli session ... was never pinned or has been released")
+  require discovery._cli_capabilities().resume => throw SessionNotResumableError("... this claude build does not support --resume")   // checked before paying the exit wait
+  require pin.exited.wait(_RESUME_EXIT_GRACE_S) => throw SessionNotResumableError("... has not exited yet; refusing to resume it")   // 5 seconds; prevents two processes writing one transcript
+  raw = if (timeout != null && timeout > 0) timeout else _AGENTIC_TIMEOUT   // 0 or null means no clock given, so the 3600 fallback applies
+  budget = effort_scaled_seconds(raw, pin.tier, kind=ClockKind.SESSION)
+  live_id = value after "--session-id" in pin.cmd
+  final = _finalize_via_resume(live_id, model=pin.model, cwd=pin.cwd, timeout=budget, tag, env=pin.env, json_schema=pin.json_schema, instruction, fail_detail)
+  require final != null => throw SessionNotResumableError("cli session $live_id could not be resumed" + _resume_fail_detail(fail_detail))
+  return final
+}
+
+// src: vvaharness/backends/llm/cli/session.py:221-228
+fn _resume_fail_detail(fail_detail):executor=code {
+  return " (rc=<rc>, stderr: <discovery._tail of redacted stderr>)" when rc is set, else " (<exception type>)" when cause is set, else ""
+}

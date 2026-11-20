@@ -1,0 +1,238 @@
+# vvaharness/backends/llm/cli_mcp.py
+
+The in-process MCP bridge for `via: cli` with caller-supplied tools: the scan's fact tools (graph and CWE queries that close over a live graph handle) are served in-process through the Claude Agent SDK, which launches the same pinned `claude` binary. A deny-by-default PreToolUse hook is the read jail. One doubled-budget truncation retry, terminal-result trust checks, and transport-error typing apply.
+
+Source: `vvaharness/backends/llm/cli_mcp.py` (lines 1-668)
+Executor: mixed
+Called from: `vvaharness/backends/llm/deepagents.py` (dispatch of an agentic call on `via: cli` when `knob("cli.mcp_tools", default=true)` and `available()`), `vvaharness/orchestrator/preflight.py` (probe)
+
+// src: vvaharness/backends/llm/cli_mcp.py:63-71
+Constants {
+  SERVER_NAME = "vvah_facts"
+  TOOL_PREFIX = "mcp__vvah_facts__"   // the model sees each bridged tool as mcp__vvah_facts__<name>
+  EVIDENCE_UNENFORCED_COUNTER = "cli_mcp_evidence_gate_unenforced"
+  _WARNED: set   // one warning per distinct degradation
+}
+
+// src: vvaharness/backends/llm/cli_mcp.py:74-85
+fn available():executor=code { return claude_agent_sdk is importable }   // external: claude_agent_sdk
+fn mcp_name(bare):executor=code { return TOOL_PREFIX + bare }
+
+// src: vvaharness/backends/llm/cli_mcp.py:548-641
+fn agentic_with_tools(user_prompt, model, system_prompt?, allowed_tools?, cwd, tool_builder, fact_tools=(), parent_middleware=(), max_turns?, max_budget_usd?, max_tokens?, effort?, allow_shell=false, response_model?, tag?, timeout?):executor=mixed {
+  require available() => throw RuntimeError("via: cli with caller-supplied tools needs the Claude Agent SDK ... set `cli.mcp_tools: false` ... or route the role via: deepagents.")
+  require !cli.aborted() => throw RuntimeError("aborted by user (Ctrl-C)")
+
+  lc_tools = _materialize(tool_builder, model, cwd, fact_tools)
+  require lc_tools is non-empty => throw RuntimeError("cli MCP bridge was asked for tools ... but the caller's tool_builder produced none — refusing to run a tool-less session that the prompt advertises tools for.")
+  called = {}
+  sdk_tools = _to_sdk_tools(lc_tools, parent_middleware, called, tag)
+  server = create_sdk_mcp_server(SERVER_NAME, tools=sdk_tools)   // external: claude_agent_sdk
+  wire_names = [mcp_name(t.name) for each t in lc_tools]
+
+  tier = cli._effective_effort(effort)
+  scaled_timeout = effort_scaled_seconds(timeout, tier, kind=ClockKind.SESSION)   // bounds EACH attempt, not a shared deadline; null timeout means no clock
+
+  // VVAH-E005: one doubled-budget retry, then raise
+  trunc_retried = 0
+  extra_env = if (max_tokens) { CLAUDE_CODE_MAX_OUTPUT_TOKENS: string(max_tokens) } else null
+  loop {
+    opts = _build_options(model, system_prompt, allowed_tools, cwd, mcp_tool_names=wire_names, max_turns, max_budget_usd, effort=tier, allow_shell, server, response_model, parent_middleware, extra_env)
+    try text = _run(user_prompt, opts, timeout=scaled_timeout, tag, effort=tier)   // run to completion on a fresh asyncio loop
+    catch error => match (error) {
+      case _SessionTruncatedError => {
+        [requested, retry_at] = _truncation_retry_budget(trunc_retried, tag, max_tokens)
+        if (retry_at != null) { extra_env = { CLAUDE_CODE_MAX_OUTPUT_TOKENS: string(retry_at) }; trunc_retried = retry_at; continue }
+        throw cli._truncation_error(requested, retried=trunc_retried, tag, retry_at)
+      }
+      case AuthenticationError | ProxyError | RuntimeError | TimeoutError => throw error   // includes CallTimeoutError raised by _run
+      default => _reraise_transport(error, tag || "")   // always raises; _SessionResultError lands here on purpose
+    }
+    if (trunc_retried) COUNTERS.bump(TRUNCATED_RETRY_RECOVERED_COUNTER)
+    break
+  }
+  // No transient-error retry and no time-out retry on this route
+  _report_evidence_degradation(parent_middleware, called, tag || "")
+  check_response_quality(text, stage=tag || "")   // external to this batch: util/response_quality
+  return text
+}
+
+// src: vvaharness/backends/llm/cli_mcp.py:90-102
+fn _materialize(tool_builder, model, cwd, fact_tools):executor=code {
+  if (fact_tools is empty) return []
+  built = tool_builder(StreamingOptions(model, cwd, fact_tools), allowed_tools=()) || []   // allowed_tools=() drops the reader tools: the CLI has native ones
+  return built where tool.name in fact_tools   // the name filter is the second safeguard
+}
+
+// src: vvaharness/backends/llm/cli_mcp.py:105-112
+fn _tool_schema(langchain_tool):executor=code {
+  return { type: "object", properties: tool.args, required: every argument whose spec has no "default" }
+}
+
+// src: vvaharness/backends/llm/cli_mcp.py:158-195
+fn _to_sdk_tools(langchain_tools, parent_middleware, called, tag?):executor=code {
+  for each lc_tool in langchain_tools {
+    // Every loop variable bound as a default argument, so a description cannot leak from the last tool
+    register an SDK tool named lc_tool.name, described by its trimmed description (or its name), schema _tool_schema(lc_tool), with handler(args) {
+      refusal = _budget_refusal(parent_middleware, name)
+      require refusal == null => return _content(refusal, is_error=true)   // the caller's ToolCallBudget is spent
+      add name to called
+      for each mw in parent_middleware with note_call, mw.note_call(name)
+      try result = lc_tool.invoke(copy of args) on a worker thread   // a slow synchronous query must not stall the stream loop
+      catch any error => { COUNTERS.bump("cli_mcp_tool_error_<name>"); return _content("<ErrorType>: <redacted message>", is_error=true) }   // a tool fault never ends the session
+      payload = _content(_serialize(result))
+      log tool name and result size only (never content), unless stage-only display
+      return payload
+    }
+  }
+  // preserved: bridged tool results are redacted but not length-capped here; the sdk and openai adapter caps each result at tools.TOOL_RESULT_CAP (48000 characters)
+}
+
+// src: vvaharness/backends/llm/cli_mcp.py:115-146
+fn _budget_refusal(parent_middleware, name):executor=code { return first non-empty mw.refusal_for(name) across middleware, else null }
+fn _required_fact_tools(parent_middleware):executor=code { return union of mw.required_tools across middleware }   // the caller's EvidenceGate
+fn _submit_guard(parent_middleware):executor=code { return first non-empty mw.hold_for_verdict() across middleware, else null }
+
+// src: vvaharness/backends/llm/cli_mcp.py:198-227
+fn _schema_for(response_model):executor=code { return response_model.model_json_schema() without "title" and "$schema" }
+fn _serialize(result):executor=code { return result if a string, else JSON (non-serializable values via str), else str(result) }
+fn _content(text, is_error=false):executor=code {
+  return { content: [{ type: "text", text: agent_sdk._redact_tool_output(text) }], is_error: true only when is_error }   // output is redaction-masked, as on every route
+}
+
+// src: vvaharness/backends/llm/cli_mcp.py:232-241
+fn _bridge_env():executor=code {
+  return { ...os.environ, ...cli.env._tls_extra }   // deliberately NOT agent_sdk._sdk_env(): that would move a subscription operator onto API-key billing
+}
+fn _session_env(extra_env, tier):executor=code {
+  return { ..._bridge_env(), ...(extra_env || {}), ...cli._session_pins(tier) }   // same effort pin and refusal no-resend as the cli route
+}
+
+// src: vvaharness/backends/llm/cli_mcp.py:244-398
+fn _build_options(model, system_prompt, allowed_tools, cwd, mcp_tool_names, max_turns, max_budget_usd, effort, allow_shell, server, response_model?, parent_middleware=(), extra_env?):executor=code {
+  require claude_agent_sdk provides ClaudeAgentOptions and HookMatcher => throw RuntimeError("This Claude Agent SDK build has no PreToolUse hook support (HookMatcher) ... or set `cli.mcp_tools: false` ...")
+  root = resolved cwd
+  native = cli.session._bare_tool_names(allowed_tools)
+  if (!allow_shell) native = native without "Bash"   // Bash only on an explicit caller grant (step2.bash)
+  granted = set(native)
+  deny_dirs_cf = casefolded cli._READ_DENY_DIRS   // (".git", ".hg", ".svn", "checkpoints", "security-scan")
+
+  // src: cli_mcp.py:280-353 — the live gate; must stay PreToolUse (a bare allowed_tools entry is auto-approved before can_use_tool is consulted)
+  _pre_tool_use_gate(input_data) {
+    try {
+      tool_name = input_data.tool_name; tool_input = input_data.tool_input
+      if (tool_name starts with TOOL_PREFIX) return allow   // the bridged fact tools
+      if (tool_name == CLI_STRUCTURED_OUTPUT_TOOL) {   // "StructuredOutput", published by the CLI itself
+        require response_model != null => deny "$tool_name is not permitted — this session has no response_model configured."
+        hold_text = _submit_guard(parent_middleware)
+        require hold_text == null => deny hold_text   // how the EvidenceGate nudge reaches the model: the verdict submit is refused with this text
+        return allow
+      }
+      require tool_name in granted => deny "$tool_name is not permitted in this detection session — only <granted> and this scan's fact tools are available, and nothing may modify the scanned repository."
+      keys = ["file_path", "path", "notebook_path"] + (["pattern"] if Glob) + (["glob"] if Grep)   // Grep's pattern is a content regex and is not resolved
+      found_path_arg = false
+      for each key in keys with a non-empty value raw {
+        found_path_arg = true
+        resolved = agent_sdk._resolve_within_root(root, raw)
+        require resolved != null => deny "$tool_name target <raw> is outside the repository root, unresolvable, or a symlink — reads are confined to <root>"
+        require first component of resolved relative to root, casefolded, not in deny_dirs_cf => deny "... falls under the internal <dir> directory, which is never readable in a scan session."   // top level only
+      }
+      require !(tool_name == "Read" && !found_path_arg) => deny "$tool_name requires a file path argument, and none was found in this call — denied as a precaution ..."
+      return allow   // an empty decision
+    }
+    catch any error => deny "the security gate could not evaluate this call (<ErrorType>) and denies it as a precaution."   // fails closed
+  }
+  hooks = { ...(agent_sdk._build_redaction_hooks() || {}), PreToolUse: [_pre_tool_use_gate] }   // PostToolUse masks native Read/Glob/Grep/LS/NotebookRead/Bash output
+
+  tier = cli._effective_effort(effort)   // unset inherits the scan-pinned cli.effort
+  opts = ClaudeAgentOptions {
+    model; cwd: root; env: _session_env(extra_env, tier)
+    cli_path: cli._CLAUDE_CMD[0]   // the same pinned binary as the cli route
+    mcp_servers: { vvah_facts: server }
+    strict_mcp_config: true          // otherwise the target repository's .mcp.json server is spawned
+    setting_sources: ["user"]        // keeps apiKeyHelper authentication; repository settings could re-grant Bash or add host hooks
+    extra_args: { "disable-slash-commands": null }
+    tools: native                    // availability
+    allowed_tools: [...native, ...mcp_tool_names]
+    disallowed_tools: [...(["Bash"] unless allow_shell), ...("Read(./$d/**)" for each d in _READ_DENY_DIRS)]
+    permission_mode: "default"
+    hooks
+    verbatim_prompts: true           // scanned-repository text cannot trigger @path expansion
+  }
+  // Not --restricted: it is mutually exclusive with setting_sources ["user"] (apiKeyHelper) and would break gateway authentication (source comment, cli_mcp.py:20-23)
+  // preserved: cli_path takes only the first element of _CLAUDE_CMD; on Windows builds where discovery returns [node, cli.js] this is the node executable
+  if (system_prompt != null) opts.system_prompt = system_prompt
+  if (max_turns != null) opts.max_turns = max_turns
+  if (max_budget_usd != null) opts.max_budget_usd = max_budget_usd
+  if (tier) opts.effort = tier
+  if (response_model != null) opts.output_format = { type: "json_schema", schema: _schema_for(response_model) }
+  return opts
+}
+
+// src: vvaharness/backends/llm/cli_mcp.py:413-475
+fn _run(user_prompt, opts, timeout?, tag?, effort?):executor=mixed {
+  parts = []
+  _on_message(message) {
+    require !cli.aborted() => throw RuntimeError("aborted by user (Ctrl-C)")   // this process is not in the cli kill list: this poll is its only stop path
+    if (message is AssistantMessage) for each TextBlock, append its text to parts and echo it to stream_trace
+  }
+  started = now
+  // model invocation:
+  // callModel({ role: caller, route: "cli", system: opts.system_prompt, prompt: user_prompt, tools: [...native tools in opts.tools, ...mcp__vvah_facts__<fact tool>], limits: { wall_clock_seconds: timeout, max_turns, max_budget_usd, max_tokens via CLAUDE_CODE_MAX_OUTPUT_TOKENS }, output: opts.output_format (response_model schema) || free text })
+  open ClaudeSDKClient(opts); client.query(user_prompt)
+  drained = agent_sdk.drain_until_result(client, on_message=_on_message, timeout, grace=TIMEOUT_STOP_GRACE_SECONDS)   // interrupt at the deadline, then 20 seconds of grace
+  close the client
+  result = drained.result
+  TOKENS.add(result.usage, usd=result.total_cost_usd, turns=result.num_turns)   // unconditional: a usage-less session is still one call
+  require !drained.timed_out => throw call_timeout_error(stage=tag || "", route="cli-mcp", budget_s=timeout, effort, cause_text="cli MCP bridge session exceeded ${timeout}s")
+  note_budget_use(now - started, timeout, effort)
+  _check_terminal_result(stop_reason=result.stop_reason, is_error=result.is_error, subtype=result.subtype, api_error_status=result.api_error_status, errors=result.errors, result_text=result.result, tag)
+  structured = result.structured_output
+  _note_structured_miss(opts, structured)
+  return trimmed (cli._structured_text({ structured_output: structured }) || result.result || join(parts))   // structured output first, then result text, then streamed text
+}
+
+// src: vvaharness/backends/llm/cli_mcp.py:491-511
+fn _check_terminal_result(stop_reason, is_error, subtype, api_error_status, errors, result_text, tag?):executor=code {
+  require stop_reason != ANTHROPIC_STOP_REFUSAL => throw model_refusal(route="cli-mcp", stage=tag || "", category=null)   // first: a refusal may also report is_error
+  require stop_reason != "max_tokens" => throw _SessionTruncatedError   // next: caught only by agentic_with_tools' retry loop
+  if (is_error || (subtype && subtype != "success")) {
+    detail = errors joined by "; " || trimmed result_text || "no detail reported by the CLI"
+    require CLI_TOKEN_CAP_RX does not match detail => throw _SessionTruncatedError   // the real CLI reports a cap hit as stop_sequence with "exceeded the N output token maximum"
+    throw _SessionResultError("subtype=... is_error=... api_error_status=...: $detail")   // deliberately not a RuntimeError, so _reraise_transport types it
+  }
+  // preserved: a session with no terminal ResultMessage at all (result null, not timed out) passes these checks and returns the streamed text
+}
+
+// src: vvaharness/backends/llm/cli_mcp.py:478-488
+fn _note_structured_miss(opts, structured):executor=code {
+  if (opts.output_format == null || structured != null) return
+  COUNTERS.bump("cli_mcp_structured_output_missing"); warn once per model "... using the text reply instead (the calling stage parses or repairs it) ..."   // not a raise: the stage's own parse and repair is cheaper than a rerun
+}
+
+// src: vvaharness/backends/llm/cli_mcp.py:514-524
+fn _reraise_transport(exc, tag):executor=code {
+  text = redact(str(exc))[:400]
+  require cli._PROXY_FAILURE does not match text => throw ProxyError(text, status_code=407 if text contains \b407\b else null, backend="cli")
+  require cli._AUTH_FAILURE does not match text => throw AuthenticationError(text, status_code=401, backend="cli")
+  throw RuntimeError("cli MCP bridge failed [$tag]: $text")
+}
+
+// src: vvaharness/backends/llm/cli_mcp.py:527-545
+fn _truncation_retry_budget(trunc_retried, tag, max_tokens?):executor=code {
+  // ResultMessage reports only stop_reason, never the budget hit
+  requested = if (trunc_retried || max_tokens) (trunc_retried || max_tokens)
+              else integer(environment CLAUDE_CODE_MAX_OUTPUT_TOKENS || MODEL_MAX_OUTPUT_TOKENS), falling back to MODEL_MAX_OUTPUT_TOKENS (64000) when unparsable
+  retry_at = if (trunc_retried) null else truncation_retry_max(requested, cap=MODEL_MAX_OUTPUT_TOKENS)
+  if (retry_at != null) cli._log_truncation_retry(tag, requested, retry_at, label="cli-mcp")
+  return [requested, retry_at]
+}
+
+// src: vvaharness/backends/llm/cli_mcp.py:644-658
+fn _report_evidence_degradation(parent_middleware, called, tag):executor=code {
+  required = _required_fact_tools(parent_middleware)
+  if (!required || (required intersection called)) return
+  COUNTERS.bump(EVIDENCE_UNENFORCED_COUNTER)
+  warn once per tag "... requires graph evidence, but the session called none of <required>. The forced structured-output submit was already denied and re-asked up to max_rejections times before being let through. The reply was accepted as-is ..."
+  // telemetry only: the reply is still returned
+}

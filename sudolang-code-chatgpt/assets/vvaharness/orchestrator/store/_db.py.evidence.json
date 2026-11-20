@@ -1,0 +1,4039 @@
+{
+  "source": "vvaharness/orchestrator/store/_db.py",
+  "sha256": "6a4a94f470099d6a028341fc05ac90db00b17d83da6a962cd8838f6a9d413c01",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\"\"\"The state DB itself: where it lives, how it is opened and hardened, and run rows.\"\"\"\nfrom __future__ import annotations\n\nimport os\nimport shutil\nimport sqlite3\nimport stat\nfrom collections.abc import Collection\nfrom pathlib import Path\n\nfrom vvaharness.orchestrator.store._schema import _DDL, _DDL_V2, _DDL_V3\nfrom vvaharness.util.warn_once import warn_once\n\n_SCHEMA_VERSION = 3\n\n# Bundles are small (bodies capped at 512 bytes); enforced here AND by a CHECK, so direct INSERT too\n_REPLAY_MAX_BYTES = 1024 * 1024\n\n# Confidentiality: payloads embed scanned SOURCE, sqlite3 creates at umask 0644; pin 0600 + sidecars\n_DB_FILE_MODE = 0o600\n_STATE_DIR_MODE = 0o700\n_SIDECAR_SUFFIXES = (\"-wal\", \"-shm\", \"-journal\")\n# Windows has no meaningful chmod/POSIX mode bits: every hardening step below is gated on this.\n_POSIX = os.name == \"posix\"\n_PERM_WARNED: set[str] = set()\n\n\ndef _warn_once(key: str, message: str) -> None:\n    \"\"\"Permission problems degrade to a single stderr warning per path per process — a confidentiality hardening...\"\"\"\n    warn_once(_PERM_WARNED, key, f\"  [store] WARN: {message}\")\n\n\ndef _tighten_mode(path: Path, mode: int) -> None:\n    \"\"\"Best-effort chmod of *path* down to *mode* when it is looser.\"\"\"\n    # Never raises; never loosens an already-tighter mode; non-POSIX is skipped entirely\n    if not _POSIX:\n        return\n    try:\n        current = stat.S_IMODE(path.stat().st_mode)\n    except OSError:\n        return  # absent (e.g. no sidecar yet) — nothing to tighten\n    if not (current & ~mode):\n        return  # already at least as tight as the target\n    try:\n        os.chmod(path, mode)\n    except OSError as e:\n        _warn_once(str(path),\n                   f\"could not tighten permissions on {path} (mode \"\n                   f\"{current:o}; it holds scanned-source snippets): {e}\")\n\n\nclass StoreError(RuntimeError):\n    \"\"\"A state-store precondition we refuse to silently work around: a symlinked state directory or DB path, or a state root that exists but is not a directory.\"\"\"\n\n\ndef state_root() -> Path:\n    \"\"\"Where scan state lives, resolved and nothing more.\"\"\"\n    # Deliberately NO I/O: scan.py resolves this pre-safety-check, so --stop-after must not mkdir ~\n    return Path(os.environ.get(\"VVAHARNESS_STATE_DIR\")\n                or Path.home() / \".vvaharness\" / \"state\")\n\n\ndef ensure_state_dir(*parts: str) -> Path:\n    \"\"\"Return ``state_root()/ *parts``, creating each level owner-only.\"\"\"\n    # Only place state-root dirs are made; tighten EVERY level (parents=True leaves umask default)\n    root = state_root()\n    if _POSIX:\n        # lstat BEFORE anything follows it: is_dir() would follow, letting a planted link redirect\n        try:\n            lst = root.lstat()\n        except OSError:\n            lst = None\n        if lst is not None and stat.S_ISLNK(lst.st_mode):\n            raise StoreError(\n                f\"refusing to use state directory {root}: it is a symlink\")\n    if root.is_dir():\n        # NOT one decision: VVAHARNESS_STATE_DIR -> warn only (operator chose it); default -> repair\n        if _POSIX:\n            try:\n                mode = stat.S_IMODE(root.stat().st_mode)\n            except OSError:\n                mode = 0\n            if mode & 0o077:\n                if os.environ.get(\"VVAHARNESS_STATE_DIR\"):\n                    _warn_once(\n                        str(root),\n                        f\"state directory {root} is group/other-accessible \"\n                        f\"(mode {mode:o}) and holds scanned-source snippets — \"\n                        \"consider `chmod 700` if it is not shared on purpose\")\n                else:\n                    _tighten_mode(root, _STATE_DIR_MODE)\n                    _warn_once(\n                        str(root),\n                        f\"tightened {root} from mode {mode:o} to 700 — it holds \"\n                        \"scanned-source snippets. Set VVAHARNESS_STATE_DIR to a \"\n                        \"path you manage if you need to share this state\")\n    else:\n        try:\n            root.mkdir(parents=True, exist_ok=True)\n        except FileExistsError as e:\n            # exist_ok forgives only an existing *directory*; a plain file is refused cleanly\n            raise StoreError(\n                f\"refusing to use state directory {root}: it exists and is not \"\n                \"a directory\") from e\n        # A directory this process created is owner-only by construction.\n        _tighten_mode(root, _STATE_DIR_MODE)\n    path = root\n    for part in parts:\n        path = path / part\n        path.mkdir(parents=True, exist_ok=True)\n        _tighten_mode(path, _STATE_DIR_MODE)\n    return path\n\n\n#: Shared by both resolvers below so the filename exists once.\n_DB_NAME = \"vvaharness.db\"\n\n\ndef db_location() -> Path:\n    \"\"\"The DB path, creating NOTHING -- the read-only counterpart of `db_path`.\"\"\"\n    # Asking whether state exists must not create the state directory; `gc` needs exactly this\n    return state_root() / _DB_NAME\n\n\ndef run_exists(run_id: str) -> bool:\n    \"\"\"Look up a run without creating, migrating or changing store permissions.\"\"\"\n    path = db_location()\n    try:\n        for candidate in (state_root(), path):\n            if candidate.is_symlink():\n                raise StoreError(f\"refusing to inspect state path {candidate}: it is a symlink\")\n        try:\n            path.stat()\n        except FileNotFoundError:\n            return False\n        con = sqlite3.connect(path.resolve().as_uri() + \"?mode=ro\", uri=True)\n        try:\n            return con.execute(\"SELECT 1 FROM runs WHERE run_id = ?\", (run_id,)).fetchone() is not None\n        finally:\n            con.close()\n    except (OSError, sqlite3.Error) as error:\n        raise StoreError(f\"could not inspect state database at {path}: {error}\") from error\n\n\ndef db_path() -> Path:\n    \"\"\"Resolve the state DB path the same way scan.py resolves the legacy ``checkpoints/`` root, so ``--resume`` and the in-target safety check see the same location.\"\"\"\n    return ensure_state_dir() / _DB_NAME\n\n\ndef _create_db_file_safe(path: Path) -> None:\n    \"\"\"Create the DB file owner-only, refusing a symlink planted at *path*.\"\"\"\n    # Pre-create 0600 before sqlite3's 0644; O_EXCL|O_NOFOLLOW (sqlite3 lacks both), lstat if extant\n    try:\n        os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_RDWR,\n                         _DB_FILE_MODE))\n        return  # freshly created by us, so not a symlink\n    except OSError as err:\n        open_err = err  # already exists, or is a symlink; either way, checked below\n    try:\n        st = os.lstat(path)\n    except FileNotFoundError:\n        # Report the create's own cause (e.g. EACCES on a read-only dir), not lstat's ENOENT.\n        raise FileNotFoundError(\n            f\"could not create state DB at {path}: {open_err.strerror}\") from open_err\n    if stat.S_ISLNK(st.st_mode):\n        raise StoreError(f\"refusing to open state DB at {path}: it is a symlink\")\n\n\ndef connect() -> sqlite3.Connection:\n    \"\"\"Open the state DB, ensure the schema exists, and return a connection — cheap enough to call per operation since sqlite3 connections are thread-affine.\"\"\"\n    path = db_path()\n    if _POSIX:\n        _create_db_file_safe(path)\n    con = sqlite3.connect(path)\n    # Per-connection pragmas — must be set on every handle.\n    con.execute(\"PRAGMA foreign_keys = ON\")\n    con.execute(\"PRAGMA busy_timeout = 30000\")\n    con.execute(\"PRAGMA synchronous  = NORMAL\")\n    # Skipped entirely once user_version matches, so the hot path is three pragmas + one read.\n    have = con.execute(\"PRAGMA user_version\").fetchone()[0]\n    if have != _SCHEMA_VERSION:\n        _migrate(con, have)\n    # Tighten a 0644 DB from an older release plus WAL/SHM/journal sidecars (same payload bytes)\n    for p in (path, *(path.with_name(path.name + s)\n                      for s in _SIDECAR_SUFFIXES)):\n        _tighten_mode(p, _DB_FILE_MODE)\n    return con\n\n\ndef _migrate(con: sqlite3.Connection, have: int) -> None:\n    # v0 gets all of _DDL; an existing DB runs migrations cumulatively, so v1 gets both V2 and V3\n    if have == 0:\n        con.executescript(_DDL)\n    else:\n        if have < 2:\n            con.executescript(_DDL_V2)\n        if have < 3:\n            con.executescript(_DDL_V3)\n    con.execute(f\"PRAGMA user_version = {_SCHEMA_VERSION}\")\n    con.commit()\n\n\ndef register_run(run_id: str, *, repo_root: str,\n                 repo_name: str | None = None,\n                 app_id: str | None = None) -> None:\n    \"\"\"Upsert the per-run metadata row, called once at the top of ``scan_repo()`` so ``gc`` can rank runs by recency.\"\"\"\n    con = connect()\n    with con:\n        con.execute(\n            \"INSERT INTO runs(run_id, repo_root, repo_name, app_id) \"\n            \"VALUES (?, ?, ?, ?) \"\n            \"ON CONFLICT(run_id) DO UPDATE SET \"\n            \"  repo_root = excluded.repo_root, \"\n            \"  repo_name = excluded.repo_name, \"\n            \"  app_id    = excluded.app_id, \"\n            \"  updated_at = datetime('now')\",\n            (run_id, repo_root, repo_name, app_id),\n        )\n    con.close()\n\n\ndef reset_run(run_id: str) -> int:\n    \"\"\"Delete every checkpoint row for one run (fixed s1..s9 steps and dynamic remediate_/validate_ steps), call...\"\"\"\n    # ev_replays DELIBERATELY NOT cleared: must outlive a rescan; delete_run reaps via FK cascade\n    con = connect()\n    try:\n        with con:\n            cleared = 0\n            cur = con.execute(\"DELETE FROM checkpoints WHERE run_id = ?\", (run_id,))\n            cleared += cur.rowcount or 0\n            cur = con.execute(\"DELETE FROM callgraph_snapshots WHERE run_id = ?\", (run_id,))\n            cleared += cur.rowcount or 0\n            return cleared\n    finally:\n        con.close()\n\n\ndef steps_with_prefix(run_id: str, prefix: str) -> list[str]:\n    \"\"\"Return *run_id*'s checkpoint step keys starting with *prefix*, sorted — the dynamic keys hash engine identity and a case id, so no caller can reconstruct one to look it up directly.\"\"\"\n    con = connect()\n    try:\n        rows = con.execute(\"SELECT step FROM checkpoints WHERE run_id = ?\",\n                           (run_id,)).fetchall()\n        return sorted(r[0] for r in rows if r[0].startswith(prefix))\n    finally:\n        con.close()\n\n\ndef delete_steps(run_id: str, prefix: str, keep: Collection[str]) -> list[str]:\n    \"\"\"Delete *run_id*'s checkpoint rows whose step starts with *prefix* and is not in *keep* — the complement of :func:`reset_run` for the standalone remediate/validate commands. Returns the deleted keys, sorted.\"\"\"\n    con = connect()\n    try:\n        with con:\n            rows = con.execute(\"SELECT step FROM checkpoints WHERE run_id = ?\",\n                               (run_id,)).fetchall()\n            victims = sorted(r[0] for r in rows\n                             if r[0].startswith(prefix) and r[0] not in keep)\n            con.executemany(\"DELETE FROM checkpoints WHERE run_id = ? AND step = ?\",\n                            [(run_id, v) for v in victims])\n        return victims\n    finally:\n        con.close()\n\n\ndef delete_run_graphs(run_id: str) -> None:\n    \"\"\"Remove the run's code-graph workspaces under ``graphs/<run_id>``; absent is fine.\"\"\"\n    shutil.rmtree(state_root() / \"graphs\" / run_id, ignore_errors=True)\n\n\ndef delete_run(run_id: str) -> bool:\n    \"\"\"Fully evict a single run: delete its ``runs`` row (dropping ``checkpoints`` and ``ev_replays`` via ON DEL...\"\"\"\n    # Same guard as `prune_checkpoints`: `connect()` would create the DB just to report no such run\n    if not db_location().exists():\n        return False\n    con = connect()\n    try:\n        with con:\n            cur = con.execute(\"DELETE FROM runs WHERE run_id = ?\", (run_id,))\n            deleted = cur.rowcount or 0\n        if deleted:\n            # incremental_vacuum frees one page per fetched row: unfetched, it frees one page\n            con.execute(\"PRAGMA incremental_vacuum\").fetchall()\n            con.execute(\"PRAGMA wal_checkpoint(TRUNCATE)\")\n        delete_run_graphs(run_id)\n        return deleted > 0\n    finally:\n        con.close()\n",
+  "literals": {
+    "source_literal_14_0": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 14,
+      "line_end": 14,
+      "value": "The state DB itself: where it lives, how it is opened and hardened, and run rows.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_42_4": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 42,
+      "line_end": 42,
+      "value": "Permission problems degrade to a single stderr warning per path per process — a confidentiality hardening...",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_43_33": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 43,
+      "line_end": 43,
+      "source_expression": "f\"  [store] WARN: {message}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_47_4": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 47,
+      "line_end": 47,
+      "value": "Best-effort chmod of *path* down to *mode* when it is looser.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_61_19": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 61,
+      "line_end": 62,
+      "source_expression": "f\"could not tighten permissions on {path} (mode \"\n                   f\"{current:o}; it holds scanned-source snippets): {e}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_66_4": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 66,
+      "line_end": 66,
+      "value": "A state-store precondition we refuse to silently work around: a symlinked state directory or DB path, or a state root that exists but is not a directory.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_70_4": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 70,
+      "line_end": 70,
+      "value": "Where scan state lives, resolved and nothing more.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_77_4": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 77,
+      "line_end": 77,
+      "value": "Return ``state_root()/ *parts``, creating each level owner-only.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_88_16": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 88,
+      "line_end": 88,
+      "source_expression": "f\"refusing to use state directory {root}: it is a symlink\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_100_24": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 100,
+      "line_end": 102,
+      "source_expression": "f\"state directory {root} is group/other-accessible \"\n                        f\"(mode {mode:o}) and holds scanned-source snippets — \"\n                        \"consider `chmod 700` if it is not shared on purpose\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_107_24": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 107,
+      "line_end": 109,
+      "source_expression": "f\"tightened {root} from mode {mode:o} to 700 — it holds \"\n                        \"scanned-source snippets. Set VVAHARNESS_STATE_DIR to a \"\n                        \"path you manage if you need to share this state\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_116_16": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 116,
+      "line_end": 117,
+      "source_expression": "f\"refusing to use state directory {root}: it exists and is not \"\n                \"a directory\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_133_4": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 133,
+      "line_end": 133,
+      "value": "The DB path, creating NOTHING -- the read-only counterpart of `db_path`.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_139_4": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 139,
+      "line_end": 139,
+      "value": "Look up a run without creating, migrating or changing store permissions.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_144_33": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 144,
+      "line_end": 144,
+      "source_expression": "f\"refusing to inspect state path {candidate}: it is a symlink\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_155_25": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 155,
+      "line_end": 155,
+      "source_expression": "f\"could not inspect state database at {path}: {error}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_159_4": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 159,
+      "line_end": 159,
+      "value": "Resolve the state DB path the same way scan.py resolves the legacy ``checkpoints/`` root, so ``--resume`` and the in-target safety check see the same location.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_164_4": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 164,
+      "line_end": 164,
+      "value": "Create the DB file owner-only, refusing a symlink planted at *path*.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_177_12": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 177,
+      "line_end": 177,
+      "source_expression": "f\"could not create state DB at {path}: {open_err.strerror}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_179_25": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 179,
+      "line_end": 179,
+      "source_expression": "f\"refusing to open state DB at {path}: it is a symlink\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_183_4": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 183,
+      "line_end": 183,
+      "value": "Open the state DB, ensure the schema exists, and return a connection — cheap enough to call per operation since sqlite3 connections are thread-affine.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_212_16": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 212,
+      "line_end": 212,
+      "source_expression": "f\"PRAGMA user_version = {_SCHEMA_VERSION}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_219_4": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 219,
+      "line_end": 219,
+      "value": "Upsert the per-run metadata row, called once at the top of ``scan_repo()`` so ``gc`` can rank runs by recency.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_223_12": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 223,
+      "line_end": 229,
+      "value": "INSERT INTO runs(run_id, repo_root, repo_name, app_id) VALUES (?, ?, ?, ?) ON CONFLICT(run_id) DO UPDATE SET   repo_root = excluded.repo_root,   repo_name = excluded.repo_name,   app_id    = excluded.app_id,   updated_at = datetime('now')",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_236_4": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 236,
+      "line_end": 236,
+      "value": "Delete every checkpoint row for one run (fixed s1..s9 steps and dynamic remediate_/validate_ steps), call...",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_252_4": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 252,
+      "line_end": 252,
+      "value": "Return *run_id*'s checkpoint step keys starting with *prefix*, sorted — the dynamic keys hash engine identity and a case id, so no caller can reconstruct one to look it up directly.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_263_4": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 263,
+      "line_end": 263,
+      "value": "Delete *run_id*'s checkpoint rows whose step starts with *prefix* and is not in *keep* — the complement of :func:`reset_run` for the standalone remediate/validate commands. Returns the deleted keys, sorted.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_279_4": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 279,
+      "line_end": 279,
+      "value": "Remove the run's code-graph workspaces under ``graphs/<run_id>``; absent is fine.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_284_4": {
+      "source": "vvaharness/orchestrator/store/_db.py",
+      "line_start": 284,
+      "line_end": 284,
+      "value": "Fully evict a single run: delete its ``runs`` row (dropping ``checkpoints`` and ``ev_replays`` via ON DEL...",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 14,
+      "line_end": 14,
+      "column": 0,
+      "value": "The state DB itself: where it lives, how it is opened and hardened, and run rows.",
+      "context": "literal"
+    },
+    {
+      "line_start": 129,
+      "line_end": 129,
+      "column": 11,
+      "value": "vvaharness.db",
+      "context": "literal"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 21,
+      "value": "-wal",
+      "context": "literal"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 29,
+      "value": "-shm",
+      "context": "literal"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 37,
+      "value": "-journal",
+      "context": "literal"
+    },
+    {
+      "line_start": 37,
+      "line_end": 37,
+      "column": 20,
+      "value": "posix",
+      "context": "literal"
+    },
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 4,
+      "value": "Permission problems degrade to a single stderr warning per path per process — a confidentiality hardening...",
+      "context": "literal"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 4,
+      "value": "Best-effort chmod of *path* down to *mode* when it is looser.",
+      "context": "literal"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 4,
+      "value": "A state-store precondition we refuse to silently work around: a symlinked state directory or DB path, or a state root that exists but is not a directory.",
+      "context": "literal"
+    },
+    {
+      "line_start": 70,
+      "line_end": 70,
+      "column": 4,
+      "value": "Where scan state lives, resolved and nothing more.",
+      "context": "literal"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 4,
+      "value": "Return ``state_root()/ *parts``, creating each level owner-only.",
+      "context": "literal"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 4,
+      "value": "The DB path, creating NOTHING -- the read-only counterpart of `db_path`.",
+      "context": "literal"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 4,
+      "value": "Look up a run without creating, migrating or changing store permissions.",
+      "context": "literal"
+    },
+    {
+      "line_start": 159,
+      "line_end": 159,
+      "column": 4,
+      "value": "Resolve the state DB path the same way scan.py resolves the legacy ``checkpoints/`` root, so ``--resume`` and the in-target safety check see the same location.",
+      "context": "literal"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 4,
+      "value": "Create the DB file owner-only, refusing a symlink planted at *path*.",
+      "context": "literal"
+    },
+    {
+      "line_start": 183,
+      "line_end": 183,
+      "column": 4,
+      "value": "Open the state DB, ensure the schema exists, and return a connection — cheap enough to call per operation since sqlite3 connections are thread-affine.",
+      "context": "literal"
+    },
+    {
+      "line_start": 219,
+      "line_end": 219,
+      "column": 4,
+      "value": "Upsert the per-run metadata row, called once at the top of ``scan_repo()`` so ``gc`` can rank runs by recency.",
+      "context": "literal"
+    },
+    {
+      "line_start": 236,
+      "line_end": 236,
+      "column": 4,
+      "value": "Delete every checkpoint row for one run (fixed s1..s9 steps and dynamic remediate_/validate_ steps), call...",
+      "context": "literal"
+    },
+    {
+      "line_start": 252,
+      "line_end": 252,
+      "column": 4,
+      "value": "Return *run_id*'s checkpoint step keys starting with *prefix*, sorted — the dynamic keys hash engine identity and a case id, so no caller can reconstruct one to look it up directly.",
+      "context": "literal"
+    },
+    {
+      "line_start": 263,
+      "line_end": 263,
+      "column": 4,
+      "value": "Delete *run_id*'s checkpoint rows whose step starts with *prefix* and is not in *keep* — the complement of :func:`reset_run` for the standalone remediate/validate commands. Returns the deleted keys, sorted.",
+      "context": "literal"
+    },
+    {
+      "line_start": 279,
+      "line_end": 279,
+      "column": 4,
+      "value": "Remove the run's code-graph workspaces under ``graphs/<run_id>``; absent is fine.",
+      "context": "literal"
+    },
+    {
+      "line_start": 284,
+      "line_end": 284,
+      "column": 4,
+      "value": "Fully evict a single run: delete its ``runs`` row (dropping ``checkpoints`` and ``ev_replays`` via ON DEL...",
+      "context": "literal"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 16,
+      "value": "PRAGMA foreign_keys = ON",
+      "context": "literal"
+    },
+    {
+      "line_start": 190,
+      "line_end": 190,
+      "column": 16,
+      "value": "PRAGMA busy_timeout = 30000",
+      "context": "literal"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 16,
+      "value": "PRAGMA synchronous  = NORMAL",
+      "context": "literal"
+    },
+    {
+      "line_start": 43,
+      "line_end": 43,
+      "column": 35,
+      "value": "  [store] WARN: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 18,
+      "value": "PRAGMA user_version = ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 223,
+      "line_end": 229,
+      "column": 12,
+      "value": "INSERT INTO runs(run_id, repo_root, repo_name, app_id) VALUES (?, ?, ?, ?) ON CONFLICT(run_id) DO UPDATE SET   repo_root = excluded.repo_root,   repo_name = excluded.repo_name,   app_id    = excluded.app_id,   updated_at = datetime('now')",
+      "context": "literal"
+    },
+    {
+      "line_start": 72,
+      "line_end": 72,
+      "column": 31,
+      "value": "VVAHARNESS_STATE_DIR",
+      "context": "literal"
+    },
+    {
+      "line_start": 73,
+      "line_end": 73,
+      "column": 49,
+      "value": "state",
+      "context": "literal"
+    },
+    {
+      "line_start": 149,
+      "line_end": 149,
+      "column": 56,
+      "value": "?mode=ro",
+      "context": "literal"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 27,
+      "value": "refusing to open state DB at ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 62,
+      "value": ": it is a symlink",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 242,
+      "line_end": 242,
+      "column": 30,
+      "value": "DELETE FROM checkpoints WHERE run_id = ?",
+      "context": "literal"
+    },
+    {
+      "line_start": 244,
+      "line_end": 244,
+      "column": 30,
+      "value": "DELETE FROM callgraph_snapshots WHERE run_id = ?",
+      "context": "literal"
+    },
+    {
+      "line_start": 271,
+      "line_end": 271,
+      "column": 28,
+      "value": "DELETE FROM checkpoints WHERE run_id = ? AND step = ?",
+      "context": "literal"
+    },
+    {
+      "line_start": 280,
+      "line_end": 280,
+      "column": 33,
+      "value": "graphs",
+      "context": "literal"
+    },
+    {
+      "line_start": 291,
+      "line_end": 291,
+      "column": 30,
+      "value": "DELETE FROM runs WHERE run_id = ?",
+      "context": "literal"
+    },
+    {
+      "line_start": 296,
+      "line_end": 296,
+      "column": 24,
+      "value": "PRAGMA wal_checkpoint(TRUNCATE)",
+      "context": "literal"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 21,
+      "value": "could not tighten permissions on ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 60,
+      "value": " (mode ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 62,
+      "line_end": 62,
+      "column": 32,
+      "value": "; it holds scanned-source snippets): ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 73,
+      "line_end": 73,
+      "column": 33,
+      "value": ".vvaharness",
+      "context": "literal"
+    },
+    {
+      "line_start": 88,
+      "line_end": 88,
+      "column": 18,
+      "value": "refusing to use state directory ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 88,
+      "line_end": 88,
+      "column": 56,
+      "value": ": it is a symlink",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 97,
+      "line_end": 97,
+      "column": 34,
+      "value": "VVAHARNESS_STATE_DIR",
+      "context": "literal"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 27,
+      "value": "could not inspect state database at ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 69,
+      "value": ": ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 14,
+      "value": "could not create state DB at ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 49,
+      "value": ": ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 193,
+      "line_end": 193,
+      "column": 23,
+      "value": "PRAGMA user_version",
+      "context": "literal"
+    },
+    {
+      "line_start": 255,
+      "line_end": 255,
+      "column": 27,
+      "value": "SELECT step FROM checkpoints WHERE run_id = ?",
+      "context": "literal"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 18,
+      "value": "refusing to use state directory ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 116,
+      "line_end": 117,
+      "column": 56,
+      "value": ": it exists and is not a directory",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 35,
+      "value": "refusing to inspect state path ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 77,
+      "value": ": it is a symlink",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 267,
+      "line_end": 267,
+      "column": 31,
+      "value": "SELECT step FROM checkpoints WHERE run_id = ?",
+      "context": "literal"
+    },
+    {
+      "line_start": 295,
+      "line_end": 295,
+      "column": 24,
+      "value": "PRAGMA incremental_vacuum",
+      "context": "literal"
+    },
+    {
+      "line_start": 62,
+      "line_end": 62,
+      "column": 30,
+      "value": "o",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 26,
+      "value": "state directory ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 100,
+      "line_end": 101,
+      "column": 48,
+      "value": " is group/other-accessible (mode ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 101,
+      "line_end": 102,
+      "column": 40,
+      "value": ") and holds scanned-source snippets — consider `chmod 700` if it is not shared on purpose",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 107,
+      "line_end": 107,
+      "column": 26,
+      "value": "tightened ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 107,
+      "line_end": 107,
+      "column": 42,
+      "value": " from mode ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 107,
+      "line_end": 109,
+      "column": 61,
+      "value": " to 700 — it holds scanned-source snippets. Set VVAHARNESS_STATE_DIR to a path you manage if you need to share this state",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 151,
+      "line_end": 151,
+      "column": 31,
+      "value": "SELECT 1 FROM runs WHERE run_id = ?",
+      "context": "literal"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 38,
+      "value": "o",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 107,
+      "line_end": 107,
+      "column": 59,
+      "value": "o",
+      "context": "f-string segment"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 29,
+      "text": "# Bundles are small (bodies capped at 512 bytes); enforced here AND by a CHECK, so direct INSERT too"
+    },
+    {
+      "line": 32,
+      "text": "# Confidentiality: payloads embed scanned SOURCE, sqlite3 creates at umask 0644; pin 0600 + sidecars"
+    },
+    {
+      "line": 36,
+      "text": "# Windows has no meaningful chmod/POSIX mode bits: every hardening step below is gated on this."
+    },
+    {
+      "line": 48,
+      "text": "# Never raises; never loosens an already-tighter mode; non-POSIX is skipped entirely"
+    },
+    {
+      "line": 54,
+      "text": "# absent (e.g. no sidecar yet) — nothing to tighten"
+    },
+    {
+      "line": 56,
+      "text": "# already at least as tight as the target"
+    },
+    {
+      "line": 71,
+      "text": "# Deliberately NO I/O: scan.py resolves this pre-safety-check, so --stop-after must not mkdir ~"
+    },
+    {
+      "line": 78,
+      "text": "# Only place state-root dirs are made; tighten EVERY level (parents=True leaves umask default)"
+    },
+    {
+      "line": 81,
+      "text": "# lstat BEFORE anything follows it: is_dir() would follow, letting a planted link redirect"
+    },
+    {
+      "line": 90,
+      "text": "# NOT one decision: VVAHARNESS_STATE_DIR -> warn only (operator chose it); default -> repair"
+    },
+    {
+      "line": 114,
+      "text": "# exist_ok forgives only an existing *directory*; a plain file is refused cleanly"
+    },
+    {
+      "line": 118,
+      "text": "# A directory this process created is owner-only by construction."
+    },
+    {
+      "line": 128,
+      "text": "#: Shared by both resolvers below so the filename exists once."
+    },
+    {
+      "line": 134,
+      "text": "# Asking whether state exists must not create the state directory; `gc` needs exactly this"
+    },
+    {
+      "line": 165,
+      "text": "# Pre-create 0600 before sqlite3's 0644; O_EXCL|O_NOFOLLOW (sqlite3 lacks both), lstat if extant"
+    },
+    {
+      "line": 169,
+      "text": "# freshly created by us, so not a symlink"
+    },
+    {
+      "line": 171,
+      "text": "# already exists, or is a symlink; either way, checked below"
+    },
+    {
+      "line": 175,
+      "text": "# Report the create's own cause (e.g. EACCES on a read-only dir), not lstat's ENOENT."
+    },
+    {
+      "line": 188,
+      "text": "# Per-connection pragmas — must be set on every handle."
+    },
+    {
+      "line": 192,
+      "text": "# Skipped entirely once user_version matches, so the hot path is three pragmas + one read."
+    },
+    {
+      "line": 196,
+      "text": "# Tighten a 0644 DB from an older release plus WAL/SHM/journal sidecars (same payload bytes)"
+    },
+    {
+      "line": 204,
+      "text": "# v0 gets all of _DDL; an existing DB runs migrations cumulatively, so v1 gets both V2 and V3"
+    },
+    {
+      "line": 237,
+      "text": "# ev_replays DELIBERATELY NOT cleared: must outlive a rescan; delete_run reaps via FK cascade"
+    },
+    {
+      "line": 285,
+      "text": "# Same guard as `prune_checkpoints`: `connect()` would create the DB just to report no such run"
+    },
+    {
+      "line": 294,
+      "text": "# incremental_vacuum frees one page per fetched row: unfetched, it frees one page"
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 14,
+      "line_end": 14,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 18,
+      "line_end": 18,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "Assign",
+      "line_start": 27,
+      "line_end": 27,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 30,
+      "line_end": 30,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 33,
+      "line_end": 33,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 34,
+      "line_end": 34,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 35,
+      "line_end": 35,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 37,
+      "line_end": 37,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 38,
+      "line_end": 38,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 41,
+      "line_end": 43,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 9
+    },
+    {
+      "kind": "Expr",
+      "line_start": 42,
+      "line_end": 42,
+      "column": 4,
+      "owner": "_warn_once",
+      "representation_line": 15
+    },
+    {
+      "kind": "Expr",
+      "line_start": 43,
+      "line_end": 43,
+      "column": 4,
+      "owner": "_warn_once",
+      "representation_line": 15
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 46,
+      "line_end": 62,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 18
+    },
+    {
+      "kind": "Expr",
+      "line_start": 47,
+      "line_end": 47,
+      "column": 4,
+      "owner": "_tighten_mode",
+      "representation_line": 24
+    },
+    {
+      "kind": "If",
+      "line_start": 49,
+      "line_end": 50,
+      "column": 4,
+      "owner": "_tighten_mode",
+      "representation_line": 25
+    },
+    {
+      "kind": "Return",
+      "line_start": 50,
+      "line_end": 50,
+      "column": 8,
+      "owner": "_tighten_mode",
+      "representation_line": 27
+    },
+    {
+      "kind": "Try",
+      "line_start": 51,
+      "line_end": 54,
+      "column": 4,
+      "owner": "_tighten_mode",
+      "representation_line": 30
+    },
+    {
+      "kind": "Assign",
+      "line_start": 52,
+      "line_end": 52,
+      "column": 8,
+      "owner": "_tighten_mode",
+      "representation_line": 33
+    },
+    {
+      "kind": "Return",
+      "line_start": 54,
+      "line_end": 54,
+      "column": 8,
+      "owner": "_tighten_mode",
+      "representation_line": 37
+    },
+    {
+      "kind": "If",
+      "line_start": 55,
+      "line_end": 56,
+      "column": 4,
+      "owner": "_tighten_mode",
+      "representation_line": 40
+    },
+    {
+      "kind": "Return",
+      "line_start": 56,
+      "line_end": 56,
+      "column": 8,
+      "owner": "_tighten_mode",
+      "representation_line": 42
+    },
+    {
+      "kind": "Try",
+      "line_start": 57,
+      "line_end": 62,
+      "column": 4,
+      "owner": "_tighten_mode",
+      "representation_line": 45
+    },
+    {
+      "kind": "Expr",
+      "line_start": 58,
+      "line_end": 58,
+      "column": 8,
+      "owner": "_tighten_mode",
+      "representation_line": 48
+    },
+    {
+      "kind": "Expr",
+      "line_start": 60,
+      "line_end": 62,
+      "column": 8,
+      "owner": "_tighten_mode",
+      "representation_line": 53
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 65,
+      "line_end": 66,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 57
+    },
+    {
+      "kind": "Expr",
+      "line_start": 66,
+      "line_end": 66,
+      "column": 4,
+      "owner": "StoreError",
+      "representation_line": 62
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 69,
+      "line_end": 73,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 64
+    },
+    {
+      "kind": "Expr",
+      "line_start": 70,
+      "line_end": 70,
+      "column": 4,
+      "owner": "state_root",
+      "representation_line": 70
+    },
+    {
+      "kind": "Return",
+      "line_start": 72,
+      "line_end": 73,
+      "column": 4,
+      "owner": "state_root",
+      "representation_line": 71
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 76,
+      "line_end": 125,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 75
+    },
+    {
+      "kind": "Expr",
+      "line_start": 77,
+      "line_end": 77,
+      "column": 4,
+      "owner": "ensure_state_dir",
+      "representation_line": 81
+    },
+    {
+      "kind": "Assign",
+      "line_start": 79,
+      "line_end": 79,
+      "column": 4,
+      "owner": "ensure_state_dir",
+      "representation_line": 81
+    },
+    {
+      "kind": "If",
+      "line_start": 80,
+      "line_end": 88,
+      "column": 4,
+      "owner": "ensure_state_dir",
+      "representation_line": 82
+    },
+    {
+      "kind": "Try",
+      "line_start": 82,
+      "line_end": 85,
+      "column": 8,
+      "owner": "ensure_state_dir",
+      "representation_line": 84
+    },
+    {
+      "kind": "Assign",
+      "line_start": 83,
+      "line_end": 83,
+      "column": 12,
+      "owner": "ensure_state_dir",
+      "representation_line": 87
+    },
+    {
+      "kind": "Assign",
+      "line_start": 85,
+      "line_end": 85,
+      "column": 12,
+      "owner": "ensure_state_dir",
+      "representation_line": 92
+    },
+    {
+      "kind": "If",
+      "line_start": 86,
+      "line_end": 88,
+      "column": 8,
+      "owner": "ensure_state_dir",
+      "representation_line": 94
+    },
+    {
+      "kind": "Raise",
+      "line_start": 87,
+      "line_end": 88,
+      "column": 12,
+      "owner": "ensure_state_dir",
+      "representation_line": 96
+    },
+    {
+      "kind": "If",
+      "line_start": 89,
+      "line_end": 119,
+      "column": 4,
+      "owner": "ensure_state_dir",
+      "representation_line": 100
+    },
+    {
+      "kind": "If",
+      "line_start": 91,
+      "line_end": 109,
+      "column": 8,
+      "owner": "ensure_state_dir",
+      "representation_line": 102
+    },
+    {
+      "kind": "Try",
+      "line_start": 92,
+      "line_end": 95,
+      "column": 12,
+      "owner": "ensure_state_dir",
+      "representation_line": 104
+    },
+    {
+      "kind": "Assign",
+      "line_start": 93,
+      "line_end": 93,
+      "column": 16,
+      "owner": "ensure_state_dir",
+      "representation_line": 107
+    },
+    {
+      "kind": "Assign",
+      "line_start": 95,
+      "line_end": 95,
+      "column": 16,
+      "owner": "ensure_state_dir",
+      "representation_line": 112
+    },
+    {
+      "kind": "If",
+      "line_start": 96,
+      "line_end": 109,
+      "column": 12,
+      "owner": "ensure_state_dir",
+      "representation_line": 114
+    },
+    {
+      "kind": "If",
+      "line_start": 97,
+      "line_end": 109,
+      "column": 16,
+      "owner": "ensure_state_dir",
+      "representation_line": 116
+    },
+    {
+      "kind": "Expr",
+      "line_start": 98,
+      "line_end": 102,
+      "column": 20,
+      "owner": "ensure_state_dir",
+      "representation_line": 119
+    },
+    {
+      "kind": "Expr",
+      "line_start": 104,
+      "line_end": 104,
+      "column": 20,
+      "owner": "ensure_state_dir",
+      "representation_line": 123
+    },
+    {
+      "kind": "Expr",
+      "line_start": 105,
+      "line_end": 109,
+      "column": 20,
+      "owner": "ensure_state_dir",
+      "representation_line": 123
+    },
+    {
+      "kind": "Try",
+      "line_start": 111,
+      "line_end": 117,
+      "column": 8,
+      "owner": "ensure_state_dir",
+      "representation_line": 129
+    },
+    {
+      "kind": "Expr",
+      "line_start": 112,
+      "line_end": 112,
+      "column": 12,
+      "owner": "ensure_state_dir",
+      "representation_line": 132
+    },
+    {
+      "kind": "Raise",
+      "line_start": 115,
+      "line_end": 117,
+      "column": 12,
+      "owner": "ensure_state_dir",
+      "representation_line": 136
+    },
+    {
+      "kind": "Expr",
+      "line_start": 119,
+      "line_end": 119,
+      "column": 8,
+      "owner": "ensure_state_dir",
+      "representation_line": 140
+    },
+    {
+      "kind": "Assign",
+      "line_start": 120,
+      "line_end": 120,
+      "column": 4,
+      "owner": "ensure_state_dir",
+      "representation_line": 143
+    },
+    {
+      "kind": "For",
+      "line_start": 121,
+      "line_end": 124,
+      "column": 4,
+      "owner": "ensure_state_dir",
+      "representation_line": 144
+    },
+    {
+      "kind": "Assign",
+      "line_start": 122,
+      "line_end": 122,
+      "column": 8,
+      "owner": "ensure_state_dir",
+      "representation_line": 147
+    },
+    {
+      "kind": "Expr",
+      "line_start": 123,
+      "line_end": 123,
+      "column": 8,
+      "owner": "ensure_state_dir",
+      "representation_line": 147
+    },
+    {
+      "kind": "Expr",
+      "line_start": 124,
+      "line_end": 124,
+      "column": 8,
+      "owner": "ensure_state_dir",
+      "representation_line": 147
+    },
+    {
+      "kind": "Return",
+      "line_start": 125,
+      "line_end": 125,
+      "column": 4,
+      "owner": "ensure_state_dir",
+      "representation_line": 149
+    },
+    {
+      "kind": "Assign",
+      "line_start": 129,
+      "line_end": 129,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 154
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 132,
+      "line_end": 135,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 155
+    },
+    {
+      "kind": "Expr",
+      "line_start": 133,
+      "line_end": 133,
+      "column": 4,
+      "owner": "db_location",
+      "representation_line": 161
+    },
+    {
+      "kind": "Return",
+      "line_start": 135,
+      "line_end": 135,
+      "column": 4,
+      "owner": "db_location",
+      "representation_line": 162
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 138,
+      "line_end": 155,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 166
+    },
+    {
+      "kind": "Expr",
+      "line_start": 139,
+      "line_end": 139,
+      "column": 4,
+      "owner": "run_exists",
+      "representation_line": 172
+    },
+    {
+      "kind": "Assign",
+      "line_start": 140,
+      "line_end": 140,
+      "column": 4,
+      "owner": "run_exists",
+      "representation_line": 172
+    },
+    {
+      "kind": "Try",
+      "line_start": 141,
+      "line_end": 155,
+      "column": 4,
+      "owner": "run_exists",
+      "representation_line": 173
+    },
+    {
+      "kind": "For",
+      "line_start": 142,
+      "line_end": 144,
+      "column": 8,
+      "owner": "run_exists",
+      "representation_line": 175
+    },
+    {
+      "kind": "If",
+      "line_start": 143,
+      "line_end": 144,
+      "column": 12,
+      "owner": "run_exists",
+      "representation_line": 177
+    },
+    {
+      "kind": "Raise",
+      "line_start": 144,
+      "line_end": 144,
+      "column": 16,
+      "owner": "run_exists",
+      "representation_line": 179
+    },
+    {
+      "kind": "Try",
+      "line_start": 145,
+      "line_end": 148,
+      "column": 8,
+      "owner": "run_exists",
+      "representation_line": 183
+    },
+    {
+      "kind": "Expr",
+      "line_start": 146,
+      "line_end": 146,
+      "column": 12,
+      "owner": "run_exists",
+      "representation_line": 186
+    },
+    {
+      "kind": "Return",
+      "line_start": 148,
+      "line_end": 148,
+      "column": 12,
+      "owner": "run_exists",
+      "representation_line": 190
+    },
+    {
+      "kind": "Assign",
+      "line_start": 149,
+      "line_end": 149,
+      "column": 8,
+      "owner": "run_exists",
+      "representation_line": 194
+    },
+    {
+      "kind": "Try",
+      "line_start": 150,
+      "line_end": 153,
+      "column": 8,
+      "owner": "run_exists",
+      "representation_line": 195
+    },
+    {
+      "kind": "Return",
+      "line_start": 151,
+      "line_end": 151,
+      "column": 12,
+      "owner": "run_exists",
+      "representation_line": 197
+    },
+    {
+      "kind": "Expr",
+      "line_start": 153,
+      "line_end": 153,
+      "column": 12,
+      "owner": "run_exists",
+      "representation_line": 202
+    },
+    {
+      "kind": "Raise",
+      "line_start": 155,
+      "line_end": 155,
+      "column": 8,
+      "owner": "run_exists",
+      "representation_line": 207
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 158,
+      "line_end": 160,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 212
+    },
+    {
+      "kind": "Expr",
+      "line_start": 159,
+      "line_end": 159,
+      "column": 4,
+      "owner": "db_path",
+      "representation_line": 218
+    },
+    {
+      "kind": "Return",
+      "line_start": 160,
+      "line_end": 160,
+      "column": 4,
+      "owner": "db_path",
+      "representation_line": 219
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 163,
+      "line_end": 179,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 223
+    },
+    {
+      "kind": "Expr",
+      "line_start": 164,
+      "line_end": 164,
+      "column": 4,
+      "owner": "_create_db_file_safe",
+      "representation_line": 229
+    },
+    {
+      "kind": "Try",
+      "line_start": 166,
+      "line_end": 171,
+      "column": 4,
+      "owner": "_create_db_file_safe",
+      "representation_line": 230
+    },
+    {
+      "kind": "Expr",
+      "line_start": 167,
+      "line_end": 168,
+      "column": 8,
+      "owner": "_create_db_file_safe",
+      "representation_line": 233
+    },
+    {
+      "kind": "Return",
+      "line_start": 169,
+      "line_end": 169,
+      "column": 8,
+      "owner": "_create_db_file_safe",
+      "representation_line": 234
+    },
+    {
+      "kind": "Assign",
+      "line_start": 171,
+      "line_end": 171,
+      "column": 8,
+      "owner": "_create_db_file_safe",
+      "representation_line": 240
+    },
+    {
+      "kind": "Try",
+      "line_start": 172,
+      "line_end": 177,
+      "column": 4,
+      "owner": "_create_db_file_safe",
+      "representation_line": 242
+    },
+    {
+      "kind": "Assign",
+      "line_start": 173,
+      "line_end": 173,
+      "column": 8,
+      "owner": "_create_db_file_safe",
+      "representation_line": 245
+    },
+    {
+      "kind": "Raise",
+      "line_start": 176,
+      "line_end": 177,
+      "column": 8,
+      "owner": "_create_db_file_safe",
+      "representation_line": 249
+    },
+    {
+      "kind": "If",
+      "line_start": 178,
+      "line_end": 179,
+      "column": 4,
+      "owner": "_create_db_file_safe",
+      "representation_line": 252
+    },
+    {
+      "kind": "Raise",
+      "line_start": 179,
+      "line_end": 179,
+      "column": 8,
+      "owner": "_create_db_file_safe",
+      "representation_line": 254
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 182,
+      "line_end": 200,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 259
+    },
+    {
+      "kind": "Expr",
+      "line_start": 183,
+      "line_end": 183,
+      "column": 4,
+      "owner": "connect",
+      "representation_line": 265
+    },
+    {
+      "kind": "Assign",
+      "line_start": 184,
+      "line_end": 184,
+      "column": 4,
+      "owner": "connect",
+      "representation_line": 265
+    },
+    {
+      "kind": "If",
+      "line_start": 185,
+      "line_end": 186,
+      "column": 4,
+      "owner": "connect",
+      "representation_line": 266
+    },
+    {
+      "kind": "Expr",
+      "line_start": 186,
+      "line_end": 186,
+      "column": 8,
+      "owner": "connect",
+      "representation_line": 269
+    },
+    {
+      "kind": "Assign",
+      "line_start": 187,
+      "line_end": 187,
+      "column": 4,
+      "owner": "connect",
+      "representation_line": 272
+    },
+    {
+      "kind": "Expr",
+      "line_start": 189,
+      "line_end": 189,
+      "column": 4,
+      "owner": "connect",
+      "representation_line": 272
+    },
+    {
+      "kind": "Expr",
+      "line_start": 190,
+      "line_end": 190,
+      "column": 4,
+      "owner": "connect",
+      "representation_line": 272
+    },
+    {
+      "kind": "Expr",
+      "line_start": 191,
+      "line_end": 191,
+      "column": 4,
+      "owner": "connect",
+      "representation_line": 272
+    },
+    {
+      "kind": "Assign",
+      "line_start": 193,
+      "line_end": 193,
+      "column": 4,
+      "owner": "connect",
+      "representation_line": 272
+    },
+    {
+      "kind": "If",
+      "line_start": 194,
+      "line_end": 195,
+      "column": 4,
+      "owner": "connect",
+      "representation_line": 273
+    },
+    {
+      "kind": "Expr",
+      "line_start": 195,
+      "line_end": 195,
+      "column": 8,
+      "owner": "connect",
+      "representation_line": 276
+    },
+    {
+      "kind": "For",
+      "line_start": 197,
+      "line_end": 199,
+      "column": 4,
+      "owner": "connect",
+      "representation_line": 278
+    },
+    {
+      "kind": "Expr",
+      "line_start": 199,
+      "line_end": 199,
+      "column": 8,
+      "owner": "connect",
+      "representation_line": 281
+    },
+    {
+      "kind": "Return",
+      "line_start": 200,
+      "line_end": 200,
+      "column": 4,
+      "owner": "connect",
+      "representation_line": 283
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 203,
+      "line_end": 213,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 287
+    },
+    {
+      "kind": "If",
+      "line_start": 205,
+      "line_end": 211,
+      "column": 4,
+      "owner": "_migrate",
+      "representation_line": 292
+    },
+    {
+      "kind": "Expr",
+      "line_start": 206,
+      "line_end": 206,
+      "column": 8,
+      "owner": "_migrate",
+      "representation_line": 295
+    },
+    {
+      "kind": "If",
+      "line_start": 208,
+      "line_end": 209,
+      "column": 8,
+      "owner": "_migrate",
+      "representation_line": 298
+    },
+    {
+      "kind": "Expr",
+      "line_start": 209,
+      "line_end": 209,
+      "column": 12,
+      "owner": "_migrate",
+      "representation_line": 301
+    },
+    {
+      "kind": "If",
+      "line_start": 210,
+      "line_end": 211,
+      "column": 8,
+      "owner": "_migrate",
+      "representation_line": 303
+    },
+    {
+      "kind": "Expr",
+      "line_start": 211,
+      "line_end": 211,
+      "column": 12,
+      "owner": "_migrate",
+      "representation_line": 306
+    },
+    {
+      "kind": "Expr",
+      "line_start": 212,
+      "line_end": 212,
+      "column": 4,
+      "owner": "_migrate",
+      "representation_line": 310
+    },
+    {
+      "kind": "Expr",
+      "line_start": 213,
+      "line_end": 213,
+      "column": 4,
+      "owner": "_migrate",
+      "representation_line": 310
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 216,
+      "line_end": 232,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 313
+    },
+    {
+      "kind": "Expr",
+      "line_start": 219,
+      "line_end": 219,
+      "column": 4,
+      "owner": "register_run",
+      "representation_line": 319
+    },
+    {
+      "kind": "Assign",
+      "line_start": 220,
+      "line_end": 220,
+      "column": 4,
+      "owner": "register_run",
+      "representation_line": 319
+    },
+    {
+      "kind": "With",
+      "line_start": 221,
+      "line_end": 231,
+      "column": 4,
+      "owner": "register_run",
+      "representation_line": 320
+    },
+    {
+      "kind": "Expr",
+      "line_start": 222,
+      "line_end": 231,
+      "column": 8,
+      "owner": "register_run",
+      "representation_line": 323
+    },
+    {
+      "kind": "Expr",
+      "line_start": 232,
+      "line_end": 232,
+      "column": 4,
+      "owner": "register_run",
+      "representation_line": 327
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 235,
+      "line_end": 248,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 330
+    },
+    {
+      "kind": "Expr",
+      "line_start": 236,
+      "line_end": 236,
+      "column": 4,
+      "owner": "reset_run",
+      "representation_line": 336
+    },
+    {
+      "kind": "Assign",
+      "line_start": 238,
+      "line_end": 238,
+      "column": 4,
+      "owner": "reset_run",
+      "representation_line": 336
+    },
+    {
+      "kind": "Try",
+      "line_start": 239,
+      "line_end": 248,
+      "column": 4,
+      "owner": "reset_run",
+      "representation_line": 337
+    },
+    {
+      "kind": "With",
+      "line_start": 240,
+      "line_end": 246,
+      "column": 8,
+      "owner": "reset_run",
+      "representation_line": 339
+    },
+    {
+      "kind": "Assign",
+      "line_start": 241,
+      "line_end": 241,
+      "column": 12,
+      "owner": "reset_run",
+      "representation_line": 342
+    },
+    {
+      "kind": "Assign",
+      "line_start": 242,
+      "line_end": 242,
+      "column": 12,
+      "owner": "reset_run",
+      "representation_line": 342
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 243,
+      "line_end": 243,
+      "column": 12,
+      "owner": "reset_run",
+      "representation_line": 342
+    },
+    {
+      "kind": "Assign",
+      "line_start": 244,
+      "line_end": 244,
+      "column": 12,
+      "owner": "reset_run",
+      "representation_line": 342
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 245,
+      "line_end": 245,
+      "column": 12,
+      "owner": "reset_run",
+      "representation_line": 342
+    },
+    {
+      "kind": "Return",
+      "line_start": 246,
+      "line_end": 246,
+      "column": 12,
+      "owner": "reset_run",
+      "representation_line": 343
+    },
+    {
+      "kind": "Expr",
+      "line_start": 248,
+      "line_end": 248,
+      "column": 8,
+      "owner": "reset_run",
+      "representation_line": 350
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 251,
+      "line_end": 259,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 354
+    },
+    {
+      "kind": "Expr",
+      "line_start": 252,
+      "line_end": 252,
+      "column": 4,
+      "owner": "steps_with_prefix",
+      "representation_line": 360
+    },
+    {
+      "kind": "Assign",
+      "line_start": 253,
+      "line_end": 253,
+      "column": 4,
+      "owner": "steps_with_prefix",
+      "representation_line": 360
+    },
+    {
+      "kind": "Try",
+      "line_start": 254,
+      "line_end": 259,
+      "column": 4,
+      "owner": "steps_with_prefix",
+      "representation_line": 361
+    },
+    {
+      "kind": "Assign",
+      "line_start": 255,
+      "line_end": 256,
+      "column": 8,
+      "owner": "steps_with_prefix",
+      "representation_line": 364
+    },
+    {
+      "kind": "Return",
+      "line_start": 257,
+      "line_end": 257,
+      "column": 8,
+      "owner": "steps_with_prefix",
+      "representation_line": 365
+    },
+    {
+      "kind": "Expr",
+      "line_start": 259,
+      "line_end": 259,
+      "column": 8,
+      "owner": "steps_with_prefix",
+      "representation_line": 370
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 262,
+      "line_end": 275,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 374
+    },
+    {
+      "kind": "Expr",
+      "line_start": 263,
+      "line_end": 263,
+      "column": 4,
+      "owner": "delete_steps",
+      "representation_line": 380
+    },
+    {
+      "kind": "Assign",
+      "line_start": 264,
+      "line_end": 264,
+      "column": 4,
+      "owner": "delete_steps",
+      "representation_line": 380
+    },
+    {
+      "kind": "Try",
+      "line_start": 265,
+      "line_end": 275,
+      "column": 4,
+      "owner": "delete_steps",
+      "representation_line": 381
+    },
+    {
+      "kind": "With",
+      "line_start": 266,
+      "line_end": 272,
+      "column": 8,
+      "owner": "delete_steps",
+      "representation_line": 383
+    },
+    {
+      "kind": "Assign",
+      "line_start": 267,
+      "line_end": 268,
+      "column": 12,
+      "owner": "delete_steps",
+      "representation_line": 386
+    },
+    {
+      "kind": "Assign",
+      "line_start": 269,
+      "line_end": 270,
+      "column": 12,
+      "owner": "delete_steps",
+      "representation_line": 386
+    },
+    {
+      "kind": "Expr",
+      "line_start": 271,
+      "line_end": 272,
+      "column": 12,
+      "owner": "delete_steps",
+      "representation_line": 386
+    },
+    {
+      "kind": "Return",
+      "line_start": 273,
+      "line_end": 273,
+      "column": 8,
+      "owner": "delete_steps",
+      "representation_line": 389
+    },
+    {
+      "kind": "Expr",
+      "line_start": 275,
+      "line_end": 275,
+      "column": 8,
+      "owner": "delete_steps",
+      "representation_line": 394
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 278,
+      "line_end": 280,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 398
+    },
+    {
+      "kind": "Expr",
+      "line_start": 279,
+      "line_end": 279,
+      "column": 4,
+      "owner": "delete_run_graphs",
+      "representation_line": 404
+    },
+    {
+      "kind": "Expr",
+      "line_start": 280,
+      "line_end": 280,
+      "column": 4,
+      "owner": "delete_run_graphs",
+      "representation_line": 404
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 283,
+      "line_end": 300,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 407
+    },
+    {
+      "kind": "Expr",
+      "line_start": 284,
+      "line_end": 284,
+      "column": 4,
+      "owner": "delete_run",
+      "representation_line": 413
+    },
+    {
+      "kind": "If",
+      "line_start": 286,
+      "line_end": 287,
+      "column": 4,
+      "owner": "delete_run",
+      "representation_line": 414
+    },
+    {
+      "kind": "Return",
+      "line_start": 287,
+      "line_end": 287,
+      "column": 8,
+      "owner": "delete_run",
+      "representation_line": 416
+    },
+    {
+      "kind": "Assign",
+      "line_start": 288,
+      "line_end": 288,
+      "column": 4,
+      "owner": "delete_run",
+      "representation_line": 420
+    },
+    {
+      "kind": "Try",
+      "line_start": 289,
+      "line_end": 300,
+      "column": 4,
+      "owner": "delete_run",
+      "representation_line": 421
+    },
+    {
+      "kind": "With",
+      "line_start": 290,
+      "line_end": 292,
+      "column": 8,
+      "owner": "delete_run",
+      "representation_line": 423
+    },
+    {
+      "kind": "Assign",
+      "line_start": 291,
+      "line_end": 291,
+      "column": 12,
+      "owner": "delete_run",
+      "representation_line": 426
+    },
+    {
+      "kind": "Assign",
+      "line_start": 292,
+      "line_end": 292,
+      "column": 12,
+      "owner": "delete_run",
+      "representation_line": 426
+    },
+    {
+      "kind": "If",
+      "line_start": 293,
+      "line_end": 296,
+      "column": 8,
+      "owner": "delete_run",
+      "representation_line": 429
+    },
+    {
+      "kind": "Expr",
+      "line_start": 295,
+      "line_end": 295,
+      "column": 12,
+      "owner": "delete_run",
+      "representation_line": 432
+    },
+    {
+      "kind": "Expr",
+      "line_start": 296,
+      "line_end": 296,
+      "column": 12,
+      "owner": "delete_run",
+      "representation_line": 432
+    },
+    {
+      "kind": "Expr",
+      "line_start": 297,
+      "line_end": 297,
+      "column": 8,
+      "owner": "delete_run",
+      "representation_line": 435
+    },
+    {
+      "kind": "Return",
+      "line_start": 298,
+      "line_end": 298,
+      "column": 8,
+      "owner": "delete_run",
+      "representation_line": 436
+    },
+    {
+      "kind": "Expr",
+      "line_start": 300,
+      "line_end": 300,
+      "column": 8,
+      "owner": "delete_run",
+      "representation_line": 441
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 27,
+      "line_end": 27,
+      "column": 18,
+      "kind": "Constant",
+      "original_ast": "Constant(value=3)",
+      "rendered": "3"
+    },
+    {
+      "line_start": 30,
+      "line_end": 30,
+      "column": 20,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Constant(value=1024), op=Mult(), right=Constant(value=1024))",
+      "rendered": "1024 * 1024"
+    },
+    {
+      "line_start": 33,
+      "line_end": 33,
+      "column": 16,
+      "kind": "Constant",
+      "original_ast": "Constant(value=384)",
+      "rendered": "384"
+    },
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 18,
+      "kind": "Constant",
+      "original_ast": "Constant(value=448)",
+      "rendered": "448"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 20,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value='-wal'), Constant(value='-shm'), Constant(value='-journal')], ctx=Load())",
+      "rendered": "('-wal', '-shm', '-journal')"
+    },
+    {
+      "line_start": 37,
+      "line_end": 37,
+      "column": 9,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='os', ctx=Load()), attr='name', ctx=Load()), ops=[Eq()], comparators=[Constant(value='posix')])",
+      "rendered": "os.name == 'posix'"
+    },
+    {
+      "line_start": 38,
+      "line_end": 38,
+      "column": 25,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 43,
+      "line_end": 43,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='warn_once', ctx=Load()), args=[Name(id='_PERM_WARNED', ctx=Load()), Name(id='key', ctx=Load()), JoinedStr(values=[Constant(value='  [store] WARN: '), FormattedValue(value=Name(id='message', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "warn_once(_PERM_WARNED, key, source_template_43_33)"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='_POSIX', ctx=Load()))",
+      "rendered": "not _POSIX"
+    },
+    {
+      "line_start": 52,
+      "line_end": 52,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='stat', ctx=Load()), attr='S_IMODE', ctx=Load()), args=[Attribute(value=Call(func=Attribute(value=Name(id='path', ctx=Load()), attr='stat', ctx=Load()), args=[], keywords=[]), attr='st_mode', ctx=Load())], keywords=[])",
+      "rendered": "stat.S_IMODE(path.stat().st_mode)"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='OSError', ctx=Load())",
+      "rendered": "OSError"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=BinOp(left=Name(id='current', ctx=Load()), op=BitAnd(), right=UnaryOp(op=Invert(), operand=Name(id='mode', ctx=Load()))))",
+      "rendered": "not current & ~mode"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='os', ctx=Load()), attr='chmod', ctx=Load()), args=[Name(id='path', ctx=Load()), Name(id='mode', ctx=Load())], keywords=[])",
+      "rendered": "os.chmod(path, mode)"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='OSError', ctx=Load())",
+      "rendered": "OSError"
+    },
+    {
+      "line_start": 60,
+      "line_end": 62,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_warn_once', ctx=Load()), args=[Call(func=Name(id='str', ctx=Load()), args=[Name(id='path', ctx=Load())], keywords=[]), JoinedStr(values=[Constant(value='could not tighten permissions on '), FormattedValue(value=Name(id='path', ctx=Load()), conversion=-1), Constant(value=' (mode '), FormattedValue(value=Name(id='current', ctx=Load()), conversion=-1, format_spec=JoinedStr(values=[Constant(value='o')])), Constant(value='; it holds scanned-source snippets): '), FormattedValue(value=Name(id='e', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "_warn_once(str(path), source_template_61_19)"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 17,
+      "kind": "Name",
+      "original_ast": "Name(id='RuntimeError', ctx=Load())",
+      "rendered": "RuntimeError"
+    },
+    {
+      "line_start": 72,
+      "line_end": 73,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='Path', ctx=Load()), args=[BoolOp(op=Or(), values=[Call(func=Attribute(value=Attribute(value=Name(id='os', ctx=Load()), attr='environ', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='VVAHARNESS_STATE_DIR')], keywords=[]), BinOp(left=BinOp(left=Call(func=Attribute(value=Name(id='Path', ctx=Load()), attr='home', ctx=Load()), args=[], keywords=[]), op=Div(), right=Constant(value='.vvaharness')), op=Div(), right=Constant(value='state'))])], keywords=[])",
+      "rendered": "Path(os.environ.get('VVAHARNESS_STATE_DIR') or Path.home() / '.vvaharness' / 'state')"
+    },
+    {
+      "line_start": 79,
+      "line_end": 79,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='state_root', ctx=Load()), args=[], keywords=[])",
+      "rendered": "state_root()"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='_POSIX', ctx=Load())",
+      "rendered": "_POSIX"
+    },
+    {
+      "line_start": 83,
+      "line_end": 83,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='root', ctx=Load()), attr='lstat', ctx=Load()), args=[], keywords=[])",
+      "rendered": "root.lstat()"
+    },
+    {
+      "line_start": 84,
+      "line_end": 84,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='OSError', ctx=Load())",
+      "rendered": "OSError"
+    },
+    {
+      "line_start": 85,
+      "line_end": 85,
+      "column": 18,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='lst', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), Call(func=Attribute(value=Name(id='stat', ctx=Load()), attr='S_ISLNK', ctx=Load()), args=[Attribute(value=Name(id='lst', ctx=Load()), attr='st_mode', ctx=Load())], keywords=[])])",
+      "rendered": "lst is not None and stat.S_ISLNK(lst.st_mode)"
+    },
+    {
+      "line_start": 87,
+      "line_end": 88,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='StoreError', ctx=Load()), args=[JoinedStr(values=[Constant(value='refusing to use state directory '), FormattedValue(value=Name(id='root', ctx=Load()), conversion=-1), Constant(value=': it is a symlink')])], keywords=[])",
+      "rendered": "StoreError(source_template_88_16)"
+    },
+    {
+      "line_start": 89,
+      "line_end": 89,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='root', ctx=Load()), attr='is_dir', ctx=Load()), args=[], keywords=[])",
+      "rendered": "root.is_dir()"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='_POSIX', ctx=Load())",
+      "rendered": "_POSIX"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='stat', ctx=Load()), attr='S_IMODE', ctx=Load()), args=[Attribute(value=Call(func=Attribute(value=Name(id='root', ctx=Load()), attr='stat', ctx=Load()), args=[], keywords=[]), attr='st_mode', ctx=Load())], keywords=[])",
+      "rendered": "stat.S_IMODE(root.stat().st_mode)"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='OSError', ctx=Load())",
+      "rendered": "OSError"
+    },
+    {
+      "line_start": 95,
+      "line_end": 95,
+      "column": 23,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 15,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Name(id='mode', ctx=Load()), op=BitAnd(), right=Constant(value=63))",
+      "rendered": "mode & 63"
+    },
+    {
+      "line_start": 97,
+      "line_end": 97,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='os', ctx=Load()), attr='environ', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='VVAHARNESS_STATE_DIR')], keywords=[])",
+      "rendered": "os.environ.get('VVAHARNESS_STATE_DIR')"
+    },
+    {
+      "line_start": 98,
+      "line_end": 102,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_warn_once', ctx=Load()), args=[Call(func=Name(id='str', ctx=Load()), args=[Name(id='root', ctx=Load())], keywords=[]), JoinedStr(values=[Constant(value='state directory '), FormattedValue(value=Name(id='root', ctx=Load()), conversion=-1), Constant(value=' is group/other-accessible (mode '), FormattedValue(value=Name(id='mode', ctx=Load()), conversion=-1, format_spec=JoinedStr(values=[Constant(value='o')])), Constant(value=') and holds scanned-source snippets — consider `chmod 700` if it is not shared on purpose')])], keywords=[])",
+      "rendered": "_warn_once(str(root), source_template_100_24)"
+    },
+    {
+      "line_start": 104,
+      "line_end": 104,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_tighten_mode', ctx=Load()), args=[Name(id='root', ctx=Load()), Name(id='_STATE_DIR_MODE', ctx=Load())], keywords=[])",
+      "rendered": "_tighten_mode(root, _STATE_DIR_MODE)"
+    },
+    {
+      "line_start": 105,
+      "line_end": 109,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_warn_once', ctx=Load()), args=[Call(func=Name(id='str', ctx=Load()), args=[Name(id='root', ctx=Load())], keywords=[]), JoinedStr(values=[Constant(value='tightened '), FormattedValue(value=Name(id='root', ctx=Load()), conversion=-1), Constant(value=' from mode '), FormattedValue(value=Name(id='mode', ctx=Load()), conversion=-1, format_spec=JoinedStr(values=[Constant(value='o')])), Constant(value=' to 700 — it holds scanned-source snippets. Set VVAHARNESS_STATE_DIR to a path you manage if you need to share this state')])], keywords=[])",
+      "rendered": "_warn_once(str(root), source_template_107_24)"
+    },
+    {
+      "line_start": 112,
+      "line_end": 112,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='root', ctx=Load()), attr='mkdir', ctx=Load()), args=[], keywords=[keyword(arg='parents', value=Constant(value=True)), keyword(arg='exist_ok', value=Constant(value=True))])",
+      "rendered": "root.mkdir(parents=True, exist_ok=True)"
+    },
+    {
+      "line_start": 113,
+      "line_end": 113,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='FileExistsError', ctx=Load())",
+      "rendered": "FileExistsError"
+    },
+    {
+      "line_start": 115,
+      "line_end": 117,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='StoreError', ctx=Load()), args=[JoinedStr(values=[Constant(value='refusing to use state directory '), FormattedValue(value=Name(id='root', ctx=Load()), conversion=-1), Constant(value=': it exists and is not a directory')])], keywords=[])",
+      "rendered": "StoreError(source_template_116_16)"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 36,
+      "kind": "Name",
+      "original_ast": "Name(id='e', ctx=Load())",
+      "rendered": "e"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_tighten_mode', ctx=Load()), args=[Name(id='root', ctx=Load()), Name(id='_STATE_DIR_MODE', ctx=Load())], keywords=[])",
+      "rendered": "_tighten_mode(root, _STATE_DIR_MODE)"
+    },
+    {
+      "line_start": 120,
+      "line_end": 120,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='root', ctx=Load())",
+      "rendered": "root"
+    },
+    {
+      "line_start": 121,
+      "line_end": 121,
+      "column": 16,
+      "kind": "Name",
+      "original_ast": "Name(id='parts', ctx=Load())",
+      "rendered": "parts"
+    },
+    {
+      "line_start": 122,
+      "line_end": 122,
+      "column": 15,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Name(id='path', ctx=Load()), op=Div(), right=Name(id='part', ctx=Load()))",
+      "rendered": "path / part"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='path', ctx=Load()), attr='mkdir', ctx=Load()), args=[], keywords=[keyword(arg='parents', value=Constant(value=True)), keyword(arg='exist_ok', value=Constant(value=True))])",
+      "rendered": "path.mkdir(parents=True, exist_ok=True)"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_tighten_mode', ctx=Load()), args=[Name(id='path', ctx=Load()), Name(id='_STATE_DIR_MODE', ctx=Load())], keywords=[])",
+      "rendered": "_tighten_mode(path, _STATE_DIR_MODE)"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='path', ctx=Load())",
+      "rendered": "path"
+    },
+    {
+      "line_start": 129,
+      "line_end": 129,
+      "column": 11,
+      "kind": "Constant",
+      "original_ast": "Constant(value='vvaharness.db')",
+      "rendered": "'vvaharness.db'"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 11,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Name(id='state_root', ctx=Load()), args=[], keywords=[]), op=Div(), right=Name(id='_DB_NAME', ctx=Load()))",
+      "rendered": "state_root() / _DB_NAME"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='db_location', ctx=Load()), args=[], keywords=[])",
+      "rendered": "db_location()"
+    },
+    {
+      "line_start": 142,
+      "line_end": 142,
+      "column": 25,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Call(func=Name(id='state_root', ctx=Load()), args=[], keywords=[]), Name(id='path', ctx=Load())], ctx=Load())",
+      "rendered": "(state_root(), path)"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='candidate', ctx=Load()), attr='is_symlink', ctx=Load()), args=[], keywords=[])",
+      "rendered": "candidate.is_symlink()"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='StoreError', ctx=Load()), args=[JoinedStr(values=[Constant(value='refusing to inspect state path '), FormattedValue(value=Name(id='candidate', ctx=Load()), conversion=-1), Constant(value=': it is a symlink')])], keywords=[])",
+      "rendered": "StoreError(source_template_144_33)"
+    },
+    {
+      "line_start": 146,
+      "line_end": 146,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='path', ctx=Load()), attr='stat', ctx=Load()), args=[], keywords=[])",
+      "rendered": "path.stat()"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='FileNotFoundError', ctx=Load())",
+      "rendered": "FileNotFoundError"
+    },
+    {
+      "line_start": 148,
+      "line_end": 148,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 149,
+      "line_end": 149,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='sqlite3', ctx=Load()), attr='connect', ctx=Load()), args=[BinOp(left=Call(func=Attribute(value=Call(func=Attribute(value=Name(id='path', ctx=Load()), attr='resolve', ctx=Load()), args=[], keywords=[]), attr='as_uri', ctx=Load()), args=[], keywords=[]), op=Add(), right=Constant(value='?mode=ro'))], keywords=[keyword(arg='uri', value=Constant(value=True))])",
+      "rendered": "sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)"
+    },
+    {
+      "line_start": 151,
+      "line_end": 151,
+      "column": 19,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Attribute(value=Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value='SELECT 1 FROM runs WHERE run_id = ?'), Tuple(elts=[Name(id='run_id', ctx=Load())], ctx=Load())], keywords=[]), attr='fetchone', ctx=Load()), args=[], keywords=[]), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "con.execute('SELECT 1 FROM runs WHERE run_id = ?', (run_id,)).fetchone() is not None"
+    },
+    {
+      "line_start": 153,
+      "line_end": 153,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='close', ctx=Load()), args=[], keywords=[])",
+      "rendered": "con.close()"
+    },
+    {
+      "line_start": 154,
+      "line_end": 154,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='OSError', ctx=Load()), Attribute(value=Name(id='sqlite3', ctx=Load()), attr='Error', ctx=Load())], ctx=Load())",
+      "rendered": "(OSError, sqlite3.Error)"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='StoreError', ctx=Load()), args=[JoinedStr(values=[Constant(value='could not inspect state database at '), FormattedValue(value=Name(id='path', ctx=Load()), conversion=-1), Constant(value=': '), FormattedValue(value=Name(id='error', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "StoreError(source_template_155_25)"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 86,
+      "kind": "Name",
+      "original_ast": "Name(id='error', ctx=Load())",
+      "rendered": "error"
+    },
+    {
+      "line_start": 160,
+      "line_end": 160,
+      "column": 11,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Name(id='ensure_state_dir', ctx=Load()), args=[], keywords=[]), op=Div(), right=Name(id='_DB_NAME', ctx=Load()))",
+      "rendered": "ensure_state_dir() / _DB_NAME"
+    },
+    {
+      "line_start": 167,
+      "line_end": 168,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='os', ctx=Load()), attr='close', ctx=Load()), args=[Call(func=Attribute(value=Name(id='os', ctx=Load()), attr='open', ctx=Load()), args=[Name(id='path', ctx=Load()), BinOp(left=BinOp(left=BinOp(left=Attribute(value=Name(id='os', ctx=Load()), attr='O_CREAT', ctx=Load()), op=BitOr(), right=Attribute(value=Name(id='os', ctx=Load()), attr='O_EXCL', ctx=Load())), op=BitOr(), right=Attribute(value=Name(id='os', ctx=Load()), attr='O_NOFOLLOW', ctx=Load())), op=BitOr(), right=Attribute(value=Name(id='os', ctx=Load()), attr='O_RDWR', ctx=Load())), Name(id='_DB_FILE_MODE', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_RDWR, _DB_FILE_MODE))"
+    },
+    {
+      "line_start": 170,
+      "line_end": 170,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='OSError', ctx=Load())",
+      "rendered": "OSError"
+    },
+    {
+      "line_start": 171,
+      "line_end": 171,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='err', ctx=Load())",
+      "rendered": "err"
+    },
+    {
+      "line_start": 173,
+      "line_end": 173,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='os', ctx=Load()), attr='lstat', ctx=Load()), args=[Name(id='path', ctx=Load())], keywords=[])",
+      "rendered": "os.lstat(path)"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='FileNotFoundError', ctx=Load())",
+      "rendered": "FileNotFoundError"
+    },
+    {
+      "line_start": 176,
+      "line_end": 177,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='FileNotFoundError', ctx=Load()), args=[JoinedStr(values=[Constant(value='could not create state DB at '), FormattedValue(value=Name(id='path', ctx=Load()), conversion=-1), Constant(value=': '), FormattedValue(value=Attribute(value=Name(id='open_err', ctx=Load()), attr='strerror', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "FileNotFoundError(source_template_177_12)"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 78,
+      "kind": "Name",
+      "original_ast": "Name(id='open_err', ctx=Load())",
+      "rendered": "open_err"
+    },
+    {
+      "line_start": 178,
+      "line_end": 178,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='stat', ctx=Load()), attr='S_ISLNK', ctx=Load()), args=[Attribute(value=Name(id='st', ctx=Load()), attr='st_mode', ctx=Load())], keywords=[])",
+      "rendered": "stat.S_ISLNK(st.st_mode)"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='StoreError', ctx=Load()), args=[JoinedStr(values=[Constant(value='refusing to open state DB at '), FormattedValue(value=Name(id='path', ctx=Load()), conversion=-1), Constant(value=': it is a symlink')])], keywords=[])",
+      "rendered": "StoreError(source_template_179_25)"
+    },
+    {
+      "line_start": 184,
+      "line_end": 184,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='db_path', ctx=Load()), args=[], keywords=[])",
+      "rendered": "db_path()"
+    },
+    {
+      "line_start": 185,
+      "line_end": 185,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='_POSIX', ctx=Load())",
+      "rendered": "_POSIX"
+    },
+    {
+      "line_start": 186,
+      "line_end": 186,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_create_db_file_safe', ctx=Load()), args=[Name(id='path', ctx=Load())], keywords=[])",
+      "rendered": "_create_db_file_safe(path)"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='sqlite3', ctx=Load()), attr='connect', ctx=Load()), args=[Name(id='path', ctx=Load())], keywords=[])",
+      "rendered": "sqlite3.connect(path)"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value='PRAGMA foreign_keys = ON')], keywords=[])",
+      "rendered": "con.execute('PRAGMA foreign_keys = ON')"
+    },
+    {
+      "line_start": 190,
+      "line_end": 190,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value='PRAGMA busy_timeout = 30000')], keywords=[])",
+      "rendered": "con.execute('PRAGMA busy_timeout = 30000')"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value='PRAGMA synchronous  = NORMAL')], keywords=[])",
+      "rendered": "con.execute('PRAGMA synchronous  = NORMAL')"
+    },
+    {
+      "line_start": 193,
+      "line_end": 193,
+      "column": 11,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Call(func=Attribute(value=Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value='PRAGMA user_version')], keywords=[]), attr='fetchone', ctx=Load()), args=[], keywords=[]), slice=Constant(value=0), ctx=Load())",
+      "rendered": "con.execute('PRAGMA user_version').fetchone()[0]"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='have', ctx=Load()), ops=[NotEq()], comparators=[Name(id='_SCHEMA_VERSION', ctx=Load())])",
+      "rendered": "have != _SCHEMA_VERSION"
+    },
+    {
+      "line_start": 195,
+      "line_end": 195,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_migrate', ctx=Load()), args=[Name(id='con', ctx=Load()), Name(id='have', ctx=Load())], keywords=[])",
+      "rendered": "_migrate(con, have)"
+    },
+    {
+      "line_start": 197,
+      "line_end": 198,
+      "column": 13,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='path', ctx=Load()), Starred(value=GeneratorExp(elt=Call(func=Attribute(value=Name(id='path', ctx=Load()), attr='with_name', ctx=Load()), args=[BinOp(left=Attribute(value=Name(id='path', ctx=Load()), attr='name', ctx=Load()), op=Add(), right=Name(id='s', ctx=Load()))], keywords=[]), generators=[comprehension(target=Name(id='s', ctx=Store()), iter=Name(id='_SIDECAR_SUFFIXES', ctx=Load()), ifs=[], is_async=0)]), ctx=Load())], ctx=Load())",
+      "rendered": "(path, *(path.with_name(path.name + s) for s in _SIDECAR_SUFFIXES))"
+    },
+    {
+      "line_start": 199,
+      "line_end": 199,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_tighten_mode', ctx=Load()), args=[Name(id='p', ctx=Load()), Name(id='_DB_FILE_MODE', ctx=Load())], keywords=[])",
+      "rendered": "_tighten_mode(p, _DB_FILE_MODE)"
+    },
+    {
+      "line_start": 200,
+      "line_end": 200,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='con', ctx=Load())",
+      "rendered": "con"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='have', ctx=Load()), ops=[Eq()], comparators=[Constant(value=0)])",
+      "rendered": "have == 0"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='executescript', ctx=Load()), args=[Name(id='_DDL', ctx=Load())], keywords=[])",
+      "rendered": "con.executescript(_DDL)"
+    },
+    {
+      "line_start": 208,
+      "line_end": 208,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='have', ctx=Load()), ops=[Lt()], comparators=[Constant(value=2)])",
+      "rendered": "have < 2"
+    },
+    {
+      "line_start": 209,
+      "line_end": 209,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='executescript', ctx=Load()), args=[Name(id='_DDL_V2', ctx=Load())], keywords=[])",
+      "rendered": "con.executescript(_DDL_V2)"
+    },
+    {
+      "line_start": 210,
+      "line_end": 210,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='have', ctx=Load()), ops=[Lt()], comparators=[Constant(value=3)])",
+      "rendered": "have < 3"
+    },
+    {
+      "line_start": 211,
+      "line_end": 211,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='executescript', ctx=Load()), args=[Name(id='_DDL_V3', ctx=Load())], keywords=[])",
+      "rendered": "con.executescript(_DDL_V3)"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[JoinedStr(values=[Constant(value='PRAGMA user_version = '), FormattedValue(value=Name(id='_SCHEMA_VERSION', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "con.execute(source_template_212_16)"
+    },
+    {
+      "line_start": 213,
+      "line_end": 213,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='commit', ctx=Load()), args=[], keywords=[])",
+      "rendered": "con.commit()"
+    },
+    {
+      "line_start": 220,
+      "line_end": 220,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='connect', ctx=Load()), args=[], keywords=[])",
+      "rendered": "connect()"
+    },
+    {
+      "line_start": 221,
+      "line_end": 221,
+      "column": 9,
+      "kind": "Name",
+      "original_ast": "Name(id='con', ctx=Load())",
+      "rendered": "con"
+    },
+    {
+      "line_start": 222,
+      "line_end": 231,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value=\"INSERT INTO runs(run_id, repo_root, repo_name, app_id) VALUES (?, ?, ?, ?) ON CONFLICT(run_id) DO UPDATE SET   repo_root = excluded.repo_root,   repo_name = excluded.repo_name,   app_id    = excluded.app_id,   updated_at = datetime('now')\"), Tuple(elts=[Name(id='run_id', ctx=Load()), Name(id='repo_root', ctx=Load()), Name(id='repo_name', ctx=Load()), Name(id='app_id', ctx=Load())], ctx=Load())], keywords=[])",
+      "rendered": "con.execute(source_literal_223_12, (run_id, repo_root, repo_name, app_id))"
+    },
+    {
+      "line_start": 232,
+      "line_end": 232,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='close', ctx=Load()), args=[], keywords=[])",
+      "rendered": "con.close()"
+    },
+    {
+      "line_start": 238,
+      "line_end": 238,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='connect', ctx=Load()), args=[], keywords=[])",
+      "rendered": "connect()"
+    },
+    {
+      "line_start": 240,
+      "line_end": 240,
+      "column": 13,
+      "kind": "Name",
+      "original_ast": "Name(id='con', ctx=Load())",
+      "rendered": "con"
+    },
+    {
+      "line_start": 241,
+      "line_end": 241,
+      "column": 22,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 242,
+      "line_end": 242,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value='DELETE FROM checkpoints WHERE run_id = ?'), Tuple(elts=[Name(id='run_id', ctx=Load())], ctx=Load())], keywords=[])",
+      "rendered": "con.execute('DELETE FROM checkpoints WHERE run_id = ?', (run_id,))"
+    },
+    {
+      "line_start": 243,
+      "line_end": 243,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='cleared', ctx=Store()), op=Add(), value=BoolOp(op=Or(), values=[Attribute(value=Name(id='cur', ctx=Load()), attr='rowcount', ctx=Load()), Constant(value=0)]))",
+      "rendered": "cleared += cur.rowcount or 0"
+    },
+    {
+      "line_start": 244,
+      "line_end": 244,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value='DELETE FROM callgraph_snapshots WHERE run_id = ?'), Tuple(elts=[Name(id='run_id', ctx=Load())], ctx=Load())], keywords=[])",
+      "rendered": "con.execute('DELETE FROM callgraph_snapshots WHERE run_id = ?', (run_id,))"
+    },
+    {
+      "line_start": 245,
+      "line_end": 245,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='cleared', ctx=Store()), op=Add(), value=BoolOp(op=Or(), values=[Attribute(value=Name(id='cur', ctx=Load()), attr='rowcount', ctx=Load()), Constant(value=0)]))",
+      "rendered": "cleared += cur.rowcount or 0"
+    },
+    {
+      "line_start": 246,
+      "line_end": 246,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='cleared', ctx=Load())",
+      "rendered": "cleared"
+    },
+    {
+      "line_start": 248,
+      "line_end": 248,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='close', ctx=Load()), args=[], keywords=[])",
+      "rendered": "con.close()"
+    },
+    {
+      "line_start": 253,
+      "line_end": 253,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='connect', ctx=Load()), args=[], keywords=[])",
+      "rendered": "connect()"
+    },
+    {
+      "line_start": 255,
+      "line_end": 256,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value='SELECT step FROM checkpoints WHERE run_id = ?'), Tuple(elts=[Name(id='run_id', ctx=Load())], ctx=Load())], keywords=[]), attr='fetchall', ctx=Load()), args=[], keywords=[])",
+      "rendered": "con.execute('SELECT step FROM checkpoints WHERE run_id = ?', (run_id,)).fetchall()"
+    },
+    {
+      "line_start": 257,
+      "line_end": 257,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[GeneratorExp(elt=Subscript(value=Name(id='r', ctx=Load()), slice=Constant(value=0), ctx=Load()), generators=[comprehension(target=Name(id='r', ctx=Store()), iter=Name(id='rows', ctx=Load()), ifs=[Call(func=Attribute(value=Subscript(value=Name(id='r', ctx=Load()), slice=Constant(value=0), ctx=Load()), attr='startswith', ctx=Load()), args=[Name(id='prefix', ctx=Load())], keywords=[])], is_async=0)])], keywords=[])",
+      "rendered": "sorted((r[0] for r in rows if r[0].startswith(prefix)))"
+    },
+    {
+      "line_start": 259,
+      "line_end": 259,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='close', ctx=Load()), args=[], keywords=[])",
+      "rendered": "con.close()"
+    },
+    {
+      "line_start": 264,
+      "line_end": 264,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='connect', ctx=Load()), args=[], keywords=[])",
+      "rendered": "connect()"
+    },
+    {
+      "line_start": 266,
+      "line_end": 266,
+      "column": 13,
+      "kind": "Name",
+      "original_ast": "Name(id='con', ctx=Load())",
+      "rendered": "con"
+    },
+    {
+      "line_start": 267,
+      "line_end": 268,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value='SELECT step FROM checkpoints WHERE run_id = ?'), Tuple(elts=[Name(id='run_id', ctx=Load())], ctx=Load())], keywords=[]), attr='fetchall', ctx=Load()), args=[], keywords=[])",
+      "rendered": "con.execute('SELECT step FROM checkpoints WHERE run_id = ?', (run_id,)).fetchall()"
+    },
+    {
+      "line_start": 269,
+      "line_end": 270,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[GeneratorExp(elt=Subscript(value=Name(id='r', ctx=Load()), slice=Constant(value=0), ctx=Load()), generators=[comprehension(target=Name(id='r', ctx=Store()), iter=Name(id='rows', ctx=Load()), ifs=[BoolOp(op=And(), values=[Call(func=Attribute(value=Subscript(value=Name(id='r', ctx=Load()), slice=Constant(value=0), ctx=Load()), attr='startswith', ctx=Load()), args=[Name(id='prefix', ctx=Load())], keywords=[]), Compare(left=Subscript(value=Name(id='r', ctx=Load()), slice=Constant(value=0), ctx=Load()), ops=[NotIn()], comparators=[Name(id='keep', ctx=Load())])])], is_async=0)])], keywords=[])",
+      "rendered": "sorted((r[0] for r in rows if r[0].startswith(prefix) and r[0] not in keep))"
+    },
+    {
+      "line_start": 271,
+      "line_end": 272,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='executemany', ctx=Load()), args=[Constant(value='DELETE FROM checkpoints WHERE run_id = ? AND step = ?'), ListComp(elt=Tuple(elts=[Name(id='run_id', ctx=Load()), Name(id='v', ctx=Load())], ctx=Load()), generators=[comprehension(target=Name(id='v', ctx=Store()), iter=Name(id='victims', ctx=Load()), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "con.executemany('DELETE FROM checkpoints WHERE run_id = ? AND step = ?', [(run_id, v) for v in victims])"
+    },
+    {
+      "line_start": 273,
+      "line_end": 273,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='victims', ctx=Load())",
+      "rendered": "victims"
+    },
+    {
+      "line_start": 275,
+      "line_end": 275,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='close', ctx=Load()), args=[], keywords=[])",
+      "rendered": "con.close()"
+    },
+    {
+      "line_start": 280,
+      "line_end": 280,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='shutil', ctx=Load()), attr='rmtree', ctx=Load()), args=[BinOp(left=BinOp(left=Call(func=Name(id='state_root', ctx=Load()), args=[], keywords=[]), op=Div(), right=Constant(value='graphs')), op=Div(), right=Name(id='run_id', ctx=Load()))], keywords=[keyword(arg='ignore_errors', value=Constant(value=True))])",
+      "rendered": "shutil.rmtree(state_root() / 'graphs' / run_id, ignore_errors=True)"
+    },
+    {
+      "line_start": 286,
+      "line_end": 286,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Attribute(value=Call(func=Name(id='db_location', ctx=Load()), args=[], keywords=[]), attr='exists', ctx=Load()), args=[], keywords=[]))",
+      "rendered": "not db_location().exists()"
+    },
+    {
+      "line_start": 287,
+      "line_end": 287,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 288,
+      "line_end": 288,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='connect', ctx=Load()), args=[], keywords=[])",
+      "rendered": "connect()"
+    },
+    {
+      "line_start": 290,
+      "line_end": 290,
+      "column": 13,
+      "kind": "Name",
+      "original_ast": "Name(id='con', ctx=Load())",
+      "rendered": "con"
+    },
+    {
+      "line_start": 291,
+      "line_end": 291,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value='DELETE FROM runs WHERE run_id = ?'), Tuple(elts=[Name(id='run_id', ctx=Load())], ctx=Load())], keywords=[])",
+      "rendered": "con.execute('DELETE FROM runs WHERE run_id = ?', (run_id,))"
+    },
+    {
+      "line_start": 292,
+      "line_end": 292,
+      "column": 22,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Attribute(value=Name(id='cur', ctx=Load()), attr='rowcount', ctx=Load()), Constant(value=0)])",
+      "rendered": "cur.rowcount or 0"
+    },
+    {
+      "line_start": 293,
+      "line_end": 293,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='deleted', ctx=Load())",
+      "rendered": "deleted"
+    },
+    {
+      "line_start": 295,
+      "line_end": 295,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value='PRAGMA incremental_vacuum')], keywords=[]), attr='fetchall', ctx=Load()), args=[], keywords=[])",
+      "rendered": "con.execute('PRAGMA incremental_vacuum').fetchall()"
+    },
+    {
+      "line_start": 296,
+      "line_end": 296,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value='PRAGMA wal_checkpoint(TRUNCATE)')], keywords=[])",
+      "rendered": "con.execute('PRAGMA wal_checkpoint(TRUNCATE)')"
+    },
+    {
+      "line_start": 297,
+      "line_end": 297,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='delete_run_graphs', ctx=Load()), args=[Name(id='run_id', ctx=Load())], keywords=[])",
+      "rendered": "delete_run_graphs(run_id)"
+    },
+    {
+      "line_start": 298,
+      "line_end": 298,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='deleted', ctx=Load()), ops=[Gt()], comparators=[Constant(value=0)])",
+      "rendered": "deleted > 0"
+    },
+    {
+      "line_start": 300,
+      "line_end": 300,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='close', ctx=Load()), args=[], keywords=[])",
+      "rendered": "con.close()"
+    }
+  ],
+  "calls": [
+    {
+      "line": 38,
+      "end_line": 38,
+      "callee": "set",
+      "enclosing": "module initialization",
+      "expression": "set()"
+    },
+    {
+      "line": 43,
+      "end_line": 43,
+      "callee": "warn_once",
+      "enclosing": "_warn_once",
+      "expression": "warn_once(_PERM_WARNED, key, f\"  [store] WARN: {message}\")"
+    },
+    {
+      "line": 72,
+      "end_line": 73,
+      "callee": "Path",
+      "enclosing": "state_root",
+      "expression": "Path(os.environ.get(\"VVAHARNESS_STATE_DIR\")\n                or Path.home() / \".vvaharness\" / \"state\")"
+    },
+    {
+      "line": 79,
+      "end_line": 79,
+      "callee": "state_root",
+      "enclosing": "ensure_state_dir",
+      "expression": "state_root()"
+    },
+    {
+      "line": 89,
+      "end_line": 89,
+      "callee": "root.is_dir",
+      "enclosing": "ensure_state_dir",
+      "expression": "root.is_dir()"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "db_location",
+      "enclosing": "run_exists",
+      "expression": "db_location()"
+    },
+    {
+      "line": 178,
+      "end_line": 178,
+      "callee": "stat.S_ISLNK",
+      "enclosing": "_create_db_file_safe",
+      "expression": "stat.S_ISLNK(st.st_mode)"
+    },
+    {
+      "line": 184,
+      "end_line": 184,
+      "callee": "db_path",
+      "enclosing": "connect",
+      "expression": "db_path()"
+    },
+    {
+      "line": 187,
+      "end_line": 187,
+      "callee": "sqlite3.connect",
+      "enclosing": "connect",
+      "expression": "sqlite3.connect(path)"
+    },
+    {
+      "line": 189,
+      "end_line": 189,
+      "callee": "con.execute",
+      "enclosing": "connect",
+      "expression": "con.execute(\"PRAGMA foreign_keys = ON\")"
+    },
+    {
+      "line": 190,
+      "end_line": 190,
+      "callee": "con.execute",
+      "enclosing": "connect",
+      "expression": "con.execute(\"PRAGMA busy_timeout = 30000\")"
+    },
+    {
+      "line": 191,
+      "end_line": 191,
+      "callee": "con.execute",
+      "enclosing": "connect",
+      "expression": "con.execute(\"PRAGMA synchronous  = NORMAL\")"
+    },
+    {
+      "line": 212,
+      "end_line": 212,
+      "callee": "con.execute",
+      "enclosing": "_migrate",
+      "expression": "con.execute(f\"PRAGMA user_version = {_SCHEMA_VERSION}\")"
+    },
+    {
+      "line": 213,
+      "end_line": 213,
+      "callee": "con.commit",
+      "enclosing": "_migrate",
+      "expression": "con.commit()"
+    },
+    {
+      "line": 220,
+      "end_line": 220,
+      "callee": "connect",
+      "enclosing": "register_run",
+      "expression": "connect()"
+    },
+    {
+      "line": 232,
+      "end_line": 232,
+      "callee": "con.close",
+      "enclosing": "register_run",
+      "expression": "con.close()"
+    },
+    {
+      "line": 238,
+      "end_line": 238,
+      "callee": "connect",
+      "enclosing": "reset_run",
+      "expression": "connect()"
+    },
+    {
+      "line": 253,
+      "end_line": 253,
+      "callee": "connect",
+      "enclosing": "steps_with_prefix",
+      "expression": "connect()"
+    },
+    {
+      "line": 264,
+      "end_line": 264,
+      "callee": "connect",
+      "enclosing": "delete_steps",
+      "expression": "connect()"
+    },
+    {
+      "line": 280,
+      "end_line": 280,
+      "callee": "shutil.rmtree",
+      "enclosing": "delete_run_graphs",
+      "expression": "shutil.rmtree(state_root() / \"graphs\" / run_id, ignore_errors=True)"
+    },
+    {
+      "line": 288,
+      "end_line": 288,
+      "callee": "connect",
+      "enclosing": "delete_run",
+      "expression": "connect()"
+    },
+    {
+      "line": 52,
+      "end_line": 52,
+      "callee": "stat.S_IMODE",
+      "enclosing": "_tighten_mode",
+      "expression": "stat.S_IMODE(path.stat().st_mode)"
+    },
+    {
+      "line": 58,
+      "end_line": 58,
+      "callee": "os.chmod",
+      "enclosing": "_tighten_mode",
+      "expression": "os.chmod(path, mode)"
+    },
+    {
+      "line": 119,
+      "end_line": 119,
+      "callee": "_tighten_mode",
+      "enclosing": "ensure_state_dir",
+      "expression": "_tighten_mode(root, _STATE_DIR_MODE)"
+    },
+    {
+      "line": 123,
+      "end_line": 123,
+      "callee": "path.mkdir",
+      "enclosing": "ensure_state_dir",
+      "expression": "path.mkdir(parents=True, exist_ok=True)"
+    },
+    {
+      "line": 124,
+      "end_line": 124,
+      "callee": "_tighten_mode",
+      "enclosing": "ensure_state_dir",
+      "expression": "_tighten_mode(path, _STATE_DIR_MODE)"
+    },
+    {
+      "line": 135,
+      "end_line": 135,
+      "callee": "state_root",
+      "enclosing": "db_location",
+      "expression": "state_root()"
+    },
+    {
+      "line": 149,
+      "end_line": 149,
+      "callee": "sqlite3.connect",
+      "enclosing": "run_exists",
+      "expression": "sqlite3.connect(path.resolve().as_uri() + \"?mode=ro\", uri=True)"
+    },
+    {
+      "line": 160,
+      "end_line": 160,
+      "callee": "ensure_state_dir",
+      "enclosing": "db_path",
+      "expression": "ensure_state_dir()"
+    },
+    {
+      "line": 167,
+      "end_line": 168,
+      "callee": "os.close",
+      "enclosing": "_create_db_file_safe",
+      "expression": "os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_RDWR,\n                         _DB_FILE_MODE))"
+    },
+    {
+      "line": 173,
+      "end_line": 173,
+      "callee": "os.lstat",
+      "enclosing": "_create_db_file_safe",
+      "expression": "os.lstat(path)"
+    },
+    {
+      "line": 179,
+      "end_line": 179,
+      "callee": "StoreError",
+      "enclosing": "_create_db_file_safe",
+      "expression": "StoreError(f\"refusing to open state DB at {path}: it is a symlink\")"
+    },
+    {
+      "line": 186,
+      "end_line": 186,
+      "callee": "_create_db_file_safe",
+      "enclosing": "connect",
+      "expression": "_create_db_file_safe(path)"
+    },
+    {
+      "line": 193,
+      "end_line": 193,
+      "callee": "con.execute('PRAGMA user_version').fetchone",
+      "enclosing": "connect",
+      "expression": "con.execute(\"PRAGMA user_version\").fetchone()"
+    },
+    {
+      "line": 195,
+      "end_line": 195,
+      "callee": "_migrate",
+      "enclosing": "connect",
+      "expression": "_migrate(con, have)"
+    },
+    {
+      "line": 199,
+      "end_line": 199,
+      "callee": "_tighten_mode",
+      "enclosing": "connect",
+      "expression": "_tighten_mode(p, _DB_FILE_MODE)"
+    },
+    {
+      "line": 206,
+      "end_line": 206,
+      "callee": "con.executescript",
+      "enclosing": "_migrate",
+      "expression": "con.executescript(_DDL)"
+    },
+    {
+      "line": 222,
+      "end_line": 231,
+      "callee": "con.execute",
+      "enclosing": "register_run",
+      "expression": "con.execute(\n            \"INSERT INTO runs(run_id, repo_root, repo_name, app_id) \"\n            \"VALUES (?, ?, ?, ?) \"\n            \"ON CONFLICT(run_id) DO UPDATE SET \"\n            \"  repo_root = excluded.repo_root, \"\n            \"  repo_name = excluded.repo_name, \"\n            \"  app_id    = excluded.app_id, \"\n            \"  updated_at = datetime('now')\",\n            (run_id, repo_root, repo_name, app_id),\n        )"
+    },
+    {
+      "line": 248,
+      "end_line": 248,
+      "callee": "con.close",
+      "enclosing": "reset_run",
+      "expression": "con.close()"
+    },
+    {
+      "line": 255,
+      "end_line": 256,
+      "callee": "con.execute('SELECT step FROM checkpoints WHERE run_id = ?', (run_id,)).fetchall",
+      "enclosing": "steps_with_prefix",
+      "expression": "con.execute(\"SELECT step FROM checkpoints WHERE run_id = ?\",\n                           (run_id,)).fetchall()"
+    },
+    {
+      "line": 257,
+      "end_line": 257,
+      "callee": "sorted",
+      "enclosing": "steps_with_prefix",
+      "expression": "sorted(r[0] for r in rows if r[0].startswith(prefix))"
+    },
+    {
+      "line": 259,
+      "end_line": 259,
+      "callee": "con.close",
+      "enclosing": "steps_with_prefix",
+      "expression": "con.close()"
+    },
+    {
+      "line": 275,
+      "end_line": 275,
+      "callee": "con.close",
+      "enclosing": "delete_steps",
+      "expression": "con.close()"
+    },
+    {
+      "line": 286,
+      "end_line": 286,
+      "callee": "db_location().exists",
+      "enclosing": "delete_run",
+      "expression": "db_location().exists()"
+    },
+    {
+      "line": 297,
+      "end_line": 297,
+      "callee": "delete_run_graphs",
+      "enclosing": "delete_run",
+      "expression": "delete_run_graphs(run_id)"
+    },
+    {
+      "line": 300,
+      "end_line": 300,
+      "callee": "con.close",
+      "enclosing": "delete_run",
+      "expression": "con.close()"
+    },
+    {
+      "line": 60,
+      "end_line": 62,
+      "callee": "_warn_once",
+      "enclosing": "_tighten_mode",
+      "expression": "_warn_once(str(path),\n                   f\"could not tighten permissions on {path} (mode \"\n                   f\"{current:o}; it holds scanned-source snippets): {e}\")"
+    },
+    {
+      "line": 72,
+      "end_line": 72,
+      "callee": "os.environ.get",
+      "enclosing": "state_root",
+      "expression": "os.environ.get(\"VVAHARNESS_STATE_DIR\")"
+    },
+    {
+      "line": 83,
+      "end_line": 83,
+      "callee": "root.lstat",
+      "enclosing": "ensure_state_dir",
+      "expression": "root.lstat()"
+    },
+    {
+      "line": 86,
+      "end_line": 86,
+      "callee": "stat.S_ISLNK",
+      "enclosing": "ensure_state_dir",
+      "expression": "stat.S_ISLNK(lst.st_mode)"
+    },
+    {
+      "line": 87,
+      "end_line": 88,
+      "callee": "StoreError",
+      "enclosing": "ensure_state_dir",
+      "expression": "StoreError(\n                f\"refusing to use state directory {root}: it is a symlink\")"
+    },
+    {
+      "line": 112,
+      "end_line": 112,
+      "callee": "root.mkdir",
+      "enclosing": "ensure_state_dir",
+      "expression": "root.mkdir(parents=True, exist_ok=True)"
+    },
+    {
+      "line": 142,
+      "end_line": 142,
+      "callee": "state_root",
+      "enclosing": "run_exists",
+      "expression": "state_root()"
+    },
+    {
+      "line": 143,
+      "end_line": 143,
+      "callee": "candidate.is_symlink",
+      "enclosing": "run_exists",
+      "expression": "candidate.is_symlink()"
+    },
+    {
+      "line": 146,
+      "end_line": 146,
+      "callee": "path.stat",
+      "enclosing": "run_exists",
+      "expression": "path.stat()"
+    },
+    {
+      "line": 153,
+      "end_line": 153,
+      "callee": "con.close",
+      "enclosing": "run_exists",
+      "expression": "con.close()"
+    },
+    {
+      "line": 155,
+      "end_line": 155,
+      "callee": "StoreError",
+      "enclosing": "run_exists",
+      "expression": "StoreError(f\"could not inspect state database at {path}: {error}\")"
+    },
+    {
+      "line": 167,
+      "end_line": 168,
+      "callee": "os.open",
+      "enclosing": "_create_db_file_safe",
+      "expression": "os.open(path, os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_RDWR,\n                         _DB_FILE_MODE)"
+    },
+    {
+      "line": 176,
+      "end_line": 177,
+      "callee": "FileNotFoundError",
+      "enclosing": "_create_db_file_safe",
+      "expression": "FileNotFoundError(\n            f\"could not create state DB at {path}: {open_err.strerror}\")"
+    },
+    {
+      "line": 209,
+      "end_line": 209,
+      "callee": "con.executescript",
+      "enclosing": "_migrate",
+      "expression": "con.executescript(_DDL_V2)"
+    },
+    {
+      "line": 211,
+      "end_line": 211,
+      "callee": "con.executescript",
+      "enclosing": "_migrate",
+      "expression": "con.executescript(_DDL_V3)"
+    },
+    {
+      "line": 242,
+      "end_line": 242,
+      "callee": "con.execute",
+      "enclosing": "reset_run",
+      "expression": "con.execute(\"DELETE FROM checkpoints WHERE run_id = ?\", (run_id,))"
+    },
+    {
+      "line": 244,
+      "end_line": 244,
+      "callee": "con.execute",
+      "enclosing": "reset_run",
+      "expression": "con.execute(\"DELETE FROM callgraph_snapshots WHERE run_id = ?\", (run_id,))"
+    },
+    {
+      "line": 267,
+      "end_line": 268,
+      "callee": "con.execute('SELECT step FROM checkpoints WHERE run_id = ?', (run_id,)).fetchall",
+      "enclosing": "delete_steps",
+      "expression": "con.execute(\"SELECT step FROM checkpoints WHERE run_id = ?\",\n                               (run_id,)).fetchall()"
+    },
+    {
+      "line": 269,
+      "end_line": 270,
+      "callee": "sorted",
+      "enclosing": "delete_steps",
+      "expression": "sorted(r[0] for r in rows\n                             if r[0].startswith(prefix) and r[0] not in keep)"
+    },
+    {
+      "line": 271,
+      "end_line": 272,
+      "callee": "con.executemany",
+      "enclosing": "delete_steps",
+      "expression": "con.executemany(\"DELETE FROM checkpoints WHERE run_id = ? AND step = ?\",\n                            [(run_id, v) for v in victims])"
+    },
+    {
+      "line": 291,
+      "end_line": 291,
+      "callee": "con.execute",
+      "enclosing": "delete_run",
+      "expression": "con.execute(\"DELETE FROM runs WHERE run_id = ?\", (run_id,))"
+    },
+    {
+      "line": 295,
+      "end_line": 295,
+      "callee": "con.execute('PRAGMA incremental_vacuum').fetchall",
+      "enclosing": "delete_run",
+      "expression": "con.execute(\"PRAGMA incremental_vacuum\").fetchall()"
+    },
+    {
+      "line": 296,
+      "end_line": 296,
+      "callee": "con.execute",
+      "enclosing": "delete_run",
+      "expression": "con.execute(\"PRAGMA wal_checkpoint(TRUNCATE)\")"
+    },
+    {
+      "line": 52,
+      "end_line": 52,
+      "callee": "path.stat",
+      "enclosing": "_tighten_mode",
+      "expression": "path.stat()"
+    },
+    {
+      "line": 60,
+      "end_line": 60,
+      "callee": "str",
+      "enclosing": "_tighten_mode",
+      "expression": "str(path)"
+    },
+    {
+      "line": 93,
+      "end_line": 93,
+      "callee": "stat.S_IMODE",
+      "enclosing": "ensure_state_dir",
+      "expression": "stat.S_IMODE(root.stat().st_mode)"
+    },
+    {
+      "line": 97,
+      "end_line": 97,
+      "callee": "os.environ.get",
+      "enclosing": "ensure_state_dir",
+      "expression": "os.environ.get(\"VVAHARNESS_STATE_DIR\")"
+    },
+    {
+      "line": 115,
+      "end_line": 117,
+      "callee": "StoreError",
+      "enclosing": "ensure_state_dir",
+      "expression": "StoreError(\n                f\"refusing to use state directory {root}: it exists and is not \"\n                \"a directory\")"
+    },
+    {
+      "line": 144,
+      "end_line": 144,
+      "callee": "StoreError",
+      "enclosing": "run_exists",
+      "expression": "StoreError(f\"refusing to inspect state path {candidate}: it is a symlink\")"
+    },
+    {
+      "line": 149,
+      "end_line": 149,
+      "callee": "path.resolve().as_uri",
+      "enclosing": "run_exists",
+      "expression": "path.resolve().as_uri()"
+    },
+    {
+      "line": 151,
+      "end_line": 151,
+      "callee": "con.execute('SELECT 1 FROM runs WHERE run_id = ?', (run_id,)).fetchone",
+      "enclosing": "run_exists",
+      "expression": "con.execute(\"SELECT 1 FROM runs WHERE run_id = ?\", (run_id,)).fetchone()"
+    },
+    {
+      "line": 193,
+      "end_line": 193,
+      "callee": "con.execute",
+      "enclosing": "connect",
+      "expression": "con.execute(\"PRAGMA user_version\")"
+    },
+    {
+      "line": 197,
+      "end_line": 197,
+      "callee": "path.with_name",
+      "enclosing": "connect",
+      "expression": "path.with_name(path.name + s)"
+    },
+    {
+      "line": 255,
+      "end_line": 256,
+      "callee": "con.execute",
+      "enclosing": "steps_with_prefix",
+      "expression": "con.execute(\"SELECT step FROM checkpoints WHERE run_id = ?\",\n                           (run_id,))"
+    },
+    {
+      "line": 280,
+      "end_line": 280,
+      "callee": "state_root",
+      "enclosing": "delete_run_graphs",
+      "expression": "state_root()"
+    },
+    {
+      "line": 286,
+      "end_line": 286,
+      "callee": "db_location",
+      "enclosing": "delete_run",
+      "expression": "db_location()"
+    },
+    {
+      "line": 73,
+      "end_line": 73,
+      "callee": "Path.home",
+      "enclosing": "state_root",
+      "expression": "Path.home()"
+    },
+    {
+      "line": 98,
+      "end_line": 102,
+      "callee": "_warn_once",
+      "enclosing": "ensure_state_dir",
+      "expression": "_warn_once(\n                        str(root),\n                        f\"state directory {root} is group/other-accessible \"\n                        f\"(mode {mode:o}) and holds scanned-source snippets — \"\n                        \"consider `chmod 700` if it is not shared on purpose\")"
+    },
+    {
+      "line": 104,
+      "end_line": 104,
+      "callee": "_tighten_mode",
+      "enclosing": "ensure_state_dir",
+      "expression": "_tighten_mode(root, _STATE_DIR_MODE)"
+    },
+    {
+      "line": 105,
+      "end_line": 109,
+      "callee": "_warn_once",
+      "enclosing": "ensure_state_dir",
+      "expression": "_warn_once(\n                        str(root),\n                        f\"tightened {root} from mode {mode:o} to 700 — it holds \"\n                        \"scanned-source snippets. Set VVAHARNESS_STATE_DIR to a \"\n                        \"path you manage if you need to share this state\")"
+    },
+    {
+      "line": 257,
+      "end_line": 257,
+      "callee": "r[0].startswith",
+      "enclosing": "steps_with_prefix",
+      "expression": "r[0].startswith(prefix)"
+    },
+    {
+      "line": 267,
+      "end_line": 268,
+      "callee": "con.execute",
+      "enclosing": "delete_steps",
+      "expression": "con.execute(\"SELECT step FROM checkpoints WHERE run_id = ?\",\n                               (run_id,))"
+    },
+    {
+      "line": 295,
+      "end_line": 295,
+      "callee": "con.execute",
+      "enclosing": "delete_run",
+      "expression": "con.execute(\"PRAGMA incremental_vacuum\")"
+    },
+    {
+      "line": 93,
+      "end_line": 93,
+      "callee": "root.stat",
+      "enclosing": "ensure_state_dir",
+      "expression": "root.stat()"
+    },
+    {
+      "line": 99,
+      "end_line": 99,
+      "callee": "str",
+      "enclosing": "ensure_state_dir",
+      "expression": "str(root)"
+    },
+    {
+      "line": 106,
+      "end_line": 106,
+      "callee": "str",
+      "enclosing": "ensure_state_dir",
+      "expression": "str(root)"
+    },
+    {
+      "line": 149,
+      "end_line": 149,
+      "callee": "path.resolve",
+      "enclosing": "run_exists",
+      "expression": "path.resolve()"
+    },
+    {
+      "line": 151,
+      "end_line": 151,
+      "callee": "con.execute",
+      "enclosing": "run_exists",
+      "expression": "con.execute(\"SELECT 1 FROM runs WHERE run_id = ?\", (run_id,))"
+    },
+    {
+      "line": 270,
+      "end_line": 270,
+      "callee": "r[0].startswith",
+      "enclosing": "delete_steps",
+      "expression": "r[0].startswith(prefix)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 15,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 17,
+      "source_expression": "import os",
+      "targets": [
+        "os"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 18,
+      "source_expression": "import shutil",
+      "targets": [
+        "shutil"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "import sqlite3",
+      "targets": [
+        "sqlite3"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "import stat",
+      "targets": [
+        "stat"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "from collections.abc import Collection",
+      "targets": [
+        "collections.abc",
+        "collections.abc.Collection"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "from pathlib import Path",
+      "targets": [
+        "pathlib",
+        "pathlib.Path"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 24,
+      "source_expression": "from vvaharness.orchestrator.store._schema import _DDL, _DDL_V2, _DDL_V3",
+      "targets": [
+        "vvaharness.orchestrator.store._schema",
+        "vvaharness.orchestrator.store._schema._DDL",
+        "vvaharness.orchestrator.store._schema._DDL_V2",
+        "vvaharness.orchestrator.store._schema._DDL_V3"
+      ],
+      "local_source_paths": [
+        "vvaharness/orchestrator/store/_schema.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 25,
+      "source_expression": "from vvaharness.util.warn_once import warn_once",
+      "targets": [
+        "vvaharness.util.warn_once",
+        "vvaharness.util.warn_once.warn_once"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/warn_once.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

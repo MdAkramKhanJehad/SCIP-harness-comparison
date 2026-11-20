@@ -1,0 +1,4052 @@
+{
+  "source": "vvaharness/orchestrator/checkpoints.py",
+  "sha256": "7f2b6e3112404b943b45af63c235bfd027bf8805d22ca08babecb3dc6a79a709",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\nfrom __future__ import annotations\nfrom vvaharness.util import logs\n\n\"\"\"Checkpoint/resume key derivation and JSON-backed storage in the SQLite state store.\"\"\"\nimport hashlib\nimport json\nfrom collections.abc import Iterable, Mapping\nfrom pathlib import Path\n\nfrom pydantic import TypeAdapter, ValidationError\nfrom typing import Literal\nfrom typing_extensions import NotRequired, TypedDict\n\nfrom vvaharness.models import (\n    ContextPackage,\n    DroppedFinding,\n    FinalReport,\n    Finding,\n    TaskManifest,\n    ThreatModel,\n)\nfrom vvaharness.models.scan import SeedPackage\nfrom vvaharness.orchestrator import store\nfrom vvaharness.util import console\nfrom vvaharness.util.events import Event\n\nlog = logs.get_logger(__name__)\n\n\n# TypeAdapter both serialises (dump_json) and validates on load (validate_json), rejecting a tampered value instead of smuggling it into the pipeline.\nclass _S4Ckpt(TypedDict):\n    findings: list[Finding]\n    outcomes: dict[str, str]\n    input_kind: NotRequired[Literal[\"deepdive\", \"external\"]]\n\n\ndef s4_input_kind(checkpoint: dict) -> str:\n    if \"input_kind\" in checkpoint:\n        return checkpoint[\"input_kind\"]\n    findings = checkpoint.get(\"findings\", [])\n    outcomes = checkpoint.get(\"outcomes\", {})\n    origins = {str(getattr(finding, \"origin\", None) or \"external\") for finding in findings}\n    if findings and outcomes == dict.fromkeys(origins, \"confirmed\"):\n        return \"external\"\n    return \"deepdive\"\n\n\n#: Per-unit outcomes meaning no trustworthy result — \"guardrail\"/\"skipped\" are excluded since they're deterministic for a given config, so retrying them on --resume alone wouldn't heal them.\n_S4_UNTRUSTED_OUTCOMES = frozenset({\"error\", \"halted\", \"uninvestigated\", \"failed\"})\n\n\ndef s4_stage_complete(checkpoint: dict) -> bool:\n    \"\"\"Whether an S4 checkpoint has no unit left in an unresolved failure state; False means --resume must not reuse it.\"\"\"\n    outcomes = checkpoint.get(\"outcomes\", {})\n    return not any(outcome in _S4_UNTRUSTED_OUTCOMES for outcome in outcomes.values())\n\n\nclass _S5Ckpt(TypedDict):\n    findings: list[Finding]\n    pre_dropped: list[DroppedFinding]\n\n\nclass _S6Ckpt(TypedDict):\n    verified: list[Finding]\n    dropped: list[DroppedFinding]\n\n\n# 6-tuple current (trailing int = post-s5 count for --resume); 5-tuple stays for scan.py legacy arm\n_S7Ckpt = (\n    tuple[list[DroppedFinding],   # pre_dropped\n         list[Finding],          # verified\n         list[DroppedFinding],   # dropped\n         list[Finding],          # canonical\n         list[DroppedFinding],   # dup_dropped\n         int]                    # s5_out_count\n    | tuple[list[DroppedFinding], list[Finding], list[DroppedFinding],\n           list[Finding], list[DroppedFinding]]\n)\n\n\n#: Step key holding the scanned tree's git HEAD at scan start; identifies the TARGET, not a stage.\nREPO_IDENTITY_STEP = \"repo_identity\"\n\n\nclass StageProvenance(TypedDict):\n    \"\"\"The model/via/config a detection stage's checkpoint was ACTUALLY produced\n    under, plus that stage's own token bucket.\n\n    Checkpoints are keyed ``(run_id, step)`` with no model/via/config column\n    (``store.py``'s ``checkpoints`` table), so resuming stage N under a\n    DIFFERENT ``--config`` than produced it left the manifest attributing N's\n    model/tokens to whatever the CURRENT config's role_models/TOKENS say —\n    misattributing route and dropping the original spend. Saved as a SECOND\n    checkpoint row per stage (``<step>_prov``, via ``save_ckpt``/``load_ckpt``\n    themselves — same pattern as :data:`REPO_IDENTITY_STEP`, no new storage\n    mechanism and no ``store.py`` schema change) so a cached stage's manifest\n    row can report the truth it was actually computed under. A stage with no\n    ``_prov`` row (written before this existed) has no envelope to read and\n    falls back to today's behaviour — see ``load_stage_provenance``.\n    \"\"\"\n\n    model: str | None\n    via: str | None\n    config_sha256: str | None\n    tokens: dict[str, int | float | None]\n\n\n#: Provenance-envelope row suffix (``\"s2_prov\"``); NOT a ``_DYNAMIC_PREFIXES`` family, an extra row\n_PROVENANCE_SUFFIX = \"_prov\"\n\n_PROVENANCE_SCHEMA: TypeAdapter = TypeAdapter(StageProvenance)\n\n\ndef _provenance_step(step: str) -> str:\n    return f\"{step}{_PROVENANCE_SUFFIX}\"\n\n\n_STEP_SCHEMA: dict[str, TypeAdapter] = {\n    # s0 is a plain @dataclass; TypeAdapter serialises/rebuilds it too, Path field included.\n    \"s0\": TypeAdapter(SeedPackage),\n    \"s1\": TypeAdapter(ContextPackage),\n    \"s2\": TypeAdapter(ThreatModel),\n    \"s3\": TypeAdapter(TaskManifest),\n    \"s4\": TypeAdapter(_S4Ckpt),\n    \"s5\": TypeAdapter(_S5Ckpt),\n    \"s6\": TypeAdapter(_S6Ckpt),\n    \"s7\": TypeAdapter(_S7Ckpt),\n    \"s8\": TypeAdapter(FinalReport),\n    \"s9\": TypeAdapter(str),\n    # Not a pipeline stage: records that the S9 artifacts were uploaded, so --resume never re-uploads.\n    \"ingest\": TypeAdapter(bool),\n    # Not a stage: git HEAD at start; run_id keys on PATH alone, so a re-clone publishes stale rows\n    REPO_IDENTITY_STEP: TypeAdapter(str),\n}\n\n# Step 10 checkpoints one dict per finding under a dynamic remediate_<digest> key, so it can't live in the fixed table above.\n_REMEDIATE_STEP_SCHEMA: TypeAdapter = TypeAdapter(dict)\n\n#: The two dynamic step families; the prefix stays in plaintext so ``_schema_for`` can sniff it after the rest is hashed.\nREMEDIATE_PREFIX = \"remediate_\"\nVALIDATE_PREFIX = \"validate_\"\n\n_DYNAMIC_PREFIXES: tuple[str, ...] = (REMEDIATE_PREFIX, VALIDATE_PREFIX)\n\n#: 96 bits of digest; names a checkpoint row, not a directory, so it only needs collision-freedom within one run's finding set.\n_STEP_DIGEST_CHARS = 24\n\n# Built lazily: ValidationResult lives in vvaharness.validation, which already imports this package, so a module-level import here would cycle.\n_VALIDATE_STEP_SCHEMA: TypeAdapter | None = None\n\n\ndef _validate_schema() -> TypeAdapter:\n    \"\"\"Lazily build and cache the TypeAdapter for ``validate_<id>`` checkpoint steps.\"\"\"\n    global _VALIDATE_STEP_SCHEMA\n    if _VALIDATE_STEP_SCHEMA is None:\n        from vvaharness.validation.models import ValidationResult\n        _VALIDATE_STEP_SCHEMA = TypeAdapter(ValidationResult)\n    return _VALIDATE_STEP_SCHEMA\n\n\n#: Normalized EV collection; --resume needs no ``EV_API_COLLECTION`` (set, it wins); named: S6 input\nEV_COLLECTION_STEP = \"ev_collection\"\n\n_EV_COLLECTION_SCHEMA: TypeAdapter | None = None\n\n\ndef _ev_collection_schema() -> TypeAdapter:\n    \"\"\"Lazily build and cache the TypeAdapter for the ``ev_collection`` step.\"\"\"\n    global _EV_COLLECTION_SCHEMA\n    if _EV_COLLECTION_SCHEMA is None:\n        from vvaharness.exploit_verification.collection.model import (\n            NormalizedCollection,\n        )\n        _EV_COLLECTION_SCHEMA = TypeAdapter(NormalizedCollection)\n    return _EV_COLLECTION_SCHEMA\n\n\ndef _schema_for(step: str) -> TypeAdapter:\n    \"\"\"Resolve the TypeAdapter for a checkpoint step, fixed or dynamic.\"\"\"\n    if step in _STEP_SCHEMA:\n        return _STEP_SCHEMA[step]\n    if (step.endswith(_PROVENANCE_SUFFIX)\n            and step[: -len(_PROVENANCE_SUFFIX)] in _STEP_SCHEMA):\n        return _PROVENANCE_SCHEMA\n    if step == EV_COLLECTION_STEP:\n        return _ev_collection_schema()\n    if step.startswith(REMEDIATE_PREFIX):\n        return _REMEDIATE_STEP_SCHEMA\n    if step.startswith(VALIDATE_PREFIX):\n        return _validate_schema()\n    return _STEP_SCHEMA[step]   # unknown step → KeyError (caller bug, fail loud)\n\n\ndef step_key_for(prefix: str, *, engine_id: str, engine_version: str,\n                 case_id: str, model: str = \"\", backend: str = \"\") -> str:\n    \"\"\"Build the dynamic checkpoint step key for one case under one engine, so ``--resume`` cannot republish another producer's result as this run's.\"\"\"\n    if prefix not in _DYNAMIC_PREFIXES:\n        msg = (f\"unknown dynamic checkpoint prefix {prefix!r}; expected one of \"\n               f\"{_DYNAMIC_PREFIXES} so _schema_for can still route the key\")\n        raise ValueError(msg)\n    material = \"\\n\".join((engine_id, engine_version, case_id, model, backend)).encode()\n    return prefix + hashlib.sha256(material).hexdigest()[:_STEP_DIGEST_CHARS]\n\n\n# One prune per (run_id, prefix) per process: the standalone remediate/validate commands never call reset_run, so without this their rows accumulate forever.\n_PRUNED: set[tuple[str, str]] = set()\n\n\ndef prune_stale_steps(run_id: str, prefix: str, live_keys: Iterable[str]) -> list[str]:\n    \"\"\"Delete this run's *prefix* rows that no live case claims, at most once per ``(run_id, prefix)`` per process. Returns the keys removed.\"\"\"\n    once = (run_id, prefix)\n    if once in _PRUNED:\n        return []\n    _PRUNED.add(once)\n    removed = store.delete_steps(run_id, prefix, set(live_keys))\n    if removed:\n        console.write(f\"  [ckpt] pruned {len(removed)} stale {prefix}* checkpoint row(s) \"\n                      f\"for {run_id[:12]}… — written by an earlier engine or finding set\")\n    return removed\n\n\n# Oversized payload is corruption or a resource-exhaustion attempt; enforced here AND by a CHECK constraint on checkpoints.size so a direct INSERT can't bypass it.\n_CKPT_MAX_BYTES = 100 * 1024 * 1024\n\n\ndef save_ckpt(ckpt_dir: Path, run_id: str, step: str, obj) -> None:\n    \"\"\"Persist ``obj`` for ``(run_id, step)`` to the SQLite state store; ``ckpt_dir`` is kept only for call-site compatibility.\"\"\"\n    del ckpt_dir\n    blob = _schema_for(step).dump_json(obj)  # JSON, never pickle — avoids CWE-502 RCE on a hostile checkpoint\n    if len(blob) > _CKPT_MAX_BYTES:\n        log.warning(Event.CKPT_TOO_LARGE, step=step, size=len(blob), cap=_CKPT_MAX_BYTES)\n        return\n    con = store.connect()\n    try:\n        with con:   # one transaction == atomic\n            # Ensure a parent runs row exists even when register_run() was skipped (tests, ad-hoc callers), so the FK + ON DELETE CASCADE hold.\n            con.execute(\"INSERT OR IGNORE INTO runs(run_id, repo_root) \"\n                        \"VALUES (?, '')\", (run_id,))\n            con.execute(\"UPDATE runs SET updated_at = datetime('now') \"\n                        \"WHERE run_id = ?\", (run_id,))\n            con.execute(\n                \"INSERT OR REPLACE INTO checkpoints\"\n                \"(run_id, step, payload, size) VALUES (?, ?, ?, ?)\",\n                (run_id, step, blob, len(blob)),\n            )\n    finally:\n        con.close()\n    console.write(f\"  [ckpt] saved {step}\")\n\n\ndef load_ckpt(ckpt_dir: Path, run_id: str, step: str):\n    \"\"\"Return the rehydrated checkpoint for ``(run_id, step)``, or ``None`` if absent, oversized, or schema-invalid — the caller re-runs the step.\"\"\"\n    del ckpt_dir\n    con = store.connect()\n    try:\n        row = con.execute(\n            \"SELECT payload, size FROM checkpoints WHERE run_id=? AND step=?\",\n            (run_id, step),\n        ).fetchone()\n    finally:\n        con.close()\n    if row is None:\n        if step == \"s1\":\n            console.write(f\"  [ckpt] no checkpoints for {run_id[:12]}… in \"\n                          f\"{store.db_path()} — if you expected resume, check \"\n                          f\"$VVAHARNESS_STATE_DIR\")\n        return None\n    payload, size = row\n    if size > _CKPT_MAX_BYTES:   # belt-and-braces; CHECK already enforces\n        log.warning(Event.CKPT_STORED_TOO_LARGE, step=step, cap=_CKPT_MAX_BYTES)\n        return None\n    try:\n        obj = _schema_for(step).validate_json(payload)\n    except (ValidationError, ValueError) as e:\n        # Both branches re-run the step; the only distinction the bytes support is \"valid JSON?\".\n        try:\n            json.loads(payload)\n        except (ValueError, TypeError):\n            # Not even well-formed JSON: truncated, corrupt, or a substituted non-checkpoint blob.\n            log.warning(Event.CKPT_UNREADABLE, step=step, detail=str(e))\n        else:\n            # Well-formed JSON failing the schema is usually a different tool version, not tampering.\n            log.warning(Event.CKPT_SCHEMA_MISMATCH, step=step, detail=str(e))\n        return None\n    console.write(f\"  [ckpt] resumed {step} from db\")\n    return obj\n\n\ndef save_stage_provenance(ckpt_dir: Path, run_id: str, step: str, *,\n                          model: str | None, via: str | None,\n                          config_sha256: str | None,\n                          tokens: Mapping[str, object]) -> None:\n    \"\"\"Save *step*'s :class:`StageProvenance` envelope alongside its normal checkpoint row — a second ``sav...\"\"\"\n    save_ckpt(ckpt_dir, run_id, _provenance_step(step), StageProvenance(\n        model=model, via=via, config_sha256=config_sha256,\n        tokens=dict(tokens)))\n\n\ndef load_stage_provenance(ckpt_dir: Path, run_id: str, step: str) -> StageProvenance | None:\n    \"\"\"Load *step*'s provenance envelope, or ``None`` when absent — either it was never saved (a legacy checkpoi...\"\"\"\n    return load_ckpt(ckpt_dir, run_id, _provenance_step(step))\n\n\ndef run_id_for(repo: str | Path) -> str:\n    \"\"\"Stable, non-reversible SHA-256 run id per repo path, so the checkpoint filename leaks nothing about the host's directory layout.\"\"\"\n    return hashlib.sha256(str(Path(repo).resolve()).encode()).hexdigest()[:32]\n\n\ndef prune_checkpoints(*, keep_runs: int = 100, max_age_days: int = 5,\n                      dry_run: bool = False) -> dict:\n    \"\"\"Delete ``runs`` rows (and their checkpoints, via ON DELETE CASCADE) and code-graph workspaces older than ``max_age_days`` or beyond the ``keep_runs`` most-recent; ``dry_run`` reports without touching anything.\"\"\"\n    # No DB = nothing to prune, BOTH modes: `store.connect()` would CREATE it, `db_location()` won't\n    db = store.db_location()\n    if not db.exists():\n        return {\"root\": str(db), \"kept\": 0, \"deleted\": []}\n    con = store.connect()\n    try:\n        total = con.execute(\"SELECT COUNT(*) FROM runs\").fetchone()[0]\n        victims = [r[0] for r in con.execute(\n            \"\"\"SELECT run_id FROM runs\n               WHERE updated_at < datetime('now', ?)\n                  OR run_id NOT IN (\n                       SELECT run_id FROM runs\n                       ORDER BY updated_at DESC LIMIT ?)\n               ORDER BY updated_at\"\"\",\n            (f\"-{max_age_days} days\", keep_runs),\n        )]\n        if not dry_run and victims:\n            with con:\n                con.executemany(\"DELETE FROM runs WHERE run_id = ?\",\n                                [(v,) for v in victims])\n            # Truncate the -wal file too, or it can sit at the high-water-mark of the largest deleted blob.\n            # incremental_vacuum frees one page per fetched row: unfetched, it frees one page\n            con.execute(\"PRAGMA incremental_vacuum\").fetchall()\n            con.execute(\"PRAGMA wal_checkpoint(TRUNCATE)\")\n            for v in victims:\n                store.delete_run_graphs(v)\n    finally:\n        con.close()\n    # `db`, not `db_path()`: re-resolving would run the state-dir mode check and creation again.\n    return {\"root\": str(db),\n            \"kept\": total - len(victims), \"deleted\": victims}\n",
+  "literals": {
+    "source_literal_19_0": {
+      "source": "vvaharness/orchestrator/checkpoints.py",
+      "line_start": 19,
+      "line_end": 19,
+      "value": "Checkpoint/resume key derivation and JSON-backed storage in the SQLite state store.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_68_4": {
+      "source": "vvaharness/orchestrator/checkpoints.py",
+      "line_start": 68,
+      "line_end": 68,
+      "value": "Whether an S4 checkpoint has no unit left in an unresolved failure state; False means --resume must not reuse it.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_101_4": {
+      "source": "vvaharness/orchestrator/checkpoints.py",
+      "line_start": 101,
+      "line_end": 115,
+      "value": "The model/via/config a detection stage's checkpoint was ACTUALLY produced\n    under, plus that stage's own token bucket.\n\n    Checkpoints are keyed ``(run_id, step)`` with no model/via/config column\n    (``store.py``'s ``checkpoints`` table), so resuming stage N under a\n    DIFFERENT ``--config`` than produced it left the manifest attributing N's\n    model/tokens to whatever the CURRENT config's role_models/TOKENS say —\n    misattributing route and dropping the original spend. Saved as a SECOND\n    checkpoint row per stage (``<step>_prov``, via ``save_ckpt``/``load_ckpt``\n    themselves — same pattern as :data:`REPO_IDENTITY_STEP`, no new storage\n    mechanism and no ``store.py`` schema change) so a cached stage's manifest\n    row can report the truth it was actually computed under. A stage with no\n    ``_prov`` row (written before this existed) has no envelope to read and\n    falls back to today's behaviour — see ``load_stage_provenance``.\n    ",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_130_11": {
+      "source": "vvaharness/orchestrator/checkpoints.py",
+      "line_start": 130,
+      "line_end": 130,
+      "source_expression": "f\"{step}{_PROVENANCE_SUFFIX}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_168_4": {
+      "source": "vvaharness/orchestrator/checkpoints.py",
+      "line_start": 168,
+      "line_end": 168,
+      "value": "Lazily build and cache the TypeAdapter for ``validate_<id>`` checkpoint steps.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_183_4": {
+      "source": "vvaharness/orchestrator/checkpoints.py",
+      "line_start": 183,
+      "line_end": 183,
+      "value": "Lazily build and cache the TypeAdapter for the ``ev_collection`` step.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_194_4": {
+      "source": "vvaharness/orchestrator/checkpoints.py",
+      "line_start": 194,
+      "line_end": 194,
+      "value": "Resolve the TypeAdapter for a checkpoint step, fixed or dynamic.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_211_4": {
+      "source": "vvaharness/orchestrator/checkpoints.py",
+      "line_start": 211,
+      "line_end": 211,
+      "value": "Build the dynamic checkpoint step key for one case under one engine, so ``--resume`` cannot republish another producer's result as this run's.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_213_15": {
+      "source": "vvaharness/orchestrator/checkpoints.py",
+      "line_start": 213,
+      "line_end": 214,
+      "source_expression": "f\"unknown dynamic checkpoint prefix {prefix!r}; expected one of \"\n               f\"{_DYNAMIC_PREFIXES} so _schema_for can still route the key\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_216_15": {
+      "source": "vvaharness/orchestrator/checkpoints.py",
+      "line_start": 216,
+      "line_end": 216,
+      "value": "\n",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_225_4": {
+      "source": "vvaharness/orchestrator/checkpoints.py",
+      "line_start": 225,
+      "line_end": 225,
+      "value": "Delete this run's *prefix* rows that no live case claims, at most once per ``(run_id, prefix)`` per process. Returns the keys removed.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_232_22": {
+      "source": "vvaharness/orchestrator/checkpoints.py",
+      "line_start": 232,
+      "line_end": 233,
+      "source_expression": "f\"  [ckpt] pruned {len(removed)} stale {prefix}* checkpoint row(s) \"\n                      f\"for {run_id[:12]}… — written by an earlier engine or finding set\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_242_4": {
+      "source": "vvaharness/orchestrator/checkpoints.py",
+      "line_start": 242,
+      "line_end": 242,
+      "value": "Persist ``obj`` for ``(run_id, step)`` to the SQLite state store; ``ckpt_dir`` is kept only for call-site compatibility.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_263_18": {
+      "source": "vvaharness/orchestrator/checkpoints.py",
+      "line_start": 263,
+      "line_end": 263,
+      "source_expression": "f\"  [ckpt] saved {step}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_267_4": {
+      "source": "vvaharness/orchestrator/checkpoints.py",
+      "line_start": 267,
+      "line_end": 267,
+      "value": "Return the rehydrated checkpoint for ``(run_id, step)``, or ``None`` if absent, oversized, or schema-invalid — the caller re-runs the step.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_279_26": {
+      "source": "vvaharness/orchestrator/checkpoints.py",
+      "line_start": 279,
+      "line_end": 281,
+      "source_expression": "f\"  [ckpt] no checkpoints for {run_id[:12]}… in \"\n                          f\"{store.db_path()} — if you expected resume, check \"\n                          f\"$VVAHARNESS_STATE_DIR\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_300_18": {
+      "source": "vvaharness/orchestrator/checkpoints.py",
+      "line_start": 300,
+      "line_end": 300,
+      "source_expression": "f\"  [ckpt] resumed {step} from db\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_308_4": {
+      "source": "vvaharness/orchestrator/checkpoints.py",
+      "line_start": 308,
+      "line_end": 308,
+      "value": "Save *step*'s :class:`StageProvenance` envelope alongside its normal checkpoint row — a second ``sav...",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_315_4": {
+      "source": "vvaharness/orchestrator/checkpoints.py",
+      "line_start": 315,
+      "line_end": 315,
+      "value": "Load *step*'s provenance envelope, or ``None`` when absent — either it was never saved (a legacy checkpoi...",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_320_4": {
+      "source": "vvaharness/orchestrator/checkpoints.py",
+      "line_start": 320,
+      "line_end": 320,
+      "value": "Stable, non-reversible SHA-256 run id per repo path, so the checkpoint filename leaks nothing about the host's directory layout.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_326_4": {
+      "source": "vvaharness/orchestrator/checkpoints.py",
+      "line_start": 326,
+      "line_end": 326,
+      "value": "Delete ``runs`` rows (and their checkpoints, via ON DELETE CASCADE) and code-graph workspaces older than ``max_age_days`` or beyond the ``keep_runs`` most-recent; ``dry_run`` reports without touching anything.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_335_12": {
+      "source": "vvaharness/orchestrator/checkpoints.py",
+      "line_start": 335,
+      "line_end": 340,
+      "value": "SELECT run_id FROM runs\n               WHERE updated_at < datetime('now', ?)\n                  OR run_id NOT IN (\n                       SELECT run_id FROM runs\n                       ORDER BY updated_at DESC LIMIT ?)\n               ORDER BY updated_at",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_341_13": {
+      "source": "vvaharness/orchestrator/checkpoints.py",
+      "line_start": 341,
+      "line_end": 341,
+      "source_expression": "f\"-{max_age_days} days\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "value": "Checkpoint/resume key derivation and JSON-backed storage in the SQLite state store.",
+      "context": "literal"
+    },
+    {
+      "line_start": 97,
+      "line_end": 97,
+      "column": 21,
+      "value": "repo_identity",
+      "context": "literal"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 21,
+      "value": "_prov",
+      "context": "literal"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 19,
+      "value": "remediate_",
+      "context": "literal"
+    },
+    {
+      "line_start": 156,
+      "line_end": 156,
+      "column": 18,
+      "value": "validate_",
+      "context": "literal"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 21,
+      "value": "ev_collection",
+      "context": "literal"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 11,
+      "value": "deepdive",
+      "context": "literal"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 4,
+      "value": "Whether an S4 checkpoint has no unit left in an unresolved failure state; False means --resume must not reuse it.",
+      "context": "literal"
+    },
+    {
+      "line_start": 101,
+      "line_end": 115,
+      "column": 4,
+      "value": "The model/via/config a detection stage's checkpoint was ACTUALLY produced\n    under, plus that stage's own token bucket.\n\n    Checkpoints are keyed ``(run_id, step)`` with no model/via/config column\n    (``store.py``'s ``checkpoints`` table), so resuming stage N under a\n    DIFFERENT ``--config`` than produced it left the manifest attributing N's\n    model/tokens to whatever the CURRENT config's role_models/TOKENS say —\n    misattributing route and dropping the original spend. Saved as a SECOND\n    checkpoint row per stage (``<step>_prov``, via ``save_ckpt``/``load_ckpt``\n    themselves — same pattern as :data:`REPO_IDENTITY_STEP`, no new storage\n    mechanism and no ``store.py`` schema change) so a cached stage's manifest\n    row can report the truth it was actually computed under. A stage with no\n    ``_prov`` row (written before this existed) has no envelope to read and\n    falls back to today's behaviour — see ``load_stage_provenance``.\n    ",
+      "context": "literal"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 4,
+      "value": "s0",
+      "context": "literal"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 4,
+      "value": "s1",
+      "context": "literal"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 4,
+      "value": "s2",
+      "context": "literal"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 4,
+      "value": "s3",
+      "context": "literal"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 4,
+      "value": "s4",
+      "context": "literal"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 4,
+      "value": "s5",
+      "context": "literal"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 4,
+      "value": "s6",
+      "context": "literal"
+    },
+    {
+      "line_start": 142,
+      "line_end": 142,
+      "column": 4,
+      "value": "s7",
+      "context": "literal"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 4,
+      "value": "s8",
+      "context": "literal"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 4,
+      "value": "s9",
+      "context": "literal"
+    },
+    {
+      "line_start": 146,
+      "line_end": 146,
+      "column": 4,
+      "value": "ingest",
+      "context": "literal"
+    },
+    {
+      "line_start": 168,
+      "line_end": 168,
+      "column": 4,
+      "value": "Lazily build and cache the TypeAdapter for ``validate_<id>`` checkpoint steps.",
+      "context": "literal"
+    },
+    {
+      "line_start": 183,
+      "line_end": 183,
+      "column": 4,
+      "value": "Lazily build and cache the TypeAdapter for the ``ev_collection`` step.",
+      "context": "literal"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 4,
+      "value": "Resolve the TypeAdapter for a checkpoint step, fixed or dynamic.",
+      "context": "literal"
+    },
+    {
+      "line_start": 210,
+      "line_end": 210,
+      "column": 44,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 210,
+      "line_end": 210,
+      "column": 63,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 211,
+      "line_end": 211,
+      "column": 4,
+      "value": "Build the dynamic checkpoint step key for one case under one engine, so ``--resume`` cannot republish another producer's result as this run's.",
+      "context": "literal"
+    },
+    {
+      "line_start": 225,
+      "line_end": 225,
+      "column": 4,
+      "value": "Delete this run's *prefix* rows that no live case claims, at most once per ``(run_id, prefix)`` per process. Returns the keys removed.",
+      "context": "literal"
+    },
+    {
+      "line_start": 242,
+      "line_end": 242,
+      "column": 4,
+      "value": "Persist ``obj`` for ``(run_id, step)`` to the SQLite state store; ``ckpt_dir`` is kept only for call-site compatibility.",
+      "context": "literal"
+    },
+    {
+      "line_start": 267,
+      "line_end": 267,
+      "column": 4,
+      "value": "Return the rehydrated checkpoint for ``(run_id, step)``, or ``None`` if absent, oversized, or schema-invalid — the caller re-runs the step.",
+      "context": "literal"
+    },
+    {
+      "line_start": 308,
+      "line_end": 308,
+      "column": 4,
+      "value": "Save *step*'s :class:`StageProvenance` envelope alongside its normal checkpoint row — a second ``sav...",
+      "context": "literal"
+    },
+    {
+      "line_start": 315,
+      "line_end": 315,
+      "column": 4,
+      "value": "Load *step*'s provenance envelope, or ``None`` when absent — either it was never saved (a legacy checkpoi...",
+      "context": "literal"
+    },
+    {
+      "line_start": 320,
+      "line_end": 320,
+      "column": 4,
+      "value": "Stable, non-reversible SHA-256 run id per repo path, so the checkpoint filename leaks nothing about the host's directory layout.",
+      "context": "literal"
+    },
+    {
+      "line_start": 326,
+      "line_end": 326,
+      "column": 4,
+      "value": "Delete ``runs`` rows (and their checkpoints, via ON DELETE CASCADE) and code-graph workspaces older than ``max_age_days`` or beyond the ``keep_runs`` most-recent; ``dry_run`` reports without touching anything.",
+      "context": "literal"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 7,
+      "value": "input_kind",
+      "context": "literal"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 30,
+      "value": "findings",
+      "context": "literal"
+    },
+    {
+      "line_start": 56,
+      "line_end": 56,
+      "column": 30,
+      "value": "outcomes",
+      "context": "literal"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 15,
+      "value": "external",
+      "context": "literal"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 36,
+      "value": "error",
+      "context": "literal"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 45,
+      "value": "halted",
+      "context": "literal"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 55,
+      "value": "uninvestigated",
+      "context": "literal"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 73,
+      "value": "failed",
+      "context": "literal"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 30,
+      "value": "outcomes",
+      "context": "literal"
+    },
+    {
+      "line_start": 356,
+      "line_end": 356,
+      "column": 12,
+      "value": "root",
+      "context": "literal"
+    },
+    {
+      "line_start": 357,
+      "line_end": 357,
+      "column": 12,
+      "value": "kept",
+      "context": "literal"
+    },
+    {
+      "line_start": 357,
+      "line_end": 357,
+      "column": 42,
+      "value": "deleted",
+      "context": "literal"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 26,
+      "value": "input_kind",
+      "context": "literal"
+    },
+    {
+      "line_start": 213,
+      "line_end": 213,
+      "column": 17,
+      "value": "unknown dynamic checkpoint prefix ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 213,
+      "line_end": 213,
+      "column": 61,
+      "value": "; expected one of ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 214,
+      "line_end": 214,
+      "column": 36,
+      "value": " so _schema_for can still route the key",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 263,
+      "line_end": 263,
+      "column": 20,
+      "value": "  [ckpt] saved ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 278,
+      "line_end": 278,
+      "column": 19,
+      "value": "s1",
+      "context": "literal"
+    },
+    {
+      "line_start": 300,
+      "line_end": 300,
+      "column": 20,
+      "value": "  [ckpt] resumed ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 300,
+      "line_end": 300,
+      "column": 43,
+      "value": " from db",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 330,
+      "line_end": 330,
+      "column": 16,
+      "value": "root",
+      "context": "literal"
+    },
+    {
+      "line_start": 330,
+      "line_end": 330,
+      "column": 33,
+      "value": "kept",
+      "context": "literal"
+    },
+    {
+      "line_start": 330,
+      "line_end": 330,
+      "column": 44,
+      "value": "deleted",
+      "context": "literal"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 36,
+      "value": "deepdive",
+      "context": "literal"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 48,
+      "value": "external",
+      "context": "literal"
+    },
+    {
+      "line_start": 57,
+      "line_end": 57,
+      "column": 55,
+      "value": "external",
+      "context": "literal"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 55,
+      "value": "confirmed",
+      "context": "literal"
+    },
+    {
+      "line_start": 232,
+      "line_end": 232,
+      "column": 24,
+      "value": "  [ckpt] pruned ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 232,
+      "line_end": 232,
+      "column": 54,
+      "value": " stale ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 232,
+      "line_end": 233,
+      "column": 69,
+      "value": "* checkpoint row(s) for ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 233,
+      "line_end": 233,
+      "column": 41,
+      "value": "… — written by an earlier engine or finding set",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 252,
+      "line_end": 253,
+      "column": 24,
+      "value": "INSERT OR IGNORE INTO runs(run_id, repo_root) VALUES (?, '')",
+      "context": "literal"
+    },
+    {
+      "line_start": 254,
+      "line_end": 255,
+      "column": 24,
+      "value": "UPDATE runs SET updated_at = datetime('now') WHERE run_id = ?",
+      "context": "literal"
+    },
+    {
+      "line_start": 257,
+      "line_end": 258,
+      "column": 16,
+      "value": "INSERT OR REPLACE INTO checkpoints(run_id, step, payload, size) VALUES (?, ?, ?, ?)",
+      "context": "literal"
+    },
+    {
+      "line_start": 350,
+      "line_end": 350,
+      "column": 24,
+      "value": "PRAGMA wal_checkpoint(TRUNCATE)",
+      "context": "literal"
+    },
+    {
+      "line_start": 57,
+      "line_end": 57,
+      "column": 36,
+      "value": "origin",
+      "context": "literal"
+    },
+    {
+      "line_start": 216,
+      "line_end": 216,
+      "column": 15,
+      "value": "\n",
+      "context": "literal"
+    },
+    {
+      "line_start": 272,
+      "line_end": 272,
+      "column": 12,
+      "value": "SELECT payload, size FROM checkpoints WHERE run_id=? AND step=?",
+      "context": "literal"
+    },
+    {
+      "line_start": 279,
+      "line_end": 279,
+      "column": 28,
+      "value": "  [ckpt] no checkpoints for ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 279,
+      "line_end": 279,
+      "column": 69,
+      "value": "… in ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 280,
+      "line_end": 281,
+      "column": 45,
+      "value": " — if you expected resume, check $VVAHARNESS_STATE_DIR",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 335,
+      "line_end": 340,
+      "column": 12,
+      "value": "SELECT run_id FROM runs\n               WHERE updated_at < datetime('now', ?)\n                  OR run_id NOT IN (\n                       SELECT run_id FROM runs\n                       ORDER BY updated_at DESC LIMIT ?)\n               ORDER BY updated_at",
+      "context": "literal"
+    },
+    {
+      "line_start": 345,
+      "line_end": 345,
+      "column": 32,
+      "value": "DELETE FROM runs WHERE run_id = ?",
+      "context": "literal"
+    },
+    {
+      "line_start": 333,
+      "line_end": 333,
+      "column": 28,
+      "value": "SELECT COUNT(*) FROM runs",
+      "context": "literal"
+    },
+    {
+      "line_start": 349,
+      "line_end": 349,
+      "column": 24,
+      "value": "PRAGMA incremental_vacuum",
+      "context": "literal"
+    },
+    {
+      "line_start": 341,
+      "line_end": 341,
+      "column": 15,
+      "value": "-",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 341,
+      "line_end": 341,
+      "column": 30,
+      "value": " days",
+      "context": "f-string segment"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 45,
+      "text": "# TypeAdapter both serialises (dump_json) and validates on load (validate_json), rejecting a tampered value instead of smuggling it into the pipeline."
+    },
+    {
+      "line": 63,
+      "text": "#: Per-unit outcomes meaning no trustworthy result — \"guardrail\"/\"skipped\" are excluded since they're deterministic for a given config, so retrying them on --resume alone wouldn't heal them."
+    },
+    {
+      "line": 83,
+      "text": "# 6-tuple current (trailing int = post-s5 count for --resume); 5-tuple stays for scan.py legacy arm"
+    },
+    {
+      "line": 85,
+      "text": "# pre_dropped"
+    },
+    {
+      "line": 86,
+      "text": "# verified"
+    },
+    {
+      "line": 87,
+      "text": "# dropped"
+    },
+    {
+      "line": 88,
+      "text": "# canonical"
+    },
+    {
+      "line": 89,
+      "text": "# dup_dropped"
+    },
+    {
+      "line": 90,
+      "text": "# s5_out_count"
+    },
+    {
+      "line": 96,
+      "text": "#: Step key holding the scanned tree's git HEAD at scan start; identifies the TARGET, not a stage."
+    },
+    {
+      "line": 123,
+      "text": "#: Provenance-envelope row suffix (``\"s2_prov\"``); NOT a ``_DYNAMIC_PREFIXES`` family, an extra row"
+    },
+    {
+      "line": 134,
+      "text": "# s0 is a plain @dataclass; TypeAdapter serialises/rebuilds it too, Path field included."
+    },
+    {
+      "line": 145,
+      "text": "# Not a pipeline stage: records that the S9 artifacts were uploaded, so --resume never re-uploads."
+    },
+    {
+      "line": 147,
+      "text": "# Not a stage: git HEAD at start; run_id keys on PATH alone, so a re-clone publishes stale rows"
+    },
+    {
+      "line": 151,
+      "text": "# Step 10 checkpoints one dict per finding under a dynamic remediate_<digest> key, so it can't live in the fixed table above."
+    },
+    {
+      "line": 154,
+      "text": "#: The two dynamic step families; the prefix stays in plaintext so ``_schema_for`` can sniff it after the rest is hashed."
+    },
+    {
+      "line": 160,
+      "text": "#: 96 bits of digest; names a checkpoint row, not a directory, so it only needs collision-freedom within one run's finding set."
+    },
+    {
+      "line": 163,
+      "text": "# Built lazily: ValidationResult lives in vvaharness.validation, which already imports this package, so a module-level import here would cycle."
+    },
+    {
+      "line": 176,
+      "text": "#: Normalized EV collection; --resume needs no ``EV_API_COLLECTION`` (set, it wins); named: S6 input"
+    },
+    {
+      "line": 206,
+      "text": "# unknown step → KeyError (caller bug, fail loud)"
+    },
+    {
+      "line": 220,
+      "text": "# One prune per (run_id, prefix) per process: the standalone remediate/validate commands never call reset_run, so without this their rows accumulate forever."
+    },
+    {
+      "line": 237,
+      "text": "# Oversized payload is corruption or a resource-exhaustion attempt; enforced here AND by a CHECK constraint on checkpoints.size so a direct INSERT can't bypass it."
+    },
+    {
+      "line": 244,
+      "text": "# JSON, never pickle — avoids CWE-502 RCE on a hostile checkpoint"
+    },
+    {
+      "line": 250,
+      "text": "# one transaction == atomic"
+    },
+    {
+      "line": 251,
+      "text": "# Ensure a parent runs row exists even when register_run() was skipped (tests, ad-hoc callers), so the FK + ON DELETE CASCADE hold."
+    },
+    {
+      "line": 284,
+      "text": "# belt-and-braces; CHECK already enforces"
+    },
+    {
+      "line": 290,
+      "text": "# Both branches re-run the step; the only distinction the bytes support is \"valid JSON?\"."
+    },
+    {
+      "line": 294,
+      "text": "# Not even well-formed JSON: truncated, corrupt, or a substituted non-checkpoint blob."
+    },
+    {
+      "line": 297,
+      "text": "# Well-formed JSON failing the schema is usually a different tool version, not tampering."
+    },
+    {
+      "line": 327,
+      "text": "# No DB = nothing to prune, BOTH modes: `store.connect()` would CREATE it, `db_location()` won't"
+    },
+    {
+      "line": 347,
+      "text": "# Truncate the -wal file too, or it can sit at the high-water-mark of the largest deleted blob."
+    },
+    {
+      "line": 348,
+      "text": "# incremental_vacuum frees one page per fetched row: unfetched, it frees one page"
+    },
+    {
+      "line": 355,
+      "text": "# `db`, not `db_path()`: re-resolving would run the state-dir mode check and creation again."
+    }
+  ],
+  "statements": [
+    {
+      "kind": "ImportFrom",
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Expr",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 23,
+      "line_end": 23,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 26,
+      "line_end": 26,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 27,
+      "line_end": 27,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 29,
+      "line_end": 36,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 37,
+      "line_end": 37,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 38,
+      "line_end": 38,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 39,
+      "line_end": 39,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 40,
+      "line_end": 40,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 42,
+      "line_end": 42,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 46,
+      "line_end": 49,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 9
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 47,
+      "line_end": 47,
+      "column": 4,
+      "owner": "_S4Ckpt",
+      "representation_line": 14
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 48,
+      "line_end": 48,
+      "column": 4,
+      "owner": "_S4Ckpt",
+      "representation_line": 14
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 49,
+      "line_end": 49,
+      "column": 4,
+      "owner": "_S4Ckpt",
+      "representation_line": 14
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 52,
+      "line_end": 60,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 16
+    },
+    {
+      "kind": "If",
+      "line_start": 53,
+      "line_end": 54,
+      "column": 4,
+      "owner": "s4_input_kind",
+      "representation_line": 21
+    },
+    {
+      "kind": "Return",
+      "line_start": 54,
+      "line_end": 54,
+      "column": 8,
+      "owner": "s4_input_kind",
+      "representation_line": 23
+    },
+    {
+      "kind": "Assign",
+      "line_start": 55,
+      "line_end": 55,
+      "column": 4,
+      "owner": "s4_input_kind",
+      "representation_line": 27
+    },
+    {
+      "kind": "Assign",
+      "line_start": 56,
+      "line_end": 56,
+      "column": 4,
+      "owner": "s4_input_kind",
+      "representation_line": 27
+    },
+    {
+      "kind": "Assign",
+      "line_start": 57,
+      "line_end": 57,
+      "column": 4,
+      "owner": "s4_input_kind",
+      "representation_line": 27
+    },
+    {
+      "kind": "If",
+      "line_start": 58,
+      "line_end": 59,
+      "column": 4,
+      "owner": "s4_input_kind",
+      "representation_line": 28
+    },
+    {
+      "kind": "Return",
+      "line_start": 59,
+      "line_end": 59,
+      "column": 8,
+      "owner": "s4_input_kind",
+      "representation_line": 30
+    },
+    {
+      "kind": "Return",
+      "line_start": 60,
+      "line_end": 60,
+      "column": 4,
+      "owner": "s4_input_kind",
+      "representation_line": 33
+    },
+    {
+      "kind": "Assign",
+      "line_start": 64,
+      "line_end": 64,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 38
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 67,
+      "line_end": 70,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 39
+    },
+    {
+      "kind": "Expr",
+      "line_start": 68,
+      "line_end": 68,
+      "column": 4,
+      "owner": "s4_stage_complete",
+      "representation_line": 45
+    },
+    {
+      "kind": "Assign",
+      "line_start": 69,
+      "line_end": 69,
+      "column": 4,
+      "owner": "s4_stage_complete",
+      "representation_line": 45
+    },
+    {
+      "kind": "Return",
+      "line_start": 70,
+      "line_end": 70,
+      "column": 4,
+      "owner": "s4_stage_complete",
+      "representation_line": 46
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 73,
+      "line_end": 75,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 50
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 74,
+      "line_end": 74,
+      "column": 4,
+      "owner": "_S5Ckpt",
+      "representation_line": 55
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 75,
+      "line_end": 75,
+      "column": 4,
+      "owner": "_S5Ckpt",
+      "representation_line": 55
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 78,
+      "line_end": 80,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 57
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 79,
+      "line_end": 79,
+      "column": 4,
+      "owner": "_S6Ckpt",
+      "representation_line": 62
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 80,
+      "line_end": 80,
+      "column": 4,
+      "owner": "_S6Ckpt",
+      "representation_line": 62
+    },
+    {
+      "kind": "Assign",
+      "line_start": 84,
+      "line_end": 93,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 65
+    },
+    {
+      "kind": "Assign",
+      "line_start": 97,
+      "line_end": 97,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 65
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 100,
+      "line_end": 120,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 66
+    },
+    {
+      "kind": "Expr",
+      "line_start": 101,
+      "line_end": 115,
+      "column": 4,
+      "owner": "StageProvenance",
+      "representation_line": 71
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 117,
+      "line_end": 117,
+      "column": 4,
+      "owner": "StageProvenance",
+      "representation_line": 71
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 118,
+      "line_end": 118,
+      "column": 4,
+      "owner": "StageProvenance",
+      "representation_line": 71
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 119,
+      "line_end": 119,
+      "column": 4,
+      "owner": "StageProvenance",
+      "representation_line": 71
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 120,
+      "line_end": 120,
+      "column": 4,
+      "owner": "StageProvenance",
+      "representation_line": 71
+    },
+    {
+      "kind": "Assign",
+      "line_start": 124,
+      "line_end": 124,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 74
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 126,
+      "line_end": 126,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 74
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 129,
+      "line_end": 130,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 75
+    },
+    {
+      "kind": "Return",
+      "line_start": 130,
+      "line_end": 130,
+      "column": 4,
+      "owner": "_provenance_step",
+      "representation_line": 80
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 133,
+      "line_end": 149,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 85
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 152,
+      "line_end": 152,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 85
+    },
+    {
+      "kind": "Assign",
+      "line_start": 155,
+      "line_end": 155,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 85
+    },
+    {
+      "kind": "Assign",
+      "line_start": 156,
+      "line_end": 156,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 85
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 158,
+      "line_end": 158,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 85
+    },
+    {
+      "kind": "Assign",
+      "line_start": 161,
+      "line_end": 161,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 87
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 164,
+      "line_end": 164,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 87
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 167,
+      "line_end": 173,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 88
+    },
+    {
+      "kind": "Expr",
+      "line_start": 168,
+      "line_end": 168,
+      "column": 4,
+      "owner": "_validate_schema",
+      "representation_line": 94
+    },
+    {
+      "kind": "Global",
+      "line_start": 169,
+      "line_end": 169,
+      "column": 4,
+      "owner": "_validate_schema",
+      "representation_line": 94
+    },
+    {
+      "kind": "If",
+      "line_start": 170,
+      "line_end": 172,
+      "column": 4,
+      "owner": "_validate_schema",
+      "representation_line": 95
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 171,
+      "line_end": 171,
+      "column": 8,
+      "owner": "_validate_schema",
+      "representation_line": 98
+    },
+    {
+      "kind": "Assign",
+      "line_start": 172,
+      "line_end": 172,
+      "column": 8,
+      "owner": "_validate_schema",
+      "representation_line": 98
+    },
+    {
+      "kind": "Return",
+      "line_start": 173,
+      "line_end": 173,
+      "column": 4,
+      "owner": "_validate_schema",
+      "representation_line": 100
+    },
+    {
+      "kind": "Assign",
+      "line_start": 177,
+      "line_end": 177,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 105
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 179,
+      "line_end": 179,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 105
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 182,
+      "line_end": 190,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 106
+    },
+    {
+      "kind": "Expr",
+      "line_start": 183,
+      "line_end": 183,
+      "column": 4,
+      "owner": "_ev_collection_schema",
+      "representation_line": 112
+    },
+    {
+      "kind": "Global",
+      "line_start": 184,
+      "line_end": 184,
+      "column": 4,
+      "owner": "_ev_collection_schema",
+      "representation_line": 112
+    },
+    {
+      "kind": "If",
+      "line_start": 185,
+      "line_end": 189,
+      "column": 4,
+      "owner": "_ev_collection_schema",
+      "representation_line": 113
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 186,
+      "line_end": 188,
+      "column": 8,
+      "owner": "_ev_collection_schema",
+      "representation_line": 116
+    },
+    {
+      "kind": "Assign",
+      "line_start": 189,
+      "line_end": 189,
+      "column": 8,
+      "owner": "_ev_collection_schema",
+      "representation_line": 116
+    },
+    {
+      "kind": "Return",
+      "line_start": 190,
+      "line_end": 190,
+      "column": 4,
+      "owner": "_ev_collection_schema",
+      "representation_line": 118
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 193,
+      "line_end": 206,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 122
+    },
+    {
+      "kind": "Expr",
+      "line_start": 194,
+      "line_end": 194,
+      "column": 4,
+      "owner": "_schema_for",
+      "representation_line": 128
+    },
+    {
+      "kind": "If",
+      "line_start": 195,
+      "line_end": 196,
+      "column": 4,
+      "owner": "_schema_for",
+      "representation_line": 129
+    },
+    {
+      "kind": "Return",
+      "line_start": 196,
+      "line_end": 196,
+      "column": 8,
+      "owner": "_schema_for",
+      "representation_line": 131
+    },
+    {
+      "kind": "If",
+      "line_start": 197,
+      "line_end": 199,
+      "column": 4,
+      "owner": "_schema_for",
+      "representation_line": 134
+    },
+    {
+      "kind": "Return",
+      "line_start": 199,
+      "line_end": 199,
+      "column": 8,
+      "owner": "_schema_for",
+      "representation_line": 136
+    },
+    {
+      "kind": "If",
+      "line_start": 200,
+      "line_end": 201,
+      "column": 4,
+      "owner": "_schema_for",
+      "representation_line": 139
+    },
+    {
+      "kind": "Return",
+      "line_start": 201,
+      "line_end": 201,
+      "column": 8,
+      "owner": "_schema_for",
+      "representation_line": 141
+    },
+    {
+      "kind": "If",
+      "line_start": 202,
+      "line_end": 203,
+      "column": 4,
+      "owner": "_schema_for",
+      "representation_line": 144
+    },
+    {
+      "kind": "Return",
+      "line_start": 203,
+      "line_end": 203,
+      "column": 8,
+      "owner": "_schema_for",
+      "representation_line": 146
+    },
+    {
+      "kind": "If",
+      "line_start": 204,
+      "line_end": 205,
+      "column": 4,
+      "owner": "_schema_for",
+      "representation_line": 149
+    },
+    {
+      "kind": "Return",
+      "line_start": 205,
+      "line_end": 205,
+      "column": 8,
+      "owner": "_schema_for",
+      "representation_line": 151
+    },
+    {
+      "kind": "Return",
+      "line_start": 206,
+      "line_end": 206,
+      "column": 4,
+      "owner": "_schema_for",
+      "representation_line": 154
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 209,
+      "line_end": 217,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 158
+    },
+    {
+      "kind": "Expr",
+      "line_start": 211,
+      "line_end": 211,
+      "column": 4,
+      "owner": "step_key_for",
+      "representation_line": 164
+    },
+    {
+      "kind": "If",
+      "line_start": 212,
+      "line_end": 215,
+      "column": 4,
+      "owner": "step_key_for",
+      "representation_line": 165
+    },
+    {
+      "kind": "Assign",
+      "line_start": 213,
+      "line_end": 214,
+      "column": 8,
+      "owner": "step_key_for",
+      "representation_line": 168
+    },
+    {
+      "kind": "Raise",
+      "line_start": 215,
+      "line_end": 215,
+      "column": 8,
+      "owner": "step_key_for",
+      "representation_line": 169
+    },
+    {
+      "kind": "Assign",
+      "line_start": 216,
+      "line_end": 216,
+      "column": 4,
+      "owner": "step_key_for",
+      "representation_line": 173
+    },
+    {
+      "kind": "Return",
+      "line_start": 217,
+      "line_end": 217,
+      "column": 4,
+      "owner": "step_key_for",
+      "representation_line": 174
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 221,
+      "line_end": 221,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 179
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 224,
+      "line_end": 234,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 180
+    },
+    {
+      "kind": "Expr",
+      "line_start": 225,
+      "line_end": 225,
+      "column": 4,
+      "owner": "prune_stale_steps",
+      "representation_line": 186
+    },
+    {
+      "kind": "Assign",
+      "line_start": 226,
+      "line_end": 226,
+      "column": 4,
+      "owner": "prune_stale_steps",
+      "representation_line": 186
+    },
+    {
+      "kind": "If",
+      "line_start": 227,
+      "line_end": 228,
+      "column": 4,
+      "owner": "prune_stale_steps",
+      "representation_line": 187
+    },
+    {
+      "kind": "Return",
+      "line_start": 228,
+      "line_end": 228,
+      "column": 8,
+      "owner": "prune_stale_steps",
+      "representation_line": 189
+    },
+    {
+      "kind": "Expr",
+      "line_start": 229,
+      "line_end": 229,
+      "column": 4,
+      "owner": "prune_stale_steps",
+      "representation_line": 193
+    },
+    {
+      "kind": "Assign",
+      "line_start": 230,
+      "line_end": 230,
+      "column": 4,
+      "owner": "prune_stale_steps",
+      "representation_line": 193
+    },
+    {
+      "kind": "If",
+      "line_start": 231,
+      "line_end": 233,
+      "column": 4,
+      "owner": "prune_stale_steps",
+      "representation_line": 194
+    },
+    {
+      "kind": "Expr",
+      "line_start": 232,
+      "line_end": 233,
+      "column": 8,
+      "owner": "prune_stale_steps",
+      "representation_line": 197
+    },
+    {
+      "kind": "Return",
+      "line_start": 234,
+      "line_end": 234,
+      "column": 4,
+      "owner": "prune_stale_steps",
+      "representation_line": 199
+    },
+    {
+      "kind": "Assign",
+      "line_start": 238,
+      "line_end": 238,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 204
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 241,
+      "line_end": 263,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 205
+    },
+    {
+      "kind": "Expr",
+      "line_start": 242,
+      "line_end": 242,
+      "column": 4,
+      "owner": "save_ckpt",
+      "representation_line": 211
+    },
+    {
+      "kind": "Delete",
+      "line_start": 243,
+      "line_end": 243,
+      "column": 4,
+      "owner": "save_ckpt",
+      "representation_line": 211
+    },
+    {
+      "kind": "Assign",
+      "line_start": 244,
+      "line_end": 244,
+      "column": 4,
+      "owner": "save_ckpt",
+      "representation_line": 211
+    },
+    {
+      "kind": "If",
+      "line_start": 245,
+      "line_end": 247,
+      "column": 4,
+      "owner": "save_ckpt",
+      "representation_line": 212
+    },
+    {
+      "kind": "Expr",
+      "line_start": 246,
+      "line_end": 246,
+      "column": 8,
+      "owner": "save_ckpt",
+      "representation_line": 215
+    },
+    {
+      "kind": "Return",
+      "line_start": 247,
+      "line_end": 247,
+      "column": 8,
+      "owner": "save_ckpt",
+      "representation_line": 216
+    },
+    {
+      "kind": "Assign",
+      "line_start": 248,
+      "line_end": 248,
+      "column": 4,
+      "owner": "save_ckpt",
+      "representation_line": 220
+    },
+    {
+      "kind": "Try",
+      "line_start": 249,
+      "line_end": 262,
+      "column": 4,
+      "owner": "save_ckpt",
+      "representation_line": 221
+    },
+    {
+      "kind": "With",
+      "line_start": 250,
+      "line_end": 260,
+      "column": 8,
+      "owner": "save_ckpt",
+      "representation_line": 223
+    },
+    {
+      "kind": "Expr",
+      "line_start": 252,
+      "line_end": 253,
+      "column": 12,
+      "owner": "save_ckpt",
+      "representation_line": 226
+    },
+    {
+      "kind": "Expr",
+      "line_start": 254,
+      "line_end": 255,
+      "column": 12,
+      "owner": "save_ckpt",
+      "representation_line": 226
+    },
+    {
+      "kind": "Expr",
+      "line_start": 256,
+      "line_end": 260,
+      "column": 12,
+      "owner": "save_ckpt",
+      "representation_line": 226
+    },
+    {
+      "kind": "Expr",
+      "line_start": 262,
+      "line_end": 262,
+      "column": 8,
+      "owner": "save_ckpt",
+      "representation_line": 232
+    },
+    {
+      "kind": "Expr",
+      "line_start": 263,
+      "line_end": 263,
+      "column": 4,
+      "owner": "save_ckpt",
+      "representation_line": 235
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 266,
+      "line_end": 301,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 238
+    },
+    {
+      "kind": "Expr",
+      "line_start": 267,
+      "line_end": 267,
+      "column": 4,
+      "owner": "load_ckpt",
+      "representation_line": 244
+    },
+    {
+      "kind": "Delete",
+      "line_start": 268,
+      "line_end": 268,
+      "column": 4,
+      "owner": "load_ckpt",
+      "representation_line": 244
+    },
+    {
+      "kind": "Assign",
+      "line_start": 269,
+      "line_end": 269,
+      "column": 4,
+      "owner": "load_ckpt",
+      "representation_line": 244
+    },
+    {
+      "kind": "Try",
+      "line_start": 270,
+      "line_end": 276,
+      "column": 4,
+      "owner": "load_ckpt",
+      "representation_line": 245
+    },
+    {
+      "kind": "Assign",
+      "line_start": 271,
+      "line_end": 274,
+      "column": 8,
+      "owner": "load_ckpt",
+      "representation_line": 248
+    },
+    {
+      "kind": "Expr",
+      "line_start": 276,
+      "line_end": 276,
+      "column": 8,
+      "owner": "load_ckpt",
+      "representation_line": 252
+    },
+    {
+      "kind": "If",
+      "line_start": 277,
+      "line_end": 282,
+      "column": 4,
+      "owner": "load_ckpt",
+      "representation_line": 254
+    },
+    {
+      "kind": "If",
+      "line_start": 278,
+      "line_end": 281,
+      "column": 8,
+      "owner": "load_ckpt",
+      "representation_line": 256
+    },
+    {
+      "kind": "Expr",
+      "line_start": 279,
+      "line_end": 281,
+      "column": 12,
+      "owner": "load_ckpt",
+      "representation_line": 259
+    },
+    {
+      "kind": "Return",
+      "line_start": 282,
+      "line_end": 282,
+      "column": 8,
+      "owner": "load_ckpt",
+      "representation_line": 261
+    },
+    {
+      "kind": "Assign",
+      "line_start": 283,
+      "line_end": 283,
+      "column": 4,
+      "owner": "load_ckpt",
+      "representation_line": 265
+    },
+    {
+      "kind": "If",
+      "line_start": 284,
+      "line_end": 286,
+      "column": 4,
+      "owner": "load_ckpt",
+      "representation_line": 266
+    },
+    {
+      "kind": "Expr",
+      "line_start": 285,
+      "line_end": 285,
+      "column": 8,
+      "owner": "load_ckpt",
+      "representation_line": 269
+    },
+    {
+      "kind": "Return",
+      "line_start": 286,
+      "line_end": 286,
+      "column": 8,
+      "owner": "load_ckpt",
+      "representation_line": 270
+    },
+    {
+      "kind": "Try",
+      "line_start": 287,
+      "line_end": 299,
+      "column": 4,
+      "owner": "load_ckpt",
+      "representation_line": 273
+    },
+    {
+      "kind": "Assign",
+      "line_start": 288,
+      "line_end": 288,
+      "column": 8,
+      "owner": "load_ckpt",
+      "representation_line": 276
+    },
+    {
+      "kind": "Try",
+      "line_start": 291,
+      "line_end": 298,
+      "column": 8,
+      "owner": "load_ckpt",
+      "representation_line": 280
+    },
+    {
+      "kind": "Expr",
+      "line_start": 292,
+      "line_end": 292,
+      "column": 12,
+      "owner": "load_ckpt",
+      "representation_line": 283
+    },
+    {
+      "kind": "Expr",
+      "line_start": 295,
+      "line_end": 295,
+      "column": 12,
+      "owner": "load_ckpt",
+      "representation_line": 288
+    },
+    {
+      "kind": "Expr",
+      "line_start": 298,
+      "line_end": 298,
+      "column": 12,
+      "owner": "load_ckpt",
+      "representation_line": 292
+    },
+    {
+      "kind": "Return",
+      "line_start": 299,
+      "line_end": 299,
+      "column": 8,
+      "owner": "load_ckpt",
+      "representation_line": 294
+    },
+    {
+      "kind": "Expr",
+      "line_start": 300,
+      "line_end": 300,
+      "column": 4,
+      "owner": "load_ckpt",
+      "representation_line": 298
+    },
+    {
+      "kind": "Return",
+      "line_start": 301,
+      "line_end": 301,
+      "column": 4,
+      "owner": "load_ckpt",
+      "representation_line": 299
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 304,
+      "line_end": 311,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 303
+    },
+    {
+      "kind": "Expr",
+      "line_start": 308,
+      "line_end": 308,
+      "column": 4,
+      "owner": "save_stage_provenance",
+      "representation_line": 309
+    },
+    {
+      "kind": "Expr",
+      "line_start": 309,
+      "line_end": 311,
+      "column": 4,
+      "owner": "save_stage_provenance",
+      "representation_line": 309
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 314,
+      "line_end": 316,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 312
+    },
+    {
+      "kind": "Expr",
+      "line_start": 315,
+      "line_end": 315,
+      "column": 4,
+      "owner": "load_stage_provenance",
+      "representation_line": 318
+    },
+    {
+      "kind": "Return",
+      "line_start": 316,
+      "line_end": 316,
+      "column": 4,
+      "owner": "load_stage_provenance",
+      "representation_line": 319
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 319,
+      "line_end": 321,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 323
+    },
+    {
+      "kind": "Expr",
+      "line_start": 320,
+      "line_end": 320,
+      "column": 4,
+      "owner": "run_id_for",
+      "representation_line": 329
+    },
+    {
+      "kind": "Return",
+      "line_start": 321,
+      "line_end": 321,
+      "column": 4,
+      "owner": "run_id_for",
+      "representation_line": 330
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 324,
+      "line_end": 357,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 334
+    },
+    {
+      "kind": "Expr",
+      "line_start": 326,
+      "line_end": 326,
+      "column": 4,
+      "owner": "prune_checkpoints",
+      "representation_line": 340
+    },
+    {
+      "kind": "Assign",
+      "line_start": 328,
+      "line_end": 328,
+      "column": 4,
+      "owner": "prune_checkpoints",
+      "representation_line": 340
+    },
+    {
+      "kind": "If",
+      "line_start": 329,
+      "line_end": 330,
+      "column": 4,
+      "owner": "prune_checkpoints",
+      "representation_line": 341
+    },
+    {
+      "kind": "Return",
+      "line_start": 330,
+      "line_end": 330,
+      "column": 8,
+      "owner": "prune_checkpoints",
+      "representation_line": 343
+    },
+    {
+      "kind": "Assign",
+      "line_start": 331,
+      "line_end": 331,
+      "column": 4,
+      "owner": "prune_checkpoints",
+      "representation_line": 347
+    },
+    {
+      "kind": "Try",
+      "line_start": 332,
+      "line_end": 354,
+      "column": 4,
+      "owner": "prune_checkpoints",
+      "representation_line": 348
+    },
+    {
+      "kind": "Assign",
+      "line_start": 333,
+      "line_end": 333,
+      "column": 8,
+      "owner": "prune_checkpoints",
+      "representation_line": 351
+    },
+    {
+      "kind": "Assign",
+      "line_start": 334,
+      "line_end": 342,
+      "column": 8,
+      "owner": "prune_checkpoints",
+      "representation_line": 351
+    },
+    {
+      "kind": "If",
+      "line_start": 343,
+      "line_end": 352,
+      "column": 8,
+      "owner": "prune_checkpoints",
+      "representation_line": 352
+    },
+    {
+      "kind": "With",
+      "line_start": 344,
+      "line_end": 346,
+      "column": 12,
+      "owner": "prune_checkpoints",
+      "representation_line": 354
+    },
+    {
+      "kind": "Expr",
+      "line_start": 345,
+      "line_end": 346,
+      "column": 16,
+      "owner": "prune_checkpoints",
+      "representation_line": 357
+    },
+    {
+      "kind": "Expr",
+      "line_start": 349,
+      "line_end": 349,
+      "column": 12,
+      "owner": "prune_checkpoints",
+      "representation_line": 361
+    },
+    {
+      "kind": "Expr",
+      "line_start": 350,
+      "line_end": 350,
+      "column": 12,
+      "owner": "prune_checkpoints",
+      "representation_line": 361
+    },
+    {
+      "kind": "For",
+      "line_start": 351,
+      "line_end": 352,
+      "column": 12,
+      "owner": "prune_checkpoints",
+      "representation_line": 362
+    },
+    {
+      "kind": "Expr",
+      "line_start": 352,
+      "line_end": 352,
+      "column": 16,
+      "owner": "prune_checkpoints",
+      "representation_line": 365
+    },
+    {
+      "kind": "Expr",
+      "line_start": 354,
+      "line_end": 354,
+      "column": 8,
+      "owner": "prune_checkpoints",
+      "representation_line": 371
+    },
+    {
+      "kind": "Return",
+      "line_start": 356,
+      "line_end": 357,
+      "column": 4,
+      "owner": "prune_checkpoints",
+      "representation_line": 373
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 6,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='logs', ctx=Load()), attr='get_logger', ctx=Load()), args=[Name(id='__name__', ctx=Load())], keywords=[])",
+      "rendered": "logs.get_logger(__name__)"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 14,
+      "kind": "Name",
+      "original_ast": "Name(id='TypedDict', ctx=Load())",
+      "rendered": "TypedDict"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Constant(value='input_kind'), ops=[In()], comparators=[Name(id='checkpoint', ctx=Load())])",
+      "rendered": "'input_kind' in checkpoint"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 15,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Name(id='checkpoint', ctx=Load()), slice=Constant(value='input_kind'), ctx=Load())",
+      "rendered": "checkpoint['input_kind']"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='checkpoint', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='findings'), List(elts=[], ctx=Load())], keywords=[])",
+      "rendered": "checkpoint.get('findings', [])"
+    },
+    {
+      "line_start": 56,
+      "line_end": 56,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='checkpoint', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='outcomes'), Dict(keys=[], values=[])], keywords=[])",
+      "rendered": "checkpoint.get('outcomes', {})"
+    },
+    {
+      "line_start": 57,
+      "line_end": 57,
+      "column": 14,
+      "kind": "SetComp",
+      "original_ast": "SetComp(elt=Call(func=Name(id='str', ctx=Load()), args=[BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='finding', ctx=Load()), Constant(value='origin'), Constant(value=None)], keywords=[]), Constant(value='external')])], keywords=[]), generators=[comprehension(target=Name(id='finding', ctx=Store()), iter=Name(id='findings', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "{str(getattr(finding, 'origin', None) or 'external') for finding in findings}"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Name(id='findings', ctx=Load()), Compare(left=Name(id='outcomes', ctx=Load()), ops=[Eq()], comparators=[Call(func=Attribute(value=Name(id='dict', ctx=Load()), attr='fromkeys', ctx=Load()), args=[Name(id='origins', ctx=Load()), Constant(value='confirmed')], keywords=[])])])",
+      "rendered": "findings and outcomes == dict.fromkeys(origins, 'confirmed')"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value='external')",
+      "rendered": "'external'"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 11,
+      "kind": "Constant",
+      "original_ast": "Constant(value='deepdive')",
+      "rendered": "'deepdive'"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 25,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='frozenset', ctx=Load()), args=[Set(elts=[Constant(value='error'), Constant(value='halted'), Constant(value='uninvestigated'), Constant(value='failed')])], keywords=[])",
+      "rendered": "frozenset({'error', 'halted', 'uninvestigated', 'failed'})"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='checkpoint', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='outcomes'), Dict(keys=[], values=[])], keywords=[])",
+      "rendered": "checkpoint.get('outcomes', {})"
+    },
+    {
+      "line_start": 70,
+      "line_end": 70,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='any', ctx=Load()), args=[GeneratorExp(elt=Compare(left=Name(id='outcome', ctx=Load()), ops=[In()], comparators=[Name(id='_S4_UNTRUSTED_OUTCOMES', ctx=Load())]), generators=[comprehension(target=Name(id='outcome', ctx=Store()), iter=Call(func=Attribute(value=Name(id='outcomes', ctx=Load()), attr='values', ctx=Load()), args=[], keywords=[]), ifs=[], is_async=0)])], keywords=[]))",
+      "rendered": "not any((outcome in _S4_UNTRUSTED_OUTCOMES for outcome in outcomes.values()))"
+    },
+    {
+      "line_start": 73,
+      "line_end": 73,
+      "column": 14,
+      "kind": "Name",
+      "original_ast": "Name(id='TypedDict', ctx=Load())",
+      "rendered": "TypedDict"
+    },
+    {
+      "line_start": 78,
+      "line_end": 78,
+      "column": 14,
+      "kind": "Name",
+      "original_ast": "Name(id='TypedDict', ctx=Load())",
+      "rendered": "TypedDict"
+    },
+    {
+      "line_start": 85,
+      "line_end": 92,
+      "column": 4,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Subscript(value=Name(id='tuple', ctx=Load()), slice=Tuple(elts=[Subscript(value=Name(id='list', ctx=Load()), slice=Name(id='DroppedFinding', ctx=Load()), ctx=Load()), Subscript(value=Name(id='list', ctx=Load()), slice=Name(id='Finding', ctx=Load()), ctx=Load()), Subscript(value=Name(id='list', ctx=Load()), slice=Name(id='DroppedFinding', ctx=Load()), ctx=Load()), Subscript(value=Name(id='list', ctx=Load()), slice=Name(id='Finding', ctx=Load()), ctx=Load()), Subscript(value=Name(id='list', ctx=Load()), slice=Name(id='DroppedFinding', ctx=Load()), ctx=Load()), Name(id='int', ctx=Load())], ctx=Load()), ctx=Load()), op=BitOr(), right=Subscript(value=Name(id='tuple', ctx=Load()), slice=Tuple(elts=[Subscript(value=Name(id='list', ctx=Load()), slice=Name(id='DroppedFinding', ctx=Load()), ctx=Load()), Subscript(value=Name(id='list', ctx=Load()), slice=Name(id='Finding', ctx=Load()), ctx=Load()), Subscript(value=Name(id='list', ctx=Load()), slice=Name(id='DroppedFinding', ctx=Load()), ctx=Load()), Subscript(value=Name(id='list', ctx=Load()), slice=Name(id='Finding', ctx=Load()), ctx=Load()), Subscript(value=Name(id='list', ctx=Load()), slice=Name(id='DroppedFinding', ctx=Load()), ctx=Load())], ctx=Load()), ctx=Load()))",
+      "rendered": "tuple[list[DroppedFinding], list[Finding], list[DroppedFinding], list[Finding], list[DroppedFinding], int] | tuple[list[DroppedFinding], list[Finding], list[DroppedFinding], list[Finding], list[DroppedFinding]]"
+    },
+    {
+      "line_start": 97,
+      "line_end": 97,
+      "column": 21,
+      "kind": "Constant",
+      "original_ast": "Constant(value='repo_identity')",
+      "rendered": "'repo_identity'"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 22,
+      "kind": "Name",
+      "original_ast": "Name(id='TypedDict', ctx=Load())",
+      "rendered": "TypedDict"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 21,
+      "kind": "Constant",
+      "original_ast": "Constant(value='_prov')",
+      "rendered": "'_prov'"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 34,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='TypeAdapter', ctx=Load()), args=[Name(id='StageProvenance', ctx=Load())], keywords=[])",
+      "rendered": "TypeAdapter(StageProvenance)"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 11,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[FormattedValue(value=Name(id='step', ctx=Load()), conversion=-1), FormattedValue(value=Name(id='_PROVENANCE_SUFFIX', ctx=Load()), conversion=-1)])",
+      "rendered": "source_template_130_11"
+    },
+    {
+      "line_start": 133,
+      "line_end": 149,
+      "column": 39,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='s0'), Constant(value='s1'), Constant(value='s2'), Constant(value='s3'), Constant(value='s4'), Constant(value='s5'), Constant(value='s6'), Constant(value='s7'), Constant(value='s8'), Constant(value='s9'), Constant(value='ingest'), Name(id='REPO_IDENTITY_STEP', ctx=Load())], values=[Call(func=Name(id='TypeAdapter', ctx=Load()), args=[Name(id='SeedPackage', ctx=Load())], keywords=[]), Call(func=Name(id='TypeAdapter', ctx=Load()), args=[Name(id='ContextPackage', ctx=Load())], keywords=[]), Call(func=Name(id='TypeAdapter', ctx=Load()), args=[Name(id='ThreatModel', ctx=Load())], keywords=[]), Call(func=Name(id='TypeAdapter', ctx=Load()), args=[Name(id='TaskManifest', ctx=Load())], keywords=[]), Call(func=Name(id='TypeAdapter', ctx=Load()), args=[Name(id='_S4Ckpt', ctx=Load())], keywords=[]), Call(func=Name(id='TypeAdapter', ctx=Load()), args=[Name(id='_S5Ckpt', ctx=Load())], keywords=[]), Call(func=Name(id='TypeAdapter', ctx=Load()), args=[Name(id='_S6Ckpt', ctx=Load())], keywords=[]), Call(func=Name(id='TypeAdapter', ctx=Load()), args=[Name(id='_S7Ckpt', ctx=Load())], keywords=[]), Call(func=Name(id='TypeAdapter', ctx=Load()), args=[Name(id='FinalReport', ctx=Load())], keywords=[]), Call(func=Name(id='TypeAdapter', ctx=Load()), args=[Name(id='str', ctx=Load())], keywords=[]), Call(func=Name(id='TypeAdapter', ctx=Load()), args=[Name(id='bool', ctx=Load())], keywords=[]), Call(func=Name(id='TypeAdapter', ctx=Load()), args=[Name(id='str', ctx=Load())], keywords=[])])",
+      "rendered": "{'s0': TypeAdapter(SeedPackage), 's1': TypeAdapter(ContextPackage), 's2': TypeAdapter(ThreatModel), 's3': TypeAdapter(TaskManifest), 's4': TypeAdapter(_S4Ckpt), 's5': TypeAdapter(_S5Ckpt), 's6': TypeAdapter(_S6Ckpt), 's7': TypeAdapter(_S7Ckpt), 's8': TypeAdapter(FinalReport), 's9': TypeAdapter(str), 'ingest': TypeAdapter(bool), REPO_IDENTITY_STEP: TypeAdapter(str)}"
+    },
+    {
+      "line_start": 152,
+      "line_end": 152,
+      "column": 38,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='TypeAdapter', ctx=Load()), args=[Name(id='dict', ctx=Load())], keywords=[])",
+      "rendered": "TypeAdapter(dict)"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value='remediate_')",
+      "rendered": "'remediate_'"
+    },
+    {
+      "line_start": 156,
+      "line_end": 156,
+      "column": 18,
+      "kind": "Constant",
+      "original_ast": "Constant(value='validate_')",
+      "rendered": "'validate_'"
+    },
+    {
+      "line_start": 158,
+      "line_end": 158,
+      "column": 37,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='REMEDIATE_PREFIX', ctx=Load()), Name(id='VALIDATE_PREFIX', ctx=Load())], ctx=Load())",
+      "rendered": "(REMEDIATE_PREFIX, VALIDATE_PREFIX)"
+    },
+    {
+      "line_start": 161,
+      "line_end": 161,
+      "column": 21,
+      "kind": "Constant",
+      "original_ast": "Constant(value=24)",
+      "rendered": "24"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 44,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 170,
+      "line_end": 170,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='_VALIDATE_STEP_SCHEMA', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "_VALIDATE_STEP_SCHEMA is None"
+    },
+    {
+      "line_start": 172,
+      "line_end": 172,
+      "column": 32,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='TypeAdapter', ctx=Load()), args=[Name(id='ValidationResult', ctx=Load())], keywords=[])",
+      "rendered": "TypeAdapter(ValidationResult)"
+    },
+    {
+      "line_start": 173,
+      "line_end": 173,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='_VALIDATE_STEP_SCHEMA', ctx=Load())",
+      "rendered": "_VALIDATE_STEP_SCHEMA"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 21,
+      "kind": "Constant",
+      "original_ast": "Constant(value='ev_collection')",
+      "rendered": "'ev_collection'"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 44,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 185,
+      "line_end": 185,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='_EV_COLLECTION_SCHEMA', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "_EV_COLLECTION_SCHEMA is None"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 32,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='TypeAdapter', ctx=Load()), args=[Name(id='NormalizedCollection', ctx=Load())], keywords=[])",
+      "rendered": "TypeAdapter(NormalizedCollection)"
+    },
+    {
+      "line_start": 190,
+      "line_end": 190,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='_EV_COLLECTION_SCHEMA', ctx=Load())",
+      "rendered": "_EV_COLLECTION_SCHEMA"
+    },
+    {
+      "line_start": 195,
+      "line_end": 195,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='step', ctx=Load()), ops=[In()], comparators=[Name(id='_STEP_SCHEMA', ctx=Load())])",
+      "rendered": "step in _STEP_SCHEMA"
+    },
+    {
+      "line_start": 196,
+      "line_end": 196,
+      "column": 15,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Name(id='_STEP_SCHEMA', ctx=Load()), slice=Name(id='step', ctx=Load()), ctx=Load())",
+      "rendered": "_STEP_SCHEMA[step]"
+    },
+    {
+      "line_start": 197,
+      "line_end": 198,
+      "column": 8,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Call(func=Attribute(value=Name(id='step', ctx=Load()), attr='endswith', ctx=Load()), args=[Name(id='_PROVENANCE_SUFFIX', ctx=Load())], keywords=[]), Compare(left=Subscript(value=Name(id='step', ctx=Load()), slice=Slice(upper=UnaryOp(op=USub(), operand=Call(func=Name(id='len', ctx=Load()), args=[Name(id='_PROVENANCE_SUFFIX', ctx=Load())], keywords=[]))), ctx=Load()), ops=[In()], comparators=[Name(id='_STEP_SCHEMA', ctx=Load())])])",
+      "rendered": "step.endswith(_PROVENANCE_SUFFIX) and step[:-len(_PROVENANCE_SUFFIX)] in _STEP_SCHEMA"
+    },
+    {
+      "line_start": 199,
+      "line_end": 199,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='_PROVENANCE_SCHEMA', ctx=Load())",
+      "rendered": "_PROVENANCE_SCHEMA"
+    },
+    {
+      "line_start": 200,
+      "line_end": 200,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='step', ctx=Load()), ops=[Eq()], comparators=[Name(id='EV_COLLECTION_STEP', ctx=Load())])",
+      "rendered": "step == EV_COLLECTION_STEP"
+    },
+    {
+      "line_start": 201,
+      "line_end": 201,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_ev_collection_schema', ctx=Load()), args=[], keywords=[])",
+      "rendered": "_ev_collection_schema()"
+    },
+    {
+      "line_start": 202,
+      "line_end": 202,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='step', ctx=Load()), attr='startswith', ctx=Load()), args=[Name(id='REMEDIATE_PREFIX', ctx=Load())], keywords=[])",
+      "rendered": "step.startswith(REMEDIATE_PREFIX)"
+    },
+    {
+      "line_start": 203,
+      "line_end": 203,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='_REMEDIATE_STEP_SCHEMA', ctx=Load())",
+      "rendered": "_REMEDIATE_STEP_SCHEMA"
+    },
+    {
+      "line_start": 204,
+      "line_end": 204,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='step', ctx=Load()), attr='startswith', ctx=Load()), args=[Name(id='VALIDATE_PREFIX', ctx=Load())], keywords=[])",
+      "rendered": "step.startswith(VALIDATE_PREFIX)"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_validate_schema', ctx=Load()), args=[], keywords=[])",
+      "rendered": "_validate_schema()"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 11,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Name(id='_STEP_SCHEMA', ctx=Load()), slice=Name(id='step', ctx=Load()), ctx=Load())",
+      "rendered": "_STEP_SCHEMA[step]"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='prefix', ctx=Load()), ops=[NotIn()], comparators=[Name(id='_DYNAMIC_PREFIXES', ctx=Load())])",
+      "rendered": "prefix not in _DYNAMIC_PREFIXES"
+    },
+    {
+      "line_start": 213,
+      "line_end": 214,
+      "column": 15,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[Constant(value='unknown dynamic checkpoint prefix '), FormattedValue(value=Name(id='prefix', ctx=Load()), conversion=114), Constant(value='; expected one of '), FormattedValue(value=Name(id='_DYNAMIC_PREFIXES', ctx=Load()), conversion=-1), Constant(value=' so _schema_for can still route the key')])",
+      "rendered": "source_template_213_15"
+    },
+    {
+      "line_start": 215,
+      "line_end": 215,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ValueError', ctx=Load()), args=[Name(id='msg', ctx=Load())], keywords=[])",
+      "rendered": "ValueError(msg)"
+    },
+    {
+      "line_start": 216,
+      "line_end": 216,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Constant(value='\\n'), attr='join', ctx=Load()), args=[Tuple(elts=[Name(id='engine_id', ctx=Load()), Name(id='engine_version', ctx=Load()), Name(id='case_id', ctx=Load()), Name(id='model', ctx=Load()), Name(id='backend', ctx=Load())], ctx=Load())], keywords=[]), attr='encode', ctx=Load()), args=[], keywords=[])",
+      "rendered": "source_literal_216_15.join((engine_id, engine_version, case_id, model, backend)).encode()"
+    },
+    {
+      "line_start": 217,
+      "line_end": 217,
+      "column": 11,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Name(id='prefix', ctx=Load()), op=Add(), right=Subscript(value=Call(func=Attribute(value=Call(func=Attribute(value=Name(id='hashlib', ctx=Load()), attr='sha256', ctx=Load()), args=[Name(id='material', ctx=Load())], keywords=[]), attr='hexdigest', ctx=Load()), args=[], keywords=[]), slice=Slice(upper=Name(id='_STEP_DIGEST_CHARS', ctx=Load())), ctx=Load()))",
+      "rendered": "prefix + hashlib.sha256(material).hexdigest()[:_STEP_DIGEST_CHARS]"
+    },
+    {
+      "line_start": 221,
+      "line_end": 221,
+      "column": 32,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 226,
+      "line_end": 226,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='run_id', ctx=Load()), Name(id='prefix', ctx=Load())], ctx=Load())",
+      "rendered": "(run_id, prefix)"
+    },
+    {
+      "line_start": 227,
+      "line_end": 227,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='once', ctx=Load()), ops=[In()], comparators=[Name(id='_PRUNED', ctx=Load())])",
+      "rendered": "once in _PRUNED"
+    },
+    {
+      "line_start": 228,
+      "line_end": 228,
+      "column": 15,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 229,
+      "line_end": 229,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_PRUNED', ctx=Load()), attr='add', ctx=Load()), args=[Name(id='once', ctx=Load())], keywords=[])",
+      "rendered": "_PRUNED.add(once)"
+    },
+    {
+      "line_start": 230,
+      "line_end": 230,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='store', ctx=Load()), attr='delete_steps', ctx=Load()), args=[Name(id='run_id', ctx=Load()), Name(id='prefix', ctx=Load()), Call(func=Name(id='set', ctx=Load()), args=[Name(id='live_keys', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "store.delete_steps(run_id, prefix, set(live_keys))"
+    },
+    {
+      "line_start": 231,
+      "line_end": 231,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='removed', ctx=Load())",
+      "rendered": "removed"
+    },
+    {
+      "line_start": 232,
+      "line_end": 233,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='  [ckpt] pruned '), FormattedValue(value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='removed', ctx=Load())], keywords=[]), conversion=-1), Constant(value=' stale '), FormattedValue(value=Name(id='prefix', ctx=Load()), conversion=-1), Constant(value='* checkpoint row(s) for '), FormattedValue(value=Subscript(value=Name(id='run_id', ctx=Load()), slice=Slice(upper=Constant(value=12)), ctx=Load()), conversion=-1), Constant(value='… — written by an earlier engine or finding set')])], keywords=[])",
+      "rendered": "console.write(source_template_232_22)"
+    },
+    {
+      "line_start": 234,
+      "line_end": 234,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='removed', ctx=Load())",
+      "rendered": "removed"
+    },
+    {
+      "line_start": 238,
+      "line_end": 238,
+      "column": 18,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=BinOp(left=Constant(value=100), op=Mult(), right=Constant(value=1024)), op=Mult(), right=Constant(value=1024))",
+      "rendered": "100 * 1024 * 1024"
+    },
+    {
+      "line_start": 244,
+      "line_end": 244,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Name(id='_schema_for', ctx=Load()), args=[Name(id='step', ctx=Load())], keywords=[]), attr='dump_json', ctx=Load()), args=[Name(id='obj', ctx=Load())], keywords=[])",
+      "rendered": "_schema_for(step).dump_json(obj)"
+    },
+    {
+      "line_start": 245,
+      "line_end": 245,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='blob', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Name(id='_CKPT_MAX_BYTES', ctx=Load())])",
+      "rendered": "len(blob) > _CKPT_MAX_BYTES"
+    },
+    {
+      "line_start": 246,
+      "line_end": 246,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Attribute(value=Name(id='Event', ctx=Load()), attr='CKPT_TOO_LARGE', ctx=Load())], keywords=[keyword(arg='step', value=Name(id='step', ctx=Load())), keyword(arg='size', value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='blob', ctx=Load())], keywords=[])), keyword(arg='cap', value=Name(id='_CKPT_MAX_BYTES', ctx=Load()))])",
+      "rendered": "log.warning(Event.CKPT_TOO_LARGE, step=step, size=len(blob), cap=_CKPT_MAX_BYTES)"
+    },
+    {
+      "line_start": 248,
+      "line_end": 248,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='store', ctx=Load()), attr='connect', ctx=Load()), args=[], keywords=[])",
+      "rendered": "store.connect()"
+    },
+    {
+      "line_start": 250,
+      "line_end": 250,
+      "column": 13,
+      "kind": "Name",
+      "original_ast": "Name(id='con', ctx=Load())",
+      "rendered": "con"
+    },
+    {
+      "line_start": 252,
+      "line_end": 253,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value=\"INSERT OR IGNORE INTO runs(run_id, repo_root) VALUES (?, '')\"), Tuple(elts=[Name(id='run_id', ctx=Load())], ctx=Load())], keywords=[])",
+      "rendered": "con.execute(\"INSERT OR IGNORE INTO runs(run_id, repo_root) VALUES (?, '')\", (run_id,))"
+    },
+    {
+      "line_start": 254,
+      "line_end": 255,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value=\"UPDATE runs SET updated_at = datetime('now') WHERE run_id = ?\"), Tuple(elts=[Name(id='run_id', ctx=Load())], ctx=Load())], keywords=[])",
+      "rendered": "con.execute(\"UPDATE runs SET updated_at = datetime('now') WHERE run_id = ?\", (run_id,))"
+    },
+    {
+      "line_start": 256,
+      "line_end": 260,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value='INSERT OR REPLACE INTO checkpoints(run_id, step, payload, size) VALUES (?, ?, ?, ?)'), Tuple(elts=[Name(id='run_id', ctx=Load()), Name(id='step', ctx=Load()), Name(id='blob', ctx=Load()), Call(func=Name(id='len', ctx=Load()), args=[Name(id='blob', ctx=Load())], keywords=[])], ctx=Load())], keywords=[])",
+      "rendered": "con.execute('INSERT OR REPLACE INTO checkpoints(run_id, step, payload, size) VALUES (?, ?, ?, ?)', (run_id, step, blob, len(blob)))"
+    },
+    {
+      "line_start": 262,
+      "line_end": 262,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='close', ctx=Load()), args=[], keywords=[])",
+      "rendered": "con.close()"
+    },
+    {
+      "line_start": 263,
+      "line_end": 263,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='  [ckpt] saved '), FormattedValue(value=Name(id='step', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "console.write(source_template_263_18)"
+    },
+    {
+      "line_start": 269,
+      "line_end": 269,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='store', ctx=Load()), attr='connect', ctx=Load()), args=[], keywords=[])",
+      "rendered": "store.connect()"
+    },
+    {
+      "line_start": 271,
+      "line_end": 274,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value='SELECT payload, size FROM checkpoints WHERE run_id=? AND step=?'), Tuple(elts=[Name(id='run_id', ctx=Load()), Name(id='step', ctx=Load())], ctx=Load())], keywords=[]), attr='fetchone', ctx=Load()), args=[], keywords=[])",
+      "rendered": "con.execute('SELECT payload, size FROM checkpoints WHERE run_id=? AND step=?', (run_id, step)).fetchone()"
+    },
+    {
+      "line_start": 276,
+      "line_end": 276,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='close', ctx=Load()), args=[], keywords=[])",
+      "rendered": "con.close()"
+    },
+    {
+      "line_start": 277,
+      "line_end": 277,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='row', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "row is None"
+    },
+    {
+      "line_start": 278,
+      "line_end": 278,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='step', ctx=Load()), ops=[Eq()], comparators=[Constant(value='s1')])",
+      "rendered": "step == 's1'"
+    },
+    {
+      "line_start": 279,
+      "line_end": 281,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='  [ckpt] no checkpoints for '), FormattedValue(value=Subscript(value=Name(id='run_id', ctx=Load()), slice=Slice(upper=Constant(value=12)), ctx=Load()), conversion=-1), Constant(value='… in '), FormattedValue(value=Call(func=Attribute(value=Name(id='store', ctx=Load()), attr='db_path', ctx=Load()), args=[], keywords=[]), conversion=-1), Constant(value=' — if you expected resume, check $VVAHARNESS_STATE_DIR')])], keywords=[])",
+      "rendered": "console.write(source_template_279_26)"
+    },
+    {
+      "line_start": 282,
+      "line_end": 282,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 283,
+      "line_end": 283,
+      "column": 20,
+      "kind": "Name",
+      "original_ast": "Name(id='row', ctx=Load())",
+      "rendered": "row"
+    },
+    {
+      "line_start": 284,
+      "line_end": 284,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='size', ctx=Load()), ops=[Gt()], comparators=[Name(id='_CKPT_MAX_BYTES', ctx=Load())])",
+      "rendered": "size > _CKPT_MAX_BYTES"
+    },
+    {
+      "line_start": 285,
+      "line_end": 285,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Attribute(value=Name(id='Event', ctx=Load()), attr='CKPT_STORED_TOO_LARGE', ctx=Load())], keywords=[keyword(arg='step', value=Name(id='step', ctx=Load())), keyword(arg='cap', value=Name(id='_CKPT_MAX_BYTES', ctx=Load()))])",
+      "rendered": "log.warning(Event.CKPT_STORED_TOO_LARGE, step=step, cap=_CKPT_MAX_BYTES)"
+    },
+    {
+      "line_start": 286,
+      "line_end": 286,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 288,
+      "line_end": 288,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Name(id='_schema_for', ctx=Load()), args=[Name(id='step', ctx=Load())], keywords=[]), attr='validate_json', ctx=Load()), args=[Name(id='payload', ctx=Load())], keywords=[])",
+      "rendered": "_schema_for(step).validate_json(payload)"
+    },
+    {
+      "line_start": 289,
+      "line_end": 289,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='ValidationError', ctx=Load()), Name(id='ValueError', ctx=Load())], ctx=Load())",
+      "rendered": "(ValidationError, ValueError)"
+    },
+    {
+      "line_start": 292,
+      "line_end": 292,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='json', ctx=Load()), attr='loads', ctx=Load()), args=[Name(id='payload', ctx=Load())], keywords=[])",
+      "rendered": "json.loads(payload)"
+    },
+    {
+      "line_start": 293,
+      "line_end": 293,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='ValueError', ctx=Load()), Name(id='TypeError', ctx=Load())], ctx=Load())",
+      "rendered": "(ValueError, TypeError)"
+    },
+    {
+      "line_start": 295,
+      "line_end": 295,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Attribute(value=Name(id='Event', ctx=Load()), attr='CKPT_UNREADABLE', ctx=Load())], keywords=[keyword(arg='step', value=Name(id='step', ctx=Load())), keyword(arg='detail', value=Call(func=Name(id='str', ctx=Load()), args=[Name(id='e', ctx=Load())], keywords=[]))])",
+      "rendered": "log.warning(Event.CKPT_UNREADABLE, step=step, detail=str(e))"
+    },
+    {
+      "line_start": 298,
+      "line_end": 298,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Attribute(value=Name(id='Event', ctx=Load()), attr='CKPT_SCHEMA_MISMATCH', ctx=Load())], keywords=[keyword(arg='step', value=Name(id='step', ctx=Load())), keyword(arg='detail', value=Call(func=Name(id='str', ctx=Load()), args=[Name(id='e', ctx=Load())], keywords=[]))])",
+      "rendered": "log.warning(Event.CKPT_SCHEMA_MISMATCH, step=step, detail=str(e))"
+    },
+    {
+      "line_start": 299,
+      "line_end": 299,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 300,
+      "line_end": 300,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='  [ckpt] resumed '), FormattedValue(value=Name(id='step', ctx=Load()), conversion=-1), Constant(value=' from db')])], keywords=[])",
+      "rendered": "console.write(source_template_300_18)"
+    },
+    {
+      "line_start": 301,
+      "line_end": 301,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='obj', ctx=Load())",
+      "rendered": "obj"
+    },
+    {
+      "line_start": 309,
+      "line_end": 311,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='save_ckpt', ctx=Load()), args=[Name(id='ckpt_dir', ctx=Load()), Name(id='run_id', ctx=Load()), Call(func=Name(id='_provenance_step', ctx=Load()), args=[Name(id='step', ctx=Load())], keywords=[]), Call(func=Name(id='StageProvenance', ctx=Load()), args=[], keywords=[keyword(arg='model', value=Name(id='model', ctx=Load())), keyword(arg='via', value=Name(id='via', ctx=Load())), keyword(arg='config_sha256', value=Name(id='config_sha256', ctx=Load())), keyword(arg='tokens', value=Call(func=Name(id='dict', ctx=Load()), args=[Name(id='tokens', ctx=Load())], keywords=[]))])], keywords=[])",
+      "rendered": "save_ckpt(ckpt_dir, run_id, _provenance_step(step), StageProvenance(model=model, via=via, config_sha256=config_sha256, tokens=dict(tokens)))"
+    },
+    {
+      "line_start": 316,
+      "line_end": 316,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='load_ckpt', ctx=Load()), args=[Name(id='ckpt_dir', ctx=Load()), Name(id='run_id', ctx=Load()), Call(func=Name(id='_provenance_step', ctx=Load()), args=[Name(id='step', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "load_ckpt(ckpt_dir, run_id, _provenance_step(step))"
+    },
+    {
+      "line_start": 321,
+      "line_end": 321,
+      "column": 11,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Call(func=Attribute(value=Call(func=Attribute(value=Name(id='hashlib', ctx=Load()), attr='sha256', ctx=Load()), args=[Call(func=Attribute(value=Call(func=Name(id='str', ctx=Load()), args=[Call(func=Attribute(value=Call(func=Name(id='Path', ctx=Load()), args=[Name(id='repo', ctx=Load())], keywords=[]), attr='resolve', ctx=Load()), args=[], keywords=[])], keywords=[]), attr='encode', ctx=Load()), args=[], keywords=[])], keywords=[]), attr='hexdigest', ctx=Load()), args=[], keywords=[]), slice=Slice(upper=Constant(value=32)), ctx=Load())",
+      "rendered": "hashlib.sha256(str(Path(repo).resolve()).encode()).hexdigest()[:32]"
+    },
+    {
+      "line_start": 328,
+      "line_end": 328,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='store', ctx=Load()), attr='db_location', ctx=Load()), args=[], keywords=[])",
+      "rendered": "store.db_location()"
+    },
+    {
+      "line_start": 329,
+      "line_end": 329,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='db', ctx=Load()), attr='exists', ctx=Load()), args=[], keywords=[]))",
+      "rendered": "not db.exists()"
+    },
+    {
+      "line_start": 330,
+      "line_end": 330,
+      "column": 15,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='root'), Constant(value='kept'), Constant(value='deleted')], values=[Call(func=Name(id='str', ctx=Load()), args=[Name(id='db', ctx=Load())], keywords=[]), Constant(value=0), List(elts=[], ctx=Load())])",
+      "rendered": "{'root': str(db), 'kept': 0, 'deleted': []}"
+    },
+    {
+      "line_start": 331,
+      "line_end": 331,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='store', ctx=Load()), attr='connect', ctx=Load()), args=[], keywords=[])",
+      "rendered": "store.connect()"
+    },
+    {
+      "line_start": 333,
+      "line_end": 333,
+      "column": 16,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Call(func=Attribute(value=Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value='SELECT COUNT(*) FROM runs')], keywords=[]), attr='fetchone', ctx=Load()), args=[], keywords=[]), slice=Constant(value=0), ctx=Load())",
+      "rendered": "con.execute('SELECT COUNT(*) FROM runs').fetchone()[0]"
+    },
+    {
+      "line_start": 334,
+      "line_end": 342,
+      "column": 18,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Subscript(value=Name(id='r', ctx=Load()), slice=Constant(value=0), ctx=Load()), generators=[comprehension(target=Name(id='r', ctx=Store()), iter=Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value=\"SELECT run_id FROM runs\\n               WHERE updated_at < datetime('now', ?)\\n                  OR run_id NOT IN (\\n                       SELECT run_id FROM runs\\n                       ORDER BY updated_at DESC LIMIT ?)\\n               ORDER BY updated_at\"), Tuple(elts=[JoinedStr(values=[Constant(value='-'), FormattedValue(value=Name(id='max_age_days', ctx=Load()), conversion=-1), Constant(value=' days')]), Name(id='keep_runs', ctx=Load())], ctx=Load())], keywords=[]), ifs=[], is_async=0)])",
+      "rendered": "[r[0] for r in con.execute(source_literal_335_12, (source_template_341_13, keep_runs))]"
+    },
+    {
+      "line_start": 343,
+      "line_end": 343,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[UnaryOp(op=Not(), operand=Name(id='dry_run', ctx=Load())), Name(id='victims', ctx=Load())])",
+      "rendered": "not dry_run and victims"
+    },
+    {
+      "line_start": 344,
+      "line_end": 344,
+      "column": 17,
+      "kind": "Name",
+      "original_ast": "Name(id='con', ctx=Load())",
+      "rendered": "con"
+    },
+    {
+      "line_start": 345,
+      "line_end": 346,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='executemany', ctx=Load()), args=[Constant(value='DELETE FROM runs WHERE run_id = ?'), ListComp(elt=Tuple(elts=[Name(id='v', ctx=Load())], ctx=Load()), generators=[comprehension(target=Name(id='v', ctx=Store()), iter=Name(id='victims', ctx=Load()), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "con.executemany('DELETE FROM runs WHERE run_id = ?', [(v,) for v in victims])"
+    },
+    {
+      "line_start": 349,
+      "line_end": 349,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value='PRAGMA incremental_vacuum')], keywords=[]), attr='fetchall', ctx=Load()), args=[], keywords=[])",
+      "rendered": "con.execute('PRAGMA incremental_vacuum').fetchall()"
+    },
+    {
+      "line_start": 350,
+      "line_end": 350,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='execute', ctx=Load()), args=[Constant(value='PRAGMA wal_checkpoint(TRUNCATE)')], keywords=[])",
+      "rendered": "con.execute('PRAGMA wal_checkpoint(TRUNCATE)')"
+    },
+    {
+      "line_start": 351,
+      "line_end": 351,
+      "column": 21,
+      "kind": "Name",
+      "original_ast": "Name(id='victims', ctx=Load())",
+      "rendered": "victims"
+    },
+    {
+      "line_start": 352,
+      "line_end": 352,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='store', ctx=Load()), attr='delete_run_graphs', ctx=Load()), args=[Name(id='v', ctx=Load())], keywords=[])",
+      "rendered": "store.delete_run_graphs(v)"
+    },
+    {
+      "line_start": 354,
+      "line_end": 354,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='con', ctx=Load()), attr='close', ctx=Load()), args=[], keywords=[])",
+      "rendered": "con.close()"
+    },
+    {
+      "line_start": 356,
+      "line_end": 357,
+      "column": 11,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='root'), Constant(value='kept'), Constant(value='deleted')], values=[Call(func=Name(id='str', ctx=Load()), args=[Name(id='db', ctx=Load())], keywords=[]), BinOp(left=Name(id='total', ctx=Load()), op=Sub(), right=Call(func=Name(id='len', ctx=Load()), args=[Name(id='victims', ctx=Load())], keywords=[])), Name(id='victims', ctx=Load())])",
+      "rendered": "{'root': str(db), 'kept': total - len(victims), 'deleted': victims}"
+    }
+  ],
+  "calls": [
+    {
+      "line": 42,
+      "end_line": 42,
+      "callee": "logs.get_logger",
+      "enclosing": "module initialization",
+      "expression": "logs.get_logger(__name__)"
+    },
+    {
+      "line": 64,
+      "end_line": 64,
+      "callee": "frozenset",
+      "enclosing": "module initialization",
+      "expression": "frozenset({\"error\", \"halted\", \"uninvestigated\", \"failed\"})"
+    },
+    {
+      "line": 126,
+      "end_line": 126,
+      "callee": "TypeAdapter",
+      "enclosing": "module initialization",
+      "expression": "TypeAdapter(StageProvenance)"
+    },
+    {
+      "line": 152,
+      "end_line": 152,
+      "callee": "TypeAdapter",
+      "enclosing": "module initialization",
+      "expression": "TypeAdapter(dict)"
+    },
+    {
+      "line": 221,
+      "end_line": 221,
+      "callee": "set",
+      "enclosing": "module initialization",
+      "expression": "set()"
+    },
+    {
+      "line": 55,
+      "end_line": 55,
+      "callee": "checkpoint.get",
+      "enclosing": "s4_input_kind",
+      "expression": "checkpoint.get(\"findings\", [])"
+    },
+    {
+      "line": 56,
+      "end_line": 56,
+      "callee": "checkpoint.get",
+      "enclosing": "s4_input_kind",
+      "expression": "checkpoint.get(\"outcomes\", {})"
+    },
+    {
+      "line": 69,
+      "end_line": 69,
+      "callee": "checkpoint.get",
+      "enclosing": "s4_stage_complete",
+      "expression": "checkpoint.get(\"outcomes\", {})"
+    },
+    {
+      "line": 135,
+      "end_line": 135,
+      "callee": "TypeAdapter",
+      "enclosing": "module initialization",
+      "expression": "TypeAdapter(SeedPackage)"
+    },
+    {
+      "line": 136,
+      "end_line": 136,
+      "callee": "TypeAdapter",
+      "enclosing": "module initialization",
+      "expression": "TypeAdapter(ContextPackage)"
+    },
+    {
+      "line": 137,
+      "end_line": 137,
+      "callee": "TypeAdapter",
+      "enclosing": "module initialization",
+      "expression": "TypeAdapter(ThreatModel)"
+    },
+    {
+      "line": 138,
+      "end_line": 138,
+      "callee": "TypeAdapter",
+      "enclosing": "module initialization",
+      "expression": "TypeAdapter(TaskManifest)"
+    },
+    {
+      "line": 139,
+      "end_line": 139,
+      "callee": "TypeAdapter",
+      "enclosing": "module initialization",
+      "expression": "TypeAdapter(_S4Ckpt)"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "TypeAdapter",
+      "enclosing": "module initialization",
+      "expression": "TypeAdapter(_S5Ckpt)"
+    },
+    {
+      "line": 141,
+      "end_line": 141,
+      "callee": "TypeAdapter",
+      "enclosing": "module initialization",
+      "expression": "TypeAdapter(_S6Ckpt)"
+    },
+    {
+      "line": 142,
+      "end_line": 142,
+      "callee": "TypeAdapter",
+      "enclosing": "module initialization",
+      "expression": "TypeAdapter(_S7Ckpt)"
+    },
+    {
+      "line": 143,
+      "end_line": 143,
+      "callee": "TypeAdapter",
+      "enclosing": "module initialization",
+      "expression": "TypeAdapter(FinalReport)"
+    },
+    {
+      "line": 144,
+      "end_line": 144,
+      "callee": "TypeAdapter",
+      "enclosing": "module initialization",
+      "expression": "TypeAdapter(str)"
+    },
+    {
+      "line": 146,
+      "end_line": 146,
+      "callee": "TypeAdapter",
+      "enclosing": "module initialization",
+      "expression": "TypeAdapter(bool)"
+    },
+    {
+      "line": 148,
+      "end_line": 148,
+      "callee": "TypeAdapter",
+      "enclosing": "module initialization",
+      "expression": "TypeAdapter(str)"
+    },
+    {
+      "line": 202,
+      "end_line": 202,
+      "callee": "step.startswith",
+      "enclosing": "_schema_for",
+      "expression": "step.startswith(REMEDIATE_PREFIX)"
+    },
+    {
+      "line": 204,
+      "end_line": 204,
+      "callee": "step.startswith",
+      "enclosing": "_schema_for",
+      "expression": "step.startswith(VALIDATE_PREFIX)"
+    },
+    {
+      "line": 216,
+      "end_line": 216,
+      "callee": "'\\n'.join((engine_id, engine_version, case_id, model, backend)).encode",
+      "enclosing": "step_key_for",
+      "expression": "\"\\n\".join((engine_id, engine_version, case_id, model, backend)).encode()"
+    },
+    {
+      "line": 229,
+      "end_line": 229,
+      "callee": "_PRUNED.add",
+      "enclosing": "prune_stale_steps",
+      "expression": "_PRUNED.add(once)"
+    },
+    {
+      "line": 230,
+      "end_line": 230,
+      "callee": "store.delete_steps",
+      "enclosing": "prune_stale_steps",
+      "expression": "store.delete_steps(run_id, prefix, set(live_keys))"
+    },
+    {
+      "line": 244,
+      "end_line": 244,
+      "callee": "_schema_for(step).dump_json",
+      "enclosing": "save_ckpt",
+      "expression": "_schema_for(step).dump_json(obj)"
+    },
+    {
+      "line": 248,
+      "end_line": 248,
+      "callee": "store.connect",
+      "enclosing": "save_ckpt",
+      "expression": "store.connect()"
+    },
+    {
+      "line": 263,
+      "end_line": 263,
+      "callee": "console.write",
+      "enclosing": "save_ckpt",
+      "expression": "console.write(f\"  [ckpt] saved {step}\")"
+    },
+    {
+      "line": 269,
+      "end_line": 269,
+      "callee": "store.connect",
+      "enclosing": "load_ckpt",
+      "expression": "store.connect()"
+    },
+    {
+      "line": 300,
+      "end_line": 300,
+      "callee": "console.write",
+      "enclosing": "load_ckpt",
+      "expression": "console.write(f\"  [ckpt] resumed {step} from db\")"
+    },
+    {
+      "line": 309,
+      "end_line": 311,
+      "callee": "save_ckpt",
+      "enclosing": "save_stage_provenance",
+      "expression": "save_ckpt(ckpt_dir, run_id, _provenance_step(step), StageProvenance(\n        model=model, via=via, config_sha256=config_sha256,\n        tokens=dict(tokens)))"
+    },
+    {
+      "line": 316,
+      "end_line": 316,
+      "callee": "load_ckpt",
+      "enclosing": "load_stage_provenance",
+      "expression": "load_ckpt(ckpt_dir, run_id, _provenance_step(step))"
+    },
+    {
+      "line": 328,
+      "end_line": 328,
+      "callee": "store.db_location",
+      "enclosing": "prune_checkpoints",
+      "expression": "store.db_location()"
+    },
+    {
+      "line": 331,
+      "end_line": 331,
+      "callee": "store.connect",
+      "enclosing": "prune_checkpoints",
+      "expression": "store.connect()"
+    },
+    {
+      "line": 57,
+      "end_line": 57,
+      "callee": "str",
+      "enclosing": "s4_input_kind",
+      "expression": "str(getattr(finding, \"origin\", None) or \"external\")"
+    },
+    {
+      "line": 70,
+      "end_line": 70,
+      "callee": "any",
+      "enclosing": "s4_stage_complete",
+      "expression": "any(outcome in _S4_UNTRUSTED_OUTCOMES for outcome in outcomes.values())"
+    },
+    {
+      "line": 172,
+      "end_line": 172,
+      "callee": "TypeAdapter",
+      "enclosing": "_validate_schema",
+      "expression": "TypeAdapter(ValidationResult)"
+    },
+    {
+      "line": 189,
+      "end_line": 189,
+      "callee": "TypeAdapter",
+      "enclosing": "_ev_collection_schema",
+      "expression": "TypeAdapter(NormalizedCollection)"
+    },
+    {
+      "line": 197,
+      "end_line": 197,
+      "callee": "step.endswith",
+      "enclosing": "_schema_for",
+      "expression": "step.endswith(_PROVENANCE_SUFFIX)"
+    },
+    {
+      "line": 201,
+      "end_line": 201,
+      "callee": "_ev_collection_schema",
+      "enclosing": "_schema_for",
+      "expression": "_ev_collection_schema()"
+    },
+    {
+      "line": 205,
+      "end_line": 205,
+      "callee": "_validate_schema",
+      "enclosing": "_schema_for",
+      "expression": "_validate_schema()"
+    },
+    {
+      "line": 215,
+      "end_line": 215,
+      "callee": "ValueError",
+      "enclosing": "step_key_for",
+      "expression": "ValueError(msg)"
+    },
+    {
+      "line": 230,
+      "end_line": 230,
+      "callee": "set",
+      "enclosing": "prune_stale_steps",
+      "expression": "set(live_keys)"
+    },
+    {
+      "line": 232,
+      "end_line": 233,
+      "callee": "console.write",
+      "enclosing": "prune_stale_steps",
+      "expression": "console.write(f\"  [ckpt] pruned {len(removed)} stale {prefix}* checkpoint row(s) \"\n                      f\"for {run_id[:12]}… — written by an earlier engine or finding set\")"
+    },
+    {
+      "line": 245,
+      "end_line": 245,
+      "callee": "len",
+      "enclosing": "save_ckpt",
+      "expression": "len(blob)"
+    },
+    {
+      "line": 246,
+      "end_line": 246,
+      "callee": "log.warning",
+      "enclosing": "save_ckpt",
+      "expression": "log.warning(Event.CKPT_TOO_LARGE, step=step, size=len(blob), cap=_CKPT_MAX_BYTES)"
+    },
+    {
+      "line": 262,
+      "end_line": 262,
+      "callee": "con.close",
+      "enclosing": "save_ckpt",
+      "expression": "con.close()"
+    },
+    {
+      "line": 271,
+      "end_line": 274,
+      "callee": "con.execute('SELECT payload, size FROM checkpoints WHERE run_id=? AND step=?', (run_id, step)).fetchone",
+      "enclosing": "load_ckpt",
+      "expression": "con.execute(\n            \"SELECT payload, size FROM checkpoints WHERE run_id=? AND step=?\",\n            (run_id, step),\n        ).fetchone()"
+    },
+    {
+      "line": 276,
+      "end_line": 276,
+      "callee": "con.close",
+      "enclosing": "load_ckpt",
+      "expression": "con.close()"
+    },
+    {
+      "line": 285,
+      "end_line": 285,
+      "callee": "log.warning",
+      "enclosing": "load_ckpt",
+      "expression": "log.warning(Event.CKPT_STORED_TOO_LARGE, step=step, cap=_CKPT_MAX_BYTES)"
+    },
+    {
+      "line": 288,
+      "end_line": 288,
+      "callee": "_schema_for(step).validate_json",
+      "enclosing": "load_ckpt",
+      "expression": "_schema_for(step).validate_json(payload)"
+    },
+    {
+      "line": 309,
+      "end_line": 309,
+      "callee": "_provenance_step",
+      "enclosing": "save_stage_provenance",
+      "expression": "_provenance_step(step)"
+    },
+    {
+      "line": 309,
+      "end_line": 311,
+      "callee": "StageProvenance",
+      "enclosing": "save_stage_provenance",
+      "expression": "StageProvenance(\n        model=model, via=via, config_sha256=config_sha256,\n        tokens=dict(tokens))"
+    },
+    {
+      "line": 316,
+      "end_line": 316,
+      "callee": "_provenance_step",
+      "enclosing": "load_stage_provenance",
+      "expression": "_provenance_step(step)"
+    },
+    {
+      "line": 321,
+      "end_line": 321,
+      "callee": "hashlib.sha256(str(Path(repo).resolve()).encode()).hexdigest",
+      "enclosing": "run_id_for",
+      "expression": "hashlib.sha256(str(Path(repo).resolve()).encode()).hexdigest()"
+    },
+    {
+      "line": 329,
+      "end_line": 329,
+      "callee": "db.exists",
+      "enclosing": "prune_checkpoints",
+      "expression": "db.exists()"
+    },
+    {
+      "line": 354,
+      "end_line": 354,
+      "callee": "con.close",
+      "enclosing": "prune_checkpoints",
+      "expression": "con.close()"
+    },
+    {
+      "line": 356,
+      "end_line": 356,
+      "callee": "str",
+      "enclosing": "prune_checkpoints",
+      "expression": "str(db)"
+    },
+    {
+      "line": 58,
+      "end_line": 58,
+      "callee": "dict.fromkeys",
+      "enclosing": "s4_input_kind",
+      "expression": "dict.fromkeys(origins, \"confirmed\")"
+    },
+    {
+      "line": 216,
+      "end_line": 216,
+      "callee": "'\\n'.join",
+      "enclosing": "step_key_for",
+      "expression": "\"\\n\".join((engine_id, engine_version, case_id, model, backend))"
+    },
+    {
+      "line": 217,
+      "end_line": 217,
+      "callee": "hashlib.sha256(material).hexdigest",
+      "enclosing": "step_key_for",
+      "expression": "hashlib.sha256(material).hexdigest()"
+    },
+    {
+      "line": 244,
+      "end_line": 244,
+      "callee": "_schema_for",
+      "enclosing": "save_ckpt",
+      "expression": "_schema_for(step)"
+    },
+    {
+      "line": 252,
+      "end_line": 253,
+      "callee": "con.execute",
+      "enclosing": "save_ckpt",
+      "expression": "con.execute(\"INSERT OR IGNORE INTO runs(run_id, repo_root) \"\n                        \"VALUES (?, '')\", (run_id,))"
+    },
+    {
+      "line": 254,
+      "end_line": 255,
+      "callee": "con.execute",
+      "enclosing": "save_ckpt",
+      "expression": "con.execute(\"UPDATE runs SET updated_at = datetime('now') \"\n                        \"WHERE run_id = ?\", (run_id,))"
+    },
+    {
+      "line": 256,
+      "end_line": 260,
+      "callee": "con.execute",
+      "enclosing": "save_ckpt",
+      "expression": "con.execute(\n                \"INSERT OR REPLACE INTO checkpoints\"\n                \"(run_id, step, payload, size) VALUES (?, ?, ?, ?)\",\n                (run_id, step, blob, len(blob)),\n            )"
+    },
+    {
+      "line": 279,
+      "end_line": 281,
+      "callee": "console.write",
+      "enclosing": "load_ckpt",
+      "expression": "console.write(f\"  [ckpt] no checkpoints for {run_id[:12]}… in \"\n                          f\"{store.db_path()} — if you expected resume, check \"\n                          f\"$VVAHARNESS_STATE_DIR\")"
+    },
+    {
+      "line": 330,
+      "end_line": 330,
+      "callee": "str",
+      "enclosing": "prune_checkpoints",
+      "expression": "str(db)"
+    },
+    {
+      "line": 333,
+      "end_line": 333,
+      "callee": "con.execute('SELECT COUNT(*) FROM runs').fetchone",
+      "enclosing": "prune_checkpoints",
+      "expression": "con.execute(\"SELECT COUNT(*) FROM runs\").fetchone()"
+    },
+    {
+      "line": 349,
+      "end_line": 349,
+      "callee": "con.execute('PRAGMA incremental_vacuum').fetchall",
+      "enclosing": "prune_checkpoints",
+      "expression": "con.execute(\"PRAGMA incremental_vacuum\").fetchall()"
+    },
+    {
+      "line": 350,
+      "end_line": 350,
+      "callee": "con.execute",
+      "enclosing": "prune_checkpoints",
+      "expression": "con.execute(\"PRAGMA wal_checkpoint(TRUNCATE)\")"
+    },
+    {
+      "line": 357,
+      "end_line": 357,
+      "callee": "len",
+      "enclosing": "prune_checkpoints",
+      "expression": "len(victims)"
+    },
+    {
+      "line": 57,
+      "end_line": 57,
+      "callee": "getattr",
+      "enclosing": "s4_input_kind",
+      "expression": "getattr(finding, \"origin\", None)"
+    },
+    {
+      "line": 246,
+      "end_line": 246,
+      "callee": "len",
+      "enclosing": "save_ckpt",
+      "expression": "len(blob)"
+    },
+    {
+      "line": 271,
+      "end_line": 274,
+      "callee": "con.execute",
+      "enclosing": "load_ckpt",
+      "expression": "con.execute(\n            \"SELECT payload, size FROM checkpoints WHERE run_id=? AND step=?\",\n            (run_id, step),\n        )"
+    },
+    {
+      "line": 288,
+      "end_line": 288,
+      "callee": "_schema_for",
+      "enclosing": "load_ckpt",
+      "expression": "_schema_for(step)"
+    },
+    {
+      "line": 292,
+      "end_line": 292,
+      "callee": "json.loads",
+      "enclosing": "load_ckpt",
+      "expression": "json.loads(payload)"
+    },
+    {
+      "line": 298,
+      "end_line": 298,
+      "callee": "log.warning",
+      "enclosing": "load_ckpt",
+      "expression": "log.warning(Event.CKPT_SCHEMA_MISMATCH, step=step, detail=str(e))"
+    },
+    {
+      "line": 311,
+      "end_line": 311,
+      "callee": "dict",
+      "enclosing": "save_stage_provenance",
+      "expression": "dict(tokens)"
+    },
+    {
+      "line": 321,
+      "end_line": 321,
+      "callee": "hashlib.sha256",
+      "enclosing": "run_id_for",
+      "expression": "hashlib.sha256(str(Path(repo).resolve()).encode())"
+    },
+    {
+      "line": 334,
+      "end_line": 342,
+      "callee": "con.execute",
+      "enclosing": "prune_checkpoints",
+      "expression": "con.execute(\n            \"\"\"SELECT run_id FROM runs\n               WHERE updated_at < datetime('now', ?)\n                  OR run_id NOT IN (\n                       SELECT run_id FROM runs\n                       ORDER BY updated_at DESC LIMIT ?)\n               ORDER BY updated_at\"\"\",\n            (f\"-{max_age_days} days\", keep_runs),\n        )"
+    },
+    {
+      "line": 345,
+      "end_line": 346,
+      "callee": "con.executemany",
+      "enclosing": "prune_checkpoints",
+      "expression": "con.executemany(\"DELETE FROM runs WHERE run_id = ?\",\n                                [(v,) for v in victims])"
+    },
+    {
+      "line": 352,
+      "end_line": 352,
+      "callee": "store.delete_run_graphs",
+      "enclosing": "prune_checkpoints",
+      "expression": "store.delete_run_graphs(v)"
+    },
+    {
+      "line": 70,
+      "end_line": 70,
+      "callee": "outcomes.values",
+      "enclosing": "s4_stage_complete",
+      "expression": "outcomes.values()"
+    },
+    {
+      "line": 217,
+      "end_line": 217,
+      "callee": "hashlib.sha256",
+      "enclosing": "step_key_for",
+      "expression": "hashlib.sha256(material)"
+    },
+    {
+      "line": 232,
+      "end_line": 232,
+      "callee": "len",
+      "enclosing": "prune_stale_steps",
+      "expression": "len(removed)"
+    },
+    {
+      "line": 259,
+      "end_line": 259,
+      "callee": "len",
+      "enclosing": "save_ckpt",
+      "expression": "len(blob)"
+    },
+    {
+      "line": 295,
+      "end_line": 295,
+      "callee": "log.warning",
+      "enclosing": "load_ckpt",
+      "expression": "log.warning(Event.CKPT_UNREADABLE, step=step, detail=str(e))"
+    },
+    {
+      "line": 321,
+      "end_line": 321,
+      "callee": "str(Path(repo).resolve()).encode",
+      "enclosing": "run_id_for",
+      "expression": "str(Path(repo).resolve()).encode()"
+    },
+    {
+      "line": 333,
+      "end_line": 333,
+      "callee": "con.execute",
+      "enclosing": "prune_checkpoints",
+      "expression": "con.execute(\"SELECT COUNT(*) FROM runs\")"
+    },
+    {
+      "line": 349,
+      "end_line": 349,
+      "callee": "con.execute",
+      "enclosing": "prune_checkpoints",
+      "expression": "con.execute(\"PRAGMA incremental_vacuum\")"
+    },
+    {
+      "line": 198,
+      "end_line": 198,
+      "callee": "len",
+      "enclosing": "_schema_for",
+      "expression": "len(_PROVENANCE_SUFFIX)"
+    },
+    {
+      "line": 280,
+      "end_line": 280,
+      "callee": "store.db_path",
+      "enclosing": "load_ckpt",
+      "expression": "store.db_path()"
+    },
+    {
+      "line": 298,
+      "end_line": 298,
+      "callee": "str",
+      "enclosing": "load_ckpt",
+      "expression": "str(e)"
+    },
+    {
+      "line": 295,
+      "end_line": 295,
+      "callee": "str",
+      "enclosing": "load_ckpt",
+      "expression": "str(e)"
+    },
+    {
+      "line": 321,
+      "end_line": 321,
+      "callee": "str",
+      "enclosing": "run_id_for",
+      "expression": "str(Path(repo).resolve())"
+    },
+    {
+      "line": 321,
+      "end_line": 321,
+      "callee": "Path(repo).resolve",
+      "enclosing": "run_id_for",
+      "expression": "Path(repo).resolve()"
+    },
+    {
+      "line": 321,
+      "end_line": 321,
+      "callee": "Path",
+      "enclosing": "run_id_for",
+      "expression": "Path(repo)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 16,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 17,
+      "source_expression": "from vvaharness.util import logs",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.logs"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/logs.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 20,
+      "source_expression": "import hashlib",
+      "targets": [
+        "hashlib"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "import json",
+      "targets": [
+        "json"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "from collections.abc import Iterable, Mapping",
+      "targets": [
+        "collections.abc",
+        "collections.abc.Iterable",
+        "collections.abc.Mapping"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 23,
+      "source_expression": "from pathlib import Path",
+      "targets": [
+        "pathlib",
+        "pathlib.Path"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 25,
+      "source_expression": "from pydantic import TypeAdapter, ValidationError",
+      "targets": [
+        "pydantic",
+        "pydantic.TypeAdapter",
+        "pydantic.ValidationError"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 26,
+      "source_expression": "from typing import Literal",
+      "targets": [
+        "typing",
+        "typing.Literal"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 27,
+      "source_expression": "from typing_extensions import NotRequired, TypedDict",
+      "targets": [
+        "typing_extensions",
+        "typing_extensions.NotRequired",
+        "typing_extensions.TypedDict"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 29,
+      "source_expression": "from vvaharness.models import ContextPackage, DroppedFinding, FinalReport, Finding, TaskManifest, ThreatModel",
+      "targets": [
+        "vvaharness.models",
+        "vvaharness.models.ContextPackage",
+        "vvaharness.models.DroppedFinding",
+        "vvaharness.models.FinalReport",
+        "vvaharness.models.Finding",
+        "vvaharness.models.TaskManifest",
+        "vvaharness.models.ThreatModel"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 37,
+      "source_expression": "from vvaharness.models.scan import SeedPackage",
+      "targets": [
+        "vvaharness.models.scan",
+        "vvaharness.models.scan.SeedPackage"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/scan/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 38,
+      "source_expression": "from vvaharness.orchestrator import store",
+      "targets": [
+        "vvaharness.orchestrator",
+        "vvaharness.orchestrator.store"
+      ],
+      "local_source_paths": [
+        "vvaharness/orchestrator/__init__.py",
+        "vvaharness/orchestrator/store/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 39,
+      "source_expression": "from vvaharness.util import console",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.console"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/console.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 40,
+      "source_expression": "from vvaharness.util.events import Event",
+      "targets": [
+        "vvaharness.util.events",
+        "vvaharness.util.events.Event"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/events.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 171,
+      "source_expression": "from vvaharness.validation.models import ValidationResult",
+      "targets": [
+        "vvaharness.validation.models",
+        "vvaharness.validation.models.ValidationResult"
+      ],
+      "local_source_paths": [
+        "vvaharness/validation/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 186,
+      "source_expression": "from vvaharness.exploit_verification.collection.model import NormalizedCollection",
+      "targets": [
+        "vvaharness.exploit_verification.collection.model",
+        "vvaharness.exploit_verification.collection.model.NormalizedCollection"
+      ],
+      "local_source_paths": [
+        "vvaharness/exploit_verification/collection/model.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

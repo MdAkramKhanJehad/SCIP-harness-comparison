@@ -1,0 +1,4114 @@
+{
+  "source": "vvaharness/codegraph/tools.py",
+  "sha256": "81de5345e293ab32889976826395a99301cc68e187533d4cb4b6d7d3c20f5107",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Read-only graph-query tools over ``ctx.graph_handle``; S2, S4 and S6 each build these.\"\"\"\nfrom __future__ import annotations\n\nimport functools\nfrom collections.abc import Callable, Iterable, Mapping, Sequence\nfrom dataclasses import dataclass\n\nfrom context_graph_sdk import SymbolAmbiguousError, SymbolSelector\nfrom langchain_core.tools import BaseTool, tool\n\nfrom vvaharness.backends.harness import StreamingOptions\nfrom vvaharness.backends.harness.deepagents.tools import (\n    build_tools as build_reader_tools,\n)\nfrom vvaharness.codegraph.handle import GraphHandle\nfrom vvaharness.models import ContextPackage\nfrom vvaharness.util.counters import COUNTERS\n\n_CONTEXT_LIMITS = {\"candidate_limit\": 5, \"group_limit\": 8, \"call_depth\": 2,\n                   \"max_nodes\": 60, \"max_edges\": 120, \"max_paths\": 8}\n_IMPACT_LIMITS = {\"candidate_limit\": 5, \"max_depth\": 4,\n                  \"max_nodes\": 80, \"max_edges\": 160, \"max_paths\": 10}\n_REF_CAP = 20\n_PATH_CAP = 6\n\n_NEIGHBORS_QUERY = \"\"\"\nMATCH (fn {name: $function, filePath: $file})-[:CALLS]->(callee)\nRETURN DISTINCT callee.filePath AS file, callee.name AS name\nLIMIT 25\n\"\"\"\n_CALLERS_QUERY = \"\"\"\nMATCH (caller)-[:CALLS]->(fn {name: $function, filePath: $file})\nRETURN DISTINCT caller.filePath AS file, caller.name AS name\nLIMIT 25\n\"\"\"\n_IMPORTERS_QUERY = \"\"\"\nMATCH (importer:File)-[:IMPORTS]->(target:File {filePath: $file})\nRETURN DISTINCT importer.filePath AS path\nLIMIT 25\n\"\"\"\n\n\ndef _qname(row: dict) -> str:\n    \"\"\"A cypher row rendered as ``file::name``, or empty when either half is missing.\"\"\"\n    file, name = row.get(\"file\"), row.get(\"name\")\n    return f\"{file}::{name}\" if isinstance(file, str) and isinstance(name, str) else \"\"\n\n\ndef _ref(entity: object) -> str:\n    \"\"\"An entity rendered as ``file::name``, or its name alone when it carries no path.\"\"\"\n    name = getattr(entity, \"name\", None) or getattr(entity, \"qualified_name\", None) or \"\"\n    path = getattr(entity, \"file_path\", None) or getattr(entity, \"path\", None) or \"\"\n    return f\"{path}::{name}\" if path and name else str(name or path)\n\n\ndef _refs(entities: Iterable[object] | None) -> list[str]:\n    \"\"\"Up to ``_REF_CAP`` rendered entity references, dropping empties.\"\"\"\n    return [r for e in (entities or ()) if (r := _ref(e))][:_REF_CAP]\n\n\ndef _paths(paths: Iterable[object] | None) -> list[str]:\n    \"\"\"Up to ``_PATH_CAP`` call paths, each an arrow-joined reference chain.\"\"\"\n    return [\" -> \".join(_refs(getattr(p, \"nodes\", ()) or getattr(p, \"entities\", ())))\n            for p in (paths or ())][:_PATH_CAP]\n\n\ndef _selector(file: str, symbol: str | None, line: int | None = None) -> SymbolSelector:\n    \"\"\"A ``SymbolSelector`` for *symbol* scoped to *file*, optionally pinned to *line*.\"\"\"\n    return SymbolSelector(symbol or file, file_path=file, line=line)\n\n\ndef _resolve_error(file: str, symbol: str, exc: Exception) -> dict:\n    \"\"\"A usable answer when the graph cannot resolve *symbol*, instead of a raised tool error.\"\"\"\n    if isinstance(exc, SymbolAmbiguousError):\n        hint = (f\"several symbols named '{symbol}' exist in {file}. Pass `line` to pick the \"\n                \"one you mean, or name the enclosing class or function so the name is unique.\")\n    else:\n        hint = (f\"the graph holds no symbol '{symbol}' in {file}. It indexes functions, methods \"\n                \"and classes — not module-level statements, templates or config. Pass the \"\n                \"enclosing function's exact name, or fall back to Grep for this location.\")\n    return {\"error\": f\"{type(exc).__name__}: {exc}\", \"hint\": hint}\n\n\ndef _cypher_error(exc: Exception) -> dict:\n    \"\"\"A usable answer when a direct graph query fails, instead of a raised tool error.\"\"\"\n    return {\"error\": f\"{type(exc).__name__}: {exc}\"}\n\n\ndef _is_empty_result(result: object) -> bool:\n    \"\"\"``None``, an empty list, or a dict whose list-valued entries are all empty.\"\"\"\n    if isinstance(result, dict):\n        return all(not v for v in result.values() if isinstance(v, list))\n    return result is None or (isinstance(result, list) and not result)\n\n\ndef _count_result(result: object) -> None:\n    \"\"\"Bumps exactly one ``graph_tool_result_{error,empty,hit}`` counter for *result*.\"\"\"\n    if isinstance(result, dict) and \"error\" in result:\n        COUNTERS.bump(\"graph_tool_result_error\")\n    elif _is_empty_result(result):\n        COUNTERS.bump(\"graph_tool_result_empty\")\n    else:\n        COUNTERS.bump(\"graph_tool_result_hit\")\n\n\ndef _counted(fn: Callable[..., object]) -> Callable[..., object]:\n    \"\"\"Counts a graph tool's return value via :func:`_count_result`; place under ``@tool``.\"\"\"\n    @functools.wraps(fn)\n    def _wrapper(*args: object, **kwargs: object) -> object:\n        result = fn(*args, **kwargs)\n        _count_result(result)\n        return result\n    return _wrapper\n\n\ndef _community_files(ctx: ContextPackage) -> dict[str, list[str]]:\n    \"\"\"``ctx.modules`` re-keyed by module name.\"\"\"\n    return {m.name: m.files for m in (getattr(ctx, \"modules\", None) or ())}\n\n\n@dataclass(frozen=True)\nclass GraphToolContext:\n    \"\"\"Everything a graph-tool factory may read; grows by field, not by signature change.\"\"\"\n\n    handle: GraphHandle\n    ctx: ContextPackage\n\n\ndef _context_tool(gtx: GraphToolContext) -> BaseTool:\n    \"\"\"Builds ``GraphContext``, the one-call neighbourhood query.\"\"\"\n\n    @tool\n    @_counted\n    def GraphContext(file: str, symbol: str, line: int | None = None) -> dict:  # noqa: N802\n        \"\"\"Callers, callees, imports, implementors and call paths of *symbol* in *file*, in one call. Prefer this over GraphNeighbors. `file` is the exact repo-relative path; `symbol` is the bare defined name, not `Class.method`, a route, or a template; `line` disambiguates a name defined more than once in the file.\"\"\"  # noqa: E501\n        from context_graph_sdk import ContextLimits\n        try:\n            res = gtx.handle.graph.context(\n                _selector(file, symbol, line), limits=ContextLimits(**_CONTEXT_LIMITS))\n        except Exception as exc:\n            return _resolve_error(file, symbol, exc)\n        return {\n            \"symbol\": _ref(res.symbol),\n            \"callers\": _refs(res.callers),\n            \"callees\": _refs(res.callees),\n            \"imports\": _refs(res.imports),\n            \"implementors\": _refs(res.implementors),\n            \"call_paths\": _paths(res.call_paths),\n        }\n\n    return GraphContext\n\n\ndef _impact_tool(gtx: GraphToolContext) -> BaseTool:\n    \"\"\"Builds ``GraphImpact``, the transitive-reachability query.\"\"\"\n\n    @tool\n    @_counted\n    def GraphImpact(file: str, symbol: str, direction: str = \"upstream\",  # noqa: N802\n                     line: int | None = None) -> dict:\n        \"\"\"Transitive reachability of *symbol*: direction \"upstream\" = everything that can reach it (an empty result means nothing calls it, so it is an entry point or dead code), \"downstream\" = everything it reaches. `file` is the exact repo-relative path; `symbol` is the bare defined name, not `Class.method`, a route, or a template; `line` disambiguates a name defined more than once in the file.\"\"\"  # noqa: E501\n        from context_graph_sdk import ImpactDirection, ImpactLimits\n        want = (ImpactDirection.DOWNSTREAM if str(direction).lower().startswith(\"down\")\n                else ImpactDirection.UPSTREAM)\n        try:\n            res = gtx.handle.graph.impact(\n                _selector(file, symbol, line), want, limits=ImpactLimits(**_IMPACT_LIMITS))\n        except Exception as exc:\n            return _resolve_error(file, symbol, exc)\n        affected = _refs(res.affected)\n        return {\n            \"symbol\": _ref(res.symbol),\n            \"direction\": want.value,\n            \"affected\": affected,\n            \"reachable\": bool(affected),\n            \"note\": (\"nothing in the graph reaches this symbol — it is an entry point, \"\n                     \"dispatched by a framework, or unreachable\"\n                     if not affected and want is ImpactDirection.UPSTREAM else \"\"),\n            \"paths\": _paths(res.paths),\n        }\n\n    return GraphImpact\n\n\ndef _neighbors_tool(gtx: GraphToolContext) -> BaseTool:\n    \"\"\"Builds ``GraphNeighbors`` as two single-MATCH queries; an OPTIONAL MATCH composite cartesian-products into QueryTimeoutError.\"\"\"  # noqa: E501\n\n    @tool\n    @_counted\n    def GraphNeighbors(file: str, function: str) -> dict:  # noqa: N802\n        \"\"\"Direct callers and callees of *function* defined in *file*. `file` is the exact repo-relative path; `function` is the bare defined name, not `Class.method`.\"\"\"  # noqa: E501\n        params = {\"file\": file, \"function\": function}\n        try:\n            callees = [_qname(r.to_dict()) for r in gtx.handle.graph.cypher(\n                _NEIGHBORS_QUERY, params).rows]\n        except Exception as exc:\n            return _cypher_error(exc)\n        try:\n            callers = [_qname(r.to_dict()) for r in gtx.handle.graph.cypher(\n                _CALLERS_QUERY, params).rows]\n        except Exception as exc:\n            # Callees already succeeded — keep them alongside the error, not instead of it\n            return {\"callees\": [q for q in callees if q], **_cypher_error(exc)}\n        return {\n            \"callees\": [q for q in callees if q],\n            \"callers\": [q for q in callers if q],\n        }\n\n    return GraphNeighbors\n\n\ndef _community_of_tool(gtx: GraphToolContext) -> BaseTool:\n    \"\"\"Builds ``GraphCommunityOf``, a pure scan of ``ctx.modules`` that touches no graph.\"\"\"\n\n    @tool\n    @_counted\n    def GraphCommunityOf(file: str) -> str | None:  # noqa: N802\n        \"\"\"Which module/community *file* belongs to, or None if unmapped. `file` is the exact repo-relative path.\"\"\"  # noqa: E501\n        for name, files in _community_files(gtx.ctx).items():\n            if file in files:\n                return name\n        return None\n\n    return GraphCommunityOf\n\n\ndef _importers_tool(gtx: GraphToolContext) -> BaseTool:\n    \"\"\"Builds ``GraphImporters``, the file-level inbound-import query.\"\"\"\n\n    @tool\n    @_counted\n    def GraphImporters(file: str) -> list[str] | dict:  # noqa: N802\n        \"\"\"Files that import *file* — a trust-boundary signal, not a function-reachability check. `file` is the exact repo-relative path.\"\"\"  # noqa: E501\n        try:\n            rows = gtx.handle.graph.cypher(_IMPORTERS_QUERY, {\"file\": file}).rows\n        except Exception as exc:\n            return _cypher_error(exc)\n        return [p for r in rows if isinstance(p := r.to_dict().get(\"path\"), str)]\n\n    return GraphImporters\n\n\ndef _sinks_in_community_tool(gtx: GraphToolContext) -> BaseTool:\n    \"\"\"Builds ``GraphSinksInCommunity``, joining ``ctx.unsafe_sinks`` onto a module's file set.\"\"\"\n\n    @tool\n    @_counted\n    def GraphSinksInCommunity(community: str) -> list[dict]:  # noqa: N802\n        \"\"\"Unsafe sinks whose file belongs to *community*.\"\"\"\n        files = set(_community_files(gtx.ctx).get(community, ()))\n        return [\n            {\"file\": s.file, \"line\": s.line, \"function\": s.function}\n            for s in (getattr(gtx.ctx, \"unsafe_sinks\", None) or ())\n            if s.file in files\n        ]\n\n    return GraphSinksInCommunity\n\n\nToolFactory = Callable[[GraphToolContext], BaseTool]\n\n#: Keyed by the model-facing tool name; insertion order fixes the order tools are built in.\nGRAPH_TOOLS: dict[str, ToolFactory] = {\n    \"GraphContext\": _context_tool,\n    \"GraphImpact\": _impact_tool,\n    \"GraphNeighbors\": _neighbors_tool,\n    \"GraphCommunityOf\": _community_of_tool,\n    \"GraphImporters\": _importers_tool,\n    \"GraphSinksInCommunity\": _sinks_in_community_tool,\n}\n\n#: The built-ins only. Stages must call :func:`graph_tool_names`, which also sees plugin tools.\nGRAPH_TOOL_NAMES: tuple[str, ...] = tuple(GRAPH_TOOLS)\n\n_PLUGIN_TOOLS: dict[str, ToolFactory] = {}\n\n\ndef register_graph_tools(tools: Mapping[str, ToolFactory]) -> None:\n    \"\"\"Adds plugin graph tools; call before any stage opens a session, since names are read then.\"\"\"\n    for name, build in tools.items():\n        if name in GRAPH_TOOLS or name in _PLUGIN_TOOLS:\n            raise ValueError(f\"graph tool already registered: {name}\")\n        _PLUGIN_TOOLS[name] = build\n\n\ndef clear_plugin_graph_tools() -> None:\n    \"\"\"Drops every registered plugin tool, leaving the built-ins; for tests and repeated scans.\"\"\"\n    _PLUGIN_TOOLS.clear()\n\n\ndef graph_tool_names() -> tuple[str, ...]:\n    \"\"\"Built-in names then plugin names; a call, not a constant, so registration is not too late.\"\"\"\n    return GRAPH_TOOL_NAMES + tuple(_PLUGIN_TOOLS)\n\n\ndef _graph_tools(ctx: ContextPackage, allowed: set[str]) -> list[BaseTool]:\n    \"\"\"The graph tools named in *allowed*; empty when ``ctx`` carries no graph handle.\"\"\"\n    handle = getattr(ctx, \"graph_handle\", None)\n    if handle is None:\n        return []\n    gtx = GraphToolContext(handle=handle, ctx=ctx)\n    registered = {**GRAPH_TOOLS, **_PLUGIN_TOOLS}\n    return [build(gtx) for name, build in registered.items() if name in allowed]\n\n\ndef build_graph_tool_builder(ctx: ContextPackage) -> Callable[..., list[BaseTool]]:\n    \"\"\"A ``ToolBuilder`` returning the generic reader tools followed by the graph tools.\"\"\"\n\n    def _build(options: StreamingOptions, *,\n               allowed_tools: Sequence[str] | None) -> list[BaseTool]:\n        \"\"\"Gates on ``options.fact_tools``; streaming.py's parent_tools strips fact names out of allowed_tools, so gating on that alone builds nothing.\"\"\"  # noqa: E501\n        reader_tools = build_reader_tools(options, allowed_tools=allowed_tools)\n        return reader_tools + _graph_tools(ctx, set(options.fact_tools))\n\n    return _build\n\n\n__all__ = [\"GRAPH_TOOLS\", \"GRAPH_TOOL_NAMES\", \"GraphToolContext\", \"ToolFactory\",\n           \"build_graph_tool_builder\", \"clear_plugin_graph_tools\", \"graph_tool_names\",\n           \"register_graph_tools\"]\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "Read-only graph-query tools over ``ctx.graph_handle``; S2, S4 and S6 each build these.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_40_19": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 40,
+      "line_end": 44,
+      "value": "\nMATCH (fn {name: $function, filePath: $file})-[:CALLS]->(callee)\nRETURN DISTINCT callee.filePath AS file, callee.name AS name\nLIMIT 25\n",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_45_17": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 45,
+      "line_end": 49,
+      "value": "\nMATCH (caller)-[:CALLS]->(fn {name: $function, filePath: $file})\nRETURN DISTINCT caller.filePath AS file, caller.name AS name\nLIMIT 25\n",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_50_19": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 50,
+      "line_end": 54,
+      "value": "\nMATCH (importer:File)-[:IMPORTS]->(target:File {filePath: $file})\nRETURN DISTINCT importer.filePath AS path\nLIMIT 25\n",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_58_4": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 58,
+      "line_end": 58,
+      "value": "A cypher row rendered as ``file::name``, or empty when either half is missing.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_60_11": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 60,
+      "line_end": 60,
+      "source_expression": "f\"{file}::{name}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_64_4": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 64,
+      "line_end": 64,
+      "value": "An entity rendered as ``file::name``, or its name alone when it carries no path.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_67_11": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 67,
+      "line_end": 67,
+      "source_expression": "f\"{path}::{name}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_71_4": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 71,
+      "line_end": 71,
+      "value": "Up to ``_REF_CAP`` rendered entity references, dropping empties.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_76_4": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 76,
+      "line_end": 76,
+      "value": "Up to ``_PATH_CAP`` call paths, each an arrow-joined reference chain.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_82_4": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 82,
+      "line_end": 82,
+      "value": "A ``SymbolSelector`` for *symbol* scoped to *file*, optionally pinned to *line*.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_87_4": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 87,
+      "line_end": 87,
+      "value": "A usable answer when the graph cannot resolve *symbol*, instead of a raised tool error.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_89_16": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 89,
+      "line_end": 90,
+      "source_expression": "f\"several symbols named '{symbol}' exist in {file}. Pass `line` to pick the \"\n                \"one you mean, or name the enclosing class or function so the name is unique.\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_92_16": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 92,
+      "line_end": 94,
+      "source_expression": "f\"the graph holds no symbol '{symbol}' in {file}. It indexes functions, methods \"\n                \"and classes — not module-level statements, templates or config. Pass the \"\n                \"enclosing function's exact name, or fall back to Grep for this location.\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_95_21": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 95,
+      "line_end": 95,
+      "source_expression": "f\"{type(exc).__name__}: {exc}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_99_4": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 99,
+      "line_end": 99,
+      "value": "A usable answer when a direct graph query fails, instead of a raised tool error.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_100_21": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 100,
+      "line_end": 100,
+      "source_expression": "f\"{type(exc).__name__}: {exc}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_104_4": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 104,
+      "line_end": 104,
+      "value": "``None``, an empty list, or a dict whose list-valued entries are all empty.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_111_4": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 111,
+      "line_end": 111,
+      "value": "Bumps exactly one ``graph_tool_result_{error,empty,hit}`` counter for *result*.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_121_4": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 121,
+      "line_end": 121,
+      "value": "Counts a graph tool's return value via :func:`_count_result`; place under ``@tool``.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_131_4": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 131,
+      "line_end": 131,
+      "value": "``ctx.modules`` re-keyed by module name.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_137_4": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 137,
+      "line_end": 137,
+      "value": "Everything a graph-tool factory may read; grows by field, not by signature change.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_144_4": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 144,
+      "line_end": 144,
+      "value": "Builds ``GraphContext``, the one-call neighbourhood query.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_149_8": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 149,
+      "line_end": 149,
+      "value": "Callers, callees, imports, implementors and call paths of *symbol* in *file*, in one call. Prefer this over GraphNeighbors. `file` is the exact repo-relative path; `symbol` is the bare defined name, not `Class.method`, a route, or a template; `line` disambiguates a name defined more than once in the file.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_169_4": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 169,
+      "line_end": 169,
+      "value": "Builds ``GraphImpact``, the transitive-reachability query.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_175_8": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 175,
+      "line_end": 175,
+      "value": "Transitive reachability of *symbol*: direction \"upstream\" = everything that can reach it (an empty result means nothing calls it, so it is an entry point or dead code), \"downstream\" = everything it reaches. `file` is the exact repo-relative path; `symbol` is the bare defined name, not `Class.method`, a route, or a template; `line` disambiguates a name defined more than once in the file.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_200_4": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 200,
+      "line_end": 200,
+      "value": "Builds ``GraphNeighbors`` as two single-MATCH queries; an OPTIONAL MATCH composite cartesian-products into QueryTimeoutError.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_205_8": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 205,
+      "line_end": 205,
+      "value": "Direct callers and callees of *function* defined in *file*. `file` is the exact repo-relative path; `function` is the bare defined name, not `Class.method`.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_227_4": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 227,
+      "line_end": 227,
+      "value": "Builds ``GraphCommunityOf``, a pure scan of ``ctx.modules`` that touches no graph.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_232_8": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 232,
+      "line_end": 232,
+      "value": "Which module/community *file* belongs to, or None if unmapped. `file` is the exact repo-relative path.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_242_4": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 242,
+      "line_end": 242,
+      "value": "Builds ``GraphImporters``, the file-level inbound-import query.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_247_8": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 247,
+      "line_end": 247,
+      "value": "Files that import *file* — a trust-boundary signal, not a function-reachability check. `file` is the exact repo-relative path.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_258_4": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 258,
+      "line_end": 258,
+      "value": "Builds ``GraphSinksInCommunity``, joining ``ctx.unsafe_sinks`` onto a module's file set.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_263_8": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 263,
+      "line_end": 263,
+      "value": "Unsafe sinks whose file belongs to *community*.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_293_4": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 293,
+      "line_end": 293,
+      "value": "Adds plugin graph tools; call before any stage opens a session, since names are read then.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_296_29": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 296,
+      "line_end": 296,
+      "source_expression": "f\"graph tool already registered: {name}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_301_4": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 301,
+      "line_end": 301,
+      "value": "Drops every registered plugin tool, leaving the built-ins; for tests and repeated scans.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_306_4": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 306,
+      "line_end": 306,
+      "value": "Built-in names then plugin names; a call, not a constant, so registration is not too late.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_311_4": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 311,
+      "line_end": 311,
+      "value": "The graph tools named in *allowed*; empty when ``ctx`` carries no graph handle.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_321_4": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 321,
+      "line_end": 321,
+      "value": "A ``ToolBuilder`` returning the generic reader tools followed by the graph tools.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_325_8": {
+      "source": "vvaharness/codegraph/tools.py",
+      "line_start": 325,
+      "line_end": 325,
+      "value": "Gates on ``options.fact_tools``; streaming.py's parent_tools strips fact names out of allowed_tools, so gating on that alone builds nothing.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "Read-only graph-query tools over ``ctx.graph_handle``; S2, S4 and S6 each build these.",
+      "context": "literal"
+    },
+    {
+      "line_start": 40,
+      "line_end": 44,
+      "column": 19,
+      "value": "\nMATCH (fn {name: $function, filePath: $file})-[:CALLS]->(callee)\nRETURN DISTINCT callee.filePath AS file, callee.name AS name\nLIMIT 25\n",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 49,
+      "column": 17,
+      "value": "\nMATCH (caller)-[:CALLS]->(fn {name: $function, filePath: $file})\nRETURN DISTINCT caller.filePath AS file, caller.name AS name\nLIMIT 25\n",
+      "context": "literal"
+    },
+    {
+      "line_start": 50,
+      "line_end": 54,
+      "column": 19,
+      "value": "\nMATCH (importer:File)-[:IMPORTS]->(target:File {filePath: $file})\nRETURN DISTINCT importer.filePath AS path\nLIMIT 25\n",
+      "context": "literal"
+    },
+    {
+      "line_start": 33,
+      "line_end": 33,
+      "column": 19,
+      "value": "candidate_limit",
+      "context": "literal"
+    },
+    {
+      "line_start": 33,
+      "line_end": 33,
+      "column": 41,
+      "value": "group_limit",
+      "context": "literal"
+    },
+    {
+      "line_start": 33,
+      "line_end": 33,
+      "column": 59,
+      "value": "call_depth",
+      "context": "literal"
+    },
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 19,
+      "value": "max_nodes",
+      "context": "literal"
+    },
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 36,
+      "value": "max_edges",
+      "context": "literal"
+    },
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 54,
+      "value": "max_paths",
+      "context": "literal"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 18,
+      "value": "candidate_limit",
+      "context": "literal"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 40,
+      "value": "max_depth",
+      "context": "literal"
+    },
+    {
+      "line_start": 36,
+      "line_end": 36,
+      "column": 18,
+      "value": "max_nodes",
+      "context": "literal"
+    },
+    {
+      "line_start": 36,
+      "line_end": 36,
+      "column": 35,
+      "value": "max_edges",
+      "context": "literal"
+    },
+    {
+      "line_start": 36,
+      "line_end": 36,
+      "column": 53,
+      "value": "max_paths",
+      "context": "literal"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 4,
+      "value": "A cypher row rendered as ``file::name``, or empty when either half is missing.",
+      "context": "literal"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 4,
+      "value": "An entity rendered as ``file::name``, or its name alone when it carries no path.",
+      "context": "literal"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 4,
+      "value": "Up to ``_REF_CAP`` rendered entity references, dropping empties.",
+      "context": "literal"
+    },
+    {
+      "line_start": 76,
+      "line_end": 76,
+      "column": 4,
+      "value": "Up to ``_PATH_CAP`` call paths, each an arrow-joined reference chain.",
+      "context": "literal"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 4,
+      "value": "A ``SymbolSelector`` for *symbol* scoped to *file*, optionally pinned to *line*.",
+      "context": "literal"
+    },
+    {
+      "line_start": 87,
+      "line_end": 87,
+      "column": 4,
+      "value": "A usable answer when the graph cannot resolve *symbol*, instead of a raised tool error.",
+      "context": "literal"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 4,
+      "value": "A usable answer when a direct graph query fails, instead of a raised tool error.",
+      "context": "literal"
+    },
+    {
+      "line_start": 104,
+      "line_end": 104,
+      "column": 4,
+      "value": "``None``, an empty list, or a dict whose list-valued entries are all empty.",
+      "context": "literal"
+    },
+    {
+      "line_start": 111,
+      "line_end": 111,
+      "column": 4,
+      "value": "Bumps exactly one ``graph_tool_result_{error,empty,hit}`` counter for *result*.",
+      "context": "literal"
+    },
+    {
+      "line_start": 121,
+      "line_end": 121,
+      "column": 4,
+      "value": "Counts a graph tool's return value via :func:`_count_result`; place under ``@tool``.",
+      "context": "literal"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 4,
+      "value": "``ctx.modules`` re-keyed by module name.",
+      "context": "literal"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 4,
+      "value": "Everything a graph-tool factory may read; grows by field, not by signature change.",
+      "context": "literal"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 4,
+      "value": "Builds ``GraphContext``, the one-call neighbourhood query.",
+      "context": "literal"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 4,
+      "value": "Builds ``GraphImpact``, the transitive-reachability query.",
+      "context": "literal"
+    },
+    {
+      "line_start": 200,
+      "line_end": 200,
+      "column": 4,
+      "value": "Builds ``GraphNeighbors`` as two single-MATCH queries; an OPTIONAL MATCH composite cartesian-products into QueryTimeoutError.",
+      "context": "literal"
+    },
+    {
+      "line_start": 227,
+      "line_end": 227,
+      "column": 4,
+      "value": "Builds ``GraphCommunityOf``, a pure scan of ``ctx.modules`` that touches no graph.",
+      "context": "literal"
+    },
+    {
+      "line_start": 242,
+      "line_end": 242,
+      "column": 4,
+      "value": "Builds ``GraphImporters``, the file-level inbound-import query.",
+      "context": "literal"
+    },
+    {
+      "line_start": 258,
+      "line_end": 258,
+      "column": 4,
+      "value": "Builds ``GraphSinksInCommunity``, joining ``ctx.unsafe_sinks`` onto a module's file set.",
+      "context": "literal"
+    },
+    {
+      "line_start": 278,
+      "line_end": 278,
+      "column": 4,
+      "value": "GraphContext",
+      "context": "literal"
+    },
+    {
+      "line_start": 279,
+      "line_end": 279,
+      "column": 4,
+      "value": "GraphImpact",
+      "context": "literal"
+    },
+    {
+      "line_start": 280,
+      "line_end": 280,
+      "column": 4,
+      "value": "GraphNeighbors",
+      "context": "literal"
+    },
+    {
+      "line_start": 281,
+      "line_end": 281,
+      "column": 4,
+      "value": "GraphCommunityOf",
+      "context": "literal"
+    },
+    {
+      "line_start": 282,
+      "line_end": 282,
+      "column": 4,
+      "value": "GraphImporters",
+      "context": "literal"
+    },
+    {
+      "line_start": 283,
+      "line_end": 283,
+      "column": 4,
+      "value": "GraphSinksInCommunity",
+      "context": "literal"
+    },
+    {
+      "line_start": 293,
+      "line_end": 293,
+      "column": 4,
+      "value": "Adds plugin graph tools; call before any stage opens a session, since names are read then.",
+      "context": "literal"
+    },
+    {
+      "line_start": 301,
+      "line_end": 301,
+      "column": 4,
+      "value": "Drops every registered plugin tool, leaving the built-ins; for tests and repeated scans.",
+      "context": "literal"
+    },
+    {
+      "line_start": 306,
+      "line_end": 306,
+      "column": 4,
+      "value": "Built-in names then plugin names; a call, not a constant, so registration is not too late.",
+      "context": "literal"
+    },
+    {
+      "line_start": 311,
+      "line_end": 311,
+      "column": 4,
+      "value": "The graph tools named in *allowed*; empty when ``ctx`` carries no graph handle.",
+      "context": "literal"
+    },
+    {
+      "line_start": 321,
+      "line_end": 321,
+      "column": 4,
+      "value": "A ``ToolBuilder`` returning the generic reader tools followed by the graph tools.",
+      "context": "literal"
+    },
+    {
+      "line_start": 332,
+      "line_end": 332,
+      "column": 11,
+      "value": "GRAPH_TOOLS",
+      "context": "literal"
+    },
+    {
+      "line_start": 332,
+      "line_end": 332,
+      "column": 26,
+      "value": "GRAPH_TOOL_NAMES",
+      "context": "literal"
+    },
+    {
+      "line_start": 332,
+      "line_end": 332,
+      "column": 46,
+      "value": "GraphToolContext",
+      "context": "literal"
+    },
+    {
+      "line_start": 332,
+      "line_end": 332,
+      "column": 66,
+      "value": "ToolFactory",
+      "context": "literal"
+    },
+    {
+      "line_start": 333,
+      "line_end": 333,
+      "column": 11,
+      "value": "build_graph_tool_builder",
+      "context": "literal"
+    },
+    {
+      "line_start": 333,
+      "line_end": 333,
+      "column": 39,
+      "value": "clear_plugin_graph_tools",
+      "context": "literal"
+    },
+    {
+      "line_start": 333,
+      "line_end": 333,
+      "column": 67,
+      "value": "graph_tool_names",
+      "context": "literal"
+    },
+    {
+      "line_start": 334,
+      "line_end": 334,
+      "column": 11,
+      "value": "register_graph_tools",
+      "context": "literal"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 85,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 87,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 82,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 95,
+      "line_end": 95,
+      "column": 12,
+      "value": "error",
+      "context": "literal"
+    },
+    {
+      "line_start": 95,
+      "line_end": 95,
+      "column": 53,
+      "value": "hint",
+      "context": "literal"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 12,
+      "value": "error",
+      "context": "literal"
+    },
+    {
+      "line_start": 149,
+      "line_end": 149,
+      "column": 8,
+      "value": "Callers, callees, imports, implementors and call paths of *symbol* in *file*, in one call. Prefer this over GraphNeighbors. `file` is the exact repo-relative path; `symbol` is the bare defined name, not `Class.method`, a route, or a template; `line` disambiguates a name defined more than once in the file.",
+      "context": "literal"
+    },
+    {
+      "line_start": 173,
+      "line_end": 173,
+      "column": 61,
+      "value": "upstream",
+      "context": "literal"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 8,
+      "value": "Transitive reachability of *symbol*: direction \"upstream\" = everything that can reach it (an empty result means nothing calls it, so it is an entry point or dead code), \"downstream\" = everything it reaches. `file` is the exact repo-relative path; `symbol` is the bare defined name, not `Class.method`, a route, or a template; `line` disambiguates a name defined more than once in the file.",
+      "context": "literal"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 8,
+      "value": "Direct callers and callees of *function* defined in *file*. `file` is the exact repo-relative path; `function` is the bare defined name, not `Class.method`.",
+      "context": "literal"
+    },
+    {
+      "line_start": 232,
+      "line_end": 232,
+      "column": 8,
+      "value": "Which module/community *file* belongs to, or None if unmapped. `file` is the exact repo-relative path.",
+      "context": "literal"
+    },
+    {
+      "line_start": 247,
+      "line_end": 247,
+      "column": 8,
+      "value": "Files that import *file* — a trust-boundary signal, not a function-reachability check. `file` is the exact repo-relative path.",
+      "context": "literal"
+    },
+    {
+      "line_start": 263,
+      "line_end": 263,
+      "column": 8,
+      "value": "Unsafe sinks whose file belongs to *community*.",
+      "context": "literal"
+    },
+    {
+      "line_start": 312,
+      "line_end": 312,
+      "column": 26,
+      "value": "graph_handle",
+      "context": "literal"
+    },
+    {
+      "line_start": 325,
+      "line_end": 325,
+      "column": 8,
+      "value": "Gates on ``options.fact_tools``; streaming.py's parent_tools strips fact names out of allowed_tools, so gating on that alone builds nothing.",
+      "context": "literal"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 25,
+      "value": "file",
+      "context": "literal"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 42,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 19,
+      "value": "::",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 27,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 60,
+      "value": "qualified_name",
+      "context": "literal"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 27,
+      "value": "file_path",
+      "context": "literal"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 65,
+      "value": "path",
+      "context": "literal"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 19,
+      "value": "::",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 89,
+      "line_end": 89,
+      "column": 18,
+      "value": "several symbols named '",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 89,
+      "line_end": 89,
+      "column": 49,
+      "value": "' exist in ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 89,
+      "line_end": 90,
+      "column": 66,
+      "value": ". Pass `line` to pick the one you mean, or name the enclosing class or function so the name is unique.",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 18,
+      "value": "the graph holds no symbol '",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 53,
+      "value": "' in ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 92,
+      "line_end": 94,
+      "column": 64,
+      "value": ". It indexes functions, methods and classes — not module-level statements, templates or config. Pass the enclosing function's exact name, or fall back to Grep for this location.",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 95,
+      "line_end": 95,
+      "column": 43,
+      "value": ": ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 43,
+      "value": ": ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 112,
+      "line_end": 112,
+      "column": 36,
+      "value": "error",
+      "context": "literal"
+    },
+    {
+      "line_start": 113,
+      "line_end": 113,
+      "column": 22,
+      "value": "graph_tool_result_error",
+      "context": "literal"
+    },
+    {
+      "line_start": 157,
+      "line_end": 157,
+      "column": 12,
+      "value": "symbol",
+      "context": "literal"
+    },
+    {
+      "line_start": 158,
+      "line_end": 158,
+      "column": 12,
+      "value": "callers",
+      "context": "literal"
+    },
+    {
+      "line_start": 159,
+      "line_end": 159,
+      "column": 12,
+      "value": "callees",
+      "context": "literal"
+    },
+    {
+      "line_start": 160,
+      "line_end": 160,
+      "column": 12,
+      "value": "imports",
+      "context": "literal"
+    },
+    {
+      "line_start": 161,
+      "line_end": 161,
+      "column": 12,
+      "value": "implementors",
+      "context": "literal"
+    },
+    {
+      "line_start": 162,
+      "line_end": 162,
+      "column": 12,
+      "value": "call_paths",
+      "context": "literal"
+    },
+    {
+      "line_start": 186,
+      "line_end": 186,
+      "column": 12,
+      "value": "symbol",
+      "context": "literal"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 12,
+      "value": "direction",
+      "context": "literal"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 12,
+      "value": "affected",
+      "context": "literal"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 12,
+      "value": "reachable",
+      "context": "literal"
+    },
+    {
+      "line_start": 190,
+      "line_end": 190,
+      "column": 12,
+      "value": "note",
+      "context": "literal"
+    },
+    {
+      "line_start": 193,
+      "line_end": 193,
+      "column": 12,
+      "value": "paths",
+      "context": "literal"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 18,
+      "value": "file",
+      "context": "literal"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 32,
+      "value": "function",
+      "context": "literal"
+    },
+    {
+      "line_start": 219,
+      "line_end": 219,
+      "column": 12,
+      "value": "callees",
+      "context": "literal"
+    },
+    {
+      "line_start": 220,
+      "line_end": 220,
+      "column": 12,
+      "value": "callers",
+      "context": "literal"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 22,
+      "value": "graph_tool_result_empty",
+      "context": "literal"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 22,
+      "value": "graph_tool_result_hit",
+      "context": "literal"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 80,
+      "value": "down",
+      "context": "literal"
+    },
+    {
+      "line_start": 190,
+      "line_end": 191,
+      "column": 21,
+      "value": "nothing in the graph reaches this symbol — it is an entry point, dispatched by a framework, or unreachable",
+      "context": "literal"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 79,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 266,
+      "line_end": 266,
+      "column": 13,
+      "value": "file",
+      "context": "literal"
+    },
+    {
+      "line_start": 266,
+      "line_end": 266,
+      "column": 29,
+      "value": "line",
+      "context": "literal"
+    },
+    {
+      "line_start": 266,
+      "line_end": 266,
+      "column": 45,
+      "value": "function",
+      "context": "literal"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 12,
+      "value": " -> ",
+      "context": "literal"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 51,
+      "value": "modules",
+      "context": "literal"
+    },
+    {
+      "line_start": 217,
+      "line_end": 217,
+      "column": 20,
+      "value": "callees",
+      "context": "literal"
+    },
+    {
+      "line_start": 296,
+      "line_end": 296,
+      "column": 31,
+      "value": "graph tool already registered: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 249,
+      "line_end": 249,
+      "column": 62,
+      "value": "file",
+      "context": "literal"
+    },
+    {
+      "line_start": 267,
+      "line_end": 267,
+      "column": 39,
+      "value": "unsafe_sinks",
+      "context": "literal"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 41,
+      "value": "nodes",
+      "context": "literal"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 68,
+      "value": "entities",
+      "context": "literal"
+    },
+    {
+      "line_start": 252,
+      "line_end": 252,
+      "column": 67,
+      "value": "path",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 148,
+      "text": "# noqa: N802"
+    },
+    {
+      "line": 149,
+      "text": "# noqa: E501"
+    },
+    {
+      "line": 173,
+      "text": "# noqa: N802"
+    },
+    {
+      "line": 175,
+      "text": "# noqa: E501"
+    },
+    {
+      "line": 200,
+      "text": "# noqa: E501"
+    },
+    {
+      "line": 204,
+      "text": "# noqa: N802"
+    },
+    {
+      "line": 205,
+      "text": "# noqa: E501"
+    },
+    {
+      "line": 216,
+      "text": "# Callees already succeeded — keep them alongside the error, not instead of it"
+    },
+    {
+      "line": 231,
+      "text": "# noqa: N802"
+    },
+    {
+      "line": 232,
+      "text": "# noqa: E501"
+    },
+    {
+      "line": 246,
+      "text": "# noqa: N802"
+    },
+    {
+      "line": 247,
+      "text": "# noqa: E501"
+    },
+    {
+      "line": 262,
+      "text": "# noqa: N802"
+    },
+    {
+      "line": 276,
+      "text": "#: Keyed by the model-facing tool name; insertion order fixes the order tools are built in."
+    },
+    {
+      "line": 286,
+      "text": "#: The built-ins only. Stages must call :func:`graph_tool_names`, which also sees plugin tools."
+    },
+    {
+      "line": 325,
+      "text": "# noqa: E501"
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 18,
+      "line_end": 18,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 23,
+      "line_end": 23,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 26,
+      "line_end": 28,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 29,
+      "line_end": 29,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 30,
+      "line_end": 30,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 31,
+      "line_end": 31,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 33,
+      "line_end": 34,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 35,
+      "line_end": 36,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 37,
+      "line_end": 37,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 38,
+      "line_end": 38,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "Assign",
+      "line_start": 40,
+      "line_end": 44,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "Assign",
+      "line_start": 45,
+      "line_end": 49,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "Assign",
+      "line_start": 50,
+      "line_end": 54,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 57,
+      "line_end": 60,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 9
+    },
+    {
+      "kind": "Expr",
+      "line_start": 58,
+      "line_end": 58,
+      "column": 4,
+      "owner": "_qname",
+      "representation_line": 15
+    },
+    {
+      "kind": "Assign",
+      "line_start": 59,
+      "line_end": 59,
+      "column": 4,
+      "owner": "_qname",
+      "representation_line": 15
+    },
+    {
+      "kind": "Return",
+      "line_start": 60,
+      "line_end": 60,
+      "column": 4,
+      "owner": "_qname",
+      "representation_line": 16
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 63,
+      "line_end": 67,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 20
+    },
+    {
+      "kind": "Expr",
+      "line_start": 64,
+      "line_end": 64,
+      "column": 4,
+      "owner": "_ref",
+      "representation_line": 26
+    },
+    {
+      "kind": "Assign",
+      "line_start": 65,
+      "line_end": 65,
+      "column": 4,
+      "owner": "_ref",
+      "representation_line": 26
+    },
+    {
+      "kind": "Assign",
+      "line_start": 66,
+      "line_end": 66,
+      "column": 4,
+      "owner": "_ref",
+      "representation_line": 26
+    },
+    {
+      "kind": "Return",
+      "line_start": 67,
+      "line_end": 67,
+      "column": 4,
+      "owner": "_ref",
+      "representation_line": 27
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 70,
+      "line_end": 72,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 31
+    },
+    {
+      "kind": "Expr",
+      "line_start": 71,
+      "line_end": 71,
+      "column": 4,
+      "owner": "_refs",
+      "representation_line": 37
+    },
+    {
+      "kind": "Return",
+      "line_start": 72,
+      "line_end": 72,
+      "column": 4,
+      "owner": "_refs",
+      "representation_line": 38
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 75,
+      "line_end": 78,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 42
+    },
+    {
+      "kind": "Expr",
+      "line_start": 76,
+      "line_end": 76,
+      "column": 4,
+      "owner": "_paths",
+      "representation_line": 48
+    },
+    {
+      "kind": "Return",
+      "line_start": 77,
+      "line_end": 78,
+      "column": 4,
+      "owner": "_paths",
+      "representation_line": 49
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 81,
+      "line_end": 83,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 53
+    },
+    {
+      "kind": "Expr",
+      "line_start": 82,
+      "line_end": 82,
+      "column": 4,
+      "owner": "_selector",
+      "representation_line": 59
+    },
+    {
+      "kind": "Return",
+      "line_start": 83,
+      "line_end": 83,
+      "column": 4,
+      "owner": "_selector",
+      "representation_line": 60
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 86,
+      "line_end": 95,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 64
+    },
+    {
+      "kind": "Expr",
+      "line_start": 87,
+      "line_end": 87,
+      "column": 4,
+      "owner": "_resolve_error",
+      "representation_line": 70
+    },
+    {
+      "kind": "If",
+      "line_start": 88,
+      "line_end": 94,
+      "column": 4,
+      "owner": "_resolve_error",
+      "representation_line": 71
+    },
+    {
+      "kind": "Assign",
+      "line_start": 89,
+      "line_end": 90,
+      "column": 8,
+      "owner": "_resolve_error",
+      "representation_line": 74
+    },
+    {
+      "kind": "Assign",
+      "line_start": 92,
+      "line_end": 94,
+      "column": 8,
+      "owner": "_resolve_error",
+      "representation_line": 78
+    },
+    {
+      "kind": "Return",
+      "line_start": 95,
+      "line_end": 95,
+      "column": 4,
+      "owner": "_resolve_error",
+      "representation_line": 80
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 98,
+      "line_end": 100,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 84
+    },
+    {
+      "kind": "Expr",
+      "line_start": 99,
+      "line_end": 99,
+      "column": 4,
+      "owner": "_cypher_error",
+      "representation_line": 90
+    },
+    {
+      "kind": "Return",
+      "line_start": 100,
+      "line_end": 100,
+      "column": 4,
+      "owner": "_cypher_error",
+      "representation_line": 91
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 103,
+      "line_end": 107,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 95
+    },
+    {
+      "kind": "Expr",
+      "line_start": 104,
+      "line_end": 104,
+      "column": 4,
+      "owner": "_is_empty_result",
+      "representation_line": 101
+    },
+    {
+      "kind": "If",
+      "line_start": 105,
+      "line_end": 106,
+      "column": 4,
+      "owner": "_is_empty_result",
+      "representation_line": 102
+    },
+    {
+      "kind": "Return",
+      "line_start": 106,
+      "line_end": 106,
+      "column": 8,
+      "owner": "_is_empty_result",
+      "representation_line": 104
+    },
+    {
+      "kind": "Return",
+      "line_start": 107,
+      "line_end": 107,
+      "column": 4,
+      "owner": "_is_empty_result",
+      "representation_line": 107
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 110,
+      "line_end": 117,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 111
+    },
+    {
+      "kind": "Expr",
+      "line_start": 111,
+      "line_end": 111,
+      "column": 4,
+      "owner": "_count_result",
+      "representation_line": 117
+    },
+    {
+      "kind": "If",
+      "line_start": 112,
+      "line_end": 117,
+      "column": 4,
+      "owner": "_count_result",
+      "representation_line": 118
+    },
+    {
+      "kind": "Expr",
+      "line_start": 113,
+      "line_end": 113,
+      "column": 8,
+      "owner": "_count_result",
+      "representation_line": 121
+    },
+    {
+      "kind": "If",
+      "line_start": 114,
+      "line_end": 117,
+      "column": 4,
+      "owner": "_count_result",
+      "representation_line": 124
+    },
+    {
+      "kind": "Expr",
+      "line_start": 115,
+      "line_end": 115,
+      "column": 8,
+      "owner": "_count_result",
+      "representation_line": 127
+    },
+    {
+      "kind": "Expr",
+      "line_start": 117,
+      "line_end": 117,
+      "column": 8,
+      "owner": "_count_result",
+      "representation_line": 131
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 120,
+      "line_end": 127,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 136
+    },
+    {
+      "kind": "Expr",
+      "line_start": 121,
+      "line_end": 121,
+      "column": 4,
+      "owner": "_counted",
+      "representation_line": 142
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 123,
+      "line_end": 126,
+      "column": 4,
+      "owner": "_counted",
+      "representation_line": 143
+    },
+    {
+      "kind": "Assign",
+      "line_start": 124,
+      "line_end": 124,
+      "column": 8,
+      "owner": "_counted._wrapper",
+      "representation_line": 152
+    },
+    {
+      "kind": "Expr",
+      "line_start": 125,
+      "line_end": 125,
+      "column": 8,
+      "owner": "_counted._wrapper",
+      "representation_line": 152
+    },
+    {
+      "kind": "Return",
+      "line_start": 126,
+      "line_end": 126,
+      "column": 8,
+      "owner": "_counted._wrapper",
+      "representation_line": 153
+    },
+    {
+      "kind": "Return",
+      "line_start": 127,
+      "line_end": 127,
+      "column": 4,
+      "owner": "_counted",
+      "representation_line": 158
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 130,
+      "line_end": 132,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 162
+    },
+    {
+      "kind": "Expr",
+      "line_start": 131,
+      "line_end": 131,
+      "column": 4,
+      "owner": "_community_files",
+      "representation_line": 168
+    },
+    {
+      "kind": "Return",
+      "line_start": 132,
+      "line_end": 132,
+      "column": 4,
+      "owner": "_community_files",
+      "representation_line": 169
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 136,
+      "line_end": 140,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 173
+    },
+    {
+      "kind": "Expr",
+      "line_start": 137,
+      "line_end": 137,
+      "column": 4,
+      "owner": "GraphToolContext",
+      "representation_line": 181
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 139,
+      "line_end": 139,
+      "column": 4,
+      "owner": "GraphToolContext",
+      "representation_line": 181
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 140,
+      "line_end": 140,
+      "column": 4,
+      "owner": "GraphToolContext",
+      "representation_line": 181
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 143,
+      "line_end": 165,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 184
+    },
+    {
+      "kind": "Expr",
+      "line_start": 144,
+      "line_end": 144,
+      "column": 4,
+      "owner": "_context_tool",
+      "representation_line": 190
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 148,
+      "line_end": 163,
+      "column": 4,
+      "owner": "_context_tool",
+      "representation_line": 191
+    },
+    {
+      "kind": "Expr",
+      "line_start": 149,
+      "line_end": 149,
+      "column": 8,
+      "owner": "_context_tool.GraphContext",
+      "representation_line": 200
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 150,
+      "line_end": 150,
+      "column": 8,
+      "owner": "_context_tool.GraphContext",
+      "representation_line": 200
+    },
+    {
+      "kind": "Try",
+      "line_start": 151,
+      "line_end": 155,
+      "column": 8,
+      "owner": "_context_tool.GraphContext",
+      "representation_line": 201
+    },
+    {
+      "kind": "Assign",
+      "line_start": 152,
+      "line_end": 153,
+      "column": 12,
+      "owner": "_context_tool.GraphContext",
+      "representation_line": 204
+    },
+    {
+      "kind": "Return",
+      "line_start": 155,
+      "line_end": 155,
+      "column": 12,
+      "owner": "_context_tool.GraphContext",
+      "representation_line": 208
+    },
+    {
+      "kind": "Return",
+      "line_start": 156,
+      "line_end": 163,
+      "column": 8,
+      "owner": "_context_tool.GraphContext",
+      "representation_line": 211
+    },
+    {
+      "kind": "Return",
+      "line_start": 165,
+      "line_end": 165,
+      "column": 4,
+      "owner": "_context_tool",
+      "representation_line": 216
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 168,
+      "line_end": 196,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 220
+    },
+    {
+      "kind": "Expr",
+      "line_start": 169,
+      "line_end": 169,
+      "column": 4,
+      "owner": "_impact_tool",
+      "representation_line": 226
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 173,
+      "line_end": 194,
+      "column": 4,
+      "owner": "_impact_tool",
+      "representation_line": 227
+    },
+    {
+      "kind": "Expr",
+      "line_start": 175,
+      "line_end": 175,
+      "column": 8,
+      "owner": "_impact_tool.GraphImpact",
+      "representation_line": 236
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 176,
+      "line_end": 176,
+      "column": 8,
+      "owner": "_impact_tool.GraphImpact",
+      "representation_line": 236
+    },
+    {
+      "kind": "Assign",
+      "line_start": 177,
+      "line_end": 178,
+      "column": 8,
+      "owner": "_impact_tool.GraphImpact",
+      "representation_line": 236
+    },
+    {
+      "kind": "Try",
+      "line_start": 179,
+      "line_end": 183,
+      "column": 8,
+      "owner": "_impact_tool.GraphImpact",
+      "representation_line": 237
+    },
+    {
+      "kind": "Assign",
+      "line_start": 180,
+      "line_end": 181,
+      "column": 12,
+      "owner": "_impact_tool.GraphImpact",
+      "representation_line": 240
+    },
+    {
+      "kind": "Return",
+      "line_start": 183,
+      "line_end": 183,
+      "column": 12,
+      "owner": "_impact_tool.GraphImpact",
+      "representation_line": 244
+    },
+    {
+      "kind": "Assign",
+      "line_start": 184,
+      "line_end": 184,
+      "column": 8,
+      "owner": "_impact_tool.GraphImpact",
+      "representation_line": 248
+    },
+    {
+      "kind": "Return",
+      "line_start": 185,
+      "line_end": 194,
+      "column": 8,
+      "owner": "_impact_tool.GraphImpact",
+      "representation_line": 249
+    },
+    {
+      "kind": "Return",
+      "line_start": 196,
+      "line_end": 196,
+      "column": 4,
+      "owner": "_impact_tool",
+      "representation_line": 254
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 199,
+      "line_end": 223,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 258
+    },
+    {
+      "kind": "Expr",
+      "line_start": 200,
+      "line_end": 200,
+      "column": 4,
+      "owner": "_neighbors_tool",
+      "representation_line": 264
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 204,
+      "line_end": 221,
+      "column": 4,
+      "owner": "_neighbors_tool",
+      "representation_line": 265
+    },
+    {
+      "kind": "Expr",
+      "line_start": 205,
+      "line_end": 205,
+      "column": 8,
+      "owner": "_neighbors_tool.GraphNeighbors",
+      "representation_line": 274
+    },
+    {
+      "kind": "Assign",
+      "line_start": 206,
+      "line_end": 206,
+      "column": 8,
+      "owner": "_neighbors_tool.GraphNeighbors",
+      "representation_line": 274
+    },
+    {
+      "kind": "Try",
+      "line_start": 207,
+      "line_end": 211,
+      "column": 8,
+      "owner": "_neighbors_tool.GraphNeighbors",
+      "representation_line": 275
+    },
+    {
+      "kind": "Assign",
+      "line_start": 208,
+      "line_end": 209,
+      "column": 12,
+      "owner": "_neighbors_tool.GraphNeighbors",
+      "representation_line": 278
+    },
+    {
+      "kind": "Return",
+      "line_start": 211,
+      "line_end": 211,
+      "column": 12,
+      "owner": "_neighbors_tool.GraphNeighbors",
+      "representation_line": 282
+    },
+    {
+      "kind": "Try",
+      "line_start": 212,
+      "line_end": 217,
+      "column": 8,
+      "owner": "_neighbors_tool.GraphNeighbors",
+      "representation_line": 285
+    },
+    {
+      "kind": "Assign",
+      "line_start": 213,
+      "line_end": 214,
+      "column": 12,
+      "owner": "_neighbors_tool.GraphNeighbors",
+      "representation_line": 288
+    },
+    {
+      "kind": "Return",
+      "line_start": 217,
+      "line_end": 217,
+      "column": 12,
+      "owner": "_neighbors_tool.GraphNeighbors",
+      "representation_line": 292
+    },
+    {
+      "kind": "Return",
+      "line_start": 218,
+      "line_end": 221,
+      "column": 8,
+      "owner": "_neighbors_tool.GraphNeighbors",
+      "representation_line": 295
+    },
+    {
+      "kind": "Return",
+      "line_start": 223,
+      "line_end": 223,
+      "column": 4,
+      "owner": "_neighbors_tool",
+      "representation_line": 300
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 226,
+      "line_end": 238,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 304
+    },
+    {
+      "kind": "Expr",
+      "line_start": 227,
+      "line_end": 227,
+      "column": 4,
+      "owner": "_community_of_tool",
+      "representation_line": 310
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 231,
+      "line_end": 236,
+      "column": 4,
+      "owner": "_community_of_tool",
+      "representation_line": 311
+    },
+    {
+      "kind": "Expr",
+      "line_start": 232,
+      "line_end": 232,
+      "column": 8,
+      "owner": "_community_of_tool.GraphCommunityOf",
+      "representation_line": 320
+    },
+    {
+      "kind": "For",
+      "line_start": 233,
+      "line_end": 235,
+      "column": 8,
+      "owner": "_community_of_tool.GraphCommunityOf",
+      "representation_line": 321
+    },
+    {
+      "kind": "If",
+      "line_start": 234,
+      "line_end": 235,
+      "column": 12,
+      "owner": "_community_of_tool.GraphCommunityOf",
+      "representation_line": 323
+    },
+    {
+      "kind": "Return",
+      "line_start": 235,
+      "line_end": 235,
+      "column": 16,
+      "owner": "_community_of_tool.GraphCommunityOf",
+      "representation_line": 325
+    },
+    {
+      "kind": "Return",
+      "line_start": 236,
+      "line_end": 236,
+      "column": 8,
+      "owner": "_community_of_tool.GraphCommunityOf",
+      "representation_line": 329
+    },
+    {
+      "kind": "Return",
+      "line_start": 238,
+      "line_end": 238,
+      "column": 4,
+      "owner": "_community_of_tool",
+      "representation_line": 334
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 241,
+      "line_end": 254,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 338
+    },
+    {
+      "kind": "Expr",
+      "line_start": 242,
+      "line_end": 242,
+      "column": 4,
+      "owner": "_importers_tool",
+      "representation_line": 344
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 246,
+      "line_end": 252,
+      "column": 4,
+      "owner": "_importers_tool",
+      "representation_line": 345
+    },
+    {
+      "kind": "Expr",
+      "line_start": 247,
+      "line_end": 247,
+      "column": 8,
+      "owner": "_importers_tool.GraphImporters",
+      "representation_line": 354
+    },
+    {
+      "kind": "Try",
+      "line_start": 248,
+      "line_end": 251,
+      "column": 8,
+      "owner": "_importers_tool.GraphImporters",
+      "representation_line": 355
+    },
+    {
+      "kind": "Assign",
+      "line_start": 249,
+      "line_end": 249,
+      "column": 12,
+      "owner": "_importers_tool.GraphImporters",
+      "representation_line": 358
+    },
+    {
+      "kind": "Return",
+      "line_start": 251,
+      "line_end": 251,
+      "column": 12,
+      "owner": "_importers_tool.GraphImporters",
+      "representation_line": 362
+    },
+    {
+      "kind": "Return",
+      "line_start": 252,
+      "line_end": 252,
+      "column": 8,
+      "owner": "_importers_tool.GraphImporters",
+      "representation_line": 365
+    },
+    {
+      "kind": "Return",
+      "line_start": 254,
+      "line_end": 254,
+      "column": 4,
+      "owner": "_importers_tool",
+      "representation_line": 370
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 257,
+      "line_end": 271,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 374
+    },
+    {
+      "kind": "Expr",
+      "line_start": 258,
+      "line_end": 258,
+      "column": 4,
+      "owner": "_sinks_in_community_tool",
+      "representation_line": 380
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 262,
+      "line_end": 269,
+      "column": 4,
+      "owner": "_sinks_in_community_tool",
+      "representation_line": 381
+    },
+    {
+      "kind": "Expr",
+      "line_start": 263,
+      "line_end": 263,
+      "column": 8,
+      "owner": "_sinks_in_community_tool.GraphSinksInCommunity",
+      "representation_line": 390
+    },
+    {
+      "kind": "Assign",
+      "line_start": 264,
+      "line_end": 264,
+      "column": 8,
+      "owner": "_sinks_in_community_tool.GraphSinksInCommunity",
+      "representation_line": 390
+    },
+    {
+      "kind": "Return",
+      "line_start": 265,
+      "line_end": 269,
+      "column": 8,
+      "owner": "_sinks_in_community_tool.GraphSinksInCommunity",
+      "representation_line": 391
+    },
+    {
+      "kind": "Return",
+      "line_start": 271,
+      "line_end": 271,
+      "column": 4,
+      "owner": "_sinks_in_community_tool",
+      "representation_line": 396
+    },
+    {
+      "kind": "Assign",
+      "line_start": 274,
+      "line_end": 274,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 401
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 277,
+      "line_end": 284,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 401
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 287,
+      "line_end": 287,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 401
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 289,
+      "line_end": 289,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 401
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 292,
+      "line_end": 297,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 402
+    },
+    {
+      "kind": "Expr",
+      "line_start": 293,
+      "line_end": 293,
+      "column": 4,
+      "owner": "register_graph_tools",
+      "representation_line": 408
+    },
+    {
+      "kind": "For",
+      "line_start": 294,
+      "line_end": 297,
+      "column": 4,
+      "owner": "register_graph_tools",
+      "representation_line": 409
+    },
+    {
+      "kind": "If",
+      "line_start": 295,
+      "line_end": 296,
+      "column": 8,
+      "owner": "register_graph_tools",
+      "representation_line": 411
+    },
+    {
+      "kind": "Raise",
+      "line_start": 296,
+      "line_end": 296,
+      "column": 12,
+      "owner": "register_graph_tools",
+      "representation_line": 413
+    },
+    {
+      "kind": "Assign",
+      "line_start": 297,
+      "line_end": 297,
+      "column": 8,
+      "owner": "register_graph_tools",
+      "representation_line": 417
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 300,
+      "line_end": 302,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 421
+    },
+    {
+      "kind": "Expr",
+      "line_start": 301,
+      "line_end": 301,
+      "column": 4,
+      "owner": "clear_plugin_graph_tools",
+      "representation_line": 427
+    },
+    {
+      "kind": "Expr",
+      "line_start": 302,
+      "line_end": 302,
+      "column": 4,
+      "owner": "clear_plugin_graph_tools",
+      "representation_line": 427
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 305,
+      "line_end": 307,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 430
+    },
+    {
+      "kind": "Expr",
+      "line_start": 306,
+      "line_end": 306,
+      "column": 4,
+      "owner": "graph_tool_names",
+      "representation_line": 436
+    },
+    {
+      "kind": "Return",
+      "line_start": 307,
+      "line_end": 307,
+      "column": 4,
+      "owner": "graph_tool_names",
+      "representation_line": 437
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 310,
+      "line_end": 317,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 441
+    },
+    {
+      "kind": "Expr",
+      "line_start": 311,
+      "line_end": 311,
+      "column": 4,
+      "owner": "_graph_tools",
+      "representation_line": 447
+    },
+    {
+      "kind": "Assign",
+      "line_start": 312,
+      "line_end": 312,
+      "column": 4,
+      "owner": "_graph_tools",
+      "representation_line": 447
+    },
+    {
+      "kind": "If",
+      "line_start": 313,
+      "line_end": 314,
+      "column": 4,
+      "owner": "_graph_tools",
+      "representation_line": 448
+    },
+    {
+      "kind": "Return",
+      "line_start": 314,
+      "line_end": 314,
+      "column": 8,
+      "owner": "_graph_tools",
+      "representation_line": 450
+    },
+    {
+      "kind": "Assign",
+      "line_start": 315,
+      "line_end": 315,
+      "column": 4,
+      "owner": "_graph_tools",
+      "representation_line": 454
+    },
+    {
+      "kind": "Assign",
+      "line_start": 316,
+      "line_end": 316,
+      "column": 4,
+      "owner": "_graph_tools",
+      "representation_line": 454
+    },
+    {
+      "kind": "Return",
+      "line_start": 317,
+      "line_end": 317,
+      "column": 4,
+      "owner": "_graph_tools",
+      "representation_line": 455
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 320,
+      "line_end": 329,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 459
+    },
+    {
+      "kind": "Expr",
+      "line_start": 321,
+      "line_end": 321,
+      "column": 4,
+      "owner": "build_graph_tool_builder",
+      "representation_line": 465
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 323,
+      "line_end": 327,
+      "column": 4,
+      "owner": "build_graph_tool_builder",
+      "representation_line": 466
+    },
+    {
+      "kind": "Expr",
+      "line_start": 325,
+      "line_end": 325,
+      "column": 8,
+      "owner": "build_graph_tool_builder._build",
+      "representation_line": 472
+    },
+    {
+      "kind": "Assign",
+      "line_start": 326,
+      "line_end": 326,
+      "column": 8,
+      "owner": "build_graph_tool_builder._build",
+      "representation_line": 472
+    },
+    {
+      "kind": "Return",
+      "line_start": 327,
+      "line_end": 327,
+      "column": 8,
+      "owner": "build_graph_tool_builder._build",
+      "representation_line": 473
+    },
+    {
+      "kind": "Return",
+      "line_start": 329,
+      "line_end": 329,
+      "column": 4,
+      "owner": "build_graph_tool_builder",
+      "representation_line": 477
+    },
+    {
+      "kind": "Assign",
+      "line_start": 332,
+      "line_end": 334,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 482
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 33,
+      "line_end": 34,
+      "column": 18,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='candidate_limit'), Constant(value='group_limit'), Constant(value='call_depth'), Constant(value='max_nodes'), Constant(value='max_edges'), Constant(value='max_paths')], values=[Constant(value=5), Constant(value=8), Constant(value=2), Constant(value=60), Constant(value=120), Constant(value=8)])",
+      "rendered": "{'candidate_limit': 5, 'group_limit': 8, 'call_depth': 2, 'max_nodes': 60, 'max_edges': 120, 'max_paths': 8}"
+    },
+    {
+      "line_start": 35,
+      "line_end": 36,
+      "column": 17,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='candidate_limit'), Constant(value='max_depth'), Constant(value='max_nodes'), Constant(value='max_edges'), Constant(value='max_paths')], values=[Constant(value=5), Constant(value=4), Constant(value=80), Constant(value=160), Constant(value=10)])",
+      "rendered": "{'candidate_limit': 5, 'max_depth': 4, 'max_nodes': 80, 'max_edges': 160, 'max_paths': 10}"
+    },
+    {
+      "line_start": 37,
+      "line_end": 37,
+      "column": 11,
+      "kind": "Constant",
+      "original_ast": "Constant(value=20)",
+      "rendered": "20"
+    },
+    {
+      "line_start": 38,
+      "line_end": 38,
+      "column": 12,
+      "kind": "Constant",
+      "original_ast": "Constant(value=6)",
+      "rendered": "6"
+    },
+    {
+      "line_start": 40,
+      "line_end": 44,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value='\\nMATCH (fn {name: $function, filePath: $file})-[:CALLS]->(callee)\\nRETURN DISTINCT callee.filePath AS file, callee.name AS name\\nLIMIT 25\\n')",
+      "rendered": "source_literal_40_19"
+    },
+    {
+      "line_start": 45,
+      "line_end": 49,
+      "column": 17,
+      "kind": "Constant",
+      "original_ast": "Constant(value='\\nMATCH (caller)-[:CALLS]->(fn {name: $function, filePath: $file})\\nRETURN DISTINCT caller.filePath AS file, caller.name AS name\\nLIMIT 25\\n')",
+      "rendered": "source_literal_45_17"
+    },
+    {
+      "line_start": 50,
+      "line_end": 54,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value='\\nMATCH (importer:File)-[:IMPORTS]->(target:File {filePath: $file})\\nRETURN DISTINCT importer.filePath AS path\\nLIMIT 25\\n')",
+      "rendered": "source_literal_50_19"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 17,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Call(func=Attribute(value=Name(id='row', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='file')], keywords=[]), Call(func=Attribute(value=Name(id='row', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='name')], keywords=[])], ctx=Load())",
+      "rendered": "(row.get('file'), row.get('name'))"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=BoolOp(op=And(), values=[Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='file', ctx=Load()), Name(id='str', ctx=Load())], keywords=[]), Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='name', ctx=Load()), Name(id='str', ctx=Load())], keywords=[])]), body=JoinedStr(values=[FormattedValue(value=Name(id='file', ctx=Load()), conversion=-1), Constant(value='::'), FormattedValue(value=Name(id='name', ctx=Load()), conversion=-1)]), orelse=Constant(value=''))",
+      "rendered": "source_template_60_11 if isinstance(file, str) and isinstance(name, str) else ''"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='entity', ctx=Load()), Constant(value='name'), Constant(value=None)], keywords=[]), Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='entity', ctx=Load()), Constant(value='qualified_name'), Constant(value=None)], keywords=[]), Constant(value='')])",
+      "rendered": "getattr(entity, 'name', None) or getattr(entity, 'qualified_name', None) or ''"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='entity', ctx=Load()), Constant(value='file_path'), Constant(value=None)], keywords=[]), Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='entity', ctx=Load()), Constant(value='path'), Constant(value=None)], keywords=[]), Constant(value='')])",
+      "rendered": "getattr(entity, 'file_path', None) or getattr(entity, 'path', None) or ''"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=BoolOp(op=And(), values=[Name(id='path', ctx=Load()), Name(id='name', ctx=Load())]), body=JoinedStr(values=[FormattedValue(value=Name(id='path', ctx=Load()), conversion=-1), Constant(value='::'), FormattedValue(value=Name(id='name', ctx=Load()), conversion=-1)]), orelse=Call(func=Name(id='str', ctx=Load()), args=[BoolOp(op=Or(), values=[Name(id='name', ctx=Load()), Name(id='path', ctx=Load())])], keywords=[]))",
+      "rendered": "source_template_67_11 if path and name else str(name or path)"
+    },
+    {
+      "line_start": 72,
+      "line_end": 72,
+      "column": 11,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=ListComp(elt=Name(id='r', ctx=Load()), generators=[comprehension(target=Name(id='e', ctx=Store()), iter=BoolOp(op=Or(), values=[Name(id='entities', ctx=Load()), Tuple(elts=[], ctx=Load())]), ifs=[NamedExpr(target=Name(id='r', ctx=Store()), value=Call(func=Name(id='_ref', ctx=Load()), args=[Name(id='e', ctx=Load())], keywords=[]))], is_async=0)]), slice=Slice(upper=Name(id='_REF_CAP', ctx=Load())), ctx=Load())",
+      "rendered": "[r for e in entities or () if (r := _ref(e))][:_REF_CAP]"
+    },
+    {
+      "line_start": 77,
+      "line_end": 78,
+      "column": 11,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=ListComp(elt=Call(func=Attribute(value=Constant(value=' -> '), attr='join', ctx=Load()), args=[Call(func=Name(id='_refs', ctx=Load()), args=[BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='p', ctx=Load()), Constant(value='nodes'), Tuple(elts=[], ctx=Load())], keywords=[]), Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='p', ctx=Load()), Constant(value='entities'), Tuple(elts=[], ctx=Load())], keywords=[])])], keywords=[])], keywords=[]), generators=[comprehension(target=Name(id='p', ctx=Store()), iter=BoolOp(op=Or(), values=[Name(id='paths', ctx=Load()), Tuple(elts=[], ctx=Load())]), ifs=[], is_async=0)]), slice=Slice(upper=Name(id='_PATH_CAP', ctx=Load())), ctx=Load())",
+      "rendered": "[' -> '.join(_refs(getattr(p, 'nodes', ()) or getattr(p, 'entities', ()))) for p in paths or ()][:_PATH_CAP]"
+    },
+    {
+      "line_start": 83,
+      "line_end": 83,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='SymbolSelector', ctx=Load()), args=[BoolOp(op=Or(), values=[Name(id='symbol', ctx=Load()), Name(id='file', ctx=Load())])], keywords=[keyword(arg='file_path', value=Name(id='file', ctx=Load())), keyword(arg='line', value=Name(id='line', ctx=Load()))])",
+      "rendered": "SymbolSelector(symbol or file, file_path=file, line=line)"
+    },
+    {
+      "line_start": 88,
+      "line_end": 88,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='exc', ctx=Load()), Name(id='SymbolAmbiguousError', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(exc, SymbolAmbiguousError)"
+    },
+    {
+      "line_start": 89,
+      "line_end": 90,
+      "column": 16,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[Constant(value=\"several symbols named '\"), FormattedValue(value=Name(id='symbol', ctx=Load()), conversion=-1), Constant(value=\"' exist in \"), FormattedValue(value=Name(id='file', ctx=Load()), conversion=-1), Constant(value='. Pass `line` to pick the one you mean, or name the enclosing class or function so the name is unique.')])",
+      "rendered": "source_template_89_16"
+    },
+    {
+      "line_start": 92,
+      "line_end": 94,
+      "column": 16,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[Constant(value=\"the graph holds no symbol '\"), FormattedValue(value=Name(id='symbol', ctx=Load()), conversion=-1), Constant(value=\"' in \"), FormattedValue(value=Name(id='file', ctx=Load()), conversion=-1), Constant(value=\". It indexes functions, methods and classes — not module-level statements, templates or config. Pass the enclosing function's exact name, or fall back to Grep for this location.\")])",
+      "rendered": "source_template_92_16"
+    },
+    {
+      "line_start": 95,
+      "line_end": 95,
+      "column": 11,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='error'), Constant(value='hint')], values=[JoinedStr(values=[FormattedValue(value=Attribute(value=Call(func=Name(id='type', ctx=Load()), args=[Name(id='exc', ctx=Load())], keywords=[]), attr='__name__', ctx=Load()), conversion=-1), Constant(value=': '), FormattedValue(value=Name(id='exc', ctx=Load()), conversion=-1)]), Name(id='hint', ctx=Load())])",
+      "rendered": "{'error': source_template_95_21, 'hint': hint}"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 11,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='error')], values=[JoinedStr(values=[FormattedValue(value=Attribute(value=Call(func=Name(id='type', ctx=Load()), args=[Name(id='exc', ctx=Load())], keywords=[]), attr='__name__', ctx=Load()), conversion=-1), Constant(value=': '), FormattedValue(value=Name(id='exc', ctx=Load()), conversion=-1)])])",
+      "rendered": "{'error': source_template_100_21}"
+    },
+    {
+      "line_start": 105,
+      "line_end": 105,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='result', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(result, dict)"
+    },
+    {
+      "line_start": 106,
+      "line_end": 106,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='all', ctx=Load()), args=[GeneratorExp(elt=UnaryOp(op=Not(), operand=Name(id='v', ctx=Load())), generators=[comprehension(target=Name(id='v', ctx=Store()), iter=Call(func=Attribute(value=Name(id='result', ctx=Load()), attr='values', ctx=Load()), args=[], keywords=[]), ifs=[Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='v', ctx=Load()), Name(id='list', ctx=Load())], keywords=[])], is_async=0)])], keywords=[])",
+      "rendered": "all((not v for v in result.values() if isinstance(v, list)))"
+    },
+    {
+      "line_start": 107,
+      "line_end": 107,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Compare(left=Name(id='result', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)]), BoolOp(op=And(), values=[Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='result', ctx=Load()), Name(id='list', ctx=Load())], keywords=[]), UnaryOp(op=Not(), operand=Name(id='result', ctx=Load()))])])",
+      "rendered": "result is None or (isinstance(result, list) and (not result))"
+    },
+    {
+      "line_start": 112,
+      "line_end": 112,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='result', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[]), Compare(left=Constant(value='error'), ops=[In()], comparators=[Name(id='result', ctx=Load())])])",
+      "rendered": "isinstance(result, dict) and 'error' in result"
+    },
+    {
+      "line_start": 113,
+      "line_end": 113,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Constant(value='graph_tool_result_error')], keywords=[])",
+      "rendered": "COUNTERS.bump('graph_tool_result_error')"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_is_empty_result', ctx=Load()), args=[Name(id='result', ctx=Load())], keywords=[])",
+      "rendered": "_is_empty_result(result)"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Constant(value='graph_tool_result_empty')], keywords=[])",
+      "rendered": "COUNTERS.bump('graph_tool_result_empty')"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Constant(value='graph_tool_result_hit')], keywords=[])",
+      "rendered": "COUNTERS.bump('graph_tool_result_hit')"
+    },
+    {
+      "line_start": 122,
+      "line_end": 122,
+      "column": 5,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='functools', ctx=Load()), attr='wraps', ctx=Load()), args=[Name(id='fn', ctx=Load())], keywords=[])",
+      "rendered": "functools.wraps(fn)"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='fn', ctx=Load()), args=[Starred(value=Name(id='args', ctx=Load()), ctx=Load())], keywords=[keyword(value=Name(id='kwargs', ctx=Load()))])",
+      "rendered": "fn(*args, **kwargs)"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_count_result', ctx=Load()), args=[Name(id='result', ctx=Load())], keywords=[])",
+      "rendered": "_count_result(result)"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='result', ctx=Load())",
+      "rendered": "result"
+    },
+    {
+      "line_start": 127,
+      "line_end": 127,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='_wrapper', ctx=Load())",
+      "rendered": "_wrapper"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 11,
+      "kind": "DictComp",
+      "original_ast": "DictComp(key=Attribute(value=Name(id='m', ctx=Load()), attr='name', ctx=Load()), value=Attribute(value=Name(id='m', ctx=Load()), attr='files', ctx=Load()), generators=[comprehension(target=Name(id='m', ctx=Store()), iter=BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='ctx', ctx=Load()), Constant(value='modules'), Constant(value=None)], keywords=[]), Tuple(elts=[], ctx=Load())]), ifs=[], is_async=0)])",
+      "rendered": "{m.name: m.files for m in getattr(ctx, 'modules', None) or ()}"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 1,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dataclass', ctx=Load()), args=[], keywords=[keyword(arg='frozen', value=Constant(value=True))])",
+      "rendered": "dataclass(frozen=True)"
+    },
+    {
+      "line_start": 146,
+      "line_end": 146,
+      "column": 5,
+      "kind": "Name",
+      "original_ast": "Name(id='tool', ctx=Load())",
+      "rendered": "tool"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 5,
+      "kind": "Name",
+      "original_ast": "Name(id='_counted', ctx=Load())",
+      "rendered": "_counted"
+    },
+    {
+      "line_start": 152,
+      "line_end": 153,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Attribute(value=Name(id='gtx', ctx=Load()), attr='handle', ctx=Load()), attr='graph', ctx=Load()), attr='context', ctx=Load()), args=[Call(func=Name(id='_selector', ctx=Load()), args=[Name(id='file', ctx=Load()), Name(id='symbol', ctx=Load()), Name(id='line', ctx=Load())], keywords=[])], keywords=[keyword(arg='limits', value=Call(func=Name(id='ContextLimits', ctx=Load()), args=[], keywords=[keyword(value=Name(id='_CONTEXT_LIMITS', ctx=Load()))]))])",
+      "rendered": "gtx.handle.graph.context(_selector(file, symbol, line), limits=ContextLimits(**_CONTEXT_LIMITS))"
+    },
+    {
+      "line_start": 154,
+      "line_end": 154,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_resolve_error', ctx=Load()), args=[Name(id='file', ctx=Load()), Name(id='symbol', ctx=Load()), Name(id='exc', ctx=Load())], keywords=[])",
+      "rendered": "_resolve_error(file, symbol, exc)"
+    },
+    {
+      "line_start": 156,
+      "line_end": 163,
+      "column": 15,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='symbol'), Constant(value='callers'), Constant(value='callees'), Constant(value='imports'), Constant(value='implementors'), Constant(value='call_paths')], values=[Call(func=Name(id='_ref', ctx=Load()), args=[Attribute(value=Name(id='res', ctx=Load()), attr='symbol', ctx=Load())], keywords=[]), Call(func=Name(id='_refs', ctx=Load()), args=[Attribute(value=Name(id='res', ctx=Load()), attr='callers', ctx=Load())], keywords=[]), Call(func=Name(id='_refs', ctx=Load()), args=[Attribute(value=Name(id='res', ctx=Load()), attr='callees', ctx=Load())], keywords=[]), Call(func=Name(id='_refs', ctx=Load()), args=[Attribute(value=Name(id='res', ctx=Load()), attr='imports', ctx=Load())], keywords=[]), Call(func=Name(id='_refs', ctx=Load()), args=[Attribute(value=Name(id='res', ctx=Load()), attr='implementors', ctx=Load())], keywords=[]), Call(func=Name(id='_paths', ctx=Load()), args=[Attribute(value=Name(id='res', ctx=Load()), attr='call_paths', ctx=Load())], keywords=[])])",
+      "rendered": "{'symbol': _ref(res.symbol), 'callers': _refs(res.callers), 'callees': _refs(res.callees), 'imports': _refs(res.imports), 'implementors': _refs(res.implementors), 'call_paths': _paths(res.call_paths)}"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='GraphContext', ctx=Load())",
+      "rendered": "GraphContext"
+    },
+    {
+      "line_start": 171,
+      "line_end": 171,
+      "column": 5,
+      "kind": "Name",
+      "original_ast": "Name(id='tool', ctx=Load())",
+      "rendered": "tool"
+    },
+    {
+      "line_start": 172,
+      "line_end": 172,
+      "column": 5,
+      "kind": "Name",
+      "original_ast": "Name(id='_counted', ctx=Load())",
+      "rendered": "_counted"
+    },
+    {
+      "line_start": 177,
+      "line_end": 178,
+      "column": 16,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Attribute(value=Call(func=Attribute(value=Call(func=Name(id='str', ctx=Load()), args=[Name(id='direction', ctx=Load())], keywords=[]), attr='lower', ctx=Load()), args=[], keywords=[]), attr='startswith', ctx=Load()), args=[Constant(value='down')], keywords=[]), body=Attribute(value=Name(id='ImpactDirection', ctx=Load()), attr='DOWNSTREAM', ctx=Load()), orelse=Attribute(value=Name(id='ImpactDirection', ctx=Load()), attr='UPSTREAM', ctx=Load()))",
+      "rendered": "ImpactDirection.DOWNSTREAM if str(direction).lower().startswith('down') else ImpactDirection.UPSTREAM"
+    },
+    {
+      "line_start": 180,
+      "line_end": 181,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Attribute(value=Name(id='gtx', ctx=Load()), attr='handle', ctx=Load()), attr='graph', ctx=Load()), attr='impact', ctx=Load()), args=[Call(func=Name(id='_selector', ctx=Load()), args=[Name(id='file', ctx=Load()), Name(id='symbol', ctx=Load()), Name(id='line', ctx=Load())], keywords=[]), Name(id='want', ctx=Load())], keywords=[keyword(arg='limits', value=Call(func=Name(id='ImpactLimits', ctx=Load()), args=[], keywords=[keyword(value=Name(id='_IMPACT_LIMITS', ctx=Load()))]))])",
+      "rendered": "gtx.handle.graph.impact(_selector(file, symbol, line), want, limits=ImpactLimits(**_IMPACT_LIMITS))"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 183,
+      "line_end": 183,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_resolve_error', ctx=Load()), args=[Name(id='file', ctx=Load()), Name(id='symbol', ctx=Load()), Name(id='exc', ctx=Load())], keywords=[])",
+      "rendered": "_resolve_error(file, symbol, exc)"
+    },
+    {
+      "line_start": 184,
+      "line_end": 184,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_refs', ctx=Load()), args=[Attribute(value=Name(id='res', ctx=Load()), attr='affected', ctx=Load())], keywords=[])",
+      "rendered": "_refs(res.affected)"
+    },
+    {
+      "line_start": 185,
+      "line_end": 194,
+      "column": 15,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='symbol'), Constant(value='direction'), Constant(value='affected'), Constant(value='reachable'), Constant(value='note'), Constant(value='paths')], values=[Call(func=Name(id='_ref', ctx=Load()), args=[Attribute(value=Name(id='res', ctx=Load()), attr='symbol', ctx=Load())], keywords=[]), Attribute(value=Name(id='want', ctx=Load()), attr='value', ctx=Load()), Name(id='affected', ctx=Load()), Call(func=Name(id='bool', ctx=Load()), args=[Name(id='affected', ctx=Load())], keywords=[]), IfExp(test=BoolOp(op=And(), values=[UnaryOp(op=Not(), operand=Name(id='affected', ctx=Load())), Compare(left=Name(id='want', ctx=Load()), ops=[Is()], comparators=[Attribute(value=Name(id='ImpactDirection', ctx=Load()), attr='UPSTREAM', ctx=Load())])]), body=Constant(value='nothing in the graph reaches this symbol — it is an entry point, dispatched by a framework, or unreachable'), orelse=Constant(value='')), Call(func=Name(id='_paths', ctx=Load()), args=[Attribute(value=Name(id='res', ctx=Load()), attr='paths', ctx=Load())], keywords=[])])",
+      "rendered": "{'symbol': _ref(res.symbol), 'direction': want.value, 'affected': affected, 'reachable': bool(affected), 'note': 'nothing in the graph reaches this symbol — it is an entry point, dispatched by a framework, or unreachable' if not affected and want is ImpactDirection.UPSTREAM else '', 'paths': _paths(res.paths)}"
+    },
+    {
+      "line_start": 196,
+      "line_end": 196,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='GraphImpact', ctx=Load())",
+      "rendered": "GraphImpact"
+    },
+    {
+      "line_start": 202,
+      "line_end": 202,
+      "column": 5,
+      "kind": "Name",
+      "original_ast": "Name(id='tool', ctx=Load())",
+      "rendered": "tool"
+    },
+    {
+      "line_start": 203,
+      "line_end": 203,
+      "column": 5,
+      "kind": "Name",
+      "original_ast": "Name(id='_counted', ctx=Load())",
+      "rendered": "_counted"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 17,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='file'), Constant(value='function')], values=[Name(id='file', ctx=Load()), Name(id='function', ctx=Load())])",
+      "rendered": "{'file': file, 'function': function}"
+    },
+    {
+      "line_start": 208,
+      "line_end": 209,
+      "column": 22,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Call(func=Name(id='_qname', ctx=Load()), args=[Call(func=Attribute(value=Name(id='r', ctx=Load()), attr='to_dict', ctx=Load()), args=[], keywords=[])], keywords=[]), generators=[comprehension(target=Name(id='r', ctx=Store()), iter=Attribute(value=Call(func=Attribute(value=Attribute(value=Attribute(value=Name(id='gtx', ctx=Load()), attr='handle', ctx=Load()), attr='graph', ctx=Load()), attr='cypher', ctx=Load()), args=[Name(id='_NEIGHBORS_QUERY', ctx=Load()), Name(id='params', ctx=Load())], keywords=[]), attr='rows', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "[_qname(r.to_dict()) for r in gtx.handle.graph.cypher(_NEIGHBORS_QUERY, params).rows]"
+    },
+    {
+      "line_start": 210,
+      "line_end": 210,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 211,
+      "line_end": 211,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_cypher_error', ctx=Load()), args=[Name(id='exc', ctx=Load())], keywords=[])",
+      "rendered": "_cypher_error(exc)"
+    },
+    {
+      "line_start": 213,
+      "line_end": 214,
+      "column": 22,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Call(func=Name(id='_qname', ctx=Load()), args=[Call(func=Attribute(value=Name(id='r', ctx=Load()), attr='to_dict', ctx=Load()), args=[], keywords=[])], keywords=[]), generators=[comprehension(target=Name(id='r', ctx=Store()), iter=Attribute(value=Call(func=Attribute(value=Attribute(value=Attribute(value=Name(id='gtx', ctx=Load()), attr='handle', ctx=Load()), attr='graph', ctx=Load()), attr='cypher', ctx=Load()), args=[Name(id='_CALLERS_QUERY', ctx=Load()), Name(id='params', ctx=Load())], keywords=[]), attr='rows', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "[_qname(r.to_dict()) for r in gtx.handle.graph.cypher(_CALLERS_QUERY, params).rows]"
+    },
+    {
+      "line_start": 215,
+      "line_end": 215,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 217,
+      "line_end": 217,
+      "column": 19,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='callees'), None], values=[ListComp(elt=Name(id='q', ctx=Load()), generators=[comprehension(target=Name(id='q', ctx=Store()), iter=Name(id='callees', ctx=Load()), ifs=[Name(id='q', ctx=Load())], is_async=0)]), Call(func=Name(id='_cypher_error', ctx=Load()), args=[Name(id='exc', ctx=Load())], keywords=[])])",
+      "rendered": "{'callees': [q for q in callees if q], **_cypher_error(exc)}"
+    },
+    {
+      "line_start": 218,
+      "line_end": 221,
+      "column": 15,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='callees'), Constant(value='callers')], values=[ListComp(elt=Name(id='q', ctx=Load()), generators=[comprehension(target=Name(id='q', ctx=Store()), iter=Name(id='callees', ctx=Load()), ifs=[Name(id='q', ctx=Load())], is_async=0)]), ListComp(elt=Name(id='q', ctx=Load()), generators=[comprehension(target=Name(id='q', ctx=Store()), iter=Name(id='callers', ctx=Load()), ifs=[Name(id='q', ctx=Load())], is_async=0)])])",
+      "rendered": "{'callees': [q for q in callees if q], 'callers': [q for q in callers if q]}"
+    },
+    {
+      "line_start": 223,
+      "line_end": 223,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='GraphNeighbors', ctx=Load())",
+      "rendered": "GraphNeighbors"
+    },
+    {
+      "line_start": 229,
+      "line_end": 229,
+      "column": 5,
+      "kind": "Name",
+      "original_ast": "Name(id='tool', ctx=Load())",
+      "rendered": "tool"
+    },
+    {
+      "line_start": 230,
+      "line_end": 230,
+      "column": 5,
+      "kind": "Name",
+      "original_ast": "Name(id='_counted', ctx=Load())",
+      "rendered": "_counted"
+    },
+    {
+      "line_start": 233,
+      "line_end": 233,
+      "column": 27,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Name(id='_community_files', ctx=Load()), args=[Attribute(value=Name(id='gtx', ctx=Load()), attr='ctx', ctx=Load())], keywords=[]), attr='items', ctx=Load()), args=[], keywords=[])",
+      "rendered": "_community_files(gtx.ctx).items()"
+    },
+    {
+      "line_start": 234,
+      "line_end": 234,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='file', ctx=Load()), ops=[In()], comparators=[Name(id='files', ctx=Load())])",
+      "rendered": "file in files"
+    },
+    {
+      "line_start": 235,
+      "line_end": 235,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='name', ctx=Load())",
+      "rendered": "name"
+    },
+    {
+      "line_start": 236,
+      "line_end": 236,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 238,
+      "line_end": 238,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='GraphCommunityOf', ctx=Load())",
+      "rendered": "GraphCommunityOf"
+    },
+    {
+      "line_start": 244,
+      "line_end": 244,
+      "column": 5,
+      "kind": "Name",
+      "original_ast": "Name(id='tool', ctx=Load())",
+      "rendered": "tool"
+    },
+    {
+      "line_start": 245,
+      "line_end": 245,
+      "column": 5,
+      "kind": "Name",
+      "original_ast": "Name(id='_counted', ctx=Load())",
+      "rendered": "_counted"
+    },
+    {
+      "line_start": 249,
+      "line_end": 249,
+      "column": 19,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Call(func=Attribute(value=Attribute(value=Attribute(value=Name(id='gtx', ctx=Load()), attr='handle', ctx=Load()), attr='graph', ctx=Load()), attr='cypher', ctx=Load()), args=[Name(id='_IMPORTERS_QUERY', ctx=Load()), Dict(keys=[Constant(value='file')], values=[Name(id='file', ctx=Load())])], keywords=[]), attr='rows', ctx=Load())",
+      "rendered": "gtx.handle.graph.cypher(_IMPORTERS_QUERY, {'file': file}).rows"
+    },
+    {
+      "line_start": 250,
+      "line_end": 250,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 251,
+      "line_end": 251,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_cypher_error', ctx=Load()), args=[Name(id='exc', ctx=Load())], keywords=[])",
+      "rendered": "_cypher_error(exc)"
+    },
+    {
+      "line_start": 252,
+      "line_end": 252,
+      "column": 15,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='p', ctx=Load()), generators=[comprehension(target=Name(id='r', ctx=Store()), iter=Name(id='rows', ctx=Load()), ifs=[Call(func=Name(id='isinstance', ctx=Load()), args=[NamedExpr(target=Name(id='p', ctx=Store()), value=Call(func=Attribute(value=Call(func=Attribute(value=Name(id='r', ctx=Load()), attr='to_dict', ctx=Load()), args=[], keywords=[]), attr='get', ctx=Load()), args=[Constant(value='path')], keywords=[])), Name(id='str', ctx=Load())], keywords=[])], is_async=0)])",
+      "rendered": "[p for r in rows if isinstance((p := r.to_dict().get('path')), str)]"
+    },
+    {
+      "line_start": 254,
+      "line_end": 254,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='GraphImporters', ctx=Load())",
+      "rendered": "GraphImporters"
+    },
+    {
+      "line_start": 260,
+      "line_end": 260,
+      "column": 5,
+      "kind": "Name",
+      "original_ast": "Name(id='tool', ctx=Load())",
+      "rendered": "tool"
+    },
+    {
+      "line_start": 261,
+      "line_end": 261,
+      "column": 5,
+      "kind": "Name",
+      "original_ast": "Name(id='_counted', ctx=Load())",
+      "rendered": "_counted"
+    },
+    {
+      "line_start": 264,
+      "line_end": 264,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[Call(func=Attribute(value=Call(func=Name(id='_community_files', ctx=Load()), args=[Attribute(value=Name(id='gtx', ctx=Load()), attr='ctx', ctx=Load())], keywords=[]), attr='get', ctx=Load()), args=[Name(id='community', ctx=Load()), Tuple(elts=[], ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "set(_community_files(gtx.ctx).get(community, ()))"
+    },
+    {
+      "line_start": 265,
+      "line_end": 269,
+      "column": 15,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Dict(keys=[Constant(value='file'), Constant(value='line'), Constant(value='function')], values=[Attribute(value=Name(id='s', ctx=Load()), attr='file', ctx=Load()), Attribute(value=Name(id='s', ctx=Load()), attr='line', ctx=Load()), Attribute(value=Name(id='s', ctx=Load()), attr='function', ctx=Load())]), generators=[comprehension(target=Name(id='s', ctx=Store()), iter=BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Attribute(value=Name(id='gtx', ctx=Load()), attr='ctx', ctx=Load()), Constant(value='unsafe_sinks'), Constant(value=None)], keywords=[]), Tuple(elts=[], ctx=Load())]), ifs=[Compare(left=Attribute(value=Name(id='s', ctx=Load()), attr='file', ctx=Load()), ops=[In()], comparators=[Name(id='files', ctx=Load())])], is_async=0)])",
+      "rendered": "[{'file': s.file, 'line': s.line, 'function': s.function} for s in getattr(gtx.ctx, 'unsafe_sinks', None) or () if s.file in files]"
+    },
+    {
+      "line_start": 271,
+      "line_end": 271,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='GraphSinksInCommunity', ctx=Load())",
+      "rendered": "GraphSinksInCommunity"
+    },
+    {
+      "line_start": 274,
+      "line_end": 274,
+      "column": 14,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Name(id='Callable', ctx=Load()), slice=Tuple(elts=[List(elts=[Name(id='GraphToolContext', ctx=Load())], ctx=Load()), Name(id='BaseTool', ctx=Load())], ctx=Load()), ctx=Load())",
+      "rendered": "Callable[[GraphToolContext], BaseTool]"
+    },
+    {
+      "line_start": 277,
+      "line_end": 284,
+      "column": 38,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='GraphContext'), Constant(value='GraphImpact'), Constant(value='GraphNeighbors'), Constant(value='GraphCommunityOf'), Constant(value='GraphImporters'), Constant(value='GraphSinksInCommunity')], values=[Name(id='_context_tool', ctx=Load()), Name(id='_impact_tool', ctx=Load()), Name(id='_neighbors_tool', ctx=Load()), Name(id='_community_of_tool', ctx=Load()), Name(id='_importers_tool', ctx=Load()), Name(id='_sinks_in_community_tool', ctx=Load())])",
+      "rendered": "{'GraphContext': _context_tool, 'GraphImpact': _impact_tool, 'GraphNeighbors': _neighbors_tool, 'GraphCommunityOf': _community_of_tool, 'GraphImporters': _importers_tool, 'GraphSinksInCommunity': _sinks_in_community_tool}"
+    },
+    {
+      "line_start": 287,
+      "line_end": 287,
+      "column": 36,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='tuple', ctx=Load()), args=[Name(id='GRAPH_TOOLS', ctx=Load())], keywords=[])",
+      "rendered": "tuple(GRAPH_TOOLS)"
+    },
+    {
+      "line_start": 289,
+      "line_end": 289,
+      "column": 40,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 294,
+      "line_end": 294,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='tools', ctx=Load()), attr='items', ctx=Load()), args=[], keywords=[])",
+      "rendered": "tools.items()"
+    },
+    {
+      "line_start": 295,
+      "line_end": 295,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Compare(left=Name(id='name', ctx=Load()), ops=[In()], comparators=[Name(id='GRAPH_TOOLS', ctx=Load())]), Compare(left=Name(id='name', ctx=Load()), ops=[In()], comparators=[Name(id='_PLUGIN_TOOLS', ctx=Load())])])",
+      "rendered": "name in GRAPH_TOOLS or name in _PLUGIN_TOOLS"
+    },
+    {
+      "line_start": 296,
+      "line_end": 296,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ValueError', ctx=Load()), args=[JoinedStr(values=[Constant(value='graph tool already registered: '), FormattedValue(value=Name(id='name', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "ValueError(source_template_296_29)"
+    },
+    {
+      "line_start": 297,
+      "line_end": 297,
+      "column": 30,
+      "kind": "Name",
+      "original_ast": "Name(id='build', ctx=Load())",
+      "rendered": "build"
+    },
+    {
+      "line_start": 302,
+      "line_end": 302,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_PLUGIN_TOOLS', ctx=Load()), attr='clear', ctx=Load()), args=[], keywords=[])",
+      "rendered": "_PLUGIN_TOOLS.clear()"
+    },
+    {
+      "line_start": 307,
+      "line_end": 307,
+      "column": 11,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Name(id='GRAPH_TOOL_NAMES', ctx=Load()), op=Add(), right=Call(func=Name(id='tuple', ctx=Load()), args=[Name(id='_PLUGIN_TOOLS', ctx=Load())], keywords=[]))",
+      "rendered": "GRAPH_TOOL_NAMES + tuple(_PLUGIN_TOOLS)"
+    },
+    {
+      "line_start": 312,
+      "line_end": 312,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='ctx', ctx=Load()), Constant(value='graph_handle'), Constant(value=None)], keywords=[])",
+      "rendered": "getattr(ctx, 'graph_handle', None)"
+    },
+    {
+      "line_start": 313,
+      "line_end": 313,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='handle', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "handle is None"
+    },
+    {
+      "line_start": 314,
+      "line_end": 314,
+      "column": 15,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 315,
+      "line_end": 315,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='GraphToolContext', ctx=Load()), args=[], keywords=[keyword(arg='handle', value=Name(id='handle', ctx=Load())), keyword(arg='ctx', value=Name(id='ctx', ctx=Load()))])",
+      "rendered": "GraphToolContext(handle=handle, ctx=ctx)"
+    },
+    {
+      "line_start": 316,
+      "line_end": 316,
+      "column": 17,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[None, None], values=[Name(id='GRAPH_TOOLS', ctx=Load()), Name(id='_PLUGIN_TOOLS', ctx=Load())])",
+      "rendered": "{**GRAPH_TOOLS, **_PLUGIN_TOOLS}"
+    },
+    {
+      "line_start": 317,
+      "line_end": 317,
+      "column": 11,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Call(func=Name(id='build', ctx=Load()), args=[Name(id='gtx', ctx=Load())], keywords=[]), generators=[comprehension(target=Tuple(elts=[Name(id='name', ctx=Store()), Name(id='build', ctx=Store())], ctx=Store()), iter=Call(func=Attribute(value=Name(id='registered', ctx=Load()), attr='items', ctx=Load()), args=[], keywords=[]), ifs=[Compare(left=Name(id='name', ctx=Load()), ops=[In()], comparators=[Name(id='allowed', ctx=Load())])], is_async=0)])",
+      "rendered": "[build(gtx) for name, build in registered.items() if name in allowed]"
+    },
+    {
+      "line_start": 326,
+      "line_end": 326,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='build_reader_tools', ctx=Load()), args=[Name(id='options', ctx=Load())], keywords=[keyword(arg='allowed_tools', value=Name(id='allowed_tools', ctx=Load()))])",
+      "rendered": "build_reader_tools(options, allowed_tools=allowed_tools)"
+    },
+    {
+      "line_start": 327,
+      "line_end": 327,
+      "column": 15,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Name(id='reader_tools', ctx=Load()), op=Add(), right=Call(func=Name(id='_graph_tools', ctx=Load()), args=[Name(id='ctx', ctx=Load()), Call(func=Name(id='set', ctx=Load()), args=[Attribute(value=Name(id='options', ctx=Load()), attr='fact_tools', ctx=Load())], keywords=[])], keywords=[]))",
+      "rendered": "reader_tools + _graph_tools(ctx, set(options.fact_tools))"
+    },
+    {
+      "line_start": 329,
+      "line_end": 329,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='_build', ctx=Load())",
+      "rendered": "_build"
+    },
+    {
+      "line_start": 332,
+      "line_end": 334,
+      "column": 10,
+      "kind": "List",
+      "original_ast": "List(elts=[Constant(value='GRAPH_TOOLS'), Constant(value='GRAPH_TOOL_NAMES'), Constant(value='GraphToolContext'), Constant(value='ToolFactory'), Constant(value='build_graph_tool_builder'), Constant(value='clear_plugin_graph_tools'), Constant(value='graph_tool_names'), Constant(value='register_graph_tools')], ctx=Load())",
+      "rendered": "['GRAPH_TOOLS', 'GRAPH_TOOL_NAMES', 'GraphToolContext', 'ToolFactory', 'build_graph_tool_builder', 'clear_plugin_graph_tools', 'graph_tool_names', 'register_graph_tools']"
+    }
+  ],
+  "calls": [
+    {
+      "line": 135,
+      "end_line": 135,
+      "callee": "dataclass",
+      "enclosing": "GraphToolContext",
+      "expression": "dataclass(frozen=True)"
+    },
+    {
+      "line": 287,
+      "end_line": 287,
+      "callee": "tuple",
+      "enclosing": "module initialization",
+      "expression": "tuple(GRAPH_TOOLS)"
+    },
+    {
+      "line": 83,
+      "end_line": 83,
+      "callee": "SymbolSelector",
+      "enclosing": "_selector",
+      "expression": "SymbolSelector(symbol or file, file_path=file, line=line)"
+    },
+    {
+      "line": 88,
+      "end_line": 88,
+      "callee": "isinstance",
+      "enclosing": "_resolve_error",
+      "expression": "isinstance(exc, SymbolAmbiguousError)"
+    },
+    {
+      "line": 105,
+      "end_line": 105,
+      "callee": "isinstance",
+      "enclosing": "_is_empty_result",
+      "expression": "isinstance(result, dict)"
+    },
+    {
+      "line": 122,
+      "end_line": 122,
+      "callee": "functools.wraps",
+      "enclosing": "_counted._wrapper",
+      "expression": "functools.wraps(fn)"
+    },
+    {
+      "line": 294,
+      "end_line": 294,
+      "callee": "tools.items",
+      "enclosing": "register_graph_tools",
+      "expression": "tools.items()"
+    },
+    {
+      "line": 302,
+      "end_line": 302,
+      "callee": "_PLUGIN_TOOLS.clear",
+      "enclosing": "clear_plugin_graph_tools",
+      "expression": "_PLUGIN_TOOLS.clear()"
+    },
+    {
+      "line": 312,
+      "end_line": 312,
+      "callee": "getattr",
+      "enclosing": "_graph_tools",
+      "expression": "getattr(ctx, \"graph_handle\", None)"
+    },
+    {
+      "line": 315,
+      "end_line": 315,
+      "callee": "GraphToolContext",
+      "enclosing": "_graph_tools",
+      "expression": "GraphToolContext(handle=handle, ctx=ctx)"
+    },
+    {
+      "line": 59,
+      "end_line": 59,
+      "callee": "row.get",
+      "enclosing": "_qname",
+      "expression": "row.get(\"file\")"
+    },
+    {
+      "line": 59,
+      "end_line": 59,
+      "callee": "row.get",
+      "enclosing": "_qname",
+      "expression": "row.get(\"name\")"
+    },
+    {
+      "line": 65,
+      "end_line": 65,
+      "callee": "getattr",
+      "enclosing": "_ref",
+      "expression": "getattr(entity, \"name\", None)"
+    },
+    {
+      "line": 65,
+      "end_line": 65,
+      "callee": "getattr",
+      "enclosing": "_ref",
+      "expression": "getattr(entity, \"qualified_name\", None)"
+    },
+    {
+      "line": 66,
+      "end_line": 66,
+      "callee": "getattr",
+      "enclosing": "_ref",
+      "expression": "getattr(entity, \"file_path\", None)"
+    },
+    {
+      "line": 66,
+      "end_line": 66,
+      "callee": "getattr",
+      "enclosing": "_ref",
+      "expression": "getattr(entity, \"path\", None)"
+    },
+    {
+      "line": 67,
+      "end_line": 67,
+      "callee": "str",
+      "enclosing": "_ref",
+      "expression": "str(name or path)"
+    },
+    {
+      "line": 106,
+      "end_line": 106,
+      "callee": "all",
+      "enclosing": "_is_empty_result",
+      "expression": "all(not v for v in result.values() if isinstance(v, list))"
+    },
+    {
+      "line": 112,
+      "end_line": 112,
+      "callee": "isinstance",
+      "enclosing": "_count_result",
+      "expression": "isinstance(result, dict)"
+    },
+    {
+      "line": 113,
+      "end_line": 113,
+      "callee": "COUNTERS.bump",
+      "enclosing": "_count_result",
+      "expression": "COUNTERS.bump(\"graph_tool_result_error\")"
+    },
+    {
+      "line": 114,
+      "end_line": 114,
+      "callee": "_is_empty_result",
+      "enclosing": "_count_result",
+      "expression": "_is_empty_result(result)"
+    },
+    {
+      "line": 124,
+      "end_line": 124,
+      "callee": "fn",
+      "enclosing": "_counted._wrapper",
+      "expression": "fn(*args, **kwargs)"
+    },
+    {
+      "line": 125,
+      "end_line": 125,
+      "callee": "_count_result",
+      "enclosing": "_counted._wrapper",
+      "expression": "_count_result(result)"
+    },
+    {
+      "line": 184,
+      "end_line": 184,
+      "callee": "_refs",
+      "enclosing": "_impact_tool.GraphImpact",
+      "expression": "_refs(res.affected)"
+    },
+    {
+      "line": 233,
+      "end_line": 233,
+      "callee": "_community_files(gtx.ctx).items",
+      "enclosing": "_community_of_tool.GraphCommunityOf",
+      "expression": "_community_files(gtx.ctx).items()"
+    },
+    {
+      "line": 264,
+      "end_line": 264,
+      "callee": "set",
+      "enclosing": "_sinks_in_community_tool.GraphSinksInCommunity",
+      "expression": "set(_community_files(gtx.ctx).get(community, ()))"
+    },
+    {
+      "line": 307,
+      "end_line": 307,
+      "callee": "tuple",
+      "enclosing": "graph_tool_names",
+      "expression": "tuple(_PLUGIN_TOOLS)"
+    },
+    {
+      "line": 317,
+      "end_line": 317,
+      "callee": "build",
+      "enclosing": "_graph_tools",
+      "expression": "build(gtx)"
+    },
+    {
+      "line": 326,
+      "end_line": 326,
+      "callee": "build_reader_tools",
+      "enclosing": "build_graph_tool_builder._build",
+      "expression": "build_reader_tools(options, allowed_tools=allowed_tools)"
+    },
+    {
+      "line": 60,
+      "end_line": 60,
+      "callee": "isinstance",
+      "enclosing": "_qname",
+      "expression": "isinstance(file, str)"
+    },
+    {
+      "line": 60,
+      "end_line": 60,
+      "callee": "isinstance",
+      "enclosing": "_qname",
+      "expression": "isinstance(name, str)"
+    },
+    {
+      "line": 77,
+      "end_line": 77,
+      "callee": "' -> '.join",
+      "enclosing": "_paths",
+      "expression": "\" -> \".join(_refs(getattr(p, \"nodes\", ()) or getattr(p, \"entities\", ())))"
+    },
+    {
+      "line": 107,
+      "end_line": 107,
+      "callee": "isinstance",
+      "enclosing": "_is_empty_result",
+      "expression": "isinstance(result, list)"
+    },
+    {
+      "line": 115,
+      "end_line": 115,
+      "callee": "COUNTERS.bump",
+      "enclosing": "_count_result",
+      "expression": "COUNTERS.bump(\"graph_tool_result_empty\")"
+    },
+    {
+      "line": 117,
+      "end_line": 117,
+      "callee": "COUNTERS.bump",
+      "enclosing": "_count_result",
+      "expression": "COUNTERS.bump(\"graph_tool_result_hit\")"
+    },
+    {
+      "line": 152,
+      "end_line": 153,
+      "callee": "gtx.handle.graph.context",
+      "enclosing": "_context_tool.GraphContext",
+      "expression": "gtx.handle.graph.context(\n                _selector(file, symbol, line), limits=ContextLimits(**_CONTEXT_LIMITS))"
+    },
+    {
+      "line": 157,
+      "end_line": 157,
+      "callee": "_ref",
+      "enclosing": "_context_tool.GraphContext",
+      "expression": "_ref(res.symbol)"
+    },
+    {
+      "line": 158,
+      "end_line": 158,
+      "callee": "_refs",
+      "enclosing": "_context_tool.GraphContext",
+      "expression": "_refs(res.callers)"
+    },
+    {
+      "line": 159,
+      "end_line": 159,
+      "callee": "_refs",
+      "enclosing": "_context_tool.GraphContext",
+      "expression": "_refs(res.callees)"
+    },
+    {
+      "line": 160,
+      "end_line": 160,
+      "callee": "_refs",
+      "enclosing": "_context_tool.GraphContext",
+      "expression": "_refs(res.imports)"
+    },
+    {
+      "line": 161,
+      "end_line": 161,
+      "callee": "_refs",
+      "enclosing": "_context_tool.GraphContext",
+      "expression": "_refs(res.implementors)"
+    },
+    {
+      "line": 162,
+      "end_line": 162,
+      "callee": "_paths",
+      "enclosing": "_context_tool.GraphContext",
+      "expression": "_paths(res.call_paths)"
+    },
+    {
+      "line": 177,
+      "end_line": 177,
+      "callee": "str(direction).lower().startswith",
+      "enclosing": "_impact_tool.GraphImpact",
+      "expression": "str(direction).lower().startswith(\"down\")"
+    },
+    {
+      "line": 180,
+      "end_line": 181,
+      "callee": "gtx.handle.graph.impact",
+      "enclosing": "_impact_tool.GraphImpact",
+      "expression": "gtx.handle.graph.impact(\n                _selector(file, symbol, line), want, limits=ImpactLimits(**_IMPACT_LIMITS))"
+    },
+    {
+      "line": 186,
+      "end_line": 186,
+      "callee": "_ref",
+      "enclosing": "_impact_tool.GraphImpact",
+      "expression": "_ref(res.symbol)"
+    },
+    {
+      "line": 189,
+      "end_line": 189,
+      "callee": "bool",
+      "enclosing": "_impact_tool.GraphImpact",
+      "expression": "bool(affected)"
+    },
+    {
+      "line": 193,
+      "end_line": 193,
+      "callee": "_paths",
+      "enclosing": "_impact_tool.GraphImpact",
+      "expression": "_paths(res.paths)"
+    },
+    {
+      "line": 264,
+      "end_line": 264,
+      "callee": "_community_files(gtx.ctx).get",
+      "enclosing": "_sinks_in_community_tool.GraphSinksInCommunity",
+      "expression": "_community_files(gtx.ctx).get(community, ())"
+    },
+    {
+      "line": 296,
+      "end_line": 296,
+      "callee": "ValueError",
+      "enclosing": "register_graph_tools",
+      "expression": "ValueError(f\"graph tool already registered: {name}\")"
+    },
+    {
+      "line": 317,
+      "end_line": 317,
+      "callee": "registered.items",
+      "enclosing": "_graph_tools",
+      "expression": "registered.items()"
+    },
+    {
+      "line": 327,
+      "end_line": 327,
+      "callee": "_graph_tools",
+      "enclosing": "build_graph_tool_builder._build",
+      "expression": "_graph_tools(ctx, set(options.fact_tools))"
+    },
+    {
+      "line": 77,
+      "end_line": 77,
+      "callee": "_refs",
+      "enclosing": "_paths",
+      "expression": "_refs(getattr(p, \"nodes\", ()) or getattr(p, \"entities\", ()))"
+    },
+    {
+      "line": 132,
+      "end_line": 132,
+      "callee": "getattr",
+      "enclosing": "_community_files",
+      "expression": "getattr(ctx, \"modules\", None)"
+    },
+    {
+      "line": 153,
+      "end_line": 153,
+      "callee": "_selector",
+      "enclosing": "_context_tool.GraphContext",
+      "expression": "_selector(file, symbol, line)"
+    },
+    {
+      "line": 155,
+      "end_line": 155,
+      "callee": "_resolve_error",
+      "enclosing": "_context_tool.GraphContext",
+      "expression": "_resolve_error(file, symbol, exc)"
+    },
+    {
+      "line": 181,
+      "end_line": 181,
+      "callee": "_selector",
+      "enclosing": "_impact_tool.GraphImpact",
+      "expression": "_selector(file, symbol, line)"
+    },
+    {
+      "line": 183,
+      "end_line": 183,
+      "callee": "_resolve_error",
+      "enclosing": "_impact_tool.GraphImpact",
+      "expression": "_resolve_error(file, symbol, exc)"
+    },
+    {
+      "line": 208,
+      "end_line": 208,
+      "callee": "_qname",
+      "enclosing": "_neighbors_tool.GraphNeighbors",
+      "expression": "_qname(r.to_dict())"
+    },
+    {
+      "line": 211,
+      "end_line": 211,
+      "callee": "_cypher_error",
+      "enclosing": "_neighbors_tool.GraphNeighbors",
+      "expression": "_cypher_error(exc)"
+    },
+    {
+      "line": 213,
+      "end_line": 213,
+      "callee": "_qname",
+      "enclosing": "_neighbors_tool.GraphNeighbors",
+      "expression": "_qname(r.to_dict())"
+    },
+    {
+      "line": 233,
+      "end_line": 233,
+      "callee": "_community_files",
+      "enclosing": "_community_of_tool.GraphCommunityOf",
+      "expression": "_community_files(gtx.ctx)"
+    },
+    {
+      "line": 249,
+      "end_line": 249,
+      "callee": "gtx.handle.graph.cypher",
+      "enclosing": "_importers_tool.GraphImporters",
+      "expression": "gtx.handle.graph.cypher(_IMPORTERS_QUERY, {\"file\": file})"
+    },
+    {
+      "line": 251,
+      "end_line": 251,
+      "callee": "_cypher_error",
+      "enclosing": "_importers_tool.GraphImporters",
+      "expression": "_cypher_error(exc)"
+    },
+    {
+      "line": 252,
+      "end_line": 252,
+      "callee": "isinstance",
+      "enclosing": "_importers_tool.GraphImporters",
+      "expression": "isinstance(p := r.to_dict().get(\"path\"), str)"
+    },
+    {
+      "line": 327,
+      "end_line": 327,
+      "callee": "set",
+      "enclosing": "build_graph_tool_builder._build",
+      "expression": "set(options.fact_tools)"
+    },
+    {
+      "line": 72,
+      "end_line": 72,
+      "callee": "_ref",
+      "enclosing": "_refs",
+      "expression": "_ref(e)"
+    },
+    {
+      "line": 95,
+      "end_line": 95,
+      "callee": "type",
+      "enclosing": "_resolve_error",
+      "expression": "type(exc)"
+    },
+    {
+      "line": 100,
+      "end_line": 100,
+      "callee": "type",
+      "enclosing": "_cypher_error",
+      "expression": "type(exc)"
+    },
+    {
+      "line": 106,
+      "end_line": 106,
+      "callee": "result.values",
+      "enclosing": "_is_empty_result",
+      "expression": "result.values()"
+    },
+    {
+      "line": 106,
+      "end_line": 106,
+      "callee": "isinstance",
+      "enclosing": "_is_empty_result",
+      "expression": "isinstance(v, list)"
+    },
+    {
+      "line": 153,
+      "end_line": 153,
+      "callee": "ContextLimits",
+      "enclosing": "_context_tool.GraphContext",
+      "expression": "ContextLimits(**_CONTEXT_LIMITS)"
+    },
+    {
+      "line": 177,
+      "end_line": 177,
+      "callee": "str(direction).lower",
+      "enclosing": "_impact_tool.GraphImpact",
+      "expression": "str(direction).lower()"
+    },
+    {
+      "line": 181,
+      "end_line": 181,
+      "callee": "ImpactLimits",
+      "enclosing": "_impact_tool.GraphImpact",
+      "expression": "ImpactLimits(**_IMPACT_LIMITS)"
+    },
+    {
+      "line": 208,
+      "end_line": 208,
+      "callee": "r.to_dict",
+      "enclosing": "_neighbors_tool.GraphNeighbors",
+      "expression": "r.to_dict()"
+    },
+    {
+      "line": 213,
+      "end_line": 213,
+      "callee": "r.to_dict",
+      "enclosing": "_neighbors_tool.GraphNeighbors",
+      "expression": "r.to_dict()"
+    },
+    {
+      "line": 217,
+      "end_line": 217,
+      "callee": "_cypher_error",
+      "enclosing": "_neighbors_tool.GraphNeighbors",
+      "expression": "_cypher_error(exc)"
+    },
+    {
+      "line": 264,
+      "end_line": 264,
+      "callee": "_community_files",
+      "enclosing": "_sinks_in_community_tool.GraphSinksInCommunity",
+      "expression": "_community_files(gtx.ctx)"
+    },
+    {
+      "line": 267,
+      "end_line": 267,
+      "callee": "getattr",
+      "enclosing": "_sinks_in_community_tool.GraphSinksInCommunity",
+      "expression": "getattr(gtx.ctx, \"unsafe_sinks\", None)"
+    },
+    {
+      "line": 77,
+      "end_line": 77,
+      "callee": "getattr",
+      "enclosing": "_paths",
+      "expression": "getattr(p, \"nodes\", ())"
+    },
+    {
+      "line": 77,
+      "end_line": 77,
+      "callee": "getattr",
+      "enclosing": "_paths",
+      "expression": "getattr(p, \"entities\", ())"
+    },
+    {
+      "line": 208,
+      "end_line": 209,
+      "callee": "gtx.handle.graph.cypher",
+      "enclosing": "_neighbors_tool.GraphNeighbors",
+      "expression": "gtx.handle.graph.cypher(\n                _NEIGHBORS_QUERY, params)"
+    },
+    {
+      "line": 213,
+      "end_line": 214,
+      "callee": "gtx.handle.graph.cypher",
+      "enclosing": "_neighbors_tool.GraphNeighbors",
+      "expression": "gtx.handle.graph.cypher(\n                _CALLERS_QUERY, params)"
+    },
+    {
+      "line": 252,
+      "end_line": 252,
+      "callee": "r.to_dict().get",
+      "enclosing": "_importers_tool.GraphImporters",
+      "expression": "r.to_dict().get(\"path\")"
+    },
+    {
+      "line": 177,
+      "end_line": 177,
+      "callee": "str",
+      "enclosing": "_impact_tool.GraphImpact",
+      "expression": "str(direction)"
+    },
+    {
+      "line": 252,
+      "end_line": 252,
+      "callee": "r.to_dict",
+      "enclosing": "_importers_tool.GraphImporters",
+      "expression": "r.to_dict()"
+    }
+  ],
+  "imports": [
+    {
+      "line": 16,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 18,
+      "source_expression": "import functools",
+      "targets": [
+        "functools"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "from collections.abc import Callable, Iterable, Mapping, Sequence",
+      "targets": [
+        "collections.abc",
+        "collections.abc.Callable",
+        "collections.abc.Iterable",
+        "collections.abc.Mapping",
+        "collections.abc.Sequence"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "from dataclasses import dataclass",
+      "targets": [
+        "dataclasses",
+        "dataclasses.dataclass"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "from context_graph_sdk import SymbolAmbiguousError, SymbolSelector",
+      "targets": [
+        "context_graph_sdk",
+        "context_graph_sdk.SymbolAmbiguousError",
+        "context_graph_sdk.SymbolSelector"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 23,
+      "source_expression": "from langchain_core.tools import BaseTool, tool",
+      "targets": [
+        "langchain_core.tools",
+        "langchain_core.tools.BaseTool",
+        "langchain_core.tools.tool"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 25,
+      "source_expression": "from vvaharness.backends.harness import StreamingOptions",
+      "targets": [
+        "vvaharness.backends.harness",
+        "vvaharness.backends.harness.StreamingOptions"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 26,
+      "source_expression": "from vvaharness.backends.harness.deepagents.tools import build_tools as build_reader_tools",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.tools",
+        "vvaharness.backends.harness.deepagents.tools.build_tools"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/tools.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 29,
+      "source_expression": "from vvaharness.codegraph.handle import GraphHandle",
+      "targets": [
+        "vvaharness.codegraph.handle",
+        "vvaharness.codegraph.handle.GraphHandle"
+      ],
+      "local_source_paths": [
+        "vvaharness/codegraph/handle.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 30,
+      "source_expression": "from vvaharness.models import ContextPackage",
+      "targets": [
+        "vvaharness.models",
+        "vvaharness.models.ContextPackage"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 31,
+      "source_expression": "from vvaharness.util.counters import COUNTERS",
+      "targets": [
+        "vvaharness.util.counters",
+        "vvaharness.util.counters.COUNTERS"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/counters.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 150,
+      "source_expression": "from context_graph_sdk import ContextLimits",
+      "targets": [
+        "context_graph_sdk",
+        "context_graph_sdk.ContextLimits"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 176,
+      "source_expression": "from context_graph_sdk import ImpactDirection, ImpactLimits",
+      "targets": [
+        "context_graph_sdk",
+        "context_graph_sdk.ImpactDirection",
+        "context_graph_sdk.ImpactLimits"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

@@ -1,0 +1,3684 @@
+{
+  "source": "vvaharness/pipeline/stages/s8_chain.py",
+  "sha256": "911e3281266ec19ab3e90f737efe9df1eb7acab728448d5ef2b73446a6b513b1",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\n\"\"\"Step 8 — deterministic ranking floor plus model-optional chain/narrative enrichment; any enrichment failure still ships the ranked report.\"\"\"\nfrom __future__ import annotations\n\nfrom typing import Any\n\nfrom vvaharness.util import logs\n\nfrom vvaharness.backends.harness.models import TruncatedResponseError, is_halt_error\nfrom vvaharness.backends.llm.models import ModelRefusal\nfrom vvaharness.models import (\n    ContextPackage,\n    DroppedFinding,\n    FinalReport,\n    Finding,\n    ScanMetrics,\n)\nfrom vvaharness.pipeline.stages.s8.outcomes import (\n    ChainReport,\n    deterministic_report,\n    hydrate_report,\n    parse_chain_reply,\n    templated_summary,\n)\nfrom vvaharness.pipeline.stages.s8.session import (\n    chain_call,\n    repair_call,\n    repair_fits,\n    repairable,\n)\nfrom vvaharness.pipeline.stages.s8.window import half_window, select_window\nfrom vvaharness.report.redact import redact\nfrom vvaharness.util import console\nfrom vvaharness.util import errlog as _errlog\nfrom vvaharness.util.counters import COUNTERS\nfrom vvaharness.util.events import Event\nfrom vvaharness.util.response_quality import is_truncated_without_retry\n\nlog = logs.get_logger(__name__)\n\n_RANKED_INVALID = \"s8_ranked_findings_entry_invalid\"\n\n\ndef _redacted_err(e: BaseException, cap: int = 400) -> str:\n    \"\"\"Returns exception text for the delivered report, redacting the full text before capping so the cut cannot bisect a secret.\"\"\"\n    return redact(str(e))[:cap]\n\n\ndef _enrichment_failure_text(e: BaseException) -> str:\n    \"\"\"The ``degraded_reason`` clause for a chain call that never returned: a plain sentence for\n    a refusal (its exception text already names route/category/stage, which otherwise leaks\n    into the shipped report verbatim), the redacted exception text for every other failure.\"\"\"\n    if isinstance(e, ModelRefusal):\n        return \"no chain analysis: the chain model refused the request\"\n    return f\"chain call failed ({_redacted_err(e)})\"\n\n\ndef _chain_call_with_half_window_retry(\n        sub: list[Finding], labels: list[str], window: list[int],\n        findings: list[Finding], ctx: ContextPackage,\n        cfg) -> tuple[str, list[int], list[str], int]:\n    \"\"\"One ``chain_call``; on an at-cap clip (``TruncatedResponseError``, ``retried=0``) halves\n    the rank-prefix *window* and resends ONCE with ``allow_resend=False`` -- the resend changes\n    the input size, not the effort tier, and vetoes its own drop-tier resend so the stage still\n    makes at most one resend of its own. Returns ``(raw, window, labels, invalid0)`` for\n    whichever call succeeded, *invalid0* being the salvage counter just before that call;\n    re-raises any other failure, including a second clip the halving cannot shrink.\"\"\"\n    # Before each call, not the parse: sdk/deepagents validate the reply inside the backend\n    invalid0 = COUNTERS.get(_RANKED_INVALID)\n    try:\n        return chain_call(sub, ctx, cfg, labels=labels), window, labels, invalid0\n    except TruncatedResponseError as e:\n        if not is_truncated_without_retry(e):\n            raise\n        half = half_window(findings, window)\n        if half == window:\n            # Already down to the smallest window a resend could try: nothing left to shrink.\n            raise\n        console.write(f\"  [s8] clipped at the output cap; retrying once over half the \"\n                      f\"window ({len(half)} of {len(window)} findings)\")\n        half_sub = [findings[i] for i in half]\n        half_labels = [f\"f{i}\" for i in half]\n        invalid0 = COUNTERS.get(_RANKED_INVALID)\n        raw = chain_call(half_sub, ctx, cfg, labels=half_labels, allow_resend=False)\n        return raw, half, half_labels, invalid0\n\n\ndef _persist_raw(text: str, suffix: str) -> None:\n    \"\"\"Writes *text*, redacted, beside the errlog as ``<stem><suffix>``; a write failure only warns.\"\"\"\n    try:\n        errp = _errlog.current_path()\n        stem = (errp.name[:-len(\"_errors.jsonl\")]\n                if errp.name.endswith(\"_errors.jsonl\") else errp.stem)\n        raw_path = errp.parent / f\"{stem}{suffix}\"\n        raw_path.parent.mkdir(parents=True, exist_ok=True)\n        raw_path.write_text(redact(text), encoding=\"utf-8\")\n    except OSError as e:\n        log.warning(Event.S8_RAW_PERSIST_FAILED, detail=redact(str(e)))\n\n\ndef _json_repair(raw: object, err: Exception, ctx: ContextPackage,\n                 cfg) -> tuple[ChainReport | None, str | None, dict[str, Any]]:\n    \"\"\"One json-repair re-ask for a reply the gate admits: ``(report, repaired_raw, {})`` on\n    success, else ``(None, None, extra)`` where *extra* carries the repair's own failure for the\n    ONE errlog row the caller writes about the original error; halt errors re-raise.\"\"\"\n    if not repairable(raw):\n        return None, None, {}\n    text = str(raw)\n    if not repair_fits(text, cfg):\n        console.write(\"  [s8] reply did not parse and is too large to restate under the \"\n                      \"replay cap; no json-repair re-ask\")\n        COUNTERS.bump(\"s8_parse_repair_skipped_oversize\")\n        return None, None, {}\n    console.write(\"  [s8] reply did not parse; one json-repair re-ask\")\n    COUNTERS.bump(\"s8_parse_repair_attempted\")\n    repaired: str | None = None\n    try:\n        repaired = repair_call(text, err, ctx, cfg)\n        data = parse_chain_reply(repaired)\n    except Exception as e2:  # provider errors are heterogeneous\n        if is_halt_error(e2):\n            raise\n        extra: dict[str, Any] = {\"repair_error\": redact(str(e2))[:400]}\n        if isinstance(repaired, str):\n            # Escaped like raw_head, after redact() and the slice\n            extra[\"repair_head\"] = redact(repaired)[:500].replace(\"\\n\", \"\\\\n\")\n        return None, None, extra\n    COUNTERS.bump(\"s8_parse_repair_recovered\")\n    _persist_raw(repaired, \"_s8_raw_repaired.txt\")\n    return data, repaired, {}\n\n\ndef run(findings: list[Finding], ctx: ContextPackage, cfg, *,\n        dropped: list[DroppedFinding] | None = None,\n        raw_findings_count: int = 0,\n        metrics: ScanMetrics | None = None) -> FinalReport:\n    dropped = dropped or []\n    if not findings:\n        # \"read nothing\" and \"found nothing\" must not share a summary.\n        empty = metrics is not None and not metrics.total_files_in_scope\n        return FinalReport(\n            repo_root=ctx.repo_root,\n            findings=[],\n            chains=[],\n            dropped=dropped,\n            raw_findings_count=raw_findings_count,\n            metrics=metrics,\n            summary=(\"0 files analysed — no conclusion can be drawn about \"\n                     \"this repository; check the S1 file inventory and \"\n                     \"exclusions.\" if empty else\n                     \"No findings survived adversarial verification.\"),\n            degraded=empty,\n            enrichment_unavailable=empty,\n            degraded_reason=(\"scope was empty: 0 files reached analysis\"\n                             if empty else \"\"),\n        )\n\n    # Windowing is a guard rail: at default budgets it seldom triggers.\n    try:\n        window = select_window(findings, ctx, cfg)\n    except Exception as e:\n        # Must never fail the stage: a garbage overlay (\"64k\") falls back to the un-windowed call\n        log.warning(Event.S8_WINDOW_SELECTION_FAILED, detail=redact(str(e)))\n        # recovered: nothing is lost, the un-windowed call still proceeds.\n        _errlog.log(\"s8\", \"chain-window\", e, recovered=True)\n        window = list(range(len(findings)))\n    if not window:\n        # A model that saw zero findings must not author the report.\n        return deterministic_report(\n            ctx, findings, dropped, raw_findings_count, metrics,\n            enrichment_failure=(\"prompt_token_budget admits no findings \"\n                                \"into the enrichment window\"),\n        )\n    sub = [findings[i] for i in window]\n    labels = [f\"f{i}\" for i in window]\n\n    try:\n        raw, window, labels, invalid0 = _chain_call_with_half_window_retry(\n            sub, labels, window, findings, ctx, cfg)\n    except Exception as e:  # provider errors are heterogeneous\n        if is_halt_error(e):\n            raise\n        log.warning(Event.S8_CALL_FAILED, detail=redact(str(e)))\n        _errlog.log(\"s8\", \"chain\", e)\n        return deterministic_report(\n            ctx, findings, dropped, raw_findings_count, metrics,\n            enrichment_failure=_enrichment_failure_text(e),\n        )\n    windowed = len(window) < len(findings)\n\n    # Persist the raw BEFORE parsing, so a parse failure is salvageable without re-spending the call\n    _persist_raw(raw or \"\", \"_s8_raw.txt\")\n\n    # ValueError covers no-JSON and off-schema (both subclass it); TypeError is a None/bytes backend\n    try:\n        data = parse_chain_reply(raw)\n    except (ValueError, TypeError) as e:\n        # The discarded reply's validation must not count against the repaired one\n        invalid0 = COUNTERS.get(_RANKED_INVALID)\n        repaired, repaired_raw, repair_extra = _json_repair(raw, e, ctx, cfg)\n        if repaired is None:\n            # redact() BEFORE the slice: slicing first could bisect a secret past matching.\n            safe_raw = redact(raw) if isinstance(raw, str) else \"\"\n            head = safe_raw[:500].replace(\"\\n\", \"\\\\n\")\n            tail = safe_raw[-200:].replace(\"\\n\", \"\\\\n\")\n            log.warning(Event.S8_RESPONSE_UNPARSEABLE, detail=redact(str(e)))\n            # ONE row, about the ORIGINAL reply (what _s8_raw.txt holds); a repair annotates it\n            _errlog.log(\"s8\", \"chain\", e, raw_head=head, raw_tail=tail, **repair_extra)\n            console.write(f\"  [s8] raw[:500]  = {head!r}\")\n            console.write(f\"  [s8] raw[-200:] = {tail!r}\")\n            return deterministic_report(\n                ctx, findings, dropped, raw_findings_count, metrics,\n                enrichment_failure=f\"reply unparseable ({_redacted_err(e)})\",\n            )\n        data = repaired\n        # Later rows quote the reply that shipped, not the one the repair replaced\n        raw = repaired_raw\n\n    # ranked_finding stamps severity in place, so restore before the floor; id()-keyed: value __eq__\n    original_severity = {id(f): f.severity for f in findings}\n    try:\n        report, covered = hydrate_report(\n            data, ctx, findings, dropped, raw_findings_count, metrics,\n            window=set(window) if windowed else None, cfg=cfg)\n    except Exception as e:  # hydration touches model-chosen ids\n        for f in findings:\n            f.severity = original_severity[id(f)]\n        log.warning(Event.S8_HYDRATION_FAILED, detail=redact(str(e)))\n        _errlog.log(\"s8\", \"chain-hydrate\", e)\n        return deterministic_report(\n            ctx, findings, dropped, raw_findings_count, metrics,\n            enrichment_failure=f\"hydration failed ({_redacted_err(e)})\",\n        )\n\n    if windowed:\n        # A windowed model saw part of the report, so its prose is not executive over all of it\n        report.summary = f\"{report.summary}\\n\\n{templated_summary(report.findings)}\"\n\n    # degraded stays False here, so only the line or row below shows it; counted against SHOWN\n    if len(covered) < len(window):\n        head = redact(raw)[:500].replace(\"\\n\", \"\\\\n\") if isinstance(raw, str) else \"\"\n        missing = len(window) - len(covered)\n        msg = (f\"chain reply ranked {len(covered)}/{len(window)} \"\n              f\"findings it was shown; {missing} ship unranked\")\n        # The id filters dropped nothing and no entry was unreadable: the reply follows the\n        # schema whatever its length; errlog only when data is lost\n        nothing_dropped = (len(data.ranked_findings) == len(covered)\n                           and COUNTERS.get(_RANKED_INVALID) == invalid0)\n        if nothing_dropped:\n            console.counts(\"s8\", \"sparse ranking (by design); shipping unranked\",\n                           ranked=len(covered), shown=len(window), unranked=missing)\n            COUNTERS.bump(\"s8_sparse_ranking_recovered\")\n        else:\n            log.warning(Event.S8_NO_RANKED_FINDINGS, ranked=len(covered), shown=len(window),\n                        unranked=missing, raw_head=head)\n            _errlog.log(\"s8\", \"chain\", msg, raw_head=head)\n\n    console.write(f\"  [s8] done: {len(report.findings)} ranked findings, \"\n                  f\"{len(report.chains)} chains, \"\n                  f\"{report.chains_dropped} chains_dropped\")\n    return report\n",
+  "literals": {
+    "source_literal_16_0": {
+      "source": "vvaharness/pipeline/stages/s8_chain.py",
+      "line_start": 16,
+      "line_end": 16,
+      "value": "Step 8 — deterministic ranking floor plus model-optional chain/narrative enrichment; any enrichment failure still ships the ranked report.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_59_4": {
+      "source": "vvaharness/pipeline/stages/s8_chain.py",
+      "line_start": 59,
+      "line_end": 59,
+      "value": "Returns exception text for the delivered report, redacting the full text before capping so the cut cannot bisect a secret.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_64_4": {
+      "source": "vvaharness/pipeline/stages/s8_chain.py",
+      "line_start": 64,
+      "line_end": 66,
+      "value": "The ``degraded_reason`` clause for a chain call that never returned: a plain sentence for\n    a refusal (its exception text already names route/category/stage, which otherwise leaks\n    into the shipped report verbatim), the redacted exception text for every other failure.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_69_11": {
+      "source": "vvaharness/pipeline/stages/s8_chain.py",
+      "line_start": 69,
+      "line_end": 69,
+      "source_expression": "f\"chain call failed ({_redacted_err(e)})\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_76_4": {
+      "source": "vvaharness/pipeline/stages/s8_chain.py",
+      "line_start": 76,
+      "line_end": 81,
+      "value": "One ``chain_call``; on an at-cap clip (``TruncatedResponseError``, ``retried=0``) halves\n    the rank-prefix *window* and resends ONCE with ``allow_resend=False`` -- the resend changes\n    the input size, not the effort tier, and vetoes its own drop-tier resend so the stage still\n    makes at most one resend of its own. Returns ``(raw, window, labels, invalid0)`` for\n    whichever call succeeded, *invalid0* being the salvage counter just before that call;\n    re-raises any other failure, including a second clip the halving cannot shrink.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_93_22": {
+      "source": "vvaharness/pipeline/stages/s8_chain.py",
+      "line_start": 93,
+      "line_end": 94,
+      "source_expression": "f\"  [s8] clipped at the output cap; retrying once over half the \"\n                      f\"window ({len(half)} of {len(window)} findings)\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_96_23": {
+      "source": "vvaharness/pipeline/stages/s8_chain.py",
+      "line_start": 96,
+      "line_end": 96,
+      "source_expression": "f\"f{i}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_103_4": {
+      "source": "vvaharness/pipeline/stages/s8_chain.py",
+      "line_start": 103,
+      "line_end": 103,
+      "value": "Writes *text*, redacted, beside the errlog as ``<stem><suffix>``; a write failure only warns.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_108_33": {
+      "source": "vvaharness/pipeline/stages/s8_chain.py",
+      "line_start": 108,
+      "line_end": 108,
+      "source_expression": "f\"{stem}{suffix}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_117_4": {
+      "source": "vvaharness/pipeline/stages/s8_chain.py",
+      "line_start": 117,
+      "line_end": 119,
+      "value": "One json-repair re-ask for a reply the gate admits: ``(report, repaired_raw, {})`` on\n    success, else ``(None, None, extra)`` where *extra* carries the repair's own failure for the\n    ONE errlog row the caller writes about the original error; halt errors re-raise.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_140_66": {
+      "source": "vvaharness/pipeline/stages/s8_chain.py",
+      "line_start": 140,
+      "line_end": 140,
+      "value": "\n",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_189_14": {
+      "source": "vvaharness/pipeline/stages/s8_chain.py",
+      "line_start": 189,
+      "line_end": 189,
+      "source_expression": "f\"f{i}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_218_42": {
+      "source": "vvaharness/pipeline/stages/s8_chain.py",
+      "line_start": 218,
+      "line_end": 218,
+      "value": "\n",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_219_43": {
+      "source": "vvaharness/pipeline/stages/s8_chain.py",
+      "line_start": 219,
+      "line_end": 219,
+      "value": "\n",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_223_26": {
+      "source": "vvaharness/pipeline/stages/s8_chain.py",
+      "line_start": 223,
+      "line_end": 223,
+      "source_expression": "f\"  [s8] raw[:500]  = {head!r}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_224_26": {
+      "source": "vvaharness/pipeline/stages/s8_chain.py",
+      "line_start": 224,
+      "line_end": 224,
+      "source_expression": "f\"  [s8] raw[-200:] = {tail!r}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_227_35": {
+      "source": "vvaharness/pipeline/stages/s8_chain.py",
+      "line_start": 227,
+      "line_end": 227,
+      "source_expression": "f\"reply unparseable ({_redacted_err(e)})\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_246_31": {
+      "source": "vvaharness/pipeline/stages/s8_chain.py",
+      "line_start": 246,
+      "line_end": 246,
+      "source_expression": "f\"hydration failed ({_redacted_err(e)})\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_251_25": {
+      "source": "vvaharness/pipeline/stages/s8_chain.py",
+      "line_start": 251,
+      "line_end": 251,
+      "source_expression": "f\"{report.summary}\\n\\n{templated_summary(report.findings)}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_255_41": {
+      "source": "vvaharness/pipeline/stages/s8_chain.py",
+      "line_start": 255,
+      "line_end": 255,
+      "value": "\n",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_257_15": {
+      "source": "vvaharness/pipeline/stages/s8_chain.py",
+      "line_start": 257,
+      "line_end": 258,
+      "source_expression": "f\"chain reply ranked {len(covered)}/{len(window)} \"\n              f\"findings it was shown; {missing} ship unranked\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_272_18": {
+      "source": "vvaharness/pipeline/stages/s8_chain.py",
+      "line_start": 272,
+      "line_end": 274,
+      "source_expression": "f\"  [s8] done: {len(report.findings)} ranked findings, \"\n                  f\"{len(report.chains)} chains, \"\n                  f\"{report.chains_dropped} chains_dropped\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "value": "Step 8 — deterministic ranking floor plus model-optional chain/narrative enrichment; any enrichment failure still ships the ranked report.",
+      "context": "literal"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 18,
+      "value": "s8_ranked_findings_entry_invalid",
+      "context": "literal"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 4,
+      "value": "Returns exception text for the delivered report, redacting the full text before capping so the cut cannot bisect a secret.",
+      "context": "literal"
+    },
+    {
+      "line_start": 64,
+      "line_end": 66,
+      "column": 4,
+      "value": "The ``degraded_reason`` clause for a chain call that never returned: a plain sentence for\n    a refusal (its exception text already names route/category/stage, which otherwise leaks\n    into the shipped report verbatim), the redacted exception text for every other failure.",
+      "context": "literal"
+    },
+    {
+      "line_start": 76,
+      "line_end": 81,
+      "column": 4,
+      "value": "One ``chain_call``; on an at-cap clip (``TruncatedResponseError``, ``retried=0``) halves\n    the rank-prefix *window* and resends ONCE with ``allow_resend=False`` -- the resend changes\n    the input size, not the effort tier, and vetoes its own drop-tier resend so the stage still\n    makes at most one resend of its own. Returns ``(raw, window, labels, invalid0)`` for\n    whichever call succeeded, *invalid0* being the salvage counter just before that call;\n    re-raises any other failure, including a second clip the halving cannot shrink.",
+      "context": "literal"
+    },
+    {
+      "line_start": 103,
+      "line_end": 103,
+      "column": 4,
+      "value": "Writes *text*, redacted, beside the errlog as ``<stem><suffix>``; a write failure only warns.",
+      "context": "literal"
+    },
+    {
+      "line_start": 117,
+      "line_end": 119,
+      "column": 4,
+      "value": "One json-repair re-ask for a reply the gate admits: ``(report, repaired_raw, {})`` on\n    success, else ``(None, None, extra)`` where *extra* carries the repair's own failure for the\n    ONE errlog row the caller writes about the original error; halt errors re-raise.",
+      "context": "literal"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 15,
+      "value": "no chain analysis: the chain model refused the request",
+      "context": "literal"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 13,
+      "value": "chain call failed (",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 50,
+      "value": ")",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 128,
+      "line_end": 128,
+      "column": 18,
+      "value": "  [s8] reply did not parse; one json-repair re-ask",
+      "context": "literal"
+    },
+    {
+      "line_start": 129,
+      "line_end": 129,
+      "column": 18,
+      "value": "s8_parse_repair_attempted",
+      "context": "literal"
+    },
+    {
+      "line_start": 142,
+      "line_end": 142,
+      "column": 18,
+      "value": "s8_parse_repair_recovered",
+      "context": "literal"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 27,
+      "value": "_s8_raw_repaired.txt",
+      "context": "literal"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 28,
+      "value": "_s8_raw.txt",
+      "context": "literal"
+    },
+    {
+      "line_start": 124,
+      "line_end": 125,
+      "column": 22,
+      "value": "  [s8] reply did not parse and is too large to restate under the replay cap; no json-repair re-ask",
+      "context": "literal"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 22,
+      "value": "s8_parse_repair_skipped_oversize",
+      "context": "literal"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 16,
+      "value": "f",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 24,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 251,
+      "line_end": 251,
+      "column": 43,
+      "value": "\n\n",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 255,
+      "line_end": 255,
+      "column": 83,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 257,
+      "line_end": 257,
+      "column": 17,
+      "value": "chain reply ranked ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 257,
+      "line_end": 257,
+      "column": 50,
+      "value": "/",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 257,
+      "line_end": 258,
+      "column": 64,
+      "value": " findings it was shown; ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 258,
+      "line_end": 258,
+      "column": 48,
+      "value": " ship unranked",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 272,
+      "line_end": 272,
+      "column": 20,
+      "value": "  [s8] done: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 272,
+      "line_end": 272,
+      "column": 55,
+      "value": " ranked findings, ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 273,
+      "line_end": 273,
+      "column": 40,
+      "value": " chains, ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 274,
+      "line_end": 274,
+      "column": 43,
+      "value": " chains_dropped",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 107,
+      "line_end": 107,
+      "column": 38,
+      "value": "_errors.jsonl",
+      "context": "literal"
+    },
+    {
+      "line_start": 110,
+      "line_end": 110,
+      "column": 51,
+      "value": "utf-8",
+      "context": "literal"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 33,
+      "value": "repair_error",
+      "context": "literal"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 20,
+      "value": "s8",
+      "context": "literal"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 26,
+      "value": "chain-window",
+      "context": "literal"
+    },
+    {
+      "line_start": 185,
+      "line_end": 186,
+      "column": 32,
+      "value": "prompt_token_budget admits no findings into the enrichment window",
+      "context": "literal"
+    },
+    {
+      "line_start": 198,
+      "line_end": 198,
+      "column": 20,
+      "value": "s8",
+      "context": "literal"
+    },
+    {
+      "line_start": 198,
+      "line_end": 198,
+      "column": 26,
+      "value": "chain",
+      "context": "literal"
+    },
+    {
+      "line_start": 243,
+      "line_end": 243,
+      "column": 20,
+      "value": "s8",
+      "context": "literal"
+    },
+    {
+      "line_start": 243,
+      "line_end": 243,
+      "column": 26,
+      "value": "chain-hydrate",
+      "context": "literal"
+    },
+    {
+      "line_start": 255,
+      "line_end": 255,
+      "column": 41,
+      "value": "\n",
+      "context": "literal"
+    },
+    {
+      "line_start": 255,
+      "line_end": 255,
+      "column": 47,
+      "value": "\\n",
+      "context": "literal"
+    },
+    {
+      "line_start": 264,
+      "line_end": 264,
+      "column": 27,
+      "value": "s8",
+      "context": "literal"
+    },
+    {
+      "line_start": 264,
+      "line_end": 264,
+      "column": 33,
+      "value": "sparse ranking (by design); shipping unranked",
+      "context": "literal"
+    },
+    {
+      "line_start": 266,
+      "line_end": 266,
+      "column": 26,
+      "value": "s8_sparse_ranking_recovered",
+      "context": "literal"
+    },
+    {
+      "line_start": 270,
+      "line_end": 270,
+      "column": 24,
+      "value": "s8",
+      "context": "literal"
+    },
+    {
+      "line_start": 270,
+      "line_end": 270,
+      "column": 30,
+      "value": "chain",
+      "context": "literal"
+    },
+    {
+      "line_start": 93,
+      "line_end": 94,
+      "column": 24,
+      "value": "  [s8] clipped at the output cap; retrying once over half the window (",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 43,
+      "value": " of ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 60,
+      "value": " findings)",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 25,
+      "value": "f",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 18,
+      "value": "repair_head",
+      "context": "literal"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 66,
+      "value": "\n",
+      "context": "literal"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 72,
+      "value": "\\n",
+      "context": "literal"
+    },
+    {
+      "line_start": 162,
+      "line_end": 164,
+      "column": 21,
+      "value": "0 files analysed — no conclusion can be drawn about this repository; check the S1 file inventory and exclusions.",
+      "context": "literal"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 21,
+      "value": "No findings survived adversarial verification.",
+      "context": "literal"
+    },
+    {
+      "line_start": 168,
+      "line_end": 168,
+      "column": 29,
+      "value": "scope was empty: 0 files reached analysis",
+      "context": "literal"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 43,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 217,
+      "line_end": 217,
+      "column": 64,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 218,
+      "line_end": 218,
+      "column": 42,
+      "value": "\n",
+      "context": "literal"
+    },
+    {
+      "line_start": 218,
+      "line_end": 218,
+      "column": 48,
+      "value": "\\n",
+      "context": "literal"
+    },
+    {
+      "line_start": 219,
+      "line_end": 219,
+      "column": 43,
+      "value": "\n",
+      "context": "literal"
+    },
+    {
+      "line_start": 219,
+      "line_end": 219,
+      "column": 49,
+      "value": "\\n",
+      "context": "literal"
+    },
+    {
+      "line_start": 222,
+      "line_end": 222,
+      "column": 24,
+      "value": "s8",
+      "context": "literal"
+    },
+    {
+      "line_start": 222,
+      "line_end": 222,
+      "column": 30,
+      "value": "chain",
+      "context": "literal"
+    },
+    {
+      "line_start": 223,
+      "line_end": 223,
+      "column": 28,
+      "value": "  [s8] raw[:500]  = ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 224,
+      "line_end": 224,
+      "column": 28,
+      "value": "  [s8] raw[-200:] = ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 246,
+      "line_end": 246,
+      "column": 33,
+      "value": "hydration failed (",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 246,
+      "line_end": 246,
+      "column": 69,
+      "value": ")",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 106,
+      "line_end": 106,
+      "column": 32,
+      "value": "_errors.jsonl",
+      "context": "literal"
+    },
+    {
+      "line_start": 227,
+      "line_end": 227,
+      "column": 37,
+      "value": "reply unparseable (",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 227,
+      "line_end": 227,
+      "column": 74,
+      "value": ")",
+      "context": "f-string segment"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 82,
+      "text": "# Before each call, not the parse: sdk/deepagents validate the reply inside the backend"
+    },
+    {
+      "line": 91,
+      "text": "# Already down to the smallest window a resend could try: nothing left to shrink."
+    },
+    {
+      "line": 134,
+      "text": "# provider errors are heterogeneous"
+    },
+    {
+      "line": 139,
+      "text": "# Escaped like raw_head, after redact() and the slice"
+    },
+    {
+      "line": 153,
+      "text": "# \"read nothing\" and \"found nothing\" must not share a summary."
+    },
+    {
+      "line": 172,
+      "text": "# Windowing is a guard rail: at default budgets it seldom triggers."
+    },
+    {
+      "line": 176,
+      "text": "# Must never fail the stage: a garbage overlay (\"64k\") falls back to the un-windowed call"
+    },
+    {
+      "line": 178,
+      "text": "# recovered: nothing is lost, the un-windowed call still proceeds."
+    },
+    {
+      "line": 182,
+      "text": "# A model that saw zero findings must not author the report."
+    },
+    {
+      "line": 194,
+      "text": "# provider errors are heterogeneous"
+    },
+    {
+      "line": 205,
+      "text": "# Persist the raw BEFORE parsing, so a parse failure is salvageable without re-spending the call"
+    },
+    {
+      "line": 208,
+      "text": "# ValueError covers no-JSON and off-schema (both subclass it); TypeError is a None/bytes backend"
+    },
+    {
+      "line": 212,
+      "text": "# The discarded reply's validation must not count against the repaired one"
+    },
+    {
+      "line": 216,
+      "text": "# redact() BEFORE the slice: slicing first could bisect a secret past matching."
+    },
+    {
+      "line": 221,
+      "text": "# ONE row, about the ORIGINAL reply (what _s8_raw.txt holds); a repair annotates it"
+    },
+    {
+      "line": 230,
+      "text": "# Later rows quote the reply that shipped, not the one the repair replaced"
+    },
+    {
+      "line": 233,
+      "text": "# ranked_finding stamps severity in place, so restore before the floor; id()-keyed: value __eq__"
+    },
+    {
+      "line": 239,
+      "text": "# hydration touches model-chosen ids"
+    },
+    {
+      "line": 250,
+      "text": "# A windowed model saw part of the report, so its prose is not executive over all of it"
+    },
+    {
+      "line": 253,
+      "text": "# degraded stays False here, so only the line or row below shows it; counted against SHOWN"
+    },
+    {
+      "line": 259,
+      "text": "# The id filters dropped nothing and no entry was unreadable: the reply follows the"
+    },
+    {
+      "line": 260,
+      "text": "# schema whatever its length; errlog only when data is lost"
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 23,
+      "line_end": 23,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 31,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 32,
+      "line_end": 38,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 39,
+      "line_end": 44,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 45,
+      "line_end": 45,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 46,
+      "line_end": 46,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 47,
+      "line_end": 47,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 48,
+      "line_end": 48,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 49,
+      "line_end": 49,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 50,
+      "line_end": 50,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 51,
+      "line_end": 51,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "Assign",
+      "line_start": 53,
+      "line_end": 53,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "Assign",
+      "line_start": 55,
+      "line_end": 55,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 58,
+      "line_end": 60,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 9
+    },
+    {
+      "kind": "Expr",
+      "line_start": 59,
+      "line_end": 59,
+      "column": 4,
+      "owner": "_redacted_err",
+      "representation_line": 15
+    },
+    {
+      "kind": "Return",
+      "line_start": 60,
+      "line_end": 60,
+      "column": 4,
+      "owner": "_redacted_err",
+      "representation_line": 16
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 63,
+      "line_end": 69,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 20
+    },
+    {
+      "kind": "Expr",
+      "line_start": 64,
+      "line_end": 66,
+      "column": 4,
+      "owner": "_enrichment_failure_text",
+      "representation_line": 26
+    },
+    {
+      "kind": "If",
+      "line_start": 67,
+      "line_end": 68,
+      "column": 4,
+      "owner": "_enrichment_failure_text",
+      "representation_line": 27
+    },
+    {
+      "kind": "Return",
+      "line_start": 68,
+      "line_end": 68,
+      "column": 8,
+      "owner": "_enrichment_failure_text",
+      "representation_line": 29
+    },
+    {
+      "kind": "Return",
+      "line_start": 69,
+      "line_end": 69,
+      "column": 4,
+      "owner": "_enrichment_failure_text",
+      "representation_line": 32
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 72,
+      "line_end": 99,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 36
+    },
+    {
+      "kind": "Expr",
+      "line_start": 76,
+      "line_end": 81,
+      "column": 4,
+      "owner": "_chain_call_with_half_window_retry",
+      "representation_line": 42
+    },
+    {
+      "kind": "Assign",
+      "line_start": 83,
+      "line_end": 83,
+      "column": 4,
+      "owner": "_chain_call_with_half_window_retry",
+      "representation_line": 42
+    },
+    {
+      "kind": "Try",
+      "line_start": 84,
+      "line_end": 99,
+      "column": 4,
+      "owner": "_chain_call_with_half_window_retry",
+      "representation_line": 43
+    },
+    {
+      "kind": "Return",
+      "line_start": 85,
+      "line_end": 85,
+      "column": 8,
+      "owner": "_chain_call_with_half_window_retry",
+      "representation_line": 45
+    },
+    {
+      "kind": "If",
+      "line_start": 87,
+      "line_end": 88,
+      "column": 8,
+      "owner": "_chain_call_with_half_window_retry",
+      "representation_line": 50
+    },
+    {
+      "kind": "Raise",
+      "line_start": 88,
+      "line_end": 88,
+      "column": 12,
+      "owner": "_chain_call_with_half_window_retry",
+      "representation_line": 52
+    },
+    {
+      "kind": "Assign",
+      "line_start": 89,
+      "line_end": 89,
+      "column": 8,
+      "owner": "_chain_call_with_half_window_retry",
+      "representation_line": 56
+    },
+    {
+      "kind": "If",
+      "line_start": 90,
+      "line_end": 92,
+      "column": 8,
+      "owner": "_chain_call_with_half_window_retry",
+      "representation_line": 57
+    },
+    {
+      "kind": "Raise",
+      "line_start": 92,
+      "line_end": 92,
+      "column": 12,
+      "owner": "_chain_call_with_half_window_retry",
+      "representation_line": 59
+    },
+    {
+      "kind": "Expr",
+      "line_start": 93,
+      "line_end": 94,
+      "column": 8,
+      "owner": "_chain_call_with_half_window_retry",
+      "representation_line": 63
+    },
+    {
+      "kind": "Assign",
+      "line_start": 95,
+      "line_end": 95,
+      "column": 8,
+      "owner": "_chain_call_with_half_window_retry",
+      "representation_line": 63
+    },
+    {
+      "kind": "Assign",
+      "line_start": 96,
+      "line_end": 96,
+      "column": 8,
+      "owner": "_chain_call_with_half_window_retry",
+      "representation_line": 63
+    },
+    {
+      "kind": "Assign",
+      "line_start": 97,
+      "line_end": 97,
+      "column": 8,
+      "owner": "_chain_call_with_half_window_retry",
+      "representation_line": 63
+    },
+    {
+      "kind": "Assign",
+      "line_start": 98,
+      "line_end": 98,
+      "column": 8,
+      "owner": "_chain_call_with_half_window_retry",
+      "representation_line": 63
+    },
+    {
+      "kind": "Return",
+      "line_start": 99,
+      "line_end": 99,
+      "column": 8,
+      "owner": "_chain_call_with_half_window_retry",
+      "representation_line": 64
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 102,
+      "line_end": 112,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 69
+    },
+    {
+      "kind": "Expr",
+      "line_start": 103,
+      "line_end": 103,
+      "column": 4,
+      "owner": "_persist_raw",
+      "representation_line": 75
+    },
+    {
+      "kind": "Try",
+      "line_start": 104,
+      "line_end": 112,
+      "column": 4,
+      "owner": "_persist_raw",
+      "representation_line": 76
+    },
+    {
+      "kind": "Assign",
+      "line_start": 105,
+      "line_end": 105,
+      "column": 8,
+      "owner": "_persist_raw",
+      "representation_line": 79
+    },
+    {
+      "kind": "Assign",
+      "line_start": 106,
+      "line_end": 107,
+      "column": 8,
+      "owner": "_persist_raw",
+      "representation_line": 79
+    },
+    {
+      "kind": "Assign",
+      "line_start": 108,
+      "line_end": 108,
+      "column": 8,
+      "owner": "_persist_raw",
+      "representation_line": 79
+    },
+    {
+      "kind": "Expr",
+      "line_start": 109,
+      "line_end": 109,
+      "column": 8,
+      "owner": "_persist_raw",
+      "representation_line": 79
+    },
+    {
+      "kind": "Expr",
+      "line_start": 110,
+      "line_end": 110,
+      "column": 8,
+      "owner": "_persist_raw",
+      "representation_line": 79
+    },
+    {
+      "kind": "Expr",
+      "line_start": 112,
+      "line_end": 112,
+      "column": 8,
+      "owner": "_persist_raw",
+      "representation_line": 84
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 115,
+      "line_end": 144,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 88
+    },
+    {
+      "kind": "Expr",
+      "line_start": 117,
+      "line_end": 119,
+      "column": 4,
+      "owner": "_json_repair",
+      "representation_line": 94
+    },
+    {
+      "kind": "If",
+      "line_start": 120,
+      "line_end": 121,
+      "column": 4,
+      "owner": "_json_repair",
+      "representation_line": 95
+    },
+    {
+      "kind": "Return",
+      "line_start": 121,
+      "line_end": 121,
+      "column": 8,
+      "owner": "_json_repair",
+      "representation_line": 97
+    },
+    {
+      "kind": "Assign",
+      "line_start": 122,
+      "line_end": 122,
+      "column": 4,
+      "owner": "_json_repair",
+      "representation_line": 101
+    },
+    {
+      "kind": "If",
+      "line_start": 123,
+      "line_end": 127,
+      "column": 4,
+      "owner": "_json_repair",
+      "representation_line": 102
+    },
+    {
+      "kind": "Expr",
+      "line_start": 124,
+      "line_end": 125,
+      "column": 8,
+      "owner": "_json_repair",
+      "representation_line": 105
+    },
+    {
+      "kind": "Expr",
+      "line_start": 126,
+      "line_end": 126,
+      "column": 8,
+      "owner": "_json_repair",
+      "representation_line": 105
+    },
+    {
+      "kind": "Return",
+      "line_start": 127,
+      "line_end": 127,
+      "column": 8,
+      "owner": "_json_repair",
+      "representation_line": 106
+    },
+    {
+      "kind": "Expr",
+      "line_start": 128,
+      "line_end": 128,
+      "column": 4,
+      "owner": "_json_repair",
+      "representation_line": 110
+    },
+    {
+      "kind": "Expr",
+      "line_start": 129,
+      "line_end": 129,
+      "column": 4,
+      "owner": "_json_repair",
+      "representation_line": 110
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 130,
+      "line_end": 130,
+      "column": 4,
+      "owner": "_json_repair",
+      "representation_line": 110
+    },
+    {
+      "kind": "Try",
+      "line_start": 131,
+      "line_end": 141,
+      "column": 4,
+      "owner": "_json_repair",
+      "representation_line": 111
+    },
+    {
+      "kind": "Assign",
+      "line_start": 132,
+      "line_end": 132,
+      "column": 8,
+      "owner": "_json_repair",
+      "representation_line": 114
+    },
+    {
+      "kind": "Assign",
+      "line_start": 133,
+      "line_end": 133,
+      "column": 8,
+      "owner": "_json_repair",
+      "representation_line": 114
+    },
+    {
+      "kind": "If",
+      "line_start": 135,
+      "line_end": 136,
+      "column": 8,
+      "owner": "_json_repair",
+      "representation_line": 118
+    },
+    {
+      "kind": "Raise",
+      "line_start": 136,
+      "line_end": 136,
+      "column": 12,
+      "owner": "_json_repair",
+      "representation_line": 120
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 137,
+      "line_end": 137,
+      "column": 8,
+      "owner": "_json_repair",
+      "representation_line": 124
+    },
+    {
+      "kind": "If",
+      "line_start": 138,
+      "line_end": 140,
+      "column": 8,
+      "owner": "_json_repair",
+      "representation_line": 125
+    },
+    {
+      "kind": "Assign",
+      "line_start": 140,
+      "line_end": 140,
+      "column": 12,
+      "owner": "_json_repair",
+      "representation_line": 128
+    },
+    {
+      "kind": "Return",
+      "line_start": 141,
+      "line_end": 141,
+      "column": 8,
+      "owner": "_json_repair",
+      "representation_line": 130
+    },
+    {
+      "kind": "Expr",
+      "line_start": 142,
+      "line_end": 142,
+      "column": 4,
+      "owner": "_json_repair",
+      "representation_line": 134
+    },
+    {
+      "kind": "Expr",
+      "line_start": 143,
+      "line_end": 143,
+      "column": 4,
+      "owner": "_json_repair",
+      "representation_line": 134
+    },
+    {
+      "kind": "Return",
+      "line_start": 144,
+      "line_end": 144,
+      "column": 4,
+      "owner": "_json_repair",
+      "representation_line": 135
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 147,
+      "line_end": 275,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 139
+    },
+    {
+      "kind": "Assign",
+      "line_start": 151,
+      "line_end": 151,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 145
+    },
+    {
+      "kind": "If",
+      "line_start": 152,
+      "line_end": 170,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 146
+    },
+    {
+      "kind": "Assign",
+      "line_start": 154,
+      "line_end": 154,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 149
+    },
+    {
+      "kind": "Return",
+      "line_start": 155,
+      "line_end": 170,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 150
+    },
+    {
+      "kind": "Try",
+      "line_start": 173,
+      "line_end": 180,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 153
+    },
+    {
+      "kind": "Assign",
+      "line_start": 174,
+      "line_end": 174,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 156
+    },
+    {
+      "kind": "Expr",
+      "line_start": 177,
+      "line_end": 177,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 161
+    },
+    {
+      "kind": "Expr",
+      "line_start": 179,
+      "line_end": 179,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 161
+    },
+    {
+      "kind": "Assign",
+      "line_start": 180,
+      "line_end": 180,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 161
+    },
+    {
+      "kind": "If",
+      "line_start": 181,
+      "line_end": 187,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 163
+    },
+    {
+      "kind": "Return",
+      "line_start": 183,
+      "line_end": 187,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 165
+    },
+    {
+      "kind": "Assign",
+      "line_start": 188,
+      "line_end": 188,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 169
+    },
+    {
+      "kind": "Assign",
+      "line_start": 189,
+      "line_end": 189,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 169
+    },
+    {
+      "kind": "Try",
+      "line_start": 191,
+      "line_end": 202,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 170
+    },
+    {
+      "kind": "Assign",
+      "line_start": 192,
+      "line_end": 193,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 173
+    },
+    {
+      "kind": "If",
+      "line_start": 195,
+      "line_end": 196,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 177
+    },
+    {
+      "kind": "Raise",
+      "line_start": 196,
+      "line_end": 196,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 179
+    },
+    {
+      "kind": "Expr",
+      "line_start": 197,
+      "line_end": 197,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 183
+    },
+    {
+      "kind": "Expr",
+      "line_start": 198,
+      "line_end": 198,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 183
+    },
+    {
+      "kind": "Return",
+      "line_start": 199,
+      "line_end": 202,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 184
+    },
+    {
+      "kind": "Assign",
+      "line_start": 203,
+      "line_end": 203,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 188
+    },
+    {
+      "kind": "Expr",
+      "line_start": 206,
+      "line_end": 206,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 188
+    },
+    {
+      "kind": "Try",
+      "line_start": 209,
+      "line_end": 231,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 189
+    },
+    {
+      "kind": "Assign",
+      "line_start": 210,
+      "line_end": 210,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 192
+    },
+    {
+      "kind": "Assign",
+      "line_start": 213,
+      "line_end": 213,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 197
+    },
+    {
+      "kind": "Assign",
+      "line_start": 214,
+      "line_end": 214,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 197
+    },
+    {
+      "kind": "If",
+      "line_start": 215,
+      "line_end": 228,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 198
+    },
+    {
+      "kind": "Assign",
+      "line_start": 217,
+      "line_end": 217,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 201
+    },
+    {
+      "kind": "Assign",
+      "line_start": 218,
+      "line_end": 218,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 201
+    },
+    {
+      "kind": "Assign",
+      "line_start": 219,
+      "line_end": 219,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 201
+    },
+    {
+      "kind": "Expr",
+      "line_start": 220,
+      "line_end": 220,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 201
+    },
+    {
+      "kind": "Expr",
+      "line_start": 222,
+      "line_end": 222,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 201
+    },
+    {
+      "kind": "Expr",
+      "line_start": 223,
+      "line_end": 223,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 203
+    },
+    {
+      "kind": "Expr",
+      "line_start": 224,
+      "line_end": 224,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 203
+    },
+    {
+      "kind": "Return",
+      "line_start": 225,
+      "line_end": 228,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 204
+    },
+    {
+      "kind": "Assign",
+      "line_start": 229,
+      "line_end": 229,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 208
+    },
+    {
+      "kind": "Assign",
+      "line_start": 231,
+      "line_end": 231,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 208
+    },
+    {
+      "kind": "Assign",
+      "line_start": 234,
+      "line_end": 234,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 211
+    },
+    {
+      "kind": "Try",
+      "line_start": 235,
+      "line_end": 247,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 212
+    },
+    {
+      "kind": "Assign",
+      "line_start": 236,
+      "line_end": 238,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 215
+    },
+    {
+      "kind": "For",
+      "line_start": 240,
+      "line_end": 241,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 219
+    },
+    {
+      "kind": "Assign",
+      "line_start": 241,
+      "line_end": 241,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 222
+    },
+    {
+      "kind": "Expr",
+      "line_start": 242,
+      "line_end": 242,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 225
+    },
+    {
+      "kind": "Expr",
+      "line_start": 243,
+      "line_end": 243,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 225
+    },
+    {
+      "kind": "Return",
+      "line_start": 244,
+      "line_end": 247,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 226
+    },
+    {
+      "kind": "If",
+      "line_start": 249,
+      "line_end": 251,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 229
+    },
+    {
+      "kind": "Assign",
+      "line_start": 251,
+      "line_end": 251,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 232
+    },
+    {
+      "kind": "If",
+      "line_start": 254,
+      "line_end": 270,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 234
+    },
+    {
+      "kind": "Assign",
+      "line_start": 255,
+      "line_end": 255,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 237
+    },
+    {
+      "kind": "Assign",
+      "line_start": 256,
+      "line_end": 256,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 237
+    },
+    {
+      "kind": "Assign",
+      "line_start": 257,
+      "line_end": 258,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 237
+    },
+    {
+      "kind": "Assign",
+      "line_start": 261,
+      "line_end": 262,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 237
+    },
+    {
+      "kind": "If",
+      "line_start": 263,
+      "line_end": 270,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 238
+    },
+    {
+      "kind": "Expr",
+      "line_start": 264,
+      "line_end": 265,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 241
+    },
+    {
+      "kind": "Expr",
+      "line_start": 266,
+      "line_end": 266,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 241
+    },
+    {
+      "kind": "Expr",
+      "line_start": 268,
+      "line_end": 269,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 245
+    },
+    {
+      "kind": "Expr",
+      "line_start": 270,
+      "line_end": 270,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 245
+    },
+    {
+      "kind": "Expr",
+      "line_start": 272,
+      "line_end": 274,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 249
+    },
+    {
+      "kind": "Return",
+      "line_start": 275,
+      "line_end": 275,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 250
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 6,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='logs', ctx=Load()), attr='get_logger', ctx=Load()), args=[Name(id='__name__', ctx=Load())], keywords=[])",
+      "rendered": "logs.get_logger(__name__)"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 18,
+      "kind": "Constant",
+      "original_ast": "Constant(value='s8_ranked_findings_entry_invalid')",
+      "rendered": "'s8_ranked_findings_entry_invalid'"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 11,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Call(func=Name(id='redact', ctx=Load()), args=[Call(func=Name(id='str', ctx=Load()), args=[Name(id='e', ctx=Load())], keywords=[])], keywords=[]), slice=Slice(upper=Name(id='cap', ctx=Load())), ctx=Load())",
+      "rendered": "redact(str(e))[:cap]"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='e', ctx=Load()), Name(id='ModelRefusal', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(e, ModelRefusal)"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value='no chain analysis: the chain model refused the request')",
+      "rendered": "'no chain analysis: the chain model refused the request'"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 11,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[Constant(value='chain call failed ('), FormattedValue(value=Call(func=Name(id='_redacted_err', ctx=Load()), args=[Name(id='e', ctx=Load())], keywords=[]), conversion=-1), Constant(value=')')])",
+      "rendered": "source_template_69_11"
+    },
+    {
+      "line_start": 83,
+      "line_end": 83,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='_RANKED_INVALID', ctx=Load())], keywords=[])",
+      "rendered": "COUNTERS.get(_RANKED_INVALID)"
+    },
+    {
+      "line_start": 85,
+      "line_end": 85,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Call(func=Name(id='chain_call', ctx=Load()), args=[Name(id='sub', ctx=Load()), Name(id='ctx', ctx=Load()), Name(id='cfg', ctx=Load())], keywords=[keyword(arg='labels', value=Name(id='labels', ctx=Load()))]), Name(id='window', ctx=Load()), Name(id='labels', ctx=Load()), Name(id='invalid0', ctx=Load())], ctx=Load())",
+      "rendered": "(chain_call(sub, ctx, cfg, labels=labels), window, labels, invalid0)"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='TruncatedResponseError', ctx=Load())",
+      "rendered": "TruncatedResponseError"
+    },
+    {
+      "line_start": 87,
+      "line_end": 87,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='is_truncated_without_retry', ctx=Load()), args=[Name(id='e', ctx=Load())], keywords=[]))",
+      "rendered": "not is_truncated_without_retry(e)"
+    },
+    {
+      "line_start": 89,
+      "line_end": 89,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='half_window', ctx=Load()), args=[Name(id='findings', ctx=Load()), Name(id='window', ctx=Load())], keywords=[])",
+      "rendered": "half_window(findings, window)"
+    },
+    {
+      "line_start": 90,
+      "line_end": 90,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='half', ctx=Load()), ops=[Eq()], comparators=[Name(id='window', ctx=Load())])",
+      "rendered": "half == window"
+    },
+    {
+      "line_start": 93,
+      "line_end": 94,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='  [s8] clipped at the output cap; retrying once over half the window ('), FormattedValue(value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='half', ctx=Load())], keywords=[]), conversion=-1), Constant(value=' of '), FormattedValue(value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='window', ctx=Load())], keywords=[]), conversion=-1), Constant(value=' findings)')])], keywords=[])",
+      "rendered": "console.write(source_template_93_22)"
+    },
+    {
+      "line_start": 95,
+      "line_end": 95,
+      "column": 19,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Subscript(value=Name(id='findings', ctx=Load()), slice=Name(id='i', ctx=Load()), ctx=Load()), generators=[comprehension(target=Name(id='i', ctx=Store()), iter=Name(id='half', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "[findings[i] for i in half]"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 22,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=JoinedStr(values=[Constant(value='f'), FormattedValue(value=Name(id='i', ctx=Load()), conversion=-1)]), generators=[comprehension(target=Name(id='i', ctx=Store()), iter=Name(id='half', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "[source_template_96_23 for i in half]"
+    },
+    {
+      "line_start": 97,
+      "line_end": 97,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='_RANKED_INVALID', ctx=Load())], keywords=[])",
+      "rendered": "COUNTERS.get(_RANKED_INVALID)"
+    },
+    {
+      "line_start": 98,
+      "line_end": 98,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='chain_call', ctx=Load()), args=[Name(id='half_sub', ctx=Load()), Name(id='ctx', ctx=Load()), Name(id='cfg', ctx=Load())], keywords=[keyword(arg='labels', value=Name(id='half_labels', ctx=Load())), keyword(arg='allow_resend', value=Constant(value=False))])",
+      "rendered": "chain_call(half_sub, ctx, cfg, labels=half_labels, allow_resend=False)"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='raw', ctx=Load()), Name(id='half', ctx=Load()), Name(id='half_labels', ctx=Load()), Name(id='invalid0', ctx=Load())], ctx=Load())",
+      "rendered": "(raw, half, half_labels, invalid0)"
+    },
+    {
+      "line_start": 105,
+      "line_end": 105,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_errlog', ctx=Load()), attr='current_path', ctx=Load()), args=[], keywords=[])",
+      "rendered": "_errlog.current_path()"
+    },
+    {
+      "line_start": 106,
+      "line_end": 107,
+      "column": 16,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Attribute(value=Attribute(value=Name(id='errp', ctx=Load()), attr='name', ctx=Load()), attr='endswith', ctx=Load()), args=[Constant(value='_errors.jsonl')], keywords=[]), body=Subscript(value=Attribute(value=Name(id='errp', ctx=Load()), attr='name', ctx=Load()), slice=Slice(upper=UnaryOp(op=USub(), operand=Call(func=Name(id='len', ctx=Load()), args=[Constant(value='_errors.jsonl')], keywords=[]))), ctx=Load()), orelse=Attribute(value=Name(id='errp', ctx=Load()), attr='stem', ctx=Load()))",
+      "rendered": "errp.name[:-len('_errors.jsonl')] if errp.name.endswith('_errors.jsonl') else errp.stem"
+    },
+    {
+      "line_start": 108,
+      "line_end": 108,
+      "column": 19,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Attribute(value=Name(id='errp', ctx=Load()), attr='parent', ctx=Load()), op=Div(), right=JoinedStr(values=[FormattedValue(value=Name(id='stem', ctx=Load()), conversion=-1), FormattedValue(value=Name(id='suffix', ctx=Load()), conversion=-1)]))",
+      "rendered": "errp.parent / source_template_108_33"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='raw_path', ctx=Load()), attr='parent', ctx=Load()), attr='mkdir', ctx=Load()), args=[], keywords=[keyword(arg='parents', value=Constant(value=True)), keyword(arg='exist_ok', value=Constant(value=True))])",
+      "rendered": "raw_path.parent.mkdir(parents=True, exist_ok=True)"
+    },
+    {
+      "line_start": 110,
+      "line_end": 110,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='raw_path', ctx=Load()), attr='write_text', ctx=Load()), args=[Call(func=Name(id='redact', ctx=Load()), args=[Name(id='text', ctx=Load())], keywords=[])], keywords=[keyword(arg='encoding', value=Constant(value='utf-8'))])",
+      "rendered": "raw_path.write_text(redact(text), encoding='utf-8')"
+    },
+    {
+      "line_start": 111,
+      "line_end": 111,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='OSError', ctx=Load())",
+      "rendered": "OSError"
+    },
+    {
+      "line_start": 112,
+      "line_end": 112,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Attribute(value=Name(id='Event', ctx=Load()), attr='S8_RAW_PERSIST_FAILED', ctx=Load())], keywords=[keyword(arg='detail', value=Call(func=Name(id='redact', ctx=Load()), args=[Call(func=Name(id='str', ctx=Load()), args=[Name(id='e', ctx=Load())], keywords=[])], keywords=[]))])",
+      "rendered": "log.warning(Event.S8_RAW_PERSIST_FAILED, detail=redact(str(e)))"
+    },
+    {
+      "line_start": 120,
+      "line_end": 120,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='repairable', ctx=Load()), args=[Name(id='raw', ctx=Load())], keywords=[]))",
+      "rendered": "not repairable(raw)"
+    },
+    {
+      "line_start": 121,
+      "line_end": 121,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value=None), Constant(value=None), Dict(keys=[], values=[])], ctx=Load())",
+      "rendered": "(None, None, {})"
+    },
+    {
+      "line_start": 122,
+      "line_end": 122,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='str', ctx=Load()), args=[Name(id='raw', ctx=Load())], keywords=[])",
+      "rendered": "str(raw)"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='repair_fits', ctx=Load()), args=[Name(id='text', ctx=Load()), Name(id='cfg', ctx=Load())], keywords=[]))",
+      "rendered": "not repair_fits(text, cfg)"
+    },
+    {
+      "line_start": 124,
+      "line_end": 125,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[Constant(value='  [s8] reply did not parse and is too large to restate under the replay cap; no json-repair re-ask')], keywords=[])",
+      "rendered": "console.write('  [s8] reply did not parse and is too large to restate under the replay cap; no json-repair re-ask')"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Constant(value='s8_parse_repair_skipped_oversize')], keywords=[])",
+      "rendered": "COUNTERS.bump('s8_parse_repair_skipped_oversize')"
+    },
+    {
+      "line_start": 127,
+      "line_end": 127,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value=None), Constant(value=None), Dict(keys=[], values=[])], ctx=Load())",
+      "rendered": "(None, None, {})"
+    },
+    {
+      "line_start": 128,
+      "line_end": 128,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[Constant(value='  [s8] reply did not parse; one json-repair re-ask')], keywords=[])",
+      "rendered": "console.write('  [s8] reply did not parse; one json-repair re-ask')"
+    },
+    {
+      "line_start": 129,
+      "line_end": 129,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Constant(value='s8_parse_repair_attempted')], keywords=[])",
+      "rendered": "COUNTERS.bump('s8_parse_repair_attempted')"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 27,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='repair_call', ctx=Load()), args=[Name(id='text', ctx=Load()), Name(id='err', ctx=Load()), Name(id='ctx', ctx=Load()), Name(id='cfg', ctx=Load())], keywords=[])",
+      "rendered": "repair_call(text, err, ctx, cfg)"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='parse_chain_reply', ctx=Load()), args=[Name(id='repaired', ctx=Load())], keywords=[])",
+      "rendered": "parse_chain_reply(repaired)"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='is_halt_error', ctx=Load()), args=[Name(id='e2', ctx=Load())], keywords=[])",
+      "rendered": "is_halt_error(e2)"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 32,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='repair_error')], values=[Subscript(value=Call(func=Name(id='redact', ctx=Load()), args=[Call(func=Name(id='str', ctx=Load()), args=[Name(id='e2', ctx=Load())], keywords=[])], keywords=[]), slice=Slice(upper=Constant(value=400)), ctx=Load())])",
+      "rendered": "{'repair_error': redact(str(e2))[:400]}"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='repaired', ctx=Load()), Name(id='str', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(repaired, str)"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 35,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Subscript(value=Call(func=Name(id='redact', ctx=Load()), args=[Name(id='repaired', ctx=Load())], keywords=[]), slice=Slice(upper=Constant(value=500)), ctx=Load()), attr='replace', ctx=Load()), args=[Constant(value='\\n'), Constant(value='\\\\n')], keywords=[])",
+      "rendered": "redact(repaired)[:500].replace(source_literal_140_66, '\\\\n')"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value=None), Constant(value=None), Name(id='extra', ctx=Load())], ctx=Load())",
+      "rendered": "(None, None, extra)"
+    },
+    {
+      "line_start": 142,
+      "line_end": 142,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Constant(value='s8_parse_repair_recovered')], keywords=[])",
+      "rendered": "COUNTERS.bump('s8_parse_repair_recovered')"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_persist_raw', ctx=Load()), args=[Name(id='repaired', ctx=Load()), Constant(value='_s8_raw_repaired.txt')], keywords=[])",
+      "rendered": "_persist_raw(repaired, '_s8_raw_repaired.txt')"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='data', ctx=Load()), Name(id='repaired', ctx=Load()), Dict(keys=[], values=[])], ctx=Load())",
+      "rendered": "(data, repaired, {})"
+    },
+    {
+      "line_start": 151,
+      "line_end": 151,
+      "column": 14,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Name(id='dropped', ctx=Load()), List(elts=[], ctx=Load())])",
+      "rendered": "dropped or []"
+    },
+    {
+      "line_start": 152,
+      "line_end": 152,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='findings', ctx=Load()))",
+      "rendered": "not findings"
+    },
+    {
+      "line_start": 154,
+      "line_end": 154,
+      "column": 16,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='metrics', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), UnaryOp(op=Not(), operand=Attribute(value=Name(id='metrics', ctx=Load()), attr='total_files_in_scope', ctx=Load()))])",
+      "rendered": "metrics is not None and (not metrics.total_files_in_scope)"
+    },
+    {
+      "line_start": 155,
+      "line_end": 170,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='FinalReport', ctx=Load()), args=[], keywords=[keyword(arg='repo_root', value=Attribute(value=Name(id='ctx', ctx=Load()), attr='repo_root', ctx=Load())), keyword(arg='findings', value=List(elts=[], ctx=Load())), keyword(arg='chains', value=List(elts=[], ctx=Load())), keyword(arg='dropped', value=Name(id='dropped', ctx=Load())), keyword(arg='raw_findings_count', value=Name(id='raw_findings_count', ctx=Load())), keyword(arg='metrics', value=Name(id='metrics', ctx=Load())), keyword(arg='summary', value=IfExp(test=Name(id='empty', ctx=Load()), body=Constant(value='0 files analysed — no conclusion can be drawn about this repository; check the S1 file inventory and exclusions.'), orelse=Constant(value='No findings survived adversarial verification.'))), keyword(arg='degraded', value=Name(id='empty', ctx=Load())), keyword(arg='enrichment_unavailable', value=Name(id='empty', ctx=Load())), keyword(arg='degraded_reason', value=IfExp(test=Name(id='empty', ctx=Load()), body=Constant(value='scope was empty: 0 files reached analysis'), orelse=Constant(value='')))])",
+      "rendered": "FinalReport(repo_root=ctx.repo_root, findings=[], chains=[], dropped=dropped, raw_findings_count=raw_findings_count, metrics=metrics, summary='0 files analysed — no conclusion can be drawn about this repository; check the S1 file inventory and exclusions.' if empty else 'No findings survived adversarial verification.', degraded=empty, enrichment_unavailable=empty, degraded_reason='scope was empty: 0 files reached analysis' if empty else '')"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='select_window', ctx=Load()), args=[Name(id='findings', ctx=Load()), Name(id='ctx', ctx=Load()), Name(id='cfg', ctx=Load())], keywords=[])",
+      "rendered": "select_window(findings, ctx, cfg)"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Attribute(value=Name(id='Event', ctx=Load()), attr='S8_WINDOW_SELECTION_FAILED', ctx=Load())], keywords=[keyword(arg='detail', value=Call(func=Name(id='redact', ctx=Load()), args=[Call(func=Name(id='str', ctx=Load()), args=[Name(id='e', ctx=Load())], keywords=[])], keywords=[]))])",
+      "rendered": "log.warning(Event.S8_WINDOW_SELECTION_FAILED, detail=redact(str(e)))"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_errlog', ctx=Load()), attr='log', ctx=Load()), args=[Constant(value='s8'), Constant(value='chain-window'), Name(id='e', ctx=Load())], keywords=[keyword(arg='recovered', value=Constant(value=True))])",
+      "rendered": "_errlog.log('s8', 'chain-window', e, recovered=True)"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='list', ctx=Load()), args=[Call(func=Name(id='range', ctx=Load()), args=[Call(func=Name(id='len', ctx=Load()), args=[Name(id='findings', ctx=Load())], keywords=[])], keywords=[])], keywords=[])",
+      "rendered": "list(range(len(findings)))"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='window', ctx=Load()))",
+      "rendered": "not window"
+    },
+    {
+      "line_start": 183,
+      "line_end": 187,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='deterministic_report', ctx=Load()), args=[Name(id='ctx', ctx=Load()), Name(id='findings', ctx=Load()), Name(id='dropped', ctx=Load()), Name(id='raw_findings_count', ctx=Load()), Name(id='metrics', ctx=Load())], keywords=[keyword(arg='enrichment_failure', value=Constant(value='prompt_token_budget admits no findings into the enrichment window'))])",
+      "rendered": "deterministic_report(ctx, findings, dropped, raw_findings_count, metrics, enrichment_failure='prompt_token_budget admits no findings into the enrichment window')"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 10,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Subscript(value=Name(id='findings', ctx=Load()), slice=Name(id='i', ctx=Load()), ctx=Load()), generators=[comprehension(target=Name(id='i', ctx=Store()), iter=Name(id='window', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "[findings[i] for i in window]"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 13,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=JoinedStr(values=[Constant(value='f'), FormattedValue(value=Name(id='i', ctx=Load()), conversion=-1)]), generators=[comprehension(target=Name(id='i', ctx=Store()), iter=Name(id='window', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "[source_template_189_14 for i in window]"
+    },
+    {
+      "line_start": 192,
+      "line_end": 193,
+      "column": 40,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_chain_call_with_half_window_retry', ctx=Load()), args=[Name(id='sub', ctx=Load()), Name(id='labels', ctx=Load()), Name(id='window', ctx=Load()), Name(id='findings', ctx=Load()), Name(id='ctx', ctx=Load()), Name(id='cfg', ctx=Load())], keywords=[])",
+      "rendered": "_chain_call_with_half_window_retry(sub, labels, window, findings, ctx, cfg)"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 195,
+      "line_end": 195,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='is_halt_error', ctx=Load()), args=[Name(id='e', ctx=Load())], keywords=[])",
+      "rendered": "is_halt_error(e)"
+    },
+    {
+      "line_start": 197,
+      "line_end": 197,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Attribute(value=Name(id='Event', ctx=Load()), attr='S8_CALL_FAILED', ctx=Load())], keywords=[keyword(arg='detail', value=Call(func=Name(id='redact', ctx=Load()), args=[Call(func=Name(id='str', ctx=Load()), args=[Name(id='e', ctx=Load())], keywords=[])], keywords=[]))])",
+      "rendered": "log.warning(Event.S8_CALL_FAILED, detail=redact(str(e)))"
+    },
+    {
+      "line_start": 198,
+      "line_end": 198,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_errlog', ctx=Load()), attr='log', ctx=Load()), args=[Constant(value='s8'), Constant(value='chain'), Name(id='e', ctx=Load())], keywords=[])",
+      "rendered": "_errlog.log('s8', 'chain', e)"
+    },
+    {
+      "line_start": 199,
+      "line_end": 202,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='deterministic_report', ctx=Load()), args=[Name(id='ctx', ctx=Load()), Name(id='findings', ctx=Load()), Name(id='dropped', ctx=Load()), Name(id='raw_findings_count', ctx=Load()), Name(id='metrics', ctx=Load())], keywords=[keyword(arg='enrichment_failure', value=Call(func=Name(id='_enrichment_failure_text', ctx=Load()), args=[Name(id='e', ctx=Load())], keywords=[]))])",
+      "rendered": "deterministic_report(ctx, findings, dropped, raw_findings_count, metrics, enrichment_failure=_enrichment_failure_text(e))"
+    },
+    {
+      "line_start": 203,
+      "line_end": 203,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='window', ctx=Load())], keywords=[]), ops=[Lt()], comparators=[Call(func=Name(id='len', ctx=Load()), args=[Name(id='findings', ctx=Load())], keywords=[])])",
+      "rendered": "len(window) < len(findings)"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_persist_raw', ctx=Load()), args=[BoolOp(op=Or(), values=[Name(id='raw', ctx=Load()), Constant(value='')]), Constant(value='_s8_raw.txt')], keywords=[])",
+      "rendered": "_persist_raw(raw or '', '_s8_raw.txt')"
+    },
+    {
+      "line_start": 210,
+      "line_end": 210,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='parse_chain_reply', ctx=Load()), args=[Name(id='raw', ctx=Load())], keywords=[])",
+      "rendered": "parse_chain_reply(raw)"
+    },
+    {
+      "line_start": 211,
+      "line_end": 211,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='ValueError', ctx=Load()), Name(id='TypeError', ctx=Load())], ctx=Load())",
+      "rendered": "(ValueError, TypeError)"
+    },
+    {
+      "line_start": 213,
+      "line_end": 213,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='_RANKED_INVALID', ctx=Load())], keywords=[])",
+      "rendered": "COUNTERS.get(_RANKED_INVALID)"
+    },
+    {
+      "line_start": 214,
+      "line_end": 214,
+      "column": 47,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_json_repair', ctx=Load()), args=[Name(id='raw', ctx=Load()), Name(id='e', ctx=Load()), Name(id='ctx', ctx=Load()), Name(id='cfg', ctx=Load())], keywords=[])",
+      "rendered": "_json_repair(raw, e, ctx, cfg)"
+    },
+    {
+      "line_start": 215,
+      "line_end": 215,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='repaired', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "repaired is None"
+    },
+    {
+      "line_start": 217,
+      "line_end": 217,
+      "column": 23,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='raw', ctx=Load()), Name(id='str', ctx=Load())], keywords=[]), body=Call(func=Name(id='redact', ctx=Load()), args=[Name(id='raw', ctx=Load())], keywords=[]), orelse=Constant(value=''))",
+      "rendered": "redact(raw) if isinstance(raw, str) else ''"
+    },
+    {
+      "line_start": 218,
+      "line_end": 218,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Subscript(value=Name(id='safe_raw', ctx=Load()), slice=Slice(upper=Constant(value=500)), ctx=Load()), attr='replace', ctx=Load()), args=[Constant(value='\\n'), Constant(value='\\\\n')], keywords=[])",
+      "rendered": "safe_raw[:500].replace(source_literal_218_42, '\\\\n')"
+    },
+    {
+      "line_start": 219,
+      "line_end": 219,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Subscript(value=Name(id='safe_raw', ctx=Load()), slice=Slice(lower=UnaryOp(op=USub(), operand=Constant(value=200))), ctx=Load()), attr='replace', ctx=Load()), args=[Constant(value='\\n'), Constant(value='\\\\n')], keywords=[])",
+      "rendered": "safe_raw[-200:].replace(source_literal_219_43, '\\\\n')"
+    },
+    {
+      "line_start": 220,
+      "line_end": 220,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Attribute(value=Name(id='Event', ctx=Load()), attr='S8_RESPONSE_UNPARSEABLE', ctx=Load())], keywords=[keyword(arg='detail', value=Call(func=Name(id='redact', ctx=Load()), args=[Call(func=Name(id='str', ctx=Load()), args=[Name(id='e', ctx=Load())], keywords=[])], keywords=[]))])",
+      "rendered": "log.warning(Event.S8_RESPONSE_UNPARSEABLE, detail=redact(str(e)))"
+    },
+    {
+      "line_start": 222,
+      "line_end": 222,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_errlog', ctx=Load()), attr='log', ctx=Load()), args=[Constant(value='s8'), Constant(value='chain'), Name(id='e', ctx=Load())], keywords=[keyword(arg='raw_head', value=Name(id='head', ctx=Load())), keyword(arg='raw_tail', value=Name(id='tail', ctx=Load())), keyword(value=Name(id='repair_extra', ctx=Load()))])",
+      "rendered": "_errlog.log('s8', 'chain', e, raw_head=head, raw_tail=tail, **repair_extra)"
+    },
+    {
+      "line_start": 223,
+      "line_end": 223,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='  [s8] raw[:500]  = '), FormattedValue(value=Name(id='head', ctx=Load()), conversion=114)])], keywords=[])",
+      "rendered": "console.write(source_template_223_26)"
+    },
+    {
+      "line_start": 224,
+      "line_end": 224,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='  [s8] raw[-200:] = '), FormattedValue(value=Name(id='tail', ctx=Load()), conversion=114)])], keywords=[])",
+      "rendered": "console.write(source_template_224_26)"
+    },
+    {
+      "line_start": 225,
+      "line_end": 228,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='deterministic_report', ctx=Load()), args=[Name(id='ctx', ctx=Load()), Name(id='findings', ctx=Load()), Name(id='dropped', ctx=Load()), Name(id='raw_findings_count', ctx=Load()), Name(id='metrics', ctx=Load())], keywords=[keyword(arg='enrichment_failure', value=JoinedStr(values=[Constant(value='reply unparseable ('), FormattedValue(value=Call(func=Name(id='_redacted_err', ctx=Load()), args=[Name(id='e', ctx=Load())], keywords=[]), conversion=-1), Constant(value=')')]))])",
+      "rendered": "deterministic_report(ctx, findings, dropped, raw_findings_count, metrics, enrichment_failure=source_template_227_35)"
+    },
+    {
+      "line_start": 229,
+      "line_end": 229,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='repaired', ctx=Load())",
+      "rendered": "repaired"
+    },
+    {
+      "line_start": 231,
+      "line_end": 231,
+      "column": 14,
+      "kind": "Name",
+      "original_ast": "Name(id='repaired_raw', ctx=Load())",
+      "rendered": "repaired_raw"
+    },
+    {
+      "line_start": 234,
+      "line_end": 234,
+      "column": 24,
+      "kind": "DictComp",
+      "original_ast": "DictComp(key=Call(func=Name(id='id', ctx=Load()), args=[Name(id='f', ctx=Load())], keywords=[]), value=Attribute(value=Name(id='f', ctx=Load()), attr='severity', ctx=Load()), generators=[comprehension(target=Name(id='f', ctx=Store()), iter=Name(id='findings', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "{id(f): f.severity for f in findings}"
+    },
+    {
+      "line_start": 236,
+      "line_end": 238,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='hydrate_report', ctx=Load()), args=[Name(id='data', ctx=Load()), Name(id='ctx', ctx=Load()), Name(id='findings', ctx=Load()), Name(id='dropped', ctx=Load()), Name(id='raw_findings_count', ctx=Load()), Name(id='metrics', ctx=Load())], keywords=[keyword(arg='window', value=IfExp(test=Name(id='windowed', ctx=Load()), body=Call(func=Name(id='set', ctx=Load()), args=[Name(id='window', ctx=Load())], keywords=[]), orelse=Constant(value=None))), keyword(arg='cfg', value=Name(id='cfg', ctx=Load()))])",
+      "rendered": "hydrate_report(data, ctx, findings, dropped, raw_findings_count, metrics, window=set(window) if windowed else None, cfg=cfg)"
+    },
+    {
+      "line_start": 239,
+      "line_end": 239,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 240,
+      "line_end": 240,
+      "column": 17,
+      "kind": "Name",
+      "original_ast": "Name(id='findings', ctx=Load())",
+      "rendered": "findings"
+    },
+    {
+      "line_start": 241,
+      "line_end": 241,
+      "column": 25,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Name(id='original_severity', ctx=Load()), slice=Call(func=Name(id='id', ctx=Load()), args=[Name(id='f', ctx=Load())], keywords=[]), ctx=Load())",
+      "rendered": "original_severity[id(f)]"
+    },
+    {
+      "line_start": 242,
+      "line_end": 242,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Attribute(value=Name(id='Event', ctx=Load()), attr='S8_HYDRATION_FAILED', ctx=Load())], keywords=[keyword(arg='detail', value=Call(func=Name(id='redact', ctx=Load()), args=[Call(func=Name(id='str', ctx=Load()), args=[Name(id='e', ctx=Load())], keywords=[])], keywords=[]))])",
+      "rendered": "log.warning(Event.S8_HYDRATION_FAILED, detail=redact(str(e)))"
+    },
+    {
+      "line_start": 243,
+      "line_end": 243,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_errlog', ctx=Load()), attr='log', ctx=Load()), args=[Constant(value='s8'), Constant(value='chain-hydrate'), Name(id='e', ctx=Load())], keywords=[])",
+      "rendered": "_errlog.log('s8', 'chain-hydrate', e)"
+    },
+    {
+      "line_start": 244,
+      "line_end": 247,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='deterministic_report', ctx=Load()), args=[Name(id='ctx', ctx=Load()), Name(id='findings', ctx=Load()), Name(id='dropped', ctx=Load()), Name(id='raw_findings_count', ctx=Load()), Name(id='metrics', ctx=Load())], keywords=[keyword(arg='enrichment_failure', value=JoinedStr(values=[Constant(value='hydration failed ('), FormattedValue(value=Call(func=Name(id='_redacted_err', ctx=Load()), args=[Name(id='e', ctx=Load())], keywords=[]), conversion=-1), Constant(value=')')]))])",
+      "rendered": "deterministic_report(ctx, findings, dropped, raw_findings_count, metrics, enrichment_failure=source_template_246_31)"
+    },
+    {
+      "line_start": 249,
+      "line_end": 249,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='windowed', ctx=Load())",
+      "rendered": "windowed"
+    },
+    {
+      "line_start": 251,
+      "line_end": 251,
+      "column": 25,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[FormattedValue(value=Attribute(value=Name(id='report', ctx=Load()), attr='summary', ctx=Load()), conversion=-1), Constant(value='\\n\\n'), FormattedValue(value=Call(func=Name(id='templated_summary', ctx=Load()), args=[Attribute(value=Name(id='report', ctx=Load()), attr='findings', ctx=Load())], keywords=[]), conversion=-1)])",
+      "rendered": "source_template_251_25"
+    },
+    {
+      "line_start": 254,
+      "line_end": 254,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='covered', ctx=Load())], keywords=[]), ops=[Lt()], comparators=[Call(func=Name(id='len', ctx=Load()), args=[Name(id='window', ctx=Load())], keywords=[])])",
+      "rendered": "len(covered) < len(window)"
+    },
+    {
+      "line_start": 255,
+      "line_end": 255,
+      "column": 15,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='raw', ctx=Load()), Name(id='str', ctx=Load())], keywords=[]), body=Call(func=Attribute(value=Subscript(value=Call(func=Name(id='redact', ctx=Load()), args=[Name(id='raw', ctx=Load())], keywords=[]), slice=Slice(upper=Constant(value=500)), ctx=Load()), attr='replace', ctx=Load()), args=[Constant(value='\\n'), Constant(value='\\\\n')], keywords=[]), orelse=Constant(value=''))",
+      "rendered": "redact(raw)[:500].replace(source_literal_255_41, '\\\\n') if isinstance(raw, str) else ''"
+    },
+    {
+      "line_start": 256,
+      "line_end": 256,
+      "column": 18,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='window', ctx=Load())], keywords=[]), op=Sub(), right=Call(func=Name(id='len', ctx=Load()), args=[Name(id='covered', ctx=Load())], keywords=[]))",
+      "rendered": "len(window) - len(covered)"
+    },
+    {
+      "line_start": 257,
+      "line_end": 258,
+      "column": 15,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[Constant(value='chain reply ranked '), FormattedValue(value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='covered', ctx=Load())], keywords=[]), conversion=-1), Constant(value='/'), FormattedValue(value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='window', ctx=Load())], keywords=[]), conversion=-1), Constant(value=' findings it was shown; '), FormattedValue(value=Name(id='missing', ctx=Load()), conversion=-1), Constant(value=' ship unranked')])",
+      "rendered": "source_template_257_15"
+    },
+    {
+      "line_start": 261,
+      "line_end": 262,
+      "column": 27,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='data', ctx=Load()), attr='ranked_findings', ctx=Load())], keywords=[]), ops=[Eq()], comparators=[Call(func=Name(id='len', ctx=Load()), args=[Name(id='covered', ctx=Load())], keywords=[])]), Compare(left=Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='_RANKED_INVALID', ctx=Load())], keywords=[]), ops=[Eq()], comparators=[Name(id='invalid0', ctx=Load())])])",
+      "rendered": "len(data.ranked_findings) == len(covered) and COUNTERS.get(_RANKED_INVALID) == invalid0"
+    },
+    {
+      "line_start": 263,
+      "line_end": 263,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='nothing_dropped', ctx=Load())",
+      "rendered": "nothing_dropped"
+    },
+    {
+      "line_start": 264,
+      "line_end": 265,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='counts', ctx=Load()), args=[Constant(value='s8'), Constant(value='sparse ranking (by design); shipping unranked')], keywords=[keyword(arg='ranked', value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='covered', ctx=Load())], keywords=[])), keyword(arg='shown', value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='window', ctx=Load())], keywords=[])), keyword(arg='unranked', value=Name(id='missing', ctx=Load()))])",
+      "rendered": "console.counts('s8', 'sparse ranking (by design); shipping unranked', ranked=len(covered), shown=len(window), unranked=missing)"
+    },
+    {
+      "line_start": 266,
+      "line_end": 266,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Constant(value='s8_sparse_ranking_recovered')], keywords=[])",
+      "rendered": "COUNTERS.bump('s8_sparse_ranking_recovered')"
+    },
+    {
+      "line_start": 268,
+      "line_end": 269,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Attribute(value=Name(id='Event', ctx=Load()), attr='S8_NO_RANKED_FINDINGS', ctx=Load())], keywords=[keyword(arg='ranked', value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='covered', ctx=Load())], keywords=[])), keyword(arg='shown', value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='window', ctx=Load())], keywords=[])), keyword(arg='unranked', value=Name(id='missing', ctx=Load())), keyword(arg='raw_head', value=Name(id='head', ctx=Load()))])",
+      "rendered": "log.warning(Event.S8_NO_RANKED_FINDINGS, ranked=len(covered), shown=len(window), unranked=missing, raw_head=head)"
+    },
+    {
+      "line_start": 270,
+      "line_end": 270,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_errlog', ctx=Load()), attr='log', ctx=Load()), args=[Constant(value='s8'), Constant(value='chain'), Name(id='msg', ctx=Load())], keywords=[keyword(arg='raw_head', value=Name(id='head', ctx=Load()))])",
+      "rendered": "_errlog.log('s8', 'chain', msg, raw_head=head)"
+    },
+    {
+      "line_start": 272,
+      "line_end": 274,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='  [s8] done: '), FormattedValue(value=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='report', ctx=Load()), attr='findings', ctx=Load())], keywords=[]), conversion=-1), Constant(value=' ranked findings, '), FormattedValue(value=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='report', ctx=Load()), attr='chains', ctx=Load())], keywords=[]), conversion=-1), Constant(value=' chains, '), FormattedValue(value=Attribute(value=Name(id='report', ctx=Load()), attr='chains_dropped', ctx=Load()), conversion=-1), Constant(value=' chains_dropped')])], keywords=[])",
+      "rendered": "console.write(source_template_272_18)"
+    },
+    {
+      "line_start": 275,
+      "line_end": 275,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='report', ctx=Load())",
+      "rendered": "report"
+    }
+  ],
+  "calls": [
+    {
+      "line": 53,
+      "end_line": 53,
+      "callee": "logs.get_logger",
+      "enclosing": "module initialization",
+      "expression": "logs.get_logger(__name__)"
+    },
+    {
+      "line": 67,
+      "end_line": 67,
+      "callee": "isinstance",
+      "enclosing": "_enrichment_failure_text",
+      "expression": "isinstance(e, ModelRefusal)"
+    },
+    {
+      "line": 83,
+      "end_line": 83,
+      "callee": "COUNTERS.get",
+      "enclosing": "_chain_call_with_half_window_retry",
+      "expression": "COUNTERS.get(_RANKED_INVALID)"
+    },
+    {
+      "line": 122,
+      "end_line": 122,
+      "callee": "str",
+      "enclosing": "_json_repair",
+      "expression": "str(raw)"
+    },
+    {
+      "line": 128,
+      "end_line": 128,
+      "callee": "console.write",
+      "enclosing": "_json_repair",
+      "expression": "console.write(\"  [s8] reply did not parse; one json-repair re-ask\")"
+    },
+    {
+      "line": 129,
+      "end_line": 129,
+      "callee": "COUNTERS.bump",
+      "enclosing": "_json_repair",
+      "expression": "COUNTERS.bump(\"s8_parse_repair_attempted\")"
+    },
+    {
+      "line": 142,
+      "end_line": 142,
+      "callee": "COUNTERS.bump",
+      "enclosing": "_json_repair",
+      "expression": "COUNTERS.bump(\"s8_parse_repair_recovered\")"
+    },
+    {
+      "line": 143,
+      "end_line": 143,
+      "callee": "_persist_raw",
+      "enclosing": "_json_repair",
+      "expression": "_persist_raw(repaired, \"_s8_raw_repaired.txt\")"
+    },
+    {
+      "line": 206,
+      "end_line": 206,
+      "callee": "_persist_raw",
+      "enclosing": "run",
+      "expression": "_persist_raw(raw or \"\", \"_s8_raw.txt\")"
+    },
+    {
+      "line": 272,
+      "end_line": 274,
+      "callee": "console.write",
+      "enclosing": "run",
+      "expression": "console.write(f\"  [s8] done: {len(report.findings)} ranked findings, \"\n                  f\"{len(report.chains)} chains, \"\n                  f\"{report.chains_dropped} chains_dropped\")"
+    },
+    {
+      "line": 60,
+      "end_line": 60,
+      "callee": "redact",
+      "enclosing": "_redacted_err",
+      "expression": "redact(str(e))"
+    },
+    {
+      "line": 105,
+      "end_line": 105,
+      "callee": "_errlog.current_path",
+      "enclosing": "_persist_raw",
+      "expression": "_errlog.current_path()"
+    },
+    {
+      "line": 109,
+      "end_line": 109,
+      "callee": "raw_path.parent.mkdir",
+      "enclosing": "_persist_raw",
+      "expression": "raw_path.parent.mkdir(parents=True, exist_ok=True)"
+    },
+    {
+      "line": 110,
+      "end_line": 110,
+      "callee": "raw_path.write_text",
+      "enclosing": "_persist_raw",
+      "expression": "raw_path.write_text(redact(text), encoding=\"utf-8\")"
+    },
+    {
+      "line": 120,
+      "end_line": 120,
+      "callee": "repairable",
+      "enclosing": "_json_repair",
+      "expression": "repairable(raw)"
+    },
+    {
+      "line": 123,
+      "end_line": 123,
+      "callee": "repair_fits",
+      "enclosing": "_json_repair",
+      "expression": "repair_fits(text, cfg)"
+    },
+    {
+      "line": 124,
+      "end_line": 125,
+      "callee": "console.write",
+      "enclosing": "_json_repair",
+      "expression": "console.write(\"  [s8] reply did not parse and is too large to restate under the \"\n                      \"replay cap; no json-repair re-ask\")"
+    },
+    {
+      "line": 126,
+      "end_line": 126,
+      "callee": "COUNTERS.bump",
+      "enclosing": "_json_repair",
+      "expression": "COUNTERS.bump(\"s8_parse_repair_skipped_oversize\")"
+    },
+    {
+      "line": 132,
+      "end_line": 132,
+      "callee": "repair_call",
+      "enclosing": "_json_repair",
+      "expression": "repair_call(text, err, ctx, cfg)"
+    },
+    {
+      "line": 133,
+      "end_line": 133,
+      "callee": "parse_chain_reply",
+      "enclosing": "_json_repair",
+      "expression": "parse_chain_reply(repaired)"
+    },
+    {
+      "line": 155,
+      "end_line": 170,
+      "callee": "FinalReport",
+      "enclosing": "run",
+      "expression": "FinalReport(\n            repo_root=ctx.repo_root,\n            findings=[],\n            chains=[],\n            dropped=dropped,\n            raw_findings_count=raw_findings_count,\n            metrics=metrics,\n            summary=(\"0 files analysed — no conclusion can be drawn about \"\n                     \"this repository; check the S1 file inventory and \"\n                     \"exclusions.\" if empty else\n                     \"No findings survived adversarial verification.\"),\n            degraded=empty,\n            enrichment_unavailable=empty,\n            degraded_reason=(\"scope was empty: 0 files reached analysis\"\n                             if empty else \"\"),\n        )"
+    },
+    {
+      "line": 174,
+      "end_line": 174,
+      "callee": "select_window",
+      "enclosing": "run",
+      "expression": "select_window(findings, ctx, cfg)"
+    },
+    {
+      "line": 183,
+      "end_line": 187,
+      "callee": "deterministic_report",
+      "enclosing": "run",
+      "expression": "deterministic_report(\n            ctx, findings, dropped, raw_findings_count, metrics,\n            enrichment_failure=(\"prompt_token_budget admits no findings \"\n                                \"into the enrichment window\"),\n        )"
+    },
+    {
+      "line": 192,
+      "end_line": 193,
+      "callee": "_chain_call_with_half_window_retry",
+      "enclosing": "run",
+      "expression": "_chain_call_with_half_window_retry(\n            sub, labels, window, findings, ctx, cfg)"
+    },
+    {
+      "line": 203,
+      "end_line": 203,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(window)"
+    },
+    {
+      "line": 203,
+      "end_line": 203,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(findings)"
+    },
+    {
+      "line": 210,
+      "end_line": 210,
+      "callee": "parse_chain_reply",
+      "enclosing": "run",
+      "expression": "parse_chain_reply(raw)"
+    },
+    {
+      "line": 234,
+      "end_line": 234,
+      "callee": "id",
+      "enclosing": "run",
+      "expression": "id(f)"
+    },
+    {
+      "line": 236,
+      "end_line": 238,
+      "callee": "hydrate_report",
+      "enclosing": "run",
+      "expression": "hydrate_report(\n            data, ctx, findings, dropped, raw_findings_count, metrics,\n            window=set(window) if windowed else None, cfg=cfg)"
+    },
+    {
+      "line": 254,
+      "end_line": 254,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(covered)"
+    },
+    {
+      "line": 254,
+      "end_line": 254,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(window)"
+    },
+    {
+      "line": 60,
+      "end_line": 60,
+      "callee": "str",
+      "enclosing": "_redacted_err",
+      "expression": "str(e)"
+    },
+    {
+      "line": 69,
+      "end_line": 69,
+      "callee": "_redacted_err",
+      "enclosing": "_enrichment_failure_text",
+      "expression": "_redacted_err(e)"
+    },
+    {
+      "line": 85,
+      "end_line": 85,
+      "callee": "chain_call",
+      "enclosing": "_chain_call_with_half_window_retry",
+      "expression": "chain_call(sub, ctx, cfg, labels=labels)"
+    },
+    {
+      "line": 89,
+      "end_line": 89,
+      "callee": "half_window",
+      "enclosing": "_chain_call_with_half_window_retry",
+      "expression": "half_window(findings, window)"
+    },
+    {
+      "line": 93,
+      "end_line": 94,
+      "callee": "console.write",
+      "enclosing": "_chain_call_with_half_window_retry",
+      "expression": "console.write(f\"  [s8] clipped at the output cap; retrying once over half the \"\n                      f\"window ({len(half)} of {len(window)} findings)\")"
+    },
+    {
+      "line": 97,
+      "end_line": 97,
+      "callee": "COUNTERS.get",
+      "enclosing": "_chain_call_with_half_window_retry",
+      "expression": "COUNTERS.get(_RANKED_INVALID)"
+    },
+    {
+      "line": 98,
+      "end_line": 98,
+      "callee": "chain_call",
+      "enclosing": "_chain_call_with_half_window_retry",
+      "expression": "chain_call(half_sub, ctx, cfg, labels=half_labels, allow_resend=False)"
+    },
+    {
+      "line": 107,
+      "end_line": 107,
+      "callee": "errp.name.endswith",
+      "enclosing": "_persist_raw",
+      "expression": "errp.name.endswith(\"_errors.jsonl\")"
+    },
+    {
+      "line": 110,
+      "end_line": 110,
+      "callee": "redact",
+      "enclosing": "_persist_raw",
+      "expression": "redact(text)"
+    },
+    {
+      "line": 112,
+      "end_line": 112,
+      "callee": "log.warning",
+      "enclosing": "_persist_raw",
+      "expression": "log.warning(Event.S8_RAW_PERSIST_FAILED, detail=redact(str(e)))"
+    },
+    {
+      "line": 135,
+      "end_line": 135,
+      "callee": "is_halt_error",
+      "enclosing": "_json_repair",
+      "expression": "is_halt_error(e2)"
+    },
+    {
+      "line": 138,
+      "end_line": 138,
+      "callee": "isinstance",
+      "enclosing": "_json_repair",
+      "expression": "isinstance(repaired, str)"
+    },
+    {
+      "line": 177,
+      "end_line": 177,
+      "callee": "log.warning",
+      "enclosing": "run",
+      "expression": "log.warning(Event.S8_WINDOW_SELECTION_FAILED, detail=redact(str(e)))"
+    },
+    {
+      "line": 179,
+      "end_line": 179,
+      "callee": "_errlog.log",
+      "enclosing": "run",
+      "expression": "_errlog.log(\"s8\", \"chain-window\", e, recovered=True)"
+    },
+    {
+      "line": 180,
+      "end_line": 180,
+      "callee": "list",
+      "enclosing": "run",
+      "expression": "list(range(len(findings)))"
+    },
+    {
+      "line": 195,
+      "end_line": 195,
+      "callee": "is_halt_error",
+      "enclosing": "run",
+      "expression": "is_halt_error(e)"
+    },
+    {
+      "line": 197,
+      "end_line": 197,
+      "callee": "log.warning",
+      "enclosing": "run",
+      "expression": "log.warning(Event.S8_CALL_FAILED, detail=redact(str(e)))"
+    },
+    {
+      "line": 198,
+      "end_line": 198,
+      "callee": "_errlog.log",
+      "enclosing": "run",
+      "expression": "_errlog.log(\"s8\", \"chain\", e)"
+    },
+    {
+      "line": 199,
+      "end_line": 202,
+      "callee": "deterministic_report",
+      "enclosing": "run",
+      "expression": "deterministic_report(\n            ctx, findings, dropped, raw_findings_count, metrics,\n            enrichment_failure=_enrichment_failure_text(e),\n        )"
+    },
+    {
+      "line": 213,
+      "end_line": 213,
+      "callee": "COUNTERS.get",
+      "enclosing": "run",
+      "expression": "COUNTERS.get(_RANKED_INVALID)"
+    },
+    {
+      "line": 214,
+      "end_line": 214,
+      "callee": "_json_repair",
+      "enclosing": "run",
+      "expression": "_json_repair(raw, e, ctx, cfg)"
+    },
+    {
+      "line": 242,
+      "end_line": 242,
+      "callee": "log.warning",
+      "enclosing": "run",
+      "expression": "log.warning(Event.S8_HYDRATION_FAILED, detail=redact(str(e)))"
+    },
+    {
+      "line": 243,
+      "end_line": 243,
+      "callee": "_errlog.log",
+      "enclosing": "run",
+      "expression": "_errlog.log(\"s8\", \"chain-hydrate\", e)"
+    },
+    {
+      "line": 244,
+      "end_line": 247,
+      "callee": "deterministic_report",
+      "enclosing": "run",
+      "expression": "deterministic_report(\n            ctx, findings, dropped, raw_findings_count, metrics,\n            enrichment_failure=f\"hydration failed ({_redacted_err(e)})\",\n        )"
+    },
+    {
+      "line": 255,
+      "end_line": 255,
+      "callee": "isinstance",
+      "enclosing": "run",
+      "expression": "isinstance(raw, str)"
+    },
+    {
+      "line": 255,
+      "end_line": 255,
+      "callee": "redact(raw)[:500].replace",
+      "enclosing": "run",
+      "expression": "redact(raw)[:500].replace(\"\\n\", \"\\\\n\")"
+    },
+    {
+      "line": 256,
+      "end_line": 256,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(window)"
+    },
+    {
+      "line": 256,
+      "end_line": 256,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(covered)"
+    },
+    {
+      "line": 264,
+      "end_line": 265,
+      "callee": "console.counts",
+      "enclosing": "run",
+      "expression": "console.counts(\"s8\", \"sparse ranking (by design); shipping unranked\",\n                           ranked=len(covered), shown=len(window), unranked=missing)"
+    },
+    {
+      "line": 266,
+      "end_line": 266,
+      "callee": "COUNTERS.bump",
+      "enclosing": "run",
+      "expression": "COUNTERS.bump(\"s8_sparse_ranking_recovered\")"
+    },
+    {
+      "line": 268,
+      "end_line": 269,
+      "callee": "log.warning",
+      "enclosing": "run",
+      "expression": "log.warning(Event.S8_NO_RANKED_FINDINGS, ranked=len(covered), shown=len(window),\n                        unranked=missing, raw_head=head)"
+    },
+    {
+      "line": 270,
+      "end_line": 270,
+      "callee": "_errlog.log",
+      "enclosing": "run",
+      "expression": "_errlog.log(\"s8\", \"chain\", msg, raw_head=head)"
+    },
+    {
+      "line": 87,
+      "end_line": 87,
+      "callee": "is_truncated_without_retry",
+      "enclosing": "_chain_call_with_half_window_retry",
+      "expression": "is_truncated_without_retry(e)"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "redact(repaired)[:500].replace",
+      "enclosing": "_json_repair",
+      "expression": "redact(repaired)[:500].replace(\"\\n\", \"\\\\n\")"
+    },
+    {
+      "line": 180,
+      "end_line": 180,
+      "callee": "range",
+      "enclosing": "run",
+      "expression": "range(len(findings))"
+    },
+    {
+      "line": 218,
+      "end_line": 218,
+      "callee": "safe_raw[:500].replace",
+      "enclosing": "run",
+      "expression": "safe_raw[:500].replace(\"\\n\", \"\\\\n\")"
+    },
+    {
+      "line": 219,
+      "end_line": 219,
+      "callee": "safe_raw[-200:].replace",
+      "enclosing": "run",
+      "expression": "safe_raw[-200:].replace(\"\\n\", \"\\\\n\")"
+    },
+    {
+      "line": 220,
+      "end_line": 220,
+      "callee": "log.warning",
+      "enclosing": "run",
+      "expression": "log.warning(Event.S8_RESPONSE_UNPARSEABLE, detail=redact(str(e)))"
+    },
+    {
+      "line": 222,
+      "end_line": 222,
+      "callee": "_errlog.log",
+      "enclosing": "run",
+      "expression": "_errlog.log(\"s8\", \"chain\", e, raw_head=head, raw_tail=tail, **repair_extra)"
+    },
+    {
+      "line": 223,
+      "end_line": 223,
+      "callee": "console.write",
+      "enclosing": "run",
+      "expression": "console.write(f\"  [s8] raw[:500]  = {head!r}\")"
+    },
+    {
+      "line": 224,
+      "end_line": 224,
+      "callee": "console.write",
+      "enclosing": "run",
+      "expression": "console.write(f\"  [s8] raw[-200:] = {tail!r}\")"
+    },
+    {
+      "line": 225,
+      "end_line": 228,
+      "callee": "deterministic_report",
+      "enclosing": "run",
+      "expression": "deterministic_report(\n                ctx, findings, dropped, raw_findings_count, metrics,\n                enrichment_failure=f\"reply unparseable ({_redacted_err(e)})\",\n            )"
+    },
+    {
+      "line": 251,
+      "end_line": 251,
+      "callee": "templated_summary",
+      "enclosing": "run",
+      "expression": "templated_summary(report.findings)"
+    },
+    {
+      "line": 257,
+      "end_line": 257,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(covered)"
+    },
+    {
+      "line": 257,
+      "end_line": 257,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(window)"
+    },
+    {
+      "line": 261,
+      "end_line": 261,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(data.ranked_findings)"
+    },
+    {
+      "line": 261,
+      "end_line": 261,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(covered)"
+    },
+    {
+      "line": 262,
+      "end_line": 262,
+      "callee": "COUNTERS.get",
+      "enclosing": "run",
+      "expression": "COUNTERS.get(_RANKED_INVALID)"
+    },
+    {
+      "line": 272,
+      "end_line": 272,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(report.findings)"
+    },
+    {
+      "line": 273,
+      "end_line": 273,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(report.chains)"
+    },
+    {
+      "line": 112,
+      "end_line": 112,
+      "callee": "redact",
+      "enclosing": "_persist_raw",
+      "expression": "redact(str(e))"
+    },
+    {
+      "line": 137,
+      "end_line": 137,
+      "callee": "redact",
+      "enclosing": "_json_repair",
+      "expression": "redact(str(e2))"
+    },
+    {
+      "line": 177,
+      "end_line": 177,
+      "callee": "redact",
+      "enclosing": "run",
+      "expression": "redact(str(e))"
+    },
+    {
+      "line": 180,
+      "end_line": 180,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(findings)"
+    },
+    {
+      "line": 197,
+      "end_line": 197,
+      "callee": "redact",
+      "enclosing": "run",
+      "expression": "redact(str(e))"
+    },
+    {
+      "line": 201,
+      "end_line": 201,
+      "callee": "_enrichment_failure_text",
+      "enclosing": "run",
+      "expression": "_enrichment_failure_text(e)"
+    },
+    {
+      "line": 217,
+      "end_line": 217,
+      "callee": "isinstance",
+      "enclosing": "run",
+      "expression": "isinstance(raw, str)"
+    },
+    {
+      "line": 217,
+      "end_line": 217,
+      "callee": "redact",
+      "enclosing": "run",
+      "expression": "redact(raw)"
+    },
+    {
+      "line": 238,
+      "end_line": 238,
+      "callee": "set",
+      "enclosing": "run",
+      "expression": "set(window)"
+    },
+    {
+      "line": 241,
+      "end_line": 241,
+      "callee": "id",
+      "enclosing": "run",
+      "expression": "id(f)"
+    },
+    {
+      "line": 242,
+      "end_line": 242,
+      "callee": "redact",
+      "enclosing": "run",
+      "expression": "redact(str(e))"
+    },
+    {
+      "line": 265,
+      "end_line": 265,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(covered)"
+    },
+    {
+      "line": 265,
+      "end_line": 265,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(window)"
+    },
+    {
+      "line": 268,
+      "end_line": 268,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(covered)"
+    },
+    {
+      "line": 268,
+      "end_line": 268,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(window)"
+    },
+    {
+      "line": 94,
+      "end_line": 94,
+      "callee": "len",
+      "enclosing": "_chain_call_with_half_window_retry",
+      "expression": "len(half)"
+    },
+    {
+      "line": 94,
+      "end_line": 94,
+      "callee": "len",
+      "enclosing": "_chain_call_with_half_window_retry",
+      "expression": "len(window)"
+    },
+    {
+      "line": 106,
+      "end_line": 106,
+      "callee": "len",
+      "enclosing": "_persist_raw",
+      "expression": "len(\"_errors.jsonl\")"
+    },
+    {
+      "line": 112,
+      "end_line": 112,
+      "callee": "str",
+      "enclosing": "_persist_raw",
+      "expression": "str(e)"
+    },
+    {
+      "line": 137,
+      "end_line": 137,
+      "callee": "str",
+      "enclosing": "_json_repair",
+      "expression": "str(e2)"
+    },
+    {
+      "line": 177,
+      "end_line": 177,
+      "callee": "str",
+      "enclosing": "run",
+      "expression": "str(e)"
+    },
+    {
+      "line": 197,
+      "end_line": 197,
+      "callee": "str",
+      "enclosing": "run",
+      "expression": "str(e)"
+    },
+    {
+      "line": 220,
+      "end_line": 220,
+      "callee": "redact",
+      "enclosing": "run",
+      "expression": "redact(str(e))"
+    },
+    {
+      "line": 242,
+      "end_line": 242,
+      "callee": "str",
+      "enclosing": "run",
+      "expression": "str(e)"
+    },
+    {
+      "line": 255,
+      "end_line": 255,
+      "callee": "redact",
+      "enclosing": "run",
+      "expression": "redact(raw)"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "redact",
+      "enclosing": "_json_repair",
+      "expression": "redact(repaired)"
+    },
+    {
+      "line": 220,
+      "end_line": 220,
+      "callee": "str",
+      "enclosing": "run",
+      "expression": "str(e)"
+    },
+    {
+      "line": 246,
+      "end_line": 246,
+      "callee": "_redacted_err",
+      "enclosing": "run",
+      "expression": "_redacted_err(e)"
+    },
+    {
+      "line": 227,
+      "end_line": 227,
+      "callee": "_redacted_err",
+      "enclosing": "run",
+      "expression": "_redacted_err(e)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 17,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "from typing import Any",
+      "targets": [
+        "typing",
+        "typing.Any"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "from vvaharness.util import logs",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.logs"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/logs.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 23,
+      "source_expression": "from vvaharness.backends.harness.models import TruncatedResponseError, is_halt_error",
+      "targets": [
+        "vvaharness.backends.harness.models",
+        "vvaharness.backends.harness.models.TruncatedResponseError",
+        "vvaharness.backends.harness.models.is_halt_error"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/models.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 24,
+      "source_expression": "from vvaharness.backends.llm.models import ModelRefusal",
+      "targets": [
+        "vvaharness.backends.llm.models",
+        "vvaharness.backends.llm.models.ModelRefusal"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/llm/models.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 25,
+      "source_expression": "from vvaharness.models import ContextPackage, DroppedFinding, FinalReport, Finding, ScanMetrics",
+      "targets": [
+        "vvaharness.models",
+        "vvaharness.models.ContextPackage",
+        "vvaharness.models.DroppedFinding",
+        "vvaharness.models.FinalReport",
+        "vvaharness.models.Finding",
+        "vvaharness.models.ScanMetrics"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 32,
+      "source_expression": "from vvaharness.pipeline.stages.s8.outcomes import ChainReport, deterministic_report, hydrate_report, parse_chain_reply, templated_summary",
+      "targets": [
+        "vvaharness.pipeline.stages.s8.outcomes",
+        "vvaharness.pipeline.stages.s8.outcomes.ChainReport",
+        "vvaharness.pipeline.stages.s8.outcomes.deterministic_report",
+        "vvaharness.pipeline.stages.s8.outcomes.hydrate_report",
+        "vvaharness.pipeline.stages.s8.outcomes.parse_chain_reply",
+        "vvaharness.pipeline.stages.s8.outcomes.templated_summary"
+      ],
+      "local_source_paths": [
+        "vvaharness/pipeline/stages/s8/outcomes.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 39,
+      "source_expression": "from vvaharness.pipeline.stages.s8.session import chain_call, repair_call, repair_fits, repairable",
+      "targets": [
+        "vvaharness.pipeline.stages.s8.session",
+        "vvaharness.pipeline.stages.s8.session.chain_call",
+        "vvaharness.pipeline.stages.s8.session.repair_call",
+        "vvaharness.pipeline.stages.s8.session.repair_fits",
+        "vvaharness.pipeline.stages.s8.session.repairable"
+      ],
+      "local_source_paths": [
+        "vvaharness/pipeline/stages/s8/session.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 45,
+      "source_expression": "from vvaharness.pipeline.stages.s8.window import half_window, select_window",
+      "targets": [
+        "vvaharness.pipeline.stages.s8.window",
+        "vvaharness.pipeline.stages.s8.window.half_window",
+        "vvaharness.pipeline.stages.s8.window.select_window"
+      ],
+      "local_source_paths": [
+        "vvaharness/pipeline/stages/s8/window.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 46,
+      "source_expression": "from vvaharness.report.redact import redact",
+      "targets": [
+        "vvaharness.report.redact",
+        "vvaharness.report.redact.redact"
+      ],
+      "local_source_paths": [
+        "vvaharness/report/redact.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 47,
+      "source_expression": "from vvaharness.util import console",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.console"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/console.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 48,
+      "source_expression": "from vvaharness.util import errlog as _errlog",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.errlog"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/errlog.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 49,
+      "source_expression": "from vvaharness.util.counters import COUNTERS",
+      "targets": [
+        "vvaharness.util.counters",
+        "vvaharness.util.counters.COUNTERS"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/counters.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 50,
+      "source_expression": "from vvaharness.util.events import Event",
+      "targets": [
+        "vvaharness.util.events",
+        "vvaharness.util.events.Event"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/events.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 51,
+      "source_expression": "from vvaharness.util.response_quality import is_truncated_without_retry",
+      "targets": [
+        "vvaharness.util.response_quality",
+        "vvaharness.util.response_quality.is_truncated_without_retry"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/response_quality.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

@@ -1,0 +1,167 @@
+# vvaharness/backends/llm/tools.py
+
+The harness's own read-only Read, Glob and Grep tools for the non-CLI routes (`sdk`, `openai`; also reused by the deepagents harness and the tool adapter). Every path is jailed to the working directory, internal directories are always excluded, and once Stage 1 registers the scan inventory, reads are limited to in-scope files. Results are size-capped and redacted. There is no shell tool.
+
+Source: `vvaharness/backends/llm/tools.py` (lines 1-431)
+Executor: code (the model chooses the calls; this code executes them)
+Called from: `vvaharness/backends/llm/sdk.py`, `vvaharness/backends/llm/openai.py` (tool schemas and `execute`), `tool_adapter.sudo` (`cap_tool_result`, `summarize_args`), `pipeline/stages/s1_preprocess.py` (`set_scope`), `pipeline/stages/s4_deepdive.py`
+
+// src: vvaharness/backends/llm/tools.py:28-41,88-100,130-131
+Constants {
+  _MAX_BYTES = 200000
+  _MAX_MATCHES = 200       // Grep output lines
+  _MAX_GLOB = 500          // Glob hits listed
+  _MAX_GREP_LINE = 50000   // per-line search and output ceiling: a ReDoS bound, since the pattern is model-supplied
+  _ALWAYS_EXCLUDED_DIRS = { ".git", ".hg", ".svn", "checkpoints", "security-scan" }   // matched case-insensitively at any depth
+  _ALWAYS_ALLOWED_PREFIXES = (".vvaharness/",)   // harness-injected content, exempt from inventory scoping
+  _SCOPE: map of resolved root -> frozen set of repository-relative paths, guarded by _SCOPE_LOCK
+  _SCOPE_ERROR = "ERROR: path '{path}' is excluded from the scan scope (not in the scanned file inventory)"
+  UNGRANTED_TOOL_ERROR = "ERROR: tool '{name}' is not available in this session"   // used by the agentic loops for a tool the session never granted
+  _BINARY_SNIFF_CHARS = 8192
+  TOOL_RESULT_CAP = 48000   // about 12K tokens; shared by openai, sdk and tool_adapter
+}
+
+// Tool definitions offered to models (Chat function shape via schemas_for, Anthropic shape via anthropic_schemas_for)
+// src: vvaharness/backends/llm/tools.py:315-361
+_SCHEMAS {
+  Read {
+    description: "Read a file from the repository. Returns numbered lines."
+    parameters: { path: String "Path relative to the repo root" (required), offset: Integer "0-based line to start from (default 0)", limit: Integer "Max lines to return (default 2000)" }
+  }
+  Glob {
+    description: "List files in the repository matching a glob pattern (e.g. **/*.java)."
+    parameters: { pattern: String (required) }
+  }
+  Grep {
+    description: "Search file contents for a regex. Returns file:line:text for each match."
+    parameters: { pattern: String "Python regex" (required), path: String "Restrict to this file or directory", glob: String "Restrict to files matching this glob", ignore_case: Boolean, context: Integer "Lines of context around each match" }
+  }
+}
+
+// src: vvaharness/backends/llm/tools.py:419-431
+fn execute(name, args, cwd):executor=code {
+  root = resolved cwd
+  require name in ["Read", "Glob", "Grep"] => return "ERROR: tool '$name' is not available on this backend"
+  try result = match (name) {
+    case "Read" => _read(root, args.path || "", args.offset || 0, args.limit || 2000)
+    case "Glob" => _glob(root, args.pattern || "")
+    case "Grep" => _grep(root, args.pattern || "", args.path, args.glob, bool(args.ignore_case), args.context || 0)
+  }
+  catch any error => return "ERROR: <ErrorType>: <message>"   // preserved: this error text is not redacted
+  if (name in ["Read", "Grep"] && result does not start with "ERROR:") result = redact_counts(result).text   // file content is never sent unredacted; Glob returns paths only
+  return result
+  // The TOOL_RESULT_CAP trim is applied by the calling loop, not here
+}
+
+// src: vvaharness/backends/llm/tools.py:144-153
+fn _jail(root, p):executor=code {
+  cand = resolve(root / p) or resolve(p) when absolute; null on OSError or ValueError
+  return if (cand is inside root) cand else null   // symlinks are followed, then the target must be inside root
+}
+
+// src: vvaharness/backends/llm/tools.py:44-85
+fn set_scope(root, files):executor=code { _SCOPE[resolved root] = set of files as forward-slash paths, under the lock }   // called by Stage 1
+fn _excluded_rel(rel, scope):executor=code {
+  if (rel starts with ".vvaharness/") return false
+  if (any directory component of rel, lowercased, in _ALWAYS_EXCLUDED_DIRS) return true   // directories only, not the file name
+  return scope != null && rel not in scope   // before set_scope there is no inventory restriction
+  // preserved: here the excluded directories match at any depth; the cli route's Read() deny rules and the cli_mcp hook exclude them only at the top level of the repository
+}
+fn _excluded_target(rel, scope):executor=code {
+  // For an explicit Grep path, which may name a directory
+  if (rel starts with ".vvaharness/") return false
+  if (any component of rel, lowercased, in _ALWAYS_EXCLUDED_DIRS) return true
+  if (scope == null || rel in scope) return false
+  return no in-scope file lies under rel + "/"
+}
+
+// src: vvaharness/backends/llm/tools.py:156-181
+fn _read(root, path, offset=0, limit=2000):executor=code {
+  fp = _jail(root, path)
+  require fp != null => return "ERROR: path '$path' is outside the repository root"
+  rel = fp relative to root
+  require !_excluded_rel(rel, _scope_for(root)) => return _SCOPE_ERROR   // scope check before the existence check: no existence oracle
+  require fp is a file => return "ERROR: file not found: $path"
+  try lines = sanitize_packed_text(first _MAX_BYTES * 4 characters of the file (800000), rel) split into lines
+  catch OSError => return "ERROR: cannot read $path: <error>"
+  body = lines[max(0, offset) .. max(0, offset) + max(1, limit)), each prefixed "<1-based line number>\t"
+  if (length(body) > _MAX_BYTES) body = first 200000 characters + "\n... [truncated]"
+  return body || "(file is empty or offset past EOF)"
+}
+
+// src: vvaharness/backends/llm/tools.py:184-204
+fn _glob(root, pattern):executor=code {
+  pat = pattern without leading "/" or "\"
+  hits = sorted relative paths of regular files matching root.glob(pat) whose resolved target is jailed inside root and not _excluded_rel   // an in-root symlink cannot list an excluded file
+  catch OSError or ValueError => return "ERROR: invalid glob '$pattern': <error>"
+  if (!hits) return "No files found"
+  if (length(hits) > _MAX_GLOB) return first 500 hits + "\n... (<rest> more)"
+  return hits joined by newlines
+}
+
+// src: vvaharness/backends/llm/tools.py:207-250
+fn _grep_files(root, path, glob, scope):executor=code {
+  if (!path) return sorted files under root (recursive) passing _grep_in_surface(..., explicit_harness=false)   // glob, if any, filters the walk
+  target = _jail(root, path)
+  require target != null => return "ERROR: path '$path' is outside the repository root"
+  rel = target relative to root
+  require rel == "." || !_excluded_target(rel, scope) => return _SCOPE_ERROR   // checked before the file or directory split
+  if (target is not a directory) return if (target is a file) [target] else []
+  explicit_harness = rel == ".vvaharness" || rel starts with ".vvaharness/"
+  return sorted files under target passing _grep_in_surface(..., explicit_harness)
+}
+fn _grep_in_surface(root, p, scope, glob, explicit_harness):executor=code {
+  fp = if (p is a file) _jail(root, p) else null; if (fp == null) return false   // the resolved target, not the link
+  rel = fp relative to root
+  if (!explicit_harness && (rel == ".vvaharness" || rel starts with ".vvaharness/")) return false   // harness skill content only surfaces when named
+  return (glob is empty || rel or its basename matches glob with fnmatch) && !_excluded_rel(rel, scope)
+}
+
+// src: vvaharness/backends/llm/tools.py:271-310
+fn _grep(root, pattern, path?, glob?, ignore_case=false, context=0):executor=code {
+  try rx = compile pattern (case-insensitive when ignore_case)
+  catch re.error => return "ERROR: invalid regex '$pattern': <error>"
+  files = _grep_files(root, path, glob, _scope_for(root))
+  if (files is an error string) return files
+  out = []; emitted = 0
+  ctx = clamp(integer(context), 0, 200)
+  for each fp in files {
+    text = file contents (UTF-8, invalid bytes replaced); skip on OSError
+    text = first _MAX_BYTES * 8 characters (1600000)
+    if (_is_binary_text(text)) skip this file
+    text = _elide_data_uris(text)
+    for each line i {
+      if (rx does not match the first 50000 characters of the line) continue
+      // src: vvaharness/backends/llm/tools.py:253-268
+      emitted += _emit_grep_match(out, rel, i, lines, ctx)   // "rel:N:line" or a context window with "rel:N-line" neighbours and a "--" separator; each line clipped at 50000 characters with " …[line clipped]"
+      if (emitted >= _MAX_MATCHES) { append "... (stopped at 200 lines; narrow pattern, path or glob)"; return out joined }
+    }
+  }
+  return if (out) out joined by newlines else "No matches found"
+}
+
+// src: vvaharness/backends/llm/tools.py:103-127
+fn _is_binary_text(text):executor=code {
+  head = first 8192 characters
+  return head contains a NUL character || (head non-empty && count of U+FFFD in head / length(head) > 0.10)
+}
+fn _elide_data_uris(text):executor=code {
+  replace each "data:<type>;base64,<payload>" with "[data-uri <type> elided: <payload length> chars]" (or "[data-uri <type> elided]" when the payload is empty)
+  then replace each remaining "data:image/<subtype>" with "[data-uri image/<subtype> elided]" (or "[data-uri image elided]")   // some gateways reject the bare marker
+}
+fn sanitize_packed_text(text, rel=""):executor=code {
+  if (_is_binary_text(text)) return "[binary content elided: ${rel || "file"} is not text]"
+  return _elide_data_uris(text)
+}
+
+// src: vvaharness/backends/llm/tools.py:134-141
+fn cap_tool_result(result):executor=code {
+  if (!result || length(result) <= TOOL_RESULT_CAP) return result
+  return first 48000 characters + "\n\n…[truncated <extra> chars to fit context — re-read a specific line range with Read offset/limit if you need more]"   // model-facing
+}
+
+// src: vvaharness/backends/llm/tools.py:374-416
+fn schemas_for(allowed):executor=code { return [{ type: "function", function: { name, ..._SCHEMAS[name] } } for each name in allowed that has a schema] }   // unknown names silently skipped
+fn anthropic_schemas_for(allowed):executor=code { return [{ name, description, input_schema: parameters } for each name in allowed that has a schema] }
+fn supported(allowed):executor=code { return [names with a schema, names without one] }
+fn summarize_args(args):executor=code { return "path=..., pattern=..., glob=..." each cut to 60 characters, plus context and ignore_case when set, or "..." }   // logging only

@@ -1,0 +1,4360 @@
+{
+  "source": "vvaharness/backends/llm/agent_sdk.py",
+  "sha256": "e11373a33fc378ad1bffebf248f2cc674fe892e454f4311e91ee2c366204691b",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Claude Agent SDK backend for the Remediation Agent's fix mode (`via: sdk`); sdk.py is read-only.\"\"\"\n\n# Deny-by-default gate: Read/Glob/Grep OK, Edit/Write cwd-confined, Bash denied (RCE + exfil risk).\nfrom __future__ import annotations\n\nimport asyncio\nimport contextlib\nimport os\nimport time\nfrom pathlib import Path\nfrom typing import TYPE_CHECKING, NamedTuple, cast\n\nfrom vvaharness.backends.llm.cli import _NO_REFUSAL_RESEND_ENV\nfrom vvaharness.backends.llm.models import (\n    DEFAULT_READ_TOOLS,\n    TIMEOUT_STOP_GRACE_SECONDS,\n    ClockKind,\n    call_timeout_error,\n    effort_scaled_seconds,\n    note_budget_use,\n)\nfrom vvaharness.report.redact import redact_counts\nfrom vvaharness.util import console\nfrom vvaharness.util.git_paths import is_git_metadata\nfrom vvaharness.util.tokens import TOKENS, TokenUsage\n\nif TYPE_CHECKING:\n    from claude_agent_sdk import ResultMessage\n\n# Read-only tools are always safe; only file-mutation tools are gated to cwd.\n_WRITE_TOOLS = frozenset({\"Edit\", \"Write\", \"MultiEdit\", \"NotebookEdit\"})\n# Read-only inspection tools — always permitted (output is redaction-hooked).\n_READ_TOOLS = frozenset({\"Read\", \"Glob\", \"Grep\", \"LS\", \"NotebookRead\"})\n# Masked by the PostToolUse hook so on-disk secrets/PII aren't egressed unredacted.\n_REDACT_TOOLS = _READ_TOOLS | frozenset({\"Bash\"})\n\n\ndef _resolve_within_root(root: Path, raw: object) -> Path | None:\n    \"\"\"Resolve *raw* to a real path confined to *root*, or None if unresolvable/escaping/a symlink.\"\"\"\n    if not isinstance(raw, str) or not raw:\n        return None\n    try:\n        candidate = Path(raw) if os.path.isabs(raw) else (root / raw)\n        # Refuse a symlinked final component without following it — the redirect primitive denied.\n        if candidate.is_symlink():\n            return None\n        target = candidate.resolve()\n        target.relative_to(root)\n    except (OSError, ValueError):\n        return None\n    return target\n\n\ndef _within_root(root: Path, raw: object) -> bool:\n    \"\"\"Return True iff *raw* resolves to a non-symlinked path inside (or equal to) *root*.\"\"\"\n    return _resolve_within_root(root, raw) is not None\n\n\ndef _sdk_env() -> dict[str, str]:\n    \"\"\"Inherit the ambient environment, forwarding the SDK-specific key as the standard ANTHROPIC_API_KEY when o...\"\"\"\n    env = dict(os.environ)\n    if not env.get(\"ANTHROPIC_API_KEY\"):\n        fallback = (env.get(\"ANTHROPIC_AUTH_TOKEN\")\n                    or env.get(\"ANTHROPIC_SDK_API_KEY\"))\n        if fallback:\n            env[\"ANTHROPIC_API_KEY\"] = fallback\n    sdk_base = env.get(\"ANTHROPIC_SDK_BASE_URL\")\n    if sdk_base and not env.get(\"ANTHROPIC_BASE_URL\"):\n        env[\"ANTHROPIC_BASE_URL\"] = sdk_base\n    # Same no-resend env as the CLI route; set last so an ambient \"0\" cannot win.\n    return {**env, **_NO_REFUSAL_RESEND_ENV}\n\n\n#: Path keys redacted with ``carry=False``; NOT redact's `_NO_CARRY_KEYS` (``file`` holds content)\n_TOOL_PATH_KEYS = frozenset({\"filePath\", \"file_path\", \"filenames\", \"path\"})\n\n\ndef _redact_tool_output(payload: object, *, carry: bool = True) -> object:\n    \"\"\"Mask secret/PII in *payload* (str/list/dict) via redact_counts(); unknown shapes pass.\"\"\"\n    if isinstance(payload, str):\n        masked, _ = redact_counts(payload, carry=carry)\n        return masked\n    if isinstance(payload, list):\n        return [_redact_tool_output(item, carry=carry) for item in payload]\n    if isinstance(payload, dict):\n        return {k: _redact_tool_output(v, carry=carry and k not in _TOOL_PATH_KEYS)\n                for k, v in payload.items()}\n    return payload\n\n\ndef _build_redaction_hooks():\n    \"\"\"Build a PostToolUse hook masking Read/Grep/Bash; best-effort, None if HookMatcher missing.\"\"\"\n    try:\n        from claude_agent_sdk import HookMatcher  # type: ignore  # noqa: PLC0415 — optional SDK\n    except Exception:\n        return None\n\n    async def _post_tool_use(input_data, tool_use_id, context):  # noqa: ANN001, ARG001\n        try:\n            tool_name = (input_data or {}).get(\"tool_name\")\n            if tool_name not in _REDACT_TOOLS:\n                return {}\n            response = (input_data or {}).get(\"tool_response\")\n            if response is None:\n                return {}\n            masked = _redact_tool_output(response)\n            if masked == response:\n                return {}\n            # `updatedToolOutput` is the only key the CLI honours; the old name leaked cleartext.\n            return {\n                \"hookSpecificOutput\": {\n                    \"hookEventName\": \"PostToolUse\",\n                    \"updatedToolOutput\": masked,\n                }\n            }\n        except Exception:\n            return {}\n\n    try:\n        return {\"PostToolUse\": [HookMatcher(hooks=[_post_tool_use])]}  # type: ignore[list-item]\n    except Exception:\n        return None\n\n\ndef _build_options(*, model: str, system_prompt: str | None,\n                   allowed_tools: list[str], cwd: str,\n                   max_budget_usd: float | None, max_turns: int | None):\n    \"\"\"Compose ClaudeAgentOptions with a cwd-confined write gate; lazy import keeps SDK optional.\"\"\"\n    try:\n        from claude_agent_sdk import (  # noqa: PLC0415 — lazy: SDK stays optional\n            ClaudeAgentOptions,\n            HookMatcher,\n        )\n    except ImportError as e:\n        raise RuntimeError(\n            \"This Claude Agent SDK build has no PreToolUse hook support \"\n            \"(HookMatcher), which is what enforces the cwd-confined write \"\n            \"gate on `via: sdk` (see _pre_tool_use_gate's docstring) — \"\n            \"reinstall vvaharness to pull in a newer SDK release.\"\n        ) from e\n\n    root = Path(cwd).resolve()\n\n    async def _pre_tool_use_gate(input_data, tool_use_id, context):  # noqa: ANN001, ARG001\n        \"\"\"PreToolUse hook enforcing the write-confinement + deny-by-default gate.\"\"\"\n        # Must stay PreToolUse, never can_use_tool (a bare allow entry bypasses it); fail-closed\n        def _deny(reason: str) -> dict:\n            return {\"hookSpecificOutput\": {\n                \"hookEventName\": \"PreToolUse\",\n                \"permissionDecision\": \"deny\",\n                \"permissionDecisionReason\": reason,\n            }}\n\n        try:\n            tool_name = (input_data or {}).get(\"tool_name\") or \"\"\n            tool_input = (input_data or {}).get(\"tool_input\") or {}\n\n            # File-mutation tools: allow only when the target stays inside the repo.\n            if tool_name in _WRITE_TOOLS:\n                raw = key_used = None\n                for key in (\"file_path\", \"path\", \"notebook_path\"):\n                    val = tool_input.get(key)\n                    if val:\n                        raw, key_used = val, key\n                        break\n                resolved = _resolve_within_root(root, raw)\n                if resolved is None:\n                    return _deny(f\"{tool_name} target {raw!r} is outside the \"\n                                 f\"repository root, unresolvable, or a symlink — \"\n                                 f\"edits are confined to {root}\")\n                if is_git_metadata(resolved.relative_to(root)):\n                    return _deny(f\"{tool_name} target {raw!r} is version-control \"\n                                 f\"metadata (.git), which remediation never edits.\")\n                # Hand the SDK the resolved path, not the raw name, so an alias can't redirect it.\n                safe_input = dict(tool_input)\n                safe_input[key_used] = str(resolved)\n                return {\"hookSpecificOutput\": {\n                    \"hookEventName\": \"PreToolUse\",\n                    \"permissionDecision\": \"allow\",\n                    \"updatedInput\": safe_input,\n                }}\n            # Read-only tools need no decision: the bare allow entry below covers them.\n            if tool_name in _READ_TOOLS:\n                return {}\n            # DENY-BY-DEFAULT, esp. Bash: host-shell RCE + credential exfil; re-adding it can't run.\n            return _deny(f\"{tool_name} is not permitted in remediation fix mode — \"\n                         f\"only Read/Glob/Grep and cwd-confined Edit/Write are \"\n                         f\"allowed (Bash and other tools are denied by default).\")\n        except Exception as exc:\n            return _deny(f\"the security gate could not evaluate this call \"\n                         f\"({type(exc).__name__}) and denies it as a precaution.\")\n\n    redaction_hooks = _build_redaction_hooks() or {}\n    hooks = {**redaction_hooks, \"PreToolUse\": [HookMatcher(hooks=[_pre_tool_use_gate])]}\n\n    opts = ClaudeAgentOptions(\n        model=model,\n        cwd=str(root),\n        env=_sdk_env(),\n        # The PreToolUse hook above is the live gate; permission_mode/allowed_tools set availability\n        permission_mode=\"default\",\n        # \"user\" only: a scanned repo's own .claude/settings.json can never re-grant Bash or\n        # register a host hook into this Edit/Write-capable session (mirrors the via:cli\n        # route's --setting-sources user).\n        setting_sources=[\"user\"],\n        # Without this, a target repo's own .mcp.json server would be spawned into this\n        # session (mirrors cli_mcp.py's strict_mcp_config=True).\n        strict_mcp_config=True,\n        allowed_tools=list(allowed_tools),\n        hooks=hooks,\n        # Finding text/code snippets reach this prompt; verbatim keeps them from being\n        # parsed as an @path expansion or a slash command.\n        verbatim_prompts=True,\n    )\n\n    if system_prompt is not None:\n        opts.system_prompt = system_prompt\n    if max_turns is not None:\n        opts.max_turns = int(max_turns)\n    if max_budget_usd is not None:\n        opts.max_budget_usd = float(max_budget_usd)\n    return opts\n\n\nclass DrainResult(NamedTuple):\n    \"\"\"One drain pass's outcome: the terminal ResultMessage, if any, and whether it timed out.\"\"\"\n\n    result: ResultMessage | None\n    timed_out: bool\n\n\nasync def _drain(client, on_message) -> ResultMessage | None:  # noqa: ANN001\n    \"\"\"One fresh pass over `client.receive_response()`, returning the terminal ResultMessage.\"\"\"\n    from claude_agent_sdk import ResultMessage  # noqa: PLC0415 — lazy: SDK stays optional\n\n    async for message in client.receive_response():\n        on_message(message)\n        if isinstance(message, ResultMessage):\n            return message\n    return None\n\n\nasync def drain_until_result(client, *, on_message, timeout: float | None,\n                             grace: float = TIMEOUT_STOP_GRACE_SECONDS) -> DrainResult:\n    \"\"\"Drain *client* to its terminal result, bounded by `timeout`; interrupt-then-regrace on expiry.\"\"\"\n    if timeout is None or timeout <= 0:\n        return DrainResult(await _drain(client, on_message), False)\n    # .expired() tells OUR deadline apart from a TimeoutError raised inside the drain itself\n    deadline = asyncio.timeout(timeout)\n    try:\n        async with deadline:\n            return DrainResult(await _drain(client, on_message), False)\n    except TimeoutError:\n        if not deadline.expired():\n            raise\n    with contextlib.suppress(Exception):\n        await client.interrupt()\n    # The cancelled `async for` above finalized its generator; receive_response() opens a new one\n    # (claude_agent_sdk.client.ClaudeSDKClient), so this second _drain is a fresh call, not a resume.\n    regrace = asyncio.timeout(grace)\n    try:\n        async with regrace:\n            return DrainResult(await _drain(client, on_message), True)\n    except TimeoutError:\n        if not regrace.expired():\n            raise\n        return DrainResult(None, True)\n\n\nasync def _run(*, user_prompt: str, opts, timeout: float | None = None,\n               tag: str | None = None, effort: str | None = None) -> str:  # noqa: ANN001\n    \"\"\"Stream one agentic session to completion and return the final text.\"\"\"\n    from claude_agent_sdk import (  # noqa: PLC0415 — lazy: SDK stays optional\n        AssistantMessage,\n        ClaudeSDKClient,\n        TextBlock,\n    )\n\n    text_parts: list[str] = []\n\n    def _on_message(message) -> None:  # noqa: ANN001\n        if isinstance(message, AssistantMessage):\n            for block in message.content:\n                if isinstance(block, TextBlock):\n                    text_parts.append(block.text)\n\n    # Session clock, scaled the same way every other route scales its own agentic() timeout.\n    budget = effort_scaled_seconds(timeout, effort, kind=ClockKind.SESSION)\n    # The caller owns no scope around this call: the client's __aexit__ (close()) must run with\n    # no cancellation in flight, or the SDK skips its own terminate/kill escalation (subprocess_cli.py).\n    _start = time.monotonic()\n    async with ClaudeSDKClient(options=opts) as client:\n        await client.query(user_prompt)\n        drained = await drain_until_result(client, on_message=_on_message, timeout=budget,\n                                           grace=TIMEOUT_STOP_GRACE_SECONDS)\n\n    result = drained.result\n    if result is not None and result.usage:\n        TOKENS.add(cast(\"TokenUsage\", result.usage))\n    if drained.timed_out:\n        raise call_timeout_error(\n            stage=tag or \"\", route=\"agent-sdk\", budget_s=budget, effort=effort,\n            cause_text=f\"agent-sdk session exceeded {budget:g}s\")\n    note_budget_use(time.monotonic() - _start, budget, effort)\n    result_text = result.result if result is not None else None\n    return (result_text or \"\".join(text_parts)).strip()\n\n\ndef agentic(\n    user_prompt: str,\n    *,\n    model: str,\n    system_prompt: str | None = None,\n    allowed_tools: list[str] | None = None,\n    cwd: str,\n    max_budget_usd: float | None = None,\n    permission_mode: str = \"auto\",   # accepted for parity; gate handles policy\n    max_turns: int | None = None,\n    tag: str | None = None,\n    timeout: float | None = None,\n    effort: str | None = None,\n) -> str:\n    \"\"\"Run an agentic loop with native Edit/Write/Bash via the Agent SDK; writes cwd-confined.\"\"\"\n    try:\n        import claude_agent_sdk  # noqa: F401, PLC0415 — availability probe\n    except ImportError as e:\n        raise RuntimeError(\n            \"An agentic role is configured `via: sdk` and requests file-editing \"\n            \"tools (Edit/Write/Bash), which require the Claude Agent SDK. \"\n            \"Reinstall vvaharness to pull it in (pip install .), or \"\n            \"set this role to `via: cli`.\"\n        ) from e\n    # `None` = unspecified (read-only default), `[]` = none wanted; same as backends.llm.sdk.agentic\n    allowed = list(DEFAULT_READ_TOOLS) if allowed_tools is None else list(allowed_tools)\n    tag_sfx = f\" [{tag}]\" if tag else \"\"\n    console.write(f\"    [agent-sdk] agentic -> {model}{tag_sfx} (tools={allowed}, \"\n                  f\"max_turns={max_turns}, cwd={cwd}, timeout={timeout})\")\n\n    opts = _build_options(\n        model=model, system_prompt=system_prompt, allowed_tools=allowed,\n        cwd=cwd, max_budget_usd=max_budget_usd, max_turns=max_turns,\n    )\n    return asyncio.run(_run(user_prompt=user_prompt, opts=opts, timeout=timeout,\n                            tag=tag, effort=effort))\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/backends/llm/agent_sdk.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "Claude Agent SDK backend for the Remediation Agent's fix mode (`via: sdk`); sdk.py is read-only.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_53_4": {
+      "source": "vvaharness/backends/llm/agent_sdk.py",
+      "line_start": 53,
+      "line_end": 53,
+      "value": "Resolve *raw* to a real path confined to *root*, or None if unresolvable/escaping/a symlink.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_69_4": {
+      "source": "vvaharness/backends/llm/agent_sdk.py",
+      "line_start": 69,
+      "line_end": 69,
+      "value": "Return True iff *raw* resolves to a non-symlinked path inside (or equal to) *root*.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_74_4": {
+      "source": "vvaharness/backends/llm/agent_sdk.py",
+      "line_start": 74,
+      "line_end": 74,
+      "value": "Inherit the ambient environment, forwarding the SDK-specific key as the standard ANTHROPIC_API_KEY when o...",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_93_4": {
+      "source": "vvaharness/backends/llm/agent_sdk.py",
+      "line_start": 93,
+      "line_end": 93,
+      "value": "Mask secret/PII in *payload* (str/list/dict) via redact_counts(); unknown shapes pass.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_106_4": {
+      "source": "vvaharness/backends/llm/agent_sdk.py",
+      "line_start": 106,
+      "line_end": 106,
+      "value": "Build a PostToolUse hook masking Read/Grep/Bash; best-effort, None if HookMatcher missing.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_142_4": {
+      "source": "vvaharness/backends/llm/agent_sdk.py",
+      "line_start": 142,
+      "line_end": 142,
+      "value": "Compose ClaudeAgentOptions with a cwd-confined write gate; lazy import keeps SDK optional.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_150_12": {
+      "source": "vvaharness/backends/llm/agent_sdk.py",
+      "line_start": 150,
+      "line_end": 153,
+      "value": "This Claude Agent SDK build has no PreToolUse hook support (HookMatcher), which is what enforces the cwd-confined write gate on `via: sdk` (see _pre_tool_use_gate's docstring) — reinstall vvaharness to pull in a newer SDK release.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_159_8": {
+      "source": "vvaharness/backends/llm/agent_sdk.py",
+      "line_start": 159,
+      "line_end": 159,
+      "value": "PreToolUse hook enforcing the write-confinement + deny-by-default gate.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_182_33": {
+      "source": "vvaharness/backends/llm/agent_sdk.py",
+      "line_start": 182,
+      "line_end": 184,
+      "source_expression": "f\"{tool_name} target {raw!r} is outside the \"\n                                 f\"repository root, unresolvable, or a symlink — \"\n                                 f\"edits are confined to {root}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_186_33": {
+      "source": "vvaharness/backends/llm/agent_sdk.py",
+      "line_start": 186,
+      "line_end": 187,
+      "source_expression": "f\"{tool_name} target {raw!r} is version-control \"\n                                 f\"metadata (.git), which remediation never edits.\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_200_25": {
+      "source": "vvaharness/backends/llm/agent_sdk.py",
+      "line_start": 200,
+      "line_end": 202,
+      "source_expression": "f\"{tool_name} is not permitted in remediation fix mode — \"\n                         f\"only Read/Glob/Grep and cwd-confined Edit/Write are \"\n                         f\"allowed (Bash and other tools are denied by default).\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_204_25": {
+      "source": "vvaharness/backends/llm/agent_sdk.py",
+      "line_start": 204,
+      "line_end": 205,
+      "source_expression": "f\"the security gate could not evaluate this call \"\n                         f\"({type(exc).__name__}) and denies it as a precaution.\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_240_4": {
+      "source": "vvaharness/backends/llm/agent_sdk.py",
+      "line_start": 240,
+      "line_end": 240,
+      "value": "One drain pass's outcome: the terminal ResultMessage, if any, and whether it timed out.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_247_4": {
+      "source": "vvaharness/backends/llm/agent_sdk.py",
+      "line_start": 247,
+      "line_end": 247,
+      "value": "One fresh pass over `client.receive_response()`, returning the terminal ResultMessage.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_259_4": {
+      "source": "vvaharness/backends/llm/agent_sdk.py",
+      "line_start": 259,
+      "line_end": 259,
+      "value": "Drain *client* to its terminal result, bounded by `timeout`; interrupt-then-regrace on expiry.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_286_4": {
+      "source": "vvaharness/backends/llm/agent_sdk.py",
+      "line_start": 286,
+      "line_end": 286,
+      "value": "Stream one agentic session to completion and return the final text.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_317_23": {
+      "source": "vvaharness/backends/llm/agent_sdk.py",
+      "line_start": 317,
+      "line_end": 317,
+      "source_expression": "f\"agent-sdk session exceeded {budget:g}s\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_337_4": {
+      "source": "vvaharness/backends/llm/agent_sdk.py",
+      "line_start": 337,
+      "line_end": 337,
+      "value": "Run an agentic loop with native Edit/Write/Bash via the Agent SDK; writes cwd-confined.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_342_12": {
+      "source": "vvaharness/backends/llm/agent_sdk.py",
+      "line_start": 342,
+      "line_end": 345,
+      "value": "An agentic role is configured `via: sdk` and requests file-editing tools (Edit/Write/Bash), which require the Claude Agent SDK. Reinstall vvaharness to pull it in (pip install .), or set this role to `via: cli`.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_349_14": {
+      "source": "vvaharness/backends/llm/agent_sdk.py",
+      "line_start": 349,
+      "line_end": 349,
+      "source_expression": "f\" [{tag}]\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_350_18": {
+      "source": "vvaharness/backends/llm/agent_sdk.py",
+      "line_start": 350,
+      "line_end": 351,
+      "source_expression": "f\"    [agent-sdk] agentic -> {model}{tag_sfx} (tools={allowed}, \"\n                  f\"max_turns={max_turns}, cwd={cwd}, timeout={timeout})\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "Claude Agent SDK backend for the Remediation Agent's fix mode (`via: sdk`); sdk.py is read-only.",
+      "context": "literal"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 4,
+      "value": "Resolve *raw* to a real path confined to *root*, or None if unresolvable/escaping/a symlink.",
+      "context": "literal"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 4,
+      "value": "Return True iff *raw* resolves to a non-symlinked path inside (or equal to) *root*.",
+      "context": "literal"
+    },
+    {
+      "line_start": 74,
+      "line_end": 74,
+      "column": 4,
+      "value": "Inherit the ambient environment, forwarding the SDK-specific key as the standard ANTHROPIC_API_KEY when o...",
+      "context": "literal"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 4,
+      "value": "Mask secret/PII in *payload* (str/list/dict) via redact_counts(); unknown shapes pass.",
+      "context": "literal"
+    },
+    {
+      "line_start": 106,
+      "line_end": 106,
+      "column": 4,
+      "value": "Build a PostToolUse hook masking Read/Grep/Bash; best-effort, None if HookMatcher missing.",
+      "context": "literal"
+    },
+    {
+      "line_start": 142,
+      "line_end": 142,
+      "column": 4,
+      "value": "Compose ClaudeAgentOptions with a cwd-confined write gate; lazy import keeps SDK optional.",
+      "context": "literal"
+    },
+    {
+      "line_start": 240,
+      "line_end": 240,
+      "column": 4,
+      "value": "One drain pass's outcome: the terminal ResultMessage, if any, and whether it timed out.",
+      "context": "literal"
+    },
+    {
+      "line_start": 247,
+      "line_end": 247,
+      "column": 4,
+      "value": "One fresh pass over `client.receive_response()`, returning the terminal ResultMessage.",
+      "context": "literal"
+    },
+    {
+      "line_start": 259,
+      "line_end": 259,
+      "column": 4,
+      "value": "Drain *client* to its terminal result, bounded by `timeout`; interrupt-then-regrace on expiry.",
+      "context": "literal"
+    },
+    {
+      "line_start": 286,
+      "line_end": 286,
+      "column": 4,
+      "value": "Stream one agentic session to completion and return the final text.",
+      "context": "literal"
+    },
+    {
+      "line_start": 331,
+      "line_end": 331,
+      "column": 27,
+      "value": "auto",
+      "context": "literal"
+    },
+    {
+      "line_start": 337,
+      "line_end": 337,
+      "column": 4,
+      "value": "Run an agentic loop with native Edit/Write/Bash via the Agent SDK; writes cwd-confined.",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 26,
+      "value": "Edit",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 34,
+      "value": "Write",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 43,
+      "value": "MultiEdit",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 56,
+      "value": "NotebookEdit",
+      "context": "literal"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 25,
+      "value": "Read",
+      "context": "literal"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 33,
+      "value": "Glob",
+      "context": "literal"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 41,
+      "value": "Grep",
+      "context": "literal"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 49,
+      "value": "LS",
+      "context": "literal"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 55,
+      "value": "NotebookRead",
+      "context": "literal"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 23,
+      "value": "ANTHROPIC_SDK_BASE_URL",
+      "context": "literal"
+    },
+    {
+      "line_start": 89,
+      "line_end": 89,
+      "column": 29,
+      "value": "filePath",
+      "context": "literal"
+    },
+    {
+      "line_start": 89,
+      "line_end": 89,
+      "column": 41,
+      "value": "file_path",
+      "context": "literal"
+    },
+    {
+      "line_start": 89,
+      "line_end": 89,
+      "column": 54,
+      "value": "filenames",
+      "context": "literal"
+    },
+    {
+      "line_start": 89,
+      "line_end": 89,
+      "column": 67,
+      "value": "path",
+      "context": "literal"
+    },
+    {
+      "line_start": 159,
+      "line_end": 159,
+      "column": 8,
+      "value": "PreToolUse hook enforcing the write-confinement + deny-by-default gate.",
+      "context": "literal"
+    },
+    {
+      "line_start": 208,
+      "line_end": 208,
+      "column": 32,
+      "value": "PreToolUse",
+      "context": "literal"
+    },
+    {
+      "line_start": 349,
+      "line_end": 349,
+      "column": 38,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 41,
+      "value": "Bash",
+      "context": "literal"
+    },
+    {
+      "line_start": 76,
+      "line_end": 76,
+      "column": 19,
+      "value": "ANTHROPIC_API_KEY",
+      "context": "literal"
+    },
+    {
+      "line_start": 83,
+      "line_end": 83,
+      "column": 12,
+      "value": "ANTHROPIC_BASE_URL",
+      "context": "literal"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 16,
+      "value": "PostToolUse",
+      "context": "literal"
+    },
+    {
+      "line_start": 215,
+      "line_end": 215,
+      "column": 24,
+      "value": "default",
+      "context": "literal"
+    },
+    {
+      "line_start": 349,
+      "line_end": 349,
+      "column": 16,
+      "value": " [",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 349,
+      "line_end": 349,
+      "column": 23,
+      "value": "]",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 350,
+      "line_end": 350,
+      "column": 20,
+      "value": "    [agent-sdk] agentic -> ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 350,
+      "line_end": 350,
+      "column": 63,
+      "value": " (tools=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 350,
+      "line_end": 351,
+      "column": 80,
+      "value": ", max_turns=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 351,
+      "line_end": 351,
+      "column": 41,
+      "value": ", cwd=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 351,
+      "line_end": 351,
+      "column": 52,
+      "value": ", timeout=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 351,
+      "line_end": 351,
+      "column": 71,
+      "value": ")",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 28,
+      "value": "ANTHROPIC_AUTH_TOKEN",
+      "context": "literal"
+    },
+    {
+      "line_start": 78,
+      "line_end": 78,
+      "column": 31,
+      "value": "ANTHROPIC_SDK_API_KEY",
+      "context": "literal"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 16,
+      "value": "ANTHROPIC_API_KEY",
+      "context": "literal"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 32,
+      "value": "ANTHROPIC_BASE_URL",
+      "context": "literal"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 47,
+      "value": "tool_name",
+      "context": "literal"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 46,
+      "value": "tool_response",
+      "context": "literal"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 16,
+      "value": "hookSpecificOutput",
+      "context": "literal"
+    },
+    {
+      "line_start": 150,
+      "line_end": 153,
+      "column": 12,
+      "value": "This Claude Agent SDK build has no PreToolUse hook support (HookMatcher), which is what enforces the cwd-confined write gate on `via: sdk` (see _pre_tool_use_gate's docstring) — reinstall vvaharness to pull in a newer SDK release.",
+      "context": "literal"
+    },
+    {
+      "line_start": 162,
+      "line_end": 162,
+      "column": 20,
+      "value": "hookSpecificOutput",
+      "context": "literal"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 63,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 219,
+      "line_end": 219,
+      "column": 25,
+      "value": "user",
+      "context": "literal"
+    },
+    {
+      "line_start": 313,
+      "line_end": 313,
+      "column": 24,
+      "value": "TokenUsage",
+      "context": "literal"
+    },
+    {
+      "line_start": 316,
+      "line_end": 316,
+      "column": 35,
+      "value": "agent-sdk",
+      "context": "literal"
+    },
+    {
+      "line_start": 342,
+      "line_end": 345,
+      "column": 12,
+      "value": "An agentic role is configured `via: sdk` and requests file-editing tools (Edit/Write/Bash), which require the Claude Agent SDK. Reinstall vvaharness to pull it in (pip install .), or set this role to `via: cli`.",
+      "context": "literal"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 20,
+      "value": "hookEventName",
+      "context": "literal"
+    },
+    {
+      "line_start": 127,
+      "line_end": 127,
+      "column": 20,
+      "value": "updatedToolOutput",
+      "context": "literal"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 37,
+      "value": "PostToolUse",
+      "context": "literal"
+    },
+    {
+      "line_start": 163,
+      "line_end": 163,
+      "column": 16,
+      "value": "hookEventName",
+      "context": "literal"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 16,
+      "value": "permissionDecision",
+      "context": "literal"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 16,
+      "value": "permissionDecisionReason",
+      "context": "literal"
+    },
+    {
+      "line_start": 163,
+      "line_end": 163,
+      "column": 33,
+      "value": "PreToolUse",
+      "context": "literal"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 38,
+      "value": "deny",
+      "context": "literal"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 47,
+      "value": "tool_name",
+      "context": "literal"
+    },
+    {
+      "line_start": 170,
+      "line_end": 170,
+      "column": 48,
+      "value": "tool_input",
+      "context": "literal"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 28,
+      "value": "file_path",
+      "context": "literal"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 41,
+      "value": "path",
+      "context": "literal"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 49,
+      "value": "notebook_path",
+      "context": "literal"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 24,
+      "value": "hookSpecificOutput",
+      "context": "literal"
+    },
+    {
+      "line_start": 200,
+      "line_end": 202,
+      "column": 38,
+      "value": " is not permitted in remediation fix mode — only Read/Glob/Grep and cwd-confined Edit/Write are allowed (Bash and other tools are denied by default).",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 316,
+      "line_end": 316,
+      "column": 25,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 317,
+      "line_end": 317,
+      "column": 25,
+      "value": "agent-sdk session exceeded ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 317,
+      "line_end": 317,
+      "column": 62,
+      "value": "s",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 20,
+      "value": "hookEventName",
+      "context": "literal"
+    },
+    {
+      "line_start": 193,
+      "line_end": 193,
+      "column": 20,
+      "value": "permissionDecision",
+      "context": "literal"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 20,
+      "value": "updatedInput",
+      "context": "literal"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 37,
+      "value": "PreToolUse",
+      "context": "literal"
+    },
+    {
+      "line_start": 193,
+      "line_end": 193,
+      "column": 42,
+      "value": "allow",
+      "context": "literal"
+    },
+    {
+      "line_start": 204,
+      "line_end": 205,
+      "column": 27,
+      "value": "the security gate could not evaluate this call (",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 48,
+      "value": ") and denies it as a precaution.",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 320,
+      "line_end": 320,
+      "column": 27,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 46,
+      "value": " target ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 182,
+      "line_end": 184,
+      "column": 61,
+      "value": " is outside the repository root, unresolvable, or a symlink — edits are confined to ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 186,
+      "line_end": 186,
+      "column": 46,
+      "value": " target ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 186,
+      "line_end": 187,
+      "column": 61,
+      "value": " is version-control metadata (.git), which remediation never edits.",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 317,
+      "line_end": 317,
+      "column": 60,
+      "value": "g",
+      "context": "f-string segment"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 17,
+      "text": "# Deny-by-default gate: Read/Glob/Grep OK, Edit/Write cwd-confined, Bash denied (RCE + exfil risk)."
+    },
+    {
+      "line": 44,
+      "text": "# Read-only tools are always safe; only file-mutation tools are gated to cwd."
+    },
+    {
+      "line": 46,
+      "text": "# Read-only inspection tools — always permitted (output is redaction-hooked)."
+    },
+    {
+      "line": 48,
+      "text": "# Masked by the PostToolUse hook so on-disk secrets/PII aren't egressed unredacted."
+    },
+    {
+      "line": 58,
+      "text": "# Refuse a symlinked final component without following it — the redirect primitive denied."
+    },
+    {
+      "line": 84,
+      "text": "# Same no-resend env as the CLI route; set last so an ambient \"0\" cannot win."
+    },
+    {
+      "line": 88,
+      "text": "#: Path keys redacted with ``carry=False``; NOT redact's `_NO_CARRY_KEYS` (``file`` holds content)"
+    },
+    {
+      "line": 108,
+      "text": "# type: ignore  # noqa: PLC0415 — optional SDK"
+    },
+    {
+      "line": 112,
+      "text": "# noqa: ANN001, ARG001"
+    },
+    {
+      "line": 123,
+      "text": "# `updatedToolOutput` is the only key the CLI honours; the old name leaked cleartext."
+    },
+    {
+      "line": 134,
+      "text": "# type: ignore[list-item]"
+    },
+    {
+      "line": 144,
+      "text": "# noqa: PLC0415 — lazy: SDK stays optional"
+    },
+    {
+      "line": 158,
+      "text": "# noqa: ANN001, ARG001"
+    },
+    {
+      "line": 160,
+      "text": "# Must stay PreToolUse, never can_use_tool (a bare allow entry bypasses it); fail-closed"
+    },
+    {
+      "line": 172,
+      "text": "# File-mutation tools: allow only when the target stays inside the repo."
+    },
+    {
+      "line": 188,
+      "text": "# Hand the SDK the resolved path, not the raw name, so an alias can't redirect it."
+    },
+    {
+      "line": 196,
+      "text": "# Read-only tools need no decision: the bare allow entry below covers them."
+    },
+    {
+      "line": 199,
+      "text": "# DENY-BY-DEFAULT, esp. Bash: host-shell RCE + credential exfil; re-adding it can't run."
+    },
+    {
+      "line": 214,
+      "text": "# The PreToolUse hook above is the live gate; permission_mode/allowed_tools set availability"
+    },
+    {
+      "line": 216,
+      "text": "# \"user\" only: a scanned repo's own .claude/settings.json can never re-grant Bash or"
+    },
+    {
+      "line": 217,
+      "text": "# register a host hook into this Edit/Write-capable session (mirrors the via:cli"
+    },
+    {
+      "line": 218,
+      "text": "# route's --setting-sources user)."
+    },
+    {
+      "line": 220,
+      "text": "# Without this, a target repo's own .mcp.json server would be spawned into this"
+    },
+    {
+      "line": 221,
+      "text": "# session (mirrors cli_mcp.py's strict_mcp_config=True)."
+    },
+    {
+      "line": 225,
+      "text": "# Finding text/code snippets reach this prompt; verbatim keeps them from being"
+    },
+    {
+      "line": 226,
+      "text": "# parsed as an @path expansion or a slash command."
+    },
+    {
+      "line": 246,
+      "text": "# noqa: ANN001"
+    },
+    {
+      "line": 248,
+      "text": "# noqa: PLC0415 — lazy: SDK stays optional"
+    },
+    {
+      "line": 262,
+      "text": "# .expired() tells OUR deadline apart from a TimeoutError raised inside the drain itself"
+    },
+    {
+      "line": 272,
+      "text": "# The cancelled `async for` above finalized its generator; receive_response() opens a new one"
+    },
+    {
+      "line": 273,
+      "text": "# (claude_agent_sdk.client.ClaudeSDKClient), so this second _drain is a fresh call, not a resume."
+    },
+    {
+      "line": 285,
+      "text": "# noqa: ANN001"
+    },
+    {
+      "line": 287,
+      "text": "# noqa: PLC0415 — lazy: SDK stays optional"
+    },
+    {
+      "line": 295,
+      "text": "# noqa: ANN001"
+    },
+    {
+      "line": 301,
+      "text": "# Session clock, scaled the same way every other route scales its own agentic() timeout."
+    },
+    {
+      "line": 303,
+      "text": "# The caller owns no scope around this call: the client's __aexit__ (close()) must run with"
+    },
+    {
+      "line": 304,
+      "text": "# no cancellation in flight, or the SDK skips its own terminate/kill escalation (subprocess_cli.py)."
+    },
+    {
+      "line": 331,
+      "text": "# accepted for parity; gate handles policy"
+    },
+    {
+      "line": 339,
+      "text": "# noqa: F401, PLC0415 — availability probe"
+    },
+    {
+      "line": 347,
+      "text": "# `None` = unspecified (read-only default), `[]` = none wanted; same as backends.llm.sdk.agentic"
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 18,
+      "line_end": 18,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 23,
+      "line_end": 23,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 27,
+      "line_end": 27,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 28,
+      "line_end": 35,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 36,
+      "line_end": 36,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 37,
+      "line_end": 37,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 38,
+      "line_end": 38,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 39,
+      "line_end": 39,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "If",
+      "line_start": 41,
+      "line_end": 42,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 7
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 42,
+      "line_end": 42,
+      "column": 4,
+      "owner": "module initialization",
+      "representation_line": 10
+    },
+    {
+      "kind": "Assign",
+      "line_start": 45,
+      "line_end": 45,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 13
+    },
+    {
+      "kind": "Assign",
+      "line_start": 47,
+      "line_end": 47,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 13
+    },
+    {
+      "kind": "Assign",
+      "line_start": 49,
+      "line_end": 49,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 13
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 52,
+      "line_end": 65,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 14
+    },
+    {
+      "kind": "Expr",
+      "line_start": 53,
+      "line_end": 53,
+      "column": 4,
+      "owner": "_resolve_within_root",
+      "representation_line": 20
+    },
+    {
+      "kind": "If",
+      "line_start": 54,
+      "line_end": 55,
+      "column": 4,
+      "owner": "_resolve_within_root",
+      "representation_line": 21
+    },
+    {
+      "kind": "Return",
+      "line_start": 55,
+      "line_end": 55,
+      "column": 8,
+      "owner": "_resolve_within_root",
+      "representation_line": 23
+    },
+    {
+      "kind": "Try",
+      "line_start": 56,
+      "line_end": 64,
+      "column": 4,
+      "owner": "_resolve_within_root",
+      "representation_line": 26
+    },
+    {
+      "kind": "Assign",
+      "line_start": 57,
+      "line_end": 57,
+      "column": 8,
+      "owner": "_resolve_within_root",
+      "representation_line": 29
+    },
+    {
+      "kind": "If",
+      "line_start": 59,
+      "line_end": 60,
+      "column": 8,
+      "owner": "_resolve_within_root",
+      "representation_line": 30
+    },
+    {
+      "kind": "Return",
+      "line_start": 60,
+      "line_end": 60,
+      "column": 12,
+      "owner": "_resolve_within_root",
+      "representation_line": 32
+    },
+    {
+      "kind": "Assign",
+      "line_start": 61,
+      "line_end": 61,
+      "column": 8,
+      "owner": "_resolve_within_root",
+      "representation_line": 36
+    },
+    {
+      "kind": "Expr",
+      "line_start": 62,
+      "line_end": 62,
+      "column": 8,
+      "owner": "_resolve_within_root",
+      "representation_line": 36
+    },
+    {
+      "kind": "Return",
+      "line_start": 64,
+      "line_end": 64,
+      "column": 8,
+      "owner": "_resolve_within_root",
+      "representation_line": 40
+    },
+    {
+      "kind": "Return",
+      "line_start": 65,
+      "line_end": 65,
+      "column": 4,
+      "owner": "_resolve_within_root",
+      "representation_line": 43
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 68,
+      "line_end": 70,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 47
+    },
+    {
+      "kind": "Expr",
+      "line_start": 69,
+      "line_end": 69,
+      "column": 4,
+      "owner": "_within_root",
+      "representation_line": 53
+    },
+    {
+      "kind": "Return",
+      "line_start": 70,
+      "line_end": 70,
+      "column": 4,
+      "owner": "_within_root",
+      "representation_line": 54
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 73,
+      "line_end": 85,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 58
+    },
+    {
+      "kind": "Expr",
+      "line_start": 74,
+      "line_end": 74,
+      "column": 4,
+      "owner": "_sdk_env",
+      "representation_line": 64
+    },
+    {
+      "kind": "Assign",
+      "line_start": 75,
+      "line_end": 75,
+      "column": 4,
+      "owner": "_sdk_env",
+      "representation_line": 64
+    },
+    {
+      "kind": "If",
+      "line_start": 76,
+      "line_end": 80,
+      "column": 4,
+      "owner": "_sdk_env",
+      "representation_line": 65
+    },
+    {
+      "kind": "Assign",
+      "line_start": 77,
+      "line_end": 78,
+      "column": 8,
+      "owner": "_sdk_env",
+      "representation_line": 68
+    },
+    {
+      "kind": "If",
+      "line_start": 79,
+      "line_end": 80,
+      "column": 8,
+      "owner": "_sdk_env",
+      "representation_line": 69
+    },
+    {
+      "kind": "Assign",
+      "line_start": 80,
+      "line_end": 80,
+      "column": 12,
+      "owner": "_sdk_env",
+      "representation_line": 72
+    },
+    {
+      "kind": "Assign",
+      "line_start": 81,
+      "line_end": 81,
+      "column": 4,
+      "owner": "_sdk_env",
+      "representation_line": 76
+    },
+    {
+      "kind": "If",
+      "line_start": 82,
+      "line_end": 83,
+      "column": 4,
+      "owner": "_sdk_env",
+      "representation_line": 77
+    },
+    {
+      "kind": "Assign",
+      "line_start": 83,
+      "line_end": 83,
+      "column": 8,
+      "owner": "_sdk_env",
+      "representation_line": 80
+    },
+    {
+      "kind": "Return",
+      "line_start": 85,
+      "line_end": 85,
+      "column": 4,
+      "owner": "_sdk_env",
+      "representation_line": 82
+    },
+    {
+      "kind": "Assign",
+      "line_start": 89,
+      "line_end": 89,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 87
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 92,
+      "line_end": 102,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 88
+    },
+    {
+      "kind": "Expr",
+      "line_start": 93,
+      "line_end": 93,
+      "column": 4,
+      "owner": "_redact_tool_output",
+      "representation_line": 94
+    },
+    {
+      "kind": "If",
+      "line_start": 94,
+      "line_end": 96,
+      "column": 4,
+      "owner": "_redact_tool_output",
+      "representation_line": 95
+    },
+    {
+      "kind": "Assign",
+      "line_start": 95,
+      "line_end": 95,
+      "column": 8,
+      "owner": "_redact_tool_output",
+      "representation_line": 98
+    },
+    {
+      "kind": "Return",
+      "line_start": 96,
+      "line_end": 96,
+      "column": 8,
+      "owner": "_redact_tool_output",
+      "representation_line": 99
+    },
+    {
+      "kind": "If",
+      "line_start": 97,
+      "line_end": 98,
+      "column": 4,
+      "owner": "_redact_tool_output",
+      "representation_line": 102
+    },
+    {
+      "kind": "Return",
+      "line_start": 98,
+      "line_end": 98,
+      "column": 8,
+      "owner": "_redact_tool_output",
+      "representation_line": 104
+    },
+    {
+      "kind": "If",
+      "line_start": 99,
+      "line_end": 101,
+      "column": 4,
+      "owner": "_redact_tool_output",
+      "representation_line": 107
+    },
+    {
+      "kind": "Return",
+      "line_start": 100,
+      "line_end": 101,
+      "column": 8,
+      "owner": "_redact_tool_output",
+      "representation_line": 109
+    },
+    {
+      "kind": "Return",
+      "line_start": 102,
+      "line_end": 102,
+      "column": 4,
+      "owner": "_redact_tool_output",
+      "representation_line": 112
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 105,
+      "line_end": 136,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 116
+    },
+    {
+      "kind": "Expr",
+      "line_start": 106,
+      "line_end": 106,
+      "column": 4,
+      "owner": "_build_redaction_hooks",
+      "representation_line": 122
+    },
+    {
+      "kind": "Try",
+      "line_start": 107,
+      "line_end": 110,
+      "column": 4,
+      "owner": "_build_redaction_hooks",
+      "representation_line": 123
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 108,
+      "line_end": 108,
+      "column": 8,
+      "owner": "_build_redaction_hooks",
+      "representation_line": 126
+    },
+    {
+      "kind": "Return",
+      "line_start": 110,
+      "line_end": 110,
+      "column": 8,
+      "owner": "_build_redaction_hooks",
+      "representation_line": 130
+    },
+    {
+      "kind": "AsyncFunctionDef",
+      "line_start": 112,
+      "line_end": 131,
+      "column": 4,
+      "owner": "_build_redaction_hooks",
+      "representation_line": 133
+    },
+    {
+      "kind": "Try",
+      "line_start": 113,
+      "line_end": 131,
+      "column": 8,
+      "owner": "_build_redaction_hooks._post_tool_use",
+      "representation_line": 139
+    },
+    {
+      "kind": "Assign",
+      "line_start": 114,
+      "line_end": 114,
+      "column": 12,
+      "owner": "_build_redaction_hooks._post_tool_use",
+      "representation_line": 142
+    },
+    {
+      "kind": "If",
+      "line_start": 115,
+      "line_end": 116,
+      "column": 12,
+      "owner": "_build_redaction_hooks._post_tool_use",
+      "representation_line": 143
+    },
+    {
+      "kind": "Return",
+      "line_start": 116,
+      "line_end": 116,
+      "column": 16,
+      "owner": "_build_redaction_hooks._post_tool_use",
+      "representation_line": 145
+    },
+    {
+      "kind": "Assign",
+      "line_start": 117,
+      "line_end": 117,
+      "column": 12,
+      "owner": "_build_redaction_hooks._post_tool_use",
+      "representation_line": 149
+    },
+    {
+      "kind": "If",
+      "line_start": 118,
+      "line_end": 119,
+      "column": 12,
+      "owner": "_build_redaction_hooks._post_tool_use",
+      "representation_line": 150
+    },
+    {
+      "kind": "Return",
+      "line_start": 119,
+      "line_end": 119,
+      "column": 16,
+      "owner": "_build_redaction_hooks._post_tool_use",
+      "representation_line": 152
+    },
+    {
+      "kind": "Assign",
+      "line_start": 120,
+      "line_end": 120,
+      "column": 12,
+      "owner": "_build_redaction_hooks._post_tool_use",
+      "representation_line": 156
+    },
+    {
+      "kind": "If",
+      "line_start": 121,
+      "line_end": 122,
+      "column": 12,
+      "owner": "_build_redaction_hooks._post_tool_use",
+      "representation_line": 157
+    },
+    {
+      "kind": "Return",
+      "line_start": 122,
+      "line_end": 122,
+      "column": 16,
+      "owner": "_build_redaction_hooks._post_tool_use",
+      "representation_line": 159
+    },
+    {
+      "kind": "Return",
+      "line_start": 124,
+      "line_end": 129,
+      "column": 12,
+      "owner": "_build_redaction_hooks._post_tool_use",
+      "representation_line": 162
+    },
+    {
+      "kind": "Return",
+      "line_start": 131,
+      "line_end": 131,
+      "column": 12,
+      "owner": "_build_redaction_hooks._post_tool_use",
+      "representation_line": 167
+    },
+    {
+      "kind": "Try",
+      "line_start": 133,
+      "line_end": 136,
+      "column": 4,
+      "owner": "_build_redaction_hooks",
+      "representation_line": 172
+    },
+    {
+      "kind": "Return",
+      "line_start": 134,
+      "line_end": 134,
+      "column": 8,
+      "owner": "_build_redaction_hooks",
+      "representation_line": 174
+    },
+    {
+      "kind": "Return",
+      "line_start": 136,
+      "line_end": 136,
+      "column": 8,
+      "owner": "_build_redaction_hooks",
+      "representation_line": 179
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 139,
+      "line_end": 236,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 184
+    },
+    {
+      "kind": "Expr",
+      "line_start": 142,
+      "line_end": 142,
+      "column": 4,
+      "owner": "_build_options",
+      "representation_line": 190
+    },
+    {
+      "kind": "Try",
+      "line_start": 143,
+      "line_end": 154,
+      "column": 4,
+      "owner": "_build_options",
+      "representation_line": 191
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 144,
+      "line_end": 147,
+      "column": 8,
+      "owner": "_build_options",
+      "representation_line": 194
+    },
+    {
+      "kind": "Raise",
+      "line_start": 149,
+      "line_end": 154,
+      "column": 8,
+      "owner": "_build_options",
+      "representation_line": 198
+    },
+    {
+      "kind": "Assign",
+      "line_start": 156,
+      "line_end": 156,
+      "column": 4,
+      "owner": "_build_options",
+      "representation_line": 202
+    },
+    {
+      "kind": "AsyncFunctionDef",
+      "line_start": 158,
+      "line_end": 205,
+      "column": 4,
+      "owner": "_build_options",
+      "representation_line": 203
+    },
+    {
+      "kind": "Expr",
+      "line_start": 159,
+      "line_end": 159,
+      "column": 8,
+      "owner": "_build_options._pre_tool_use_gate",
+      "representation_line": 210
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 161,
+      "line_end": 166,
+      "column": 8,
+      "owner": "_build_options._pre_tool_use_gate",
+      "representation_line": 211
+    },
+    {
+      "kind": "Return",
+      "line_start": 162,
+      "line_end": 166,
+      "column": 12,
+      "owner": "_build_options._pre_tool_use_gate._deny",
+      "representation_line": 216
+    },
+    {
+      "kind": "Try",
+      "line_start": 168,
+      "line_end": 205,
+      "column": 8,
+      "owner": "_build_options._pre_tool_use_gate",
+      "representation_line": 220
+    },
+    {
+      "kind": "Assign",
+      "line_start": 169,
+      "line_end": 169,
+      "column": 12,
+      "owner": "_build_options._pre_tool_use_gate",
+      "representation_line": 223
+    },
+    {
+      "kind": "Assign",
+      "line_start": 170,
+      "line_end": 170,
+      "column": 12,
+      "owner": "_build_options._pre_tool_use_gate",
+      "representation_line": 223
+    },
+    {
+      "kind": "If",
+      "line_start": 173,
+      "line_end": 195,
+      "column": 12,
+      "owner": "_build_options._pre_tool_use_gate",
+      "representation_line": 224
+    },
+    {
+      "kind": "Assign",
+      "line_start": 174,
+      "line_end": 174,
+      "column": 16,
+      "owner": "_build_options._pre_tool_use_gate",
+      "representation_line": 227
+    },
+    {
+      "kind": "For",
+      "line_start": 175,
+      "line_end": 179,
+      "column": 16,
+      "owner": "_build_options._pre_tool_use_gate",
+      "representation_line": 228
+    },
+    {
+      "kind": "Assign",
+      "line_start": 176,
+      "line_end": 176,
+      "column": 20,
+      "owner": "_build_options._pre_tool_use_gate",
+      "representation_line": 231
+    },
+    {
+      "kind": "If",
+      "line_start": 177,
+      "line_end": 179,
+      "column": 20,
+      "owner": "_build_options._pre_tool_use_gate",
+      "representation_line": 232
+    },
+    {
+      "kind": "Assign",
+      "line_start": 178,
+      "line_end": 178,
+      "column": 24,
+      "owner": "_build_options._pre_tool_use_gate",
+      "representation_line": 235
+    },
+    {
+      "kind": "Break",
+      "line_start": 179,
+      "line_end": 179,
+      "column": 24,
+      "owner": "_build_options._pre_tool_use_gate",
+      "representation_line": 236
+    },
+    {
+      "kind": "Assign",
+      "line_start": 180,
+      "line_end": 180,
+      "column": 16,
+      "owner": "_build_options._pre_tool_use_gate",
+      "representation_line": 241
+    },
+    {
+      "kind": "If",
+      "line_start": 181,
+      "line_end": 184,
+      "column": 16,
+      "owner": "_build_options._pre_tool_use_gate",
+      "representation_line": 242
+    },
+    {
+      "kind": "Return",
+      "line_start": 182,
+      "line_end": 184,
+      "column": 20,
+      "owner": "_build_options._pre_tool_use_gate",
+      "representation_line": 244
+    },
+    {
+      "kind": "If",
+      "line_start": 185,
+      "line_end": 187,
+      "column": 16,
+      "owner": "_build_options._pre_tool_use_gate",
+      "representation_line": 247
+    },
+    {
+      "kind": "Return",
+      "line_start": 186,
+      "line_end": 187,
+      "column": 20,
+      "owner": "_build_options._pre_tool_use_gate",
+      "representation_line": 249
+    },
+    {
+      "kind": "Assign",
+      "line_start": 189,
+      "line_end": 189,
+      "column": 16,
+      "owner": "_build_options._pre_tool_use_gate",
+      "representation_line": 253
+    },
+    {
+      "kind": "Assign",
+      "line_start": 190,
+      "line_end": 190,
+      "column": 16,
+      "owner": "_build_options._pre_tool_use_gate",
+      "representation_line": 253
+    },
+    {
+      "kind": "Return",
+      "line_start": 191,
+      "line_end": 195,
+      "column": 16,
+      "owner": "_build_options._pre_tool_use_gate",
+      "representation_line": 254
+    },
+    {
+      "kind": "If",
+      "line_start": 197,
+      "line_end": 198,
+      "column": 12,
+      "owner": "_build_options._pre_tool_use_gate",
+      "representation_line": 257
+    },
+    {
+      "kind": "Return",
+      "line_start": 198,
+      "line_end": 198,
+      "column": 16,
+      "owner": "_build_options._pre_tool_use_gate",
+      "representation_line": 259
+    },
+    {
+      "kind": "Return",
+      "line_start": 200,
+      "line_end": 202,
+      "column": 12,
+      "owner": "_build_options._pre_tool_use_gate",
+      "representation_line": 262
+    },
+    {
+      "kind": "Return",
+      "line_start": 204,
+      "line_end": 205,
+      "column": 12,
+      "owner": "_build_options._pre_tool_use_gate",
+      "representation_line": 267
+    },
+    {
+      "kind": "Assign",
+      "line_start": 207,
+      "line_end": 207,
+      "column": 4,
+      "owner": "_build_options",
+      "representation_line": 273
+    },
+    {
+      "kind": "Assign",
+      "line_start": 208,
+      "line_end": 208,
+      "column": 4,
+      "owner": "_build_options",
+      "representation_line": 273
+    },
+    {
+      "kind": "Assign",
+      "line_start": 210,
+      "line_end": 228,
+      "column": 4,
+      "owner": "_build_options",
+      "representation_line": 273
+    },
+    {
+      "kind": "If",
+      "line_start": 230,
+      "line_end": 231,
+      "column": 4,
+      "owner": "_build_options",
+      "representation_line": 274
+    },
+    {
+      "kind": "Assign",
+      "line_start": 231,
+      "line_end": 231,
+      "column": 8,
+      "owner": "_build_options",
+      "representation_line": 277
+    },
+    {
+      "kind": "If",
+      "line_start": 232,
+      "line_end": 233,
+      "column": 4,
+      "owner": "_build_options",
+      "representation_line": 279
+    },
+    {
+      "kind": "Assign",
+      "line_start": 233,
+      "line_end": 233,
+      "column": 8,
+      "owner": "_build_options",
+      "representation_line": 282
+    },
+    {
+      "kind": "If",
+      "line_start": 234,
+      "line_end": 235,
+      "column": 4,
+      "owner": "_build_options",
+      "representation_line": 284
+    },
+    {
+      "kind": "Assign",
+      "line_start": 235,
+      "line_end": 235,
+      "column": 8,
+      "owner": "_build_options",
+      "representation_line": 287
+    },
+    {
+      "kind": "Return",
+      "line_start": 236,
+      "line_end": 236,
+      "column": 4,
+      "owner": "_build_options",
+      "representation_line": 289
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 239,
+      "line_end": 243,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 293
+    },
+    {
+      "kind": "Expr",
+      "line_start": 240,
+      "line_end": 240,
+      "column": 4,
+      "owner": "DrainResult",
+      "representation_line": 298
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 242,
+      "line_end": 242,
+      "column": 4,
+      "owner": "DrainResult",
+      "representation_line": 298
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 243,
+      "line_end": 243,
+      "column": 4,
+      "owner": "DrainResult",
+      "representation_line": 298
+    },
+    {
+      "kind": "AsyncFunctionDef",
+      "line_start": 246,
+      "line_end": 254,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 300
+    },
+    {
+      "kind": "Expr",
+      "line_start": 247,
+      "line_end": 247,
+      "column": 4,
+      "owner": "_drain",
+      "representation_line": 307
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 248,
+      "line_end": 248,
+      "column": 4,
+      "owner": "_drain",
+      "representation_line": 307
+    },
+    {
+      "kind": "AsyncFor",
+      "line_start": 250,
+      "line_end": 253,
+      "column": 4,
+      "owner": "_drain",
+      "representation_line": 308
+    },
+    {
+      "kind": "Expr",
+      "line_start": 251,
+      "line_end": 251,
+      "column": 8,
+      "owner": "_drain",
+      "representation_line": 312
+    },
+    {
+      "kind": "If",
+      "line_start": 252,
+      "line_end": 253,
+      "column": 8,
+      "owner": "_drain",
+      "representation_line": 313
+    },
+    {
+      "kind": "Return",
+      "line_start": 253,
+      "line_end": 253,
+      "column": 12,
+      "owner": "_drain",
+      "representation_line": 315
+    },
+    {
+      "kind": "Return",
+      "line_start": 254,
+      "line_end": 254,
+      "column": 4,
+      "owner": "_drain",
+      "representation_line": 319
+    },
+    {
+      "kind": "AsyncFunctionDef",
+      "line_start": 257,
+      "line_end": 281,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 323
+    },
+    {
+      "kind": "Expr",
+      "line_start": 259,
+      "line_end": 259,
+      "column": 4,
+      "owner": "drain_until_result",
+      "representation_line": 330
+    },
+    {
+      "kind": "If",
+      "line_start": 260,
+      "line_end": 261,
+      "column": 4,
+      "owner": "drain_until_result",
+      "representation_line": 331
+    },
+    {
+      "kind": "Return",
+      "line_start": 261,
+      "line_end": 261,
+      "column": 8,
+      "owner": "drain_until_result",
+      "representation_line": 333
+    },
+    {
+      "kind": "Assign",
+      "line_start": 263,
+      "line_end": 263,
+      "column": 4,
+      "owner": "drain_until_result",
+      "representation_line": 337
+    },
+    {
+      "kind": "Try",
+      "line_start": 264,
+      "line_end": 269,
+      "column": 4,
+      "owner": "drain_until_result",
+      "representation_line": 338
+    },
+    {
+      "kind": "AsyncWith",
+      "line_start": 265,
+      "line_end": 266,
+      "column": 8,
+      "owner": "drain_until_result",
+      "representation_line": 340
+    },
+    {
+      "kind": "Return",
+      "line_start": 266,
+      "line_end": 266,
+      "column": 12,
+      "owner": "drain_until_result",
+      "representation_line": 342
+    },
+    {
+      "kind": "If",
+      "line_start": 268,
+      "line_end": 269,
+      "column": 8,
+      "owner": "drain_until_result",
+      "representation_line": 349
+    },
+    {
+      "kind": "Raise",
+      "line_start": 269,
+      "line_end": 269,
+      "column": 12,
+      "owner": "drain_until_result",
+      "representation_line": 351
+    },
+    {
+      "kind": "With",
+      "line_start": 270,
+      "line_end": 271,
+      "column": 4,
+      "owner": "drain_until_result",
+      "representation_line": 355
+    },
+    {
+      "kind": "Expr",
+      "line_start": 271,
+      "line_end": 271,
+      "column": 8,
+      "owner": "drain_until_result",
+      "representation_line": 358
+    },
+    {
+      "kind": "Assign",
+      "line_start": 274,
+      "line_end": 274,
+      "column": 4,
+      "owner": "drain_until_result",
+      "representation_line": 362
+    },
+    {
+      "kind": "Try",
+      "line_start": 275,
+      "line_end": 281,
+      "column": 4,
+      "owner": "drain_until_result",
+      "representation_line": 363
+    },
+    {
+      "kind": "AsyncWith",
+      "line_start": 276,
+      "line_end": 277,
+      "column": 8,
+      "owner": "drain_until_result",
+      "representation_line": 365
+    },
+    {
+      "kind": "Return",
+      "line_start": 277,
+      "line_end": 277,
+      "column": 12,
+      "owner": "drain_until_result",
+      "representation_line": 367
+    },
+    {
+      "kind": "If",
+      "line_start": 279,
+      "line_end": 280,
+      "column": 8,
+      "owner": "drain_until_result",
+      "representation_line": 374
+    },
+    {
+      "kind": "Raise",
+      "line_start": 280,
+      "line_end": 280,
+      "column": 12,
+      "owner": "drain_until_result",
+      "representation_line": 376
+    },
+    {
+      "kind": "Return",
+      "line_start": 281,
+      "line_end": 281,
+      "column": 8,
+      "owner": "drain_until_result",
+      "representation_line": 379
+    },
+    {
+      "kind": "AsyncFunctionDef",
+      "line_start": 284,
+      "line_end": 320,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 384
+    },
+    {
+      "kind": "Expr",
+      "line_start": 286,
+      "line_end": 286,
+      "column": 4,
+      "owner": "_run",
+      "representation_line": 391
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 287,
+      "line_end": 291,
+      "column": 4,
+      "owner": "_run",
+      "representation_line": 391
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 293,
+      "line_end": 293,
+      "column": 4,
+      "owner": "_run",
+      "representation_line": 391
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 295,
+      "line_end": 299,
+      "column": 4,
+      "owner": "_run",
+      "representation_line": 392
+    },
+    {
+      "kind": "If",
+      "line_start": 296,
+      "line_end": 299,
+      "column": 8,
+      "owner": "_run._on_message",
+      "representation_line": 397
+    },
+    {
+      "kind": "For",
+      "line_start": 297,
+      "line_end": 299,
+      "column": 12,
+      "owner": "_run._on_message",
+      "representation_line": 399
+    },
+    {
+      "kind": "If",
+      "line_start": 298,
+      "line_end": 299,
+      "column": 16,
+      "owner": "_run._on_message",
+      "representation_line": 401
+    },
+    {
+      "kind": "Expr",
+      "line_start": 299,
+      "line_end": 299,
+      "column": 20,
+      "owner": "_run._on_message",
+      "representation_line": 404
+    },
+    {
+      "kind": "Assign",
+      "line_start": 302,
+      "line_end": 302,
+      "column": 4,
+      "owner": "_run",
+      "representation_line": 411
+    },
+    {
+      "kind": "Assign",
+      "line_start": 305,
+      "line_end": 305,
+      "column": 4,
+      "owner": "_run",
+      "representation_line": 411
+    },
+    {
+      "kind": "AsyncWith",
+      "line_start": 306,
+      "line_end": 309,
+      "column": 4,
+      "owner": "_run",
+      "representation_line": 412
+    },
+    {
+      "kind": "Expr",
+      "line_start": 307,
+      "line_end": 307,
+      "column": 8,
+      "owner": "_run",
+      "representation_line": 415
+    },
+    {
+      "kind": "Assign",
+      "line_start": 308,
+      "line_end": 309,
+      "column": 8,
+      "owner": "_run",
+      "representation_line": 415
+    },
+    {
+      "kind": "Assign",
+      "line_start": 311,
+      "line_end": 311,
+      "column": 4,
+      "owner": "_run",
+      "representation_line": 419
+    },
+    {
+      "kind": "If",
+      "line_start": 312,
+      "line_end": 313,
+      "column": 4,
+      "owner": "_run",
+      "representation_line": 420
+    },
+    {
+      "kind": "Expr",
+      "line_start": 313,
+      "line_end": 313,
+      "column": 8,
+      "owner": "_run",
+      "representation_line": 423
+    },
+    {
+      "kind": "If",
+      "line_start": 314,
+      "line_end": 317,
+      "column": 4,
+      "owner": "_run",
+      "representation_line": 425
+    },
+    {
+      "kind": "Raise",
+      "line_start": 315,
+      "line_end": 317,
+      "column": 8,
+      "owner": "_run",
+      "representation_line": 427
+    },
+    {
+      "kind": "Expr",
+      "line_start": 318,
+      "line_end": 318,
+      "column": 4,
+      "owner": "_run",
+      "representation_line": 431
+    },
+    {
+      "kind": "Assign",
+      "line_start": 319,
+      "line_end": 319,
+      "column": 4,
+      "owner": "_run",
+      "representation_line": 431
+    },
+    {
+      "kind": "Return",
+      "line_start": 320,
+      "line_end": 320,
+      "column": 4,
+      "owner": "_run",
+      "representation_line": 432
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 323,
+      "line_end": 358,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 436
+    },
+    {
+      "kind": "Expr",
+      "line_start": 337,
+      "line_end": 337,
+      "column": 4,
+      "owner": "agentic",
+      "representation_line": 442
+    },
+    {
+      "kind": "Try",
+      "line_start": 338,
+      "line_end": 346,
+      "column": 4,
+      "owner": "agentic",
+      "representation_line": 443
+    },
+    {
+      "kind": "Import",
+      "line_start": 339,
+      "line_end": 339,
+      "column": 8,
+      "owner": "agentic",
+      "representation_line": 446
+    },
+    {
+      "kind": "Raise",
+      "line_start": 341,
+      "line_end": 346,
+      "column": 8,
+      "owner": "agentic",
+      "representation_line": 450
+    },
+    {
+      "kind": "Assign",
+      "line_start": 348,
+      "line_end": 348,
+      "column": 4,
+      "owner": "agentic",
+      "representation_line": 454
+    },
+    {
+      "kind": "Assign",
+      "line_start": 349,
+      "line_end": 349,
+      "column": 4,
+      "owner": "agentic",
+      "representation_line": 454
+    },
+    {
+      "kind": "Expr",
+      "line_start": 350,
+      "line_end": 351,
+      "column": 4,
+      "owner": "agentic",
+      "representation_line": 454
+    },
+    {
+      "kind": "Assign",
+      "line_start": 353,
+      "line_end": 356,
+      "column": 4,
+      "owner": "agentic",
+      "representation_line": 454
+    },
+    {
+      "kind": "Return",
+      "line_start": 357,
+      "line_end": 358,
+      "column": 4,
+      "owner": "agentic",
+      "representation_line": 455
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 41,
+      "line_end": 41,
+      "column": 3,
+      "kind": "Name",
+      "original_ast": "Name(id='TYPE_CHECKING', ctx=Load())",
+      "rendered": "TYPE_CHECKING"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='frozenset', ctx=Load()), args=[Set(elts=[Constant(value='Edit'), Constant(value='Write'), Constant(value='MultiEdit'), Constant(value='NotebookEdit')])], keywords=[])",
+      "rendered": "frozenset({'Edit', 'Write', 'MultiEdit', 'NotebookEdit'})"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='frozenset', ctx=Load()), args=[Set(elts=[Constant(value='Read'), Constant(value='Glob'), Constant(value='Grep'), Constant(value='LS'), Constant(value='NotebookRead')])], keywords=[])",
+      "rendered": "frozenset({'Read', 'Glob', 'Grep', 'LS', 'NotebookRead'})"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 16,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Name(id='_READ_TOOLS', ctx=Load()), op=BitOr(), right=Call(func=Name(id='frozenset', ctx=Load()), args=[Set(elts=[Constant(value='Bash')])], keywords=[]))",
+      "rendered": "_READ_TOOLS | frozenset({'Bash'})"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[UnaryOp(op=Not(), operand=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='raw', ctx=Load()), Name(id='str', ctx=Load())], keywords=[])), UnaryOp(op=Not(), operand=Name(id='raw', ctx=Load()))])",
+      "rendered": "not isinstance(raw, str) or not raw"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 57,
+      "line_end": 57,
+      "column": 20,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Attribute(value=Attribute(value=Name(id='os', ctx=Load()), attr='path', ctx=Load()), attr='isabs', ctx=Load()), args=[Name(id='raw', ctx=Load())], keywords=[]), body=Call(func=Name(id='Path', ctx=Load()), args=[Name(id='raw', ctx=Load())], keywords=[]), orelse=BinOp(left=Name(id='root', ctx=Load()), op=Div(), right=Name(id='raw', ctx=Load())))",
+      "rendered": "Path(raw) if os.path.isabs(raw) else root / raw"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='candidate', ctx=Load()), attr='is_symlink', ctx=Load()), args=[], keywords=[])",
+      "rendered": "candidate.is_symlink()"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='candidate', ctx=Load()), attr='resolve', ctx=Load()), args=[], keywords=[])",
+      "rendered": "candidate.resolve()"
+    },
+    {
+      "line_start": 62,
+      "line_end": 62,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='target', ctx=Load()), attr='relative_to', ctx=Load()), args=[Name(id='root', ctx=Load())], keywords=[])",
+      "rendered": "target.relative_to(root)"
+    },
+    {
+      "line_start": 63,
+      "line_end": 63,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='OSError', ctx=Load()), Name(id='ValueError', ctx=Load())], ctx=Load())",
+      "rendered": "(OSError, ValueError)"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='target', ctx=Load())",
+      "rendered": "target"
+    },
+    {
+      "line_start": 70,
+      "line_end": 70,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='_resolve_within_root', ctx=Load()), args=[Name(id='root', ctx=Load()), Name(id='raw', ctx=Load())], keywords=[]), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "_resolve_within_root(root, raw) is not None"
+    },
+    {
+      "line_start": 75,
+      "line_end": 75,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dict', ctx=Load()), args=[Attribute(value=Name(id='os', ctx=Load()), attr='environ', ctx=Load())], keywords=[])",
+      "rendered": "dict(os.environ)"
+    },
+    {
+      "line_start": 76,
+      "line_end": 76,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='env', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='ANTHROPIC_API_KEY')], keywords=[]))",
+      "rendered": "not env.get('ANTHROPIC_API_KEY')"
+    },
+    {
+      "line_start": 77,
+      "line_end": 78,
+      "column": 20,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='env', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='ANTHROPIC_AUTH_TOKEN')], keywords=[]), Call(func=Attribute(value=Name(id='env', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='ANTHROPIC_SDK_API_KEY')], keywords=[])])",
+      "rendered": "env.get('ANTHROPIC_AUTH_TOKEN') or env.get('ANTHROPIC_SDK_API_KEY')"
+    },
+    {
+      "line_start": 79,
+      "line_end": 79,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='fallback', ctx=Load())",
+      "rendered": "fallback"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 39,
+      "kind": "Name",
+      "original_ast": "Name(id='fallback', ctx=Load())",
+      "rendered": "fallback"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='env', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='ANTHROPIC_SDK_BASE_URL')], keywords=[])",
+      "rendered": "env.get('ANTHROPIC_SDK_BASE_URL')"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Name(id='sdk_base', ctx=Load()), UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='env', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='ANTHROPIC_BASE_URL')], keywords=[]))])",
+      "rendered": "sdk_base and (not env.get('ANTHROPIC_BASE_URL'))"
+    },
+    {
+      "line_start": 83,
+      "line_end": 83,
+      "column": 36,
+      "kind": "Name",
+      "original_ast": "Name(id='sdk_base', ctx=Load())",
+      "rendered": "sdk_base"
+    },
+    {
+      "line_start": 85,
+      "line_end": 85,
+      "column": 11,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[None, None], values=[Name(id='env', ctx=Load()), Name(id='_NO_REFUSAL_RESEND_ENV', ctx=Load())])",
+      "rendered": "{**env, **_NO_REFUSAL_RESEND_ENV}"
+    },
+    {
+      "line_start": 89,
+      "line_end": 89,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='frozenset', ctx=Load()), args=[Set(elts=[Constant(value='filePath'), Constant(value='file_path'), Constant(value='filenames'), Constant(value='path')])], keywords=[])",
+      "rendered": "frozenset({'filePath', 'file_path', 'filenames', 'path'})"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='payload', ctx=Load()), Name(id='str', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(payload, str)"
+    },
+    {
+      "line_start": 95,
+      "line_end": 95,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='redact_counts', ctx=Load()), args=[Name(id='payload', ctx=Load())], keywords=[keyword(arg='carry', value=Name(id='carry', ctx=Load()))])",
+      "rendered": "redact_counts(payload, carry=carry)"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='masked', ctx=Load())",
+      "rendered": "masked"
+    },
+    {
+      "line_start": 97,
+      "line_end": 97,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='payload', ctx=Load()), Name(id='list', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(payload, list)"
+    },
+    {
+      "line_start": 98,
+      "line_end": 98,
+      "column": 15,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Call(func=Name(id='_redact_tool_output', ctx=Load()), args=[Name(id='item', ctx=Load())], keywords=[keyword(arg='carry', value=Name(id='carry', ctx=Load()))]), generators=[comprehension(target=Name(id='item', ctx=Store()), iter=Name(id='payload', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "[_redact_tool_output(item, carry=carry) for item in payload]"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='payload', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(payload, dict)"
+    },
+    {
+      "line_start": 100,
+      "line_end": 101,
+      "column": 15,
+      "kind": "DictComp",
+      "original_ast": "DictComp(key=Name(id='k', ctx=Load()), value=Call(func=Name(id='_redact_tool_output', ctx=Load()), args=[Name(id='v', ctx=Load())], keywords=[keyword(arg='carry', value=BoolOp(op=And(), values=[Name(id='carry', ctx=Load()), Compare(left=Name(id='k', ctx=Load()), ops=[NotIn()], comparators=[Name(id='_TOOL_PATH_KEYS', ctx=Load())])]))]), generators=[comprehension(target=Tuple(elts=[Name(id='k', ctx=Store()), Name(id='v', ctx=Store())], ctx=Store()), iter=Call(func=Attribute(value=Name(id='payload', ctx=Load()), attr='items', ctx=Load()), args=[], keywords=[]), ifs=[], is_async=0)])",
+      "rendered": "{k: _redact_tool_output(v, carry=carry and k not in _TOOL_PATH_KEYS) for k, v in payload.items()}"
+    },
+    {
+      "line_start": 102,
+      "line_end": 102,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='payload', ctx=Load())",
+      "rendered": "payload"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 110,
+      "line_end": 110,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 24,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=BoolOp(op=Or(), values=[Name(id='input_data', ctx=Load()), Dict(keys=[], values=[])]), attr='get', ctx=Load()), args=[Constant(value='tool_name')], keywords=[])",
+      "rendered": "(input_data or {}).get('tool_name')"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='tool_name', ctx=Load()), ops=[NotIn()], comparators=[Name(id='_REDACT_TOOLS', ctx=Load())])",
+      "rendered": "tool_name not in _REDACT_TOOLS"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 23,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=BoolOp(op=Or(), values=[Name(id='input_data', ctx=Load()), Dict(keys=[], values=[])]), attr='get', ctx=Load()), args=[Constant(value='tool_response')], keywords=[])",
+      "rendered": "(input_data or {}).get('tool_response')"
+    },
+    {
+      "line_start": 118,
+      "line_end": 118,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='response', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "response is None"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 23,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 120,
+      "line_end": 120,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_redact_tool_output', ctx=Load()), args=[Name(id='response', ctx=Load())], keywords=[])",
+      "rendered": "_redact_tool_output(response)"
+    },
+    {
+      "line_start": 121,
+      "line_end": 121,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='masked', ctx=Load()), ops=[Eq()], comparators=[Name(id='response', ctx=Load())])",
+      "rendered": "masked == response"
+    },
+    {
+      "line_start": 122,
+      "line_end": 122,
+      "column": 23,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 124,
+      "line_end": 129,
+      "column": 19,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='hookSpecificOutput')], values=[Dict(keys=[Constant(value='hookEventName'), Constant(value='updatedToolOutput')], values=[Constant(value='PostToolUse'), Name(id='masked', ctx=Load())])])",
+      "rendered": "{'hookSpecificOutput': {'hookEventName': 'PostToolUse', 'updatedToolOutput': masked}}"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 19,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 15,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='PostToolUse')], values=[List(elts=[Call(func=Name(id='HookMatcher', ctx=Load()), args=[], keywords=[keyword(arg='hooks', value=List(elts=[Name(id='_post_tool_use', ctx=Load())], ctx=Load()))])], ctx=Load())])",
+      "rendered": "{'PostToolUse': [HookMatcher(hooks=[_post_tool_use])]}"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 148,
+      "line_end": 148,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='ImportError', ctx=Load())",
+      "rendered": "ImportError"
+    },
+    {
+      "line_start": 149,
+      "line_end": 154,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='RuntimeError', ctx=Load()), args=[Constant(value=\"This Claude Agent SDK build has no PreToolUse hook support (HookMatcher), which is what enforces the cwd-confined write gate on `via: sdk` (see _pre_tool_use_gate's docstring) — reinstall vvaharness to pull in a newer SDK release.\")], keywords=[])",
+      "rendered": "RuntimeError(source_literal_150_12)"
+    },
+    {
+      "line_start": 154,
+      "line_end": 154,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='e', ctx=Load())",
+      "rendered": "e"
+    },
+    {
+      "line_start": 156,
+      "line_end": 156,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Name(id='Path', ctx=Load()), args=[Name(id='cwd', ctx=Load())], keywords=[]), attr='resolve', ctx=Load()), args=[], keywords=[])",
+      "rendered": "Path(cwd).resolve()"
+    },
+    {
+      "line_start": 162,
+      "line_end": 166,
+      "column": 19,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='hookSpecificOutput')], values=[Dict(keys=[Constant(value='hookEventName'), Constant(value='permissionDecision'), Constant(value='permissionDecisionReason')], values=[Constant(value='PreToolUse'), Constant(value='deny'), Name(id='reason', ctx=Load())])])",
+      "rendered": "{'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny', 'permissionDecisionReason': reason}}"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 24,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Attribute(value=BoolOp(op=Or(), values=[Name(id='input_data', ctx=Load()), Dict(keys=[], values=[])]), attr='get', ctx=Load()), args=[Constant(value='tool_name')], keywords=[]), Constant(value='')])",
+      "rendered": "(input_data or {}).get('tool_name') or ''"
+    },
+    {
+      "line_start": 170,
+      "line_end": 170,
+      "column": 25,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Attribute(value=BoolOp(op=Or(), values=[Name(id='input_data', ctx=Load()), Dict(keys=[], values=[])]), attr='get', ctx=Load()), args=[Constant(value='tool_input')], keywords=[]), Dict(keys=[], values=[])])",
+      "rendered": "(input_data or {}).get('tool_input') or {}"
+    },
+    {
+      "line_start": 173,
+      "line_end": 173,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='tool_name', ctx=Load()), ops=[In()], comparators=[Name(id='_WRITE_TOOLS', ctx=Load())])",
+      "rendered": "tool_name in _WRITE_TOOLS"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 33,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 27,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value='file_path'), Constant(value='path'), Constant(value='notebook_path')], ctx=Load())",
+      "rendered": "('file_path', 'path', 'notebook_path')"
+    },
+    {
+      "line_start": 176,
+      "line_end": 176,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='tool_input', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='key', ctx=Load())], keywords=[])",
+      "rendered": "tool_input.get(key)"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='val', ctx=Load())",
+      "rendered": "val"
+    },
+    {
+      "line_start": 178,
+      "line_end": 178,
+      "column": 40,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='val', ctx=Load()), Name(id='key', ctx=Load())], ctx=Load())",
+      "rendered": "(val, key)"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 27,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_resolve_within_root', ctx=Load()), args=[Name(id='root', ctx=Load()), Name(id='raw', ctx=Load())], keywords=[])",
+      "rendered": "_resolve_within_root(root, raw)"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 19,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='resolved', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "resolved is None"
+    },
+    {
+      "line_start": 182,
+      "line_end": 184,
+      "column": 27,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_deny', ctx=Load()), args=[JoinedStr(values=[FormattedValue(value=Name(id='tool_name', ctx=Load()), conversion=-1), Constant(value=' target '), FormattedValue(value=Name(id='raw', ctx=Load()), conversion=114), Constant(value=' is outside the repository root, unresolvable, or a symlink — edits are confined to '), FormattedValue(value=Name(id='root', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "_deny(source_template_182_33)"
+    },
+    {
+      "line_start": 185,
+      "line_end": 185,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='is_git_metadata', ctx=Load()), args=[Call(func=Attribute(value=Name(id='resolved', ctx=Load()), attr='relative_to', ctx=Load()), args=[Name(id='root', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "is_git_metadata(resolved.relative_to(root))"
+    },
+    {
+      "line_start": 186,
+      "line_end": 187,
+      "column": 27,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_deny', ctx=Load()), args=[JoinedStr(values=[FormattedValue(value=Name(id='tool_name', ctx=Load()), conversion=-1), Constant(value=' target '), FormattedValue(value=Name(id='raw', ctx=Load()), conversion=114), Constant(value=' is version-control metadata (.git), which remediation never edits.')])], keywords=[])",
+      "rendered": "_deny(source_template_186_33)"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 29,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dict', ctx=Load()), args=[Name(id='tool_input', ctx=Load())], keywords=[])",
+      "rendered": "dict(tool_input)"
+    },
+    {
+      "line_start": 190,
+      "line_end": 190,
+      "column": 39,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='str', ctx=Load()), args=[Name(id='resolved', ctx=Load())], keywords=[])",
+      "rendered": "str(resolved)"
+    },
+    {
+      "line_start": 191,
+      "line_end": 195,
+      "column": 23,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='hookSpecificOutput')], values=[Dict(keys=[Constant(value='hookEventName'), Constant(value='permissionDecision'), Constant(value='updatedInput')], values=[Constant(value='PreToolUse'), Constant(value='allow'), Name(id='safe_input', ctx=Load())])])",
+      "rendered": "{'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'allow', 'updatedInput': safe_input}}"
+    },
+    {
+      "line_start": 197,
+      "line_end": 197,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='tool_name', ctx=Load()), ops=[In()], comparators=[Name(id='_READ_TOOLS', ctx=Load())])",
+      "rendered": "tool_name in _READ_TOOLS"
+    },
+    {
+      "line_start": 198,
+      "line_end": 198,
+      "column": 23,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 200,
+      "line_end": 202,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_deny', ctx=Load()), args=[JoinedStr(values=[FormattedValue(value=Name(id='tool_name', ctx=Load()), conversion=-1), Constant(value=' is not permitted in remediation fix mode — only Read/Glob/Grep and cwd-confined Edit/Write are allowed (Bash and other tools are denied by default).')])], keywords=[])",
+      "rendered": "_deny(source_template_200_25)"
+    },
+    {
+      "line_start": 203,
+      "line_end": 203,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 204,
+      "line_end": 205,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_deny', ctx=Load()), args=[JoinedStr(values=[Constant(value='the security gate could not evaluate this call ('), FormattedValue(value=Attribute(value=Call(func=Name(id='type', ctx=Load()), args=[Name(id='exc', ctx=Load())], keywords=[]), attr='__name__', ctx=Load()), conversion=-1), Constant(value=') and denies it as a precaution.')])], keywords=[])",
+      "rendered": "_deny(source_template_204_25)"
+    },
+    {
+      "line_start": 207,
+      "line_end": 207,
+      "column": 22,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Name(id='_build_redaction_hooks', ctx=Load()), args=[], keywords=[]), Dict(keys=[], values=[])])",
+      "rendered": "_build_redaction_hooks() or {}"
+    },
+    {
+      "line_start": 208,
+      "line_end": 208,
+      "column": 12,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[None, Constant(value='PreToolUse')], values=[Name(id='redaction_hooks', ctx=Load()), List(elts=[Call(func=Name(id='HookMatcher', ctx=Load()), args=[], keywords=[keyword(arg='hooks', value=List(elts=[Name(id='_pre_tool_use_gate', ctx=Load())], ctx=Load()))])], ctx=Load())])",
+      "rendered": "{**redaction_hooks, 'PreToolUse': [HookMatcher(hooks=[_pre_tool_use_gate])]}"
+    },
+    {
+      "line_start": 210,
+      "line_end": 228,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ClaudeAgentOptions', ctx=Load()), args=[], keywords=[keyword(arg='model', value=Name(id='model', ctx=Load())), keyword(arg='cwd', value=Call(func=Name(id='str', ctx=Load()), args=[Name(id='root', ctx=Load())], keywords=[])), keyword(arg='env', value=Call(func=Name(id='_sdk_env', ctx=Load()), args=[], keywords=[])), keyword(arg='permission_mode', value=Constant(value='default')), keyword(arg='setting_sources', value=List(elts=[Constant(value='user')], ctx=Load())), keyword(arg='strict_mcp_config', value=Constant(value=True)), keyword(arg='allowed_tools', value=Call(func=Name(id='list', ctx=Load()), args=[Name(id='allowed_tools', ctx=Load())], keywords=[])), keyword(arg='hooks', value=Name(id='hooks', ctx=Load())), keyword(arg='verbatim_prompts', value=Constant(value=True))])",
+      "rendered": "ClaudeAgentOptions(model=model, cwd=str(root), env=_sdk_env(), permission_mode='default', setting_sources=['user'], strict_mcp_config=True, allowed_tools=list(allowed_tools), hooks=hooks, verbatim_prompts=True)"
+    },
+    {
+      "line_start": 230,
+      "line_end": 230,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='system_prompt', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "system_prompt is not None"
+    },
+    {
+      "line_start": 231,
+      "line_end": 231,
+      "column": 29,
+      "kind": "Name",
+      "original_ast": "Name(id='system_prompt', ctx=Load())",
+      "rendered": "system_prompt"
+    },
+    {
+      "line_start": 232,
+      "line_end": 232,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='max_turns', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "max_turns is not None"
+    },
+    {
+      "line_start": 233,
+      "line_end": 233,
+      "column": 25,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='int', ctx=Load()), args=[Name(id='max_turns', ctx=Load())], keywords=[])",
+      "rendered": "int(max_turns)"
+    },
+    {
+      "line_start": 234,
+      "line_end": 234,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='max_budget_usd', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "max_budget_usd is not None"
+    },
+    {
+      "line_start": 235,
+      "line_end": 235,
+      "column": 30,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='float', ctx=Load()), args=[Name(id='max_budget_usd', ctx=Load())], keywords=[])",
+      "rendered": "float(max_budget_usd)"
+    },
+    {
+      "line_start": 236,
+      "line_end": 236,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='opts', ctx=Load())",
+      "rendered": "opts"
+    },
+    {
+      "line_start": 239,
+      "line_end": 239,
+      "column": 18,
+      "kind": "Name",
+      "original_ast": "Name(id='NamedTuple', ctx=Load())",
+      "rendered": "NamedTuple"
+    },
+    {
+      "line_start": 250,
+      "line_end": 250,
+      "column": 25,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='client', ctx=Load()), attr='receive_response', ctx=Load()), args=[], keywords=[])",
+      "rendered": "client.receive_response()"
+    },
+    {
+      "line_start": 251,
+      "line_end": 251,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='on_message', ctx=Load()), args=[Name(id='message', ctx=Load())], keywords=[])",
+      "rendered": "on_message(message)"
+    },
+    {
+      "line_start": 252,
+      "line_end": 252,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='message', ctx=Load()), Name(id='ResultMessage', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(message, ResultMessage)"
+    },
+    {
+      "line_start": 253,
+      "line_end": 253,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='message', ctx=Load())",
+      "rendered": "message"
+    },
+    {
+      "line_start": 254,
+      "line_end": 254,
+      "column": 11,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 260,
+      "line_end": 260,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Compare(left=Name(id='timeout', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)]), Compare(left=Name(id='timeout', ctx=Load()), ops=[LtE()], comparators=[Constant(value=0)])])",
+      "rendered": "timeout is None or timeout <= 0"
+    },
+    {
+      "line_start": 261,
+      "line_end": 261,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='DrainResult', ctx=Load()), args=[Await(value=Call(func=Name(id='_drain', ctx=Load()), args=[Name(id='client', ctx=Load()), Name(id='on_message', ctx=Load())], keywords=[])), Constant(value=False)], keywords=[])",
+      "rendered": "DrainResult(await _drain(client, on_message), False)"
+    },
+    {
+      "line_start": 263,
+      "line_end": 263,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='asyncio', ctx=Load()), attr='timeout', ctx=Load()), args=[Name(id='timeout', ctx=Load())], keywords=[])",
+      "rendered": "asyncio.timeout(timeout)"
+    },
+    {
+      "line_start": 265,
+      "line_end": 265,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='deadline', ctx=Load())",
+      "rendered": "deadline"
+    },
+    {
+      "line_start": 266,
+      "line_end": 266,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='DrainResult', ctx=Load()), args=[Await(value=Call(func=Name(id='_drain', ctx=Load()), args=[Name(id='client', ctx=Load()), Name(id='on_message', ctx=Load())], keywords=[])), Constant(value=False)], keywords=[])",
+      "rendered": "DrainResult(await _drain(client, on_message), False)"
+    },
+    {
+      "line_start": 267,
+      "line_end": 267,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='TimeoutError', ctx=Load())",
+      "rendered": "TimeoutError"
+    },
+    {
+      "line_start": 268,
+      "line_end": 268,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='deadline', ctx=Load()), attr='expired', ctx=Load()), args=[], keywords=[]))",
+      "rendered": "not deadline.expired()"
+    },
+    {
+      "line_start": 270,
+      "line_end": 270,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='contextlib', ctx=Load()), attr='suppress', ctx=Load()), args=[Name(id='Exception', ctx=Load())], keywords=[])",
+      "rendered": "contextlib.suppress(Exception)"
+    },
+    {
+      "line_start": 271,
+      "line_end": 271,
+      "column": 8,
+      "kind": "Await",
+      "original_ast": "Await(value=Call(func=Attribute(value=Name(id='client', ctx=Load()), attr='interrupt', ctx=Load()), args=[], keywords=[]))",
+      "rendered": "await client.interrupt()"
+    },
+    {
+      "line_start": 274,
+      "line_end": 274,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='asyncio', ctx=Load()), attr='timeout', ctx=Load()), args=[Name(id='grace', ctx=Load())], keywords=[])",
+      "rendered": "asyncio.timeout(grace)"
+    },
+    {
+      "line_start": 276,
+      "line_end": 276,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='regrace', ctx=Load())",
+      "rendered": "regrace"
+    },
+    {
+      "line_start": 277,
+      "line_end": 277,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='DrainResult', ctx=Load()), args=[Await(value=Call(func=Name(id='_drain', ctx=Load()), args=[Name(id='client', ctx=Load()), Name(id='on_message', ctx=Load())], keywords=[])), Constant(value=True)], keywords=[])",
+      "rendered": "DrainResult(await _drain(client, on_message), True)"
+    },
+    {
+      "line_start": 278,
+      "line_end": 278,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='TimeoutError', ctx=Load())",
+      "rendered": "TimeoutError"
+    },
+    {
+      "line_start": 279,
+      "line_end": 279,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='regrace', ctx=Load()), attr='expired', ctx=Load()), args=[], keywords=[]))",
+      "rendered": "not regrace.expired()"
+    },
+    {
+      "line_start": 281,
+      "line_end": 281,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='DrainResult', ctx=Load()), args=[Constant(value=None), Constant(value=True)], keywords=[])",
+      "rendered": "DrainResult(None, True)"
+    },
+    {
+      "line_start": 293,
+      "line_end": 293,
+      "column": 28,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 296,
+      "line_end": 296,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='message', ctx=Load()), Name(id='AssistantMessage', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(message, AssistantMessage)"
+    },
+    {
+      "line_start": 297,
+      "line_end": 297,
+      "column": 25,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='message', ctx=Load()), attr='content', ctx=Load())",
+      "rendered": "message.content"
+    },
+    {
+      "line_start": 298,
+      "line_end": 298,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='block', ctx=Load()), Name(id='TextBlock', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(block, TextBlock)"
+    },
+    {
+      "line_start": 299,
+      "line_end": 299,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='text_parts', ctx=Load()), attr='append', ctx=Load()), args=[Attribute(value=Name(id='block', ctx=Load()), attr='text', ctx=Load())], keywords=[])",
+      "rendered": "text_parts.append(block.text)"
+    },
+    {
+      "line_start": 302,
+      "line_end": 302,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='effort_scaled_seconds', ctx=Load()), args=[Name(id='timeout', ctx=Load()), Name(id='effort', ctx=Load())], keywords=[keyword(arg='kind', value=Attribute(value=Name(id='ClockKind', ctx=Load()), attr='SESSION', ctx=Load()))])",
+      "rendered": "effort_scaled_seconds(timeout, effort, kind=ClockKind.SESSION)"
+    },
+    {
+      "line_start": 305,
+      "line_end": 305,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='time', ctx=Load()), attr='monotonic', ctx=Load()), args=[], keywords=[])",
+      "rendered": "time.monotonic()"
+    },
+    {
+      "line_start": 306,
+      "line_end": 306,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ClaudeSDKClient', ctx=Load()), args=[], keywords=[keyword(arg='options', value=Name(id='opts', ctx=Load()))])",
+      "rendered": "ClaudeSDKClient(options=opts)"
+    },
+    {
+      "line_start": 307,
+      "line_end": 307,
+      "column": 8,
+      "kind": "Await",
+      "original_ast": "Await(value=Call(func=Attribute(value=Name(id='client', ctx=Load()), attr='query', ctx=Load()), args=[Name(id='user_prompt', ctx=Load())], keywords=[]))",
+      "rendered": "await client.query(user_prompt)"
+    },
+    {
+      "line_start": 308,
+      "line_end": 309,
+      "column": 18,
+      "kind": "Await",
+      "original_ast": "Await(value=Call(func=Name(id='drain_until_result', ctx=Load()), args=[Name(id='client', ctx=Load())], keywords=[keyword(arg='on_message', value=Name(id='_on_message', ctx=Load())), keyword(arg='timeout', value=Name(id='budget', ctx=Load())), keyword(arg='grace', value=Name(id='TIMEOUT_STOP_GRACE_SECONDS', ctx=Load()))]))",
+      "rendered": "await drain_until_result(client, on_message=_on_message, timeout=budget, grace=TIMEOUT_STOP_GRACE_SECONDS)"
+    },
+    {
+      "line_start": 311,
+      "line_end": 311,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='drained', ctx=Load()), attr='result', ctx=Load())",
+      "rendered": "drained.result"
+    },
+    {
+      "line_start": 312,
+      "line_end": 312,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='result', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), Attribute(value=Name(id='result', ctx=Load()), attr='usage', ctx=Load())])",
+      "rendered": "result is not None and result.usage"
+    },
+    {
+      "line_start": 313,
+      "line_end": 313,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='TOKENS', ctx=Load()), attr='add', ctx=Load()), args=[Call(func=Name(id='cast', ctx=Load()), args=[Constant(value='TokenUsage'), Attribute(value=Name(id='result', ctx=Load()), attr='usage', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "TOKENS.add(cast('TokenUsage', result.usage))"
+    },
+    {
+      "line_start": 314,
+      "line_end": 314,
+      "column": 7,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='drained', ctx=Load()), attr='timed_out', ctx=Load())",
+      "rendered": "drained.timed_out"
+    },
+    {
+      "line_start": 315,
+      "line_end": 317,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='call_timeout_error', ctx=Load()), args=[], keywords=[keyword(arg='stage', value=BoolOp(op=Or(), values=[Name(id='tag', ctx=Load()), Constant(value='')])), keyword(arg='route', value=Constant(value='agent-sdk')), keyword(arg='budget_s', value=Name(id='budget', ctx=Load())), keyword(arg='effort', value=Name(id='effort', ctx=Load())), keyword(arg='cause_text', value=JoinedStr(values=[Constant(value='agent-sdk session exceeded '), FormattedValue(value=Name(id='budget', ctx=Load()), conversion=-1, format_spec=JoinedStr(values=[Constant(value='g')])), Constant(value='s')]))])",
+      "rendered": "call_timeout_error(stage=tag or '', route='agent-sdk', budget_s=budget, effort=effort, cause_text=source_template_317_23)"
+    },
+    {
+      "line_start": 318,
+      "line_end": 318,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='note_budget_use', ctx=Load()), args=[BinOp(left=Call(func=Attribute(value=Name(id='time', ctx=Load()), attr='monotonic', ctx=Load()), args=[], keywords=[]), op=Sub(), right=Name(id='_start', ctx=Load())), Name(id='budget', ctx=Load()), Name(id='effort', ctx=Load())], keywords=[])",
+      "rendered": "note_budget_use(time.monotonic() - _start, budget, effort)"
+    },
+    {
+      "line_start": 319,
+      "line_end": 319,
+      "column": 18,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=Name(id='result', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), body=Attribute(value=Name(id='result', ctx=Load()), attr='result', ctx=Load()), orelse=Constant(value=None))",
+      "rendered": "result.result if result is not None else None"
+    },
+    {
+      "line_start": 320,
+      "line_end": 320,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=BoolOp(op=Or(), values=[Name(id='result_text', ctx=Load()), Call(func=Attribute(value=Constant(value=''), attr='join', ctx=Load()), args=[Name(id='text_parts', ctx=Load())], keywords=[])]), attr='strip', ctx=Load()), args=[], keywords=[])",
+      "rendered": "(result_text or ''.join(text_parts)).strip()"
+    },
+    {
+      "line_start": 340,
+      "line_end": 340,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='ImportError', ctx=Load())",
+      "rendered": "ImportError"
+    },
+    {
+      "line_start": 341,
+      "line_end": 346,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='RuntimeError', ctx=Load()), args=[Constant(value='An agentic role is configured `via: sdk` and requests file-editing tools (Edit/Write/Bash), which require the Claude Agent SDK. Reinstall vvaharness to pull it in (pip install .), or set this role to `via: cli`.')], keywords=[])",
+      "rendered": "RuntimeError(source_literal_342_12)"
+    },
+    {
+      "line_start": 346,
+      "line_end": 346,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='e', ctx=Load())",
+      "rendered": "e"
+    },
+    {
+      "line_start": 348,
+      "line_end": 348,
+      "column": 14,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=Name(id='allowed_tools', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)]), body=Call(func=Name(id='list', ctx=Load()), args=[Name(id='DEFAULT_READ_TOOLS', ctx=Load())], keywords=[]), orelse=Call(func=Name(id='list', ctx=Load()), args=[Name(id='allowed_tools', ctx=Load())], keywords=[]))",
+      "rendered": "list(DEFAULT_READ_TOOLS) if allowed_tools is None else list(allowed_tools)"
+    },
+    {
+      "line_start": 349,
+      "line_end": 349,
+      "column": 14,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='tag', ctx=Load()), body=JoinedStr(values=[Constant(value=' ['), FormattedValue(value=Name(id='tag', ctx=Load()), conversion=-1), Constant(value=']')]), orelse=Constant(value=''))",
+      "rendered": "source_template_349_14 if tag else ''"
+    },
+    {
+      "line_start": 350,
+      "line_end": 351,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='    [agent-sdk] agentic -> '), FormattedValue(value=Name(id='model', ctx=Load()), conversion=-1), FormattedValue(value=Name(id='tag_sfx', ctx=Load()), conversion=-1), Constant(value=' (tools='), FormattedValue(value=Name(id='allowed', ctx=Load()), conversion=-1), Constant(value=', max_turns='), FormattedValue(value=Name(id='max_turns', ctx=Load()), conversion=-1), Constant(value=', cwd='), FormattedValue(value=Name(id='cwd', ctx=Load()), conversion=-1), Constant(value=', timeout='), FormattedValue(value=Name(id='timeout', ctx=Load()), conversion=-1), Constant(value=')')])], keywords=[])",
+      "rendered": "console.write(source_template_350_18)"
+    },
+    {
+      "line_start": 353,
+      "line_end": 356,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_build_options', ctx=Load()), args=[], keywords=[keyword(arg='model', value=Name(id='model', ctx=Load())), keyword(arg='system_prompt', value=Name(id='system_prompt', ctx=Load())), keyword(arg='allowed_tools', value=Name(id='allowed', ctx=Load())), keyword(arg='cwd', value=Name(id='cwd', ctx=Load())), keyword(arg='max_budget_usd', value=Name(id='max_budget_usd', ctx=Load())), keyword(arg='max_turns', value=Name(id='max_turns', ctx=Load()))])",
+      "rendered": "_build_options(model=model, system_prompt=system_prompt, allowed_tools=allowed, cwd=cwd, max_budget_usd=max_budget_usd, max_turns=max_turns)"
+    },
+    {
+      "line_start": 357,
+      "line_end": 358,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='asyncio', ctx=Load()), attr='run', ctx=Load()), args=[Call(func=Name(id='_run', ctx=Load()), args=[], keywords=[keyword(arg='user_prompt', value=Name(id='user_prompt', ctx=Load())), keyword(arg='opts', value=Name(id='opts', ctx=Load())), keyword(arg='timeout', value=Name(id='timeout', ctx=Load())), keyword(arg='tag', value=Name(id='tag', ctx=Load())), keyword(arg='effort', value=Name(id='effort', ctx=Load()))])], keywords=[])",
+      "rendered": "asyncio.run(_run(user_prompt=user_prompt, opts=opts, timeout=timeout, tag=tag, effort=effort))"
+    }
+  ],
+  "calls": [
+    {
+      "line": 45,
+      "end_line": 45,
+      "callee": "frozenset",
+      "enclosing": "module initialization",
+      "expression": "frozenset({\"Edit\", \"Write\", \"MultiEdit\", \"NotebookEdit\"})"
+    },
+    {
+      "line": 47,
+      "end_line": 47,
+      "callee": "frozenset",
+      "enclosing": "module initialization",
+      "expression": "frozenset({\"Read\", \"Glob\", \"Grep\", \"LS\", \"NotebookRead\"})"
+    },
+    {
+      "line": 89,
+      "end_line": 89,
+      "callee": "frozenset",
+      "enclosing": "module initialization",
+      "expression": "frozenset({\"filePath\", \"file_path\", \"filenames\", \"path\"})"
+    },
+    {
+      "line": 49,
+      "end_line": 49,
+      "callee": "frozenset",
+      "enclosing": "module initialization",
+      "expression": "frozenset({\"Bash\"})"
+    },
+    {
+      "line": 75,
+      "end_line": 75,
+      "callee": "dict",
+      "enclosing": "_sdk_env",
+      "expression": "dict(os.environ)"
+    },
+    {
+      "line": 81,
+      "end_line": 81,
+      "callee": "env.get",
+      "enclosing": "_sdk_env",
+      "expression": "env.get(\"ANTHROPIC_SDK_BASE_URL\")"
+    },
+    {
+      "line": 94,
+      "end_line": 94,
+      "callee": "isinstance",
+      "enclosing": "_redact_tool_output",
+      "expression": "isinstance(payload, str)"
+    },
+    {
+      "line": 97,
+      "end_line": 97,
+      "callee": "isinstance",
+      "enclosing": "_redact_tool_output",
+      "expression": "isinstance(payload, list)"
+    },
+    {
+      "line": 99,
+      "end_line": 99,
+      "callee": "isinstance",
+      "enclosing": "_redact_tool_output",
+      "expression": "isinstance(payload, dict)"
+    },
+    {
+      "line": 156,
+      "end_line": 156,
+      "callee": "Path(cwd).resolve",
+      "enclosing": "_build_options",
+      "expression": "Path(cwd).resolve()"
+    },
+    {
+      "line": 210,
+      "end_line": 228,
+      "callee": "ClaudeAgentOptions",
+      "enclosing": "_build_options",
+      "expression": "ClaudeAgentOptions(\n        model=model,\n        cwd=str(root),\n        env=_sdk_env(),\n        # The PreToolUse hook above is the live gate; permission_mode/allowed_tools set availability\n        permission_mode=\"default\",\n        # \"user\" only: a scanned repo's own .claude/settings.json can never re-grant Bash or\n        # register a host hook into this Edit/Write-capable session (mirrors the via:cli\n        # route's --setting-sources user).\n        setting_sources=[\"user\"],\n        # Without this, a target repo's own .mcp.json server would be spawned into this\n        # session (mirrors cli_mcp.py's strict_mcp_config=True).\n        strict_mcp_config=True,\n        allowed_tools=list(allowed_tools),\n        hooks=hooks,\n        # Finding text/code snippets reach this prompt; verbatim keeps them from being\n        # parsed as an @path expansion or a slash command.\n        verbatim_prompts=True,\n    )"
+    },
+    {
+      "line": 250,
+      "end_line": 250,
+      "callee": "client.receive_response",
+      "enclosing": "_drain",
+      "expression": "client.receive_response()"
+    },
+    {
+      "line": 263,
+      "end_line": 263,
+      "callee": "asyncio.timeout",
+      "enclosing": "drain_until_result",
+      "expression": "asyncio.timeout(timeout)"
+    },
+    {
+      "line": 274,
+      "end_line": 274,
+      "callee": "asyncio.timeout",
+      "enclosing": "drain_until_result",
+      "expression": "asyncio.timeout(grace)"
+    },
+    {
+      "line": 302,
+      "end_line": 302,
+      "callee": "effort_scaled_seconds",
+      "enclosing": "_run",
+      "expression": "effort_scaled_seconds(timeout, effort, kind=ClockKind.SESSION)"
+    },
+    {
+      "line": 305,
+      "end_line": 305,
+      "callee": "time.monotonic",
+      "enclosing": "_run",
+      "expression": "time.monotonic()"
+    },
+    {
+      "line": 318,
+      "end_line": 318,
+      "callee": "note_budget_use",
+      "enclosing": "_run",
+      "expression": "note_budget_use(time.monotonic() - _start, budget, effort)"
+    },
+    {
+      "line": 320,
+      "end_line": 320,
+      "callee": "(result_text or ''.join(text_parts)).strip",
+      "enclosing": "_run",
+      "expression": "(result_text or \"\".join(text_parts)).strip()"
+    },
+    {
+      "line": 350,
+      "end_line": 351,
+      "callee": "console.write",
+      "enclosing": "agentic",
+      "expression": "console.write(f\"    [agent-sdk] agentic -> {model}{tag_sfx} (tools={allowed}, \"\n                  f\"max_turns={max_turns}, cwd={cwd}, timeout={timeout})\")"
+    },
+    {
+      "line": 353,
+      "end_line": 356,
+      "callee": "_build_options",
+      "enclosing": "agentic",
+      "expression": "_build_options(\n        model=model, system_prompt=system_prompt, allowed_tools=allowed,\n        cwd=cwd, max_budget_usd=max_budget_usd, max_turns=max_turns,\n    )"
+    },
+    {
+      "line": 357,
+      "end_line": 358,
+      "callee": "asyncio.run",
+      "enclosing": "agentic",
+      "expression": "asyncio.run(_run(user_prompt=user_prompt, opts=opts, timeout=timeout,\n                            tag=tag, effort=effort))"
+    },
+    {
+      "line": 59,
+      "end_line": 59,
+      "callee": "candidate.is_symlink",
+      "enclosing": "_resolve_within_root",
+      "expression": "candidate.is_symlink()"
+    },
+    {
+      "line": 61,
+      "end_line": 61,
+      "callee": "candidate.resolve",
+      "enclosing": "_resolve_within_root",
+      "expression": "candidate.resolve()"
+    },
+    {
+      "line": 62,
+      "end_line": 62,
+      "callee": "target.relative_to",
+      "enclosing": "_resolve_within_root",
+      "expression": "target.relative_to(root)"
+    },
+    {
+      "line": 70,
+      "end_line": 70,
+      "callee": "_resolve_within_root",
+      "enclosing": "_within_root",
+      "expression": "_resolve_within_root(root, raw)"
+    },
+    {
+      "line": 76,
+      "end_line": 76,
+      "callee": "env.get",
+      "enclosing": "_sdk_env",
+      "expression": "env.get(\"ANTHROPIC_API_KEY\")"
+    },
+    {
+      "line": 95,
+      "end_line": 95,
+      "callee": "redact_counts",
+      "enclosing": "_redact_tool_output",
+      "expression": "redact_counts(payload, carry=carry)"
+    },
+    {
+      "line": 207,
+      "end_line": 207,
+      "callee": "_build_redaction_hooks",
+      "enclosing": "_build_options",
+      "expression": "_build_redaction_hooks()"
+    },
+    {
+      "line": 233,
+      "end_line": 233,
+      "callee": "int",
+      "enclosing": "_build_options",
+      "expression": "int(max_turns)"
+    },
+    {
+      "line": 235,
+      "end_line": 235,
+      "callee": "float",
+      "enclosing": "_build_options",
+      "expression": "float(max_budget_usd)"
+    },
+    {
+      "line": 251,
+      "end_line": 251,
+      "callee": "on_message",
+      "enclosing": "_drain",
+      "expression": "on_message(message)"
+    },
+    {
+      "line": 252,
+      "end_line": 252,
+      "callee": "isinstance",
+      "enclosing": "_drain",
+      "expression": "isinstance(message, ResultMessage)"
+    },
+    {
+      "line": 261,
+      "end_line": 261,
+      "callee": "DrainResult",
+      "enclosing": "drain_until_result",
+      "expression": "DrainResult(await _drain(client, on_message), False)"
+    },
+    {
+      "line": 270,
+      "end_line": 270,
+      "callee": "contextlib.suppress",
+      "enclosing": "drain_until_result",
+      "expression": "contextlib.suppress(Exception)"
+    },
+    {
+      "line": 296,
+      "end_line": 296,
+      "callee": "isinstance",
+      "enclosing": "_run._on_message",
+      "expression": "isinstance(message, AssistantMessage)"
+    },
+    {
+      "line": 306,
+      "end_line": 306,
+      "callee": "ClaudeSDKClient",
+      "enclosing": "_run",
+      "expression": "ClaudeSDKClient(options=opts)"
+    },
+    {
+      "line": 313,
+      "end_line": 313,
+      "callee": "TOKENS.add",
+      "enclosing": "_run",
+      "expression": "TOKENS.add(cast(\"TokenUsage\", result.usage))"
+    },
+    {
+      "line": 315,
+      "end_line": 317,
+      "callee": "call_timeout_error",
+      "enclosing": "_run",
+      "expression": "call_timeout_error(\n            stage=tag or \"\", route=\"agent-sdk\", budget_s=budget, effort=effort,\n            cause_text=f\"agent-sdk session exceeded {budget:g}s\")"
+    },
+    {
+      "line": 348,
+      "end_line": 348,
+      "callee": "list",
+      "enclosing": "agentic",
+      "expression": "list(DEFAULT_READ_TOOLS)"
+    },
+    {
+      "line": 348,
+      "end_line": 348,
+      "callee": "list",
+      "enclosing": "agentic",
+      "expression": "list(allowed_tools)"
+    },
+    {
+      "line": 357,
+      "end_line": 358,
+      "callee": "_run",
+      "enclosing": "agentic",
+      "expression": "_run(user_prompt=user_prompt, opts=opts, timeout=timeout,\n                            tag=tag, effort=effort)"
+    },
+    {
+      "line": 54,
+      "end_line": 54,
+      "callee": "isinstance",
+      "enclosing": "_resolve_within_root",
+      "expression": "isinstance(raw, str)"
+    },
+    {
+      "line": 57,
+      "end_line": 57,
+      "callee": "os.path.isabs",
+      "enclosing": "_resolve_within_root",
+      "expression": "os.path.isabs(raw)"
+    },
+    {
+      "line": 57,
+      "end_line": 57,
+      "callee": "Path",
+      "enclosing": "_resolve_within_root",
+      "expression": "Path(raw)"
+    },
+    {
+      "line": 77,
+      "end_line": 77,
+      "callee": "env.get",
+      "enclosing": "_sdk_env",
+      "expression": "env.get(\"ANTHROPIC_AUTH_TOKEN\")"
+    },
+    {
+      "line": 78,
+      "end_line": 78,
+      "callee": "env.get",
+      "enclosing": "_sdk_env",
+      "expression": "env.get(\"ANTHROPIC_SDK_API_KEY\")"
+    },
+    {
+      "line": 82,
+      "end_line": 82,
+      "callee": "env.get",
+      "enclosing": "_sdk_env",
+      "expression": "env.get(\"ANTHROPIC_BASE_URL\")"
+    },
+    {
+      "line": 98,
+      "end_line": 98,
+      "callee": "_redact_tool_output",
+      "enclosing": "_redact_tool_output",
+      "expression": "_redact_tool_output(item, carry=carry)"
+    },
+    {
+      "line": 100,
+      "end_line": 100,
+      "callee": "_redact_tool_output",
+      "enclosing": "_redact_tool_output",
+      "expression": "_redact_tool_output(v, carry=carry and k not in _TOOL_PATH_KEYS)"
+    },
+    {
+      "line": 114,
+      "end_line": 114,
+      "callee": "(input_data or {}).get",
+      "enclosing": "_build_redaction_hooks._post_tool_use",
+      "expression": "(input_data or {}).get(\"tool_name\")"
+    },
+    {
+      "line": 117,
+      "end_line": 117,
+      "callee": "(input_data or {}).get",
+      "enclosing": "_build_redaction_hooks._post_tool_use",
+      "expression": "(input_data or {}).get(\"tool_response\")"
+    },
+    {
+      "line": 120,
+      "end_line": 120,
+      "callee": "_redact_tool_output",
+      "enclosing": "_build_redaction_hooks._post_tool_use",
+      "expression": "_redact_tool_output(response)"
+    },
+    {
+      "line": 149,
+      "end_line": 154,
+      "callee": "RuntimeError",
+      "enclosing": "_build_options",
+      "expression": "RuntimeError(\n            \"This Claude Agent SDK build has no PreToolUse hook support \"\n            \"(HookMatcher), which is what enforces the cwd-confined write \"\n            \"gate on `via: sdk` (see _pre_tool_use_gate's docstring) — \"\n            \"reinstall vvaharness to pull in a newer SDK release.\"\n        )"
+    },
+    {
+      "line": 156,
+      "end_line": 156,
+      "callee": "Path",
+      "enclosing": "_build_options",
+      "expression": "Path(cwd)"
+    },
+    {
+      "line": 200,
+      "end_line": 202,
+      "callee": "_deny",
+      "enclosing": "_build_options._pre_tool_use_gate",
+      "expression": "_deny(f\"{tool_name} is not permitted in remediation fix mode — \"\n                         f\"only Read/Glob/Grep and cwd-confined Edit/Write are \"\n                         f\"allowed (Bash and other tools are denied by default).\")"
+    },
+    {
+      "line": 208,
+      "end_line": 208,
+      "callee": "HookMatcher",
+      "enclosing": "_build_options",
+      "expression": "HookMatcher(hooks=[_pre_tool_use_gate])"
+    },
+    {
+      "line": 212,
+      "end_line": 212,
+      "callee": "str",
+      "enclosing": "_build_options",
+      "expression": "str(root)"
+    },
+    {
+      "line": 213,
+      "end_line": 213,
+      "callee": "_sdk_env",
+      "enclosing": "_build_options",
+      "expression": "_sdk_env()"
+    },
+    {
+      "line": 223,
+      "end_line": 223,
+      "callee": "list",
+      "enclosing": "_build_options",
+      "expression": "list(allowed_tools)"
+    },
+    {
+      "line": 266,
+      "end_line": 266,
+      "callee": "DrainResult",
+      "enclosing": "drain_until_result",
+      "expression": "DrainResult(await _drain(client, on_message), False)"
+    },
+    {
+      "line": 271,
+      "end_line": 271,
+      "callee": "client.interrupt",
+      "enclosing": "drain_until_result",
+      "expression": "client.interrupt()"
+    },
+    {
+      "line": 277,
+      "end_line": 277,
+      "callee": "DrainResult",
+      "enclosing": "drain_until_result",
+      "expression": "DrainResult(await _drain(client, on_message), True)"
+    },
+    {
+      "line": 281,
+      "end_line": 281,
+      "callee": "DrainResult",
+      "enclosing": "drain_until_result",
+      "expression": "DrainResult(None, True)"
+    },
+    {
+      "line": 307,
+      "end_line": 307,
+      "callee": "client.query",
+      "enclosing": "_run",
+      "expression": "client.query(user_prompt)"
+    },
+    {
+      "line": 308,
+      "end_line": 309,
+      "callee": "drain_until_result",
+      "enclosing": "_run",
+      "expression": "drain_until_result(client, on_message=_on_message, timeout=budget,\n                                           grace=TIMEOUT_STOP_GRACE_SECONDS)"
+    },
+    {
+      "line": 313,
+      "end_line": 313,
+      "callee": "cast",
+      "enclosing": "_run",
+      "expression": "cast(\"TokenUsage\", result.usage)"
+    },
+    {
+      "line": 318,
+      "end_line": 318,
+      "callee": "time.monotonic",
+      "enclosing": "_run",
+      "expression": "time.monotonic()"
+    },
+    {
+      "line": 341,
+      "end_line": 346,
+      "callee": "RuntimeError",
+      "enclosing": "agentic",
+      "expression": "RuntimeError(\n            \"An agentic role is configured `via: sdk` and requests file-editing \"\n            \"tools (Edit/Write/Bash), which require the Claude Agent SDK. \"\n            \"Reinstall vvaharness to pull it in (pip install .), or \"\n            \"set this role to `via: cli`.\"\n        )"
+    },
+    {
+      "line": 101,
+      "end_line": 101,
+      "callee": "payload.items",
+      "enclosing": "_redact_tool_output",
+      "expression": "payload.items()"
+    },
+    {
+      "line": 134,
+      "end_line": 134,
+      "callee": "HookMatcher",
+      "enclosing": "_build_redaction_hooks",
+      "expression": "HookMatcher(hooks=[_post_tool_use])"
+    },
+    {
+      "line": 169,
+      "end_line": 169,
+      "callee": "(input_data or {}).get",
+      "enclosing": "_build_options._pre_tool_use_gate",
+      "expression": "(input_data or {}).get(\"tool_name\")"
+    },
+    {
+      "line": 170,
+      "end_line": 170,
+      "callee": "(input_data or {}).get",
+      "enclosing": "_build_options._pre_tool_use_gate",
+      "expression": "(input_data or {}).get(\"tool_input\")"
+    },
+    {
+      "line": 180,
+      "end_line": 180,
+      "callee": "_resolve_within_root",
+      "enclosing": "_build_options._pre_tool_use_gate",
+      "expression": "_resolve_within_root(root, raw)"
+    },
+    {
+      "line": 185,
+      "end_line": 185,
+      "callee": "is_git_metadata",
+      "enclosing": "_build_options._pre_tool_use_gate",
+      "expression": "is_git_metadata(resolved.relative_to(root))"
+    },
+    {
+      "line": 189,
+      "end_line": 189,
+      "callee": "dict",
+      "enclosing": "_build_options._pre_tool_use_gate",
+      "expression": "dict(tool_input)"
+    },
+    {
+      "line": 190,
+      "end_line": 190,
+      "callee": "str",
+      "enclosing": "_build_options._pre_tool_use_gate",
+      "expression": "str(resolved)"
+    },
+    {
+      "line": 204,
+      "end_line": 205,
+      "callee": "_deny",
+      "enclosing": "_build_options._pre_tool_use_gate",
+      "expression": "_deny(f\"the security gate could not evaluate this call \"\n                         f\"({type(exc).__name__}) and denies it as a precaution.\")"
+    },
+    {
+      "line": 261,
+      "end_line": 261,
+      "callee": "_drain",
+      "enclosing": "drain_until_result",
+      "expression": "_drain(client, on_message)"
+    },
+    {
+      "line": 268,
+      "end_line": 268,
+      "callee": "deadline.expired",
+      "enclosing": "drain_until_result",
+      "expression": "deadline.expired()"
+    },
+    {
+      "line": 279,
+      "end_line": 279,
+      "callee": "regrace.expired",
+      "enclosing": "drain_until_result",
+      "expression": "regrace.expired()"
+    },
+    {
+      "line": 298,
+      "end_line": 298,
+      "callee": "isinstance",
+      "enclosing": "_run._on_message",
+      "expression": "isinstance(block, TextBlock)"
+    },
+    {
+      "line": 320,
+      "end_line": 320,
+      "callee": "''.join",
+      "enclosing": "_run",
+      "expression": "\"\".join(text_parts)"
+    },
+    {
+      "line": 176,
+      "end_line": 176,
+      "callee": "tool_input.get",
+      "enclosing": "_build_options._pre_tool_use_gate",
+      "expression": "tool_input.get(key)"
+    },
+    {
+      "line": 182,
+      "end_line": 184,
+      "callee": "_deny",
+      "enclosing": "_build_options._pre_tool_use_gate",
+      "expression": "_deny(f\"{tool_name} target {raw!r} is outside the \"\n                                 f\"repository root, unresolvable, or a symlink — \"\n                                 f\"edits are confined to {root}\")"
+    },
+    {
+      "line": 185,
+      "end_line": 185,
+      "callee": "resolved.relative_to",
+      "enclosing": "_build_options._pre_tool_use_gate",
+      "expression": "resolved.relative_to(root)"
+    },
+    {
+      "line": 186,
+      "end_line": 187,
+      "callee": "_deny",
+      "enclosing": "_build_options._pre_tool_use_gate",
+      "expression": "_deny(f\"{tool_name} target {raw!r} is version-control \"\n                                 f\"metadata (.git), which remediation never edits.\")"
+    },
+    {
+      "line": 266,
+      "end_line": 266,
+      "callee": "_drain",
+      "enclosing": "drain_until_result",
+      "expression": "_drain(client, on_message)"
+    },
+    {
+      "line": 277,
+      "end_line": 277,
+      "callee": "_drain",
+      "enclosing": "drain_until_result",
+      "expression": "_drain(client, on_message)"
+    },
+    {
+      "line": 299,
+      "end_line": 299,
+      "callee": "text_parts.append",
+      "enclosing": "_run._on_message",
+      "expression": "text_parts.append(block.text)"
+    },
+    {
+      "line": 205,
+      "end_line": 205,
+      "callee": "type",
+      "enclosing": "_build_options._pre_tool_use_gate",
+      "expression": "type(exc)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 18,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "import asyncio",
+      "targets": [
+        "asyncio"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "import contextlib",
+      "targets": [
+        "contextlib"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "import os",
+      "targets": [
+        "os"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 23,
+      "source_expression": "import time",
+      "targets": [
+        "time"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 24,
+      "source_expression": "from pathlib import Path",
+      "targets": [
+        "pathlib",
+        "pathlib.Path"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 25,
+      "source_expression": "from typing import TYPE_CHECKING, NamedTuple, cast",
+      "targets": [
+        "typing",
+        "typing.TYPE_CHECKING",
+        "typing.NamedTuple",
+        "typing.cast"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 27,
+      "source_expression": "from vvaharness.backends.llm.cli import _NO_REFUSAL_RESEND_ENV",
+      "targets": [
+        "vvaharness.backends.llm.cli",
+        "vvaharness.backends.llm.cli._NO_REFUSAL_RESEND_ENV"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/llm/cli/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 28,
+      "source_expression": "from vvaharness.backends.llm.models import DEFAULT_READ_TOOLS, TIMEOUT_STOP_GRACE_SECONDS, ClockKind, call_timeout_error, effort_scaled_seconds, note_budget_use",
+      "targets": [
+        "vvaharness.backends.llm.models",
+        "vvaharness.backends.llm.models.DEFAULT_READ_TOOLS",
+        "vvaharness.backends.llm.models.TIMEOUT_STOP_GRACE_SECONDS",
+        "vvaharness.backends.llm.models.ClockKind",
+        "vvaharness.backends.llm.models.call_timeout_error",
+        "vvaharness.backends.llm.models.effort_scaled_seconds",
+        "vvaharness.backends.llm.models.note_budget_use"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/llm/models.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 36,
+      "source_expression": "from vvaharness.report.redact import redact_counts",
+      "targets": [
+        "vvaharness.report.redact",
+        "vvaharness.report.redact.redact_counts"
+      ],
+      "local_source_paths": [
+        "vvaharness/report/redact.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 37,
+      "source_expression": "from vvaharness.util import console",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.console"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/console.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 38,
+      "source_expression": "from vvaharness.util.git_paths import is_git_metadata",
+      "targets": [
+        "vvaharness.util.git_paths",
+        "vvaharness.util.git_paths.is_git_metadata"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/git_paths.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 39,
+      "source_expression": "from vvaharness.util.tokens import TOKENS, TokenUsage",
+      "targets": [
+        "vvaharness.util.tokens",
+        "vvaharness.util.tokens.TOKENS",
+        "vvaharness.util.tokens.TokenUsage"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/tokens.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 42,
+      "source_expression": "from claude_agent_sdk import ResultMessage",
+      "targets": [
+        "claude_agent_sdk",
+        "claude_agent_sdk.ResultMessage"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 248,
+      "source_expression": "from claude_agent_sdk import ResultMessage",
+      "targets": [
+        "claude_agent_sdk",
+        "claude_agent_sdk.ResultMessage"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 287,
+      "source_expression": "from claude_agent_sdk import AssistantMessage, ClaudeSDKClient, TextBlock",
+      "targets": [
+        "claude_agent_sdk",
+        "claude_agent_sdk.AssistantMessage",
+        "claude_agent_sdk.ClaudeSDKClient",
+        "claude_agent_sdk.TextBlock"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 108,
+      "source_expression": "from claude_agent_sdk import HookMatcher",
+      "targets": [
+        "claude_agent_sdk",
+        "claude_agent_sdk.HookMatcher"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 144,
+      "source_expression": "from claude_agent_sdk import ClaudeAgentOptions, HookMatcher",
+      "targets": [
+        "claude_agent_sdk",
+        "claude_agent_sdk.ClaudeAgentOptions",
+        "claude_agent_sdk.HookMatcher"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 339,
+      "source_expression": "import claude_agent_sdk",
+      "targets": [
+        "claude_agent_sdk"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    }
+  ]
+}

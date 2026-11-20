@@ -1,0 +1,2150 @@
+{
+  "source": "vvaharness/backends/harness/deepagents/force_verdict_only.py",
+  "sha256": "a9a6c219f76c34ae2e8a986c5113c5e85261ca7617e473213e3f6bad50275628",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Middleware that forces the structured-output tool only for the call that ends a session.\"\"\"\n\nfrom __future__ import annotations\n\nimport threading\nfrom collections.abc import Awaitable, Callable\nfrom typing import TYPE_CHECKING, cast\n\nfrom langchain.agents.middleware.types import (\n    AgentMiddleware,\n    ExtendedModelResponse,\n    ModelCallResult,\n    ModelRequest,\n    ModelResponse,\n)\nfrom langchain.agents.structured_output import ToolStrategy\nfrom langchain_core.messages import AIMessage, HumanMessage\n\nfrom vvaharness.backends.harness.deepagents.tool_choice_rejection import (\n    UNSUPPORTED_MODELS,\n    is_tool_choice_unsupported_rejection,\n    learn_tool_choice_unsupported,\n)\nfrom vvaharness.util.counters import COUNTERS\n\nif TYPE_CHECKING:\n    # Typing only: importing options.* here would cycle through options/streaming.py.\n    from vvaharness.backends.harness.deepagents.options.forcing import ForcingChatAnthropic\n\n#: Bumped once per session end the middleware turned into a forced outcome call.\nFORCED_VERDICT_COUNTER = \"deepagents_verdict_forced_after_auto\"\n\n\ndef _report_now(tool_names: list[str]) -> HumanMessage:\n    \"\"\"The turn appended when the model stopped working without reporting its outcome.\"\"\"\n    names = \" or \".join(f\"`{n}`\" for n in tool_names) or \"the outcome tool\"\n    return HumanMessage(content=(\n        f\"You have finished working. Report your outcome NOW by calling {names} with the \"\n        \"conclusion you just reached. Every other tool has been withdrawn.\"\n    ))\n\n\ndef _forcing(request: ModelRequest) -> ForcingChatAnthropic:\n    \"\"\"*request*'s model, which ``ForceVerdictOnly._applies`` checked is a ForcingChatAnthropic.\"\"\"\n    return cast(\"ForcingChatAnthropic\", request.model)\n\n\ndef _reply(result: ModelCallResult) -> AIMessage | None:\n    \"\"\"The AI message a ``wrap_model_call`` handler's result ends on, if any.\"\"\"\n    if isinstance(result, ExtendedModelResponse):\n        result = result.model_response\n    messages = result.result if isinstance(result, ModelResponse) else [result]\n    last = messages[-1] if messages else None\n    return last if isinstance(last, AIMessage) else None\n\n\nclass ForceVerdictOnly(AgentMiddleware):\n    \"\"\"Leave tool_choice on auto while the session works; force the outcome tool only to end it.\n\n    A model that rejects the forcing with a 400 is learned and its outcome call re-issued on\n    auto in the same session, with only the outcome tool offered, instead of the client\n    re-running the whole session.\n    \"\"\"\n    # The forced outcome call is one extra model call an outer ModelCallBudget does not count\n\n    def __init__(self) -> None:\n        \"\"\"Start with no auto-binding model copies; one is made per model on first use.\"\"\"\n        super().__init__()\n        self._auto: dict[int, ForcingChatAnthropic] = {}\n        self._lock = threading.Lock()\n\n    def _auto_model(self, model: ForcingChatAnthropic) -> ForcingChatAnthropic:\n        \"\"\"*model*, copied once to bind tool_choice as auto.\"\"\"\n        with self._lock:\n            copy = self._auto.get(id(model))\n            if copy is None:\n                copy = self._auto[id(model)] = model.model_copy(update={\"force_tool_choice\": False})\n            return copy\n\n    @staticmethod\n    def _applies(request: ModelRequest) -> bool:\n        \"\"\"Whether *request* forces an outcome on a model that can bind auto.\"\"\"\n        # Duck-typed on ForcingChatAnthropic.force_tool_choice, for the import cycle above\n        return (isinstance(request.response_format, ToolStrategy)\n                and getattr(request.model, \"force_tool_choice\", None) is True)\n\n    def _unforced(self, request: ModelRequest) -> ModelRequest:\n        \"\"\"*request* on the auto-binding copy of its model.\"\"\"\n        return request.override(model=self._auto_model(_forcing(request)))\n\n    def _learn_rejection(self, request: ModelRequest, exc: Exception) -> bool:\n        \"\"\"Learn *request*'s model when *exc* is its forced-tool_choice 400; True to re-issue.\"\"\"\n        if not is_tool_choice_unsupported_rejection(exc):\n            return False\n        learn_tool_choice_unsupported(_forcing(request).model)\n        return True\n\n    @staticmethod\n    def _forced(request: ModelRequest, reply: AIMessage) -> ModelRequest:\n        \"\"\"*request* re-issued after *reply* with only the outcome tool, which langchain forces.\"\"\"\n        strategy = request.response_format\n        names = [spec.name for spec in strategy.schema_specs] if isinstance(\n            strategy, ToolStrategy) else []\n        COUNTERS.bump(FORCED_VERDICT_COUNTER)\n        return request.override(tools=[],\n                                messages=[*request.messages, reply, _report_now(names)])\n\n    def _force(\n        self, request: ModelRequest, handler: Callable[[ModelRequest], ModelCallResult],\n    ) -> ModelCallResult:\n        \"\"\"Run the outcome-only *request* forced, or on auto for a model that rejects forcing.\"\"\"\n        if _forcing(request).model in UNSUPPORTED_MODELS:\n            return handler(self._unforced(request))\n        try:\n            return handler(request)\n        except Exception as exc:\n            if not self._learn_rejection(request, exc):\n                raise\n        return handler(self._unforced(request))\n\n    async def _aforce(\n        self, request: ModelRequest,\n        handler: Callable[[ModelRequest], Awaitable[ModelCallResult]],\n    ) -> ModelCallResult:\n        \"\"\"Async counterpart of :meth:`_force`.\"\"\"\n        if _forcing(request).model in UNSUPPORTED_MODELS:\n            return await handler(self._unforced(request))\n        try:\n            return await handler(request)\n        except Exception as exc:\n            if not self._learn_rejection(request, exc):\n                raise\n        return await handler(self._unforced(request))\n\n    def wrap_model_call(\n        self,\n        request: ModelRequest,\n        handler: Callable[[ModelRequest], ModelCallResult],\n    ) -> ModelCallResult:\n        \"\"\"Run the call on auto; if it ends the session without an outcome, force one.\"\"\"\n        if not self._applies(request):\n            return handler(request)\n        # No regular tools: already outcome-only (ModelCallBudget's final turn), forced as it is\n        if request.tools:\n            result = handler(self._unforced(request))\n            reply = _reply(result)\n            if reply is None or reply.tool_calls:\n                return result\n            request = self._forced(request, reply)\n        return self._force(request, handler)\n\n    async def awrap_model_call(\n        self,\n        request: ModelRequest,\n        handler: Callable[[ModelRequest], Awaitable[ModelCallResult]],\n    ) -> ModelCallResult:\n        \"\"\"Async counterpart of :meth:`wrap_model_call`.\"\"\"\n        if not self._applies(request):\n            return await handler(request)\n        if request.tools:\n            result = await handler(self._unforced(request))\n            reply = _reply(result)\n            if reply is None or reply.tool_calls:\n                return result\n            request = self._forced(request, reply)\n        return await self._aforce(request, handler)\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/backends/harness/deepagents/force_verdict_only.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "Middleware that forces the structured-output tool only for the call that ends a session.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_49_4": {
+      "source": "vvaharness/backends/harness/deepagents/force_verdict_only.py",
+      "line_start": 49,
+      "line_end": 49,
+      "value": "The turn appended when the model stopped working without reporting its outcome.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_50_24": {
+      "source": "vvaharness/backends/harness/deepagents/force_verdict_only.py",
+      "line_start": 50,
+      "line_end": 50,
+      "source_expression": "f\"`{n}`\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_52_8": {
+      "source": "vvaharness/backends/harness/deepagents/force_verdict_only.py",
+      "line_start": 52,
+      "line_end": 53,
+      "source_expression": "f\"You have finished working. Report your outcome NOW by calling {names} with the \"\n        \"conclusion you just reached. Every other tool has been withdrawn.\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_58_4": {
+      "source": "vvaharness/backends/harness/deepagents/force_verdict_only.py",
+      "line_start": 58,
+      "line_end": 58,
+      "value": "*request*'s model, which ``ForceVerdictOnly._applies`` checked is a ForcingChatAnthropic.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_63_4": {
+      "source": "vvaharness/backends/harness/deepagents/force_verdict_only.py",
+      "line_start": 63,
+      "line_end": 63,
+      "value": "The AI message a ``wrap_model_call`` handler's result ends on, if any.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_72_4": {
+      "source": "vvaharness/backends/harness/deepagents/force_verdict_only.py",
+      "line_start": 72,
+      "line_end": 77,
+      "value": "Leave tool_choice on auto while the session works; force the outcome tool only to end it.\n\n    A model that rejects the forcing with a 400 is learned and its outcome call re-issued on\n    auto in the same session, with only the outcome tool offered, instead of the client\n    re-running the whole session.\n    ",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_81_8": {
+      "source": "vvaharness/backends/harness/deepagents/force_verdict_only.py",
+      "line_start": 81,
+      "line_end": 81,
+      "value": "Start with no auto-binding model copies; one is made per model on first use.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_87_8": {
+      "source": "vvaharness/backends/harness/deepagents/force_verdict_only.py",
+      "line_start": 87,
+      "line_end": 87,
+      "value": "*model*, copied once to bind tool_choice as auto.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_96_8": {
+      "source": "vvaharness/backends/harness/deepagents/force_verdict_only.py",
+      "line_start": 96,
+      "line_end": 96,
+      "value": "Whether *request* forces an outcome on a model that can bind auto.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_102_8": {
+      "source": "vvaharness/backends/harness/deepagents/force_verdict_only.py",
+      "line_start": 102,
+      "line_end": 102,
+      "value": "*request* on the auto-binding copy of its model.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_106_8": {
+      "source": "vvaharness/backends/harness/deepagents/force_verdict_only.py",
+      "line_start": 106,
+      "line_end": 106,
+      "value": "Learn *request*'s model when *exc* is its forced-tool_choice 400; True to re-issue.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_114_8": {
+      "source": "vvaharness/backends/harness/deepagents/force_verdict_only.py",
+      "line_start": 114,
+      "line_end": 114,
+      "value": "*request* re-issued after *reply* with only the outcome tool, which langchain forces.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_125_8": {
+      "source": "vvaharness/backends/harness/deepagents/force_verdict_only.py",
+      "line_start": 125,
+      "line_end": 125,
+      "value": "Run the outcome-only *request* forced, or on auto for a model that rejects forcing.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_139_8": {
+      "source": "vvaharness/backends/harness/deepagents/force_verdict_only.py",
+      "line_start": 139,
+      "line_end": 139,
+      "value": "Async counterpart of :meth:`_force`.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_154_8": {
+      "source": "vvaharness/backends/harness/deepagents/force_verdict_only.py",
+      "line_start": 154,
+      "line_end": 154,
+      "value": "Run the call on auto; if it ends the session without an outcome, force one.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_171_8": {
+      "source": "vvaharness/backends/harness/deepagents/force_verdict_only.py",
+      "line_start": 171,
+      "line_end": 171,
+      "value": "Async counterpart of :meth:`wrap_model_call`.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "Middleware that forces the structured-output tool only for the call that ends a session.",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 25,
+      "value": "deepagents_verdict_forced_after_auto",
+      "context": "literal"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 4,
+      "value": "The turn appended when the model stopped working without reporting its outcome.",
+      "context": "literal"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 4,
+      "value": "*request*'s model, which ``ForceVerdictOnly._applies`` checked is a ForcingChatAnthropic.",
+      "context": "literal"
+    },
+    {
+      "line_start": 63,
+      "line_end": 63,
+      "column": 4,
+      "value": "The AI message a ``wrap_model_call`` handler's result ends on, if any.",
+      "context": "literal"
+    },
+    {
+      "line_start": 72,
+      "line_end": 77,
+      "column": 4,
+      "value": "Leave tool_choice on auto while the session works; force the outcome tool only to end it.\n\n    A model that rejects the forcing with a 400 is learned and its outcome call re-issued on\n    auto in the same session, with only the outcome tool offered, instead of the client\n    re-running the whole session.\n    ",
+      "context": "literal"
+    },
+    {
+      "line_start": 50,
+      "line_end": 50,
+      "column": 57,
+      "value": "the outcome tool",
+      "context": "literal"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 16,
+      "value": "ForcingChatAnthropic",
+      "context": "literal"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 8,
+      "value": "Start with no auto-binding model copies; one is made per model on first use.",
+      "context": "literal"
+    },
+    {
+      "line_start": 87,
+      "line_end": 87,
+      "column": 8,
+      "value": "*model*, copied once to bind tool_choice as auto.",
+      "context": "literal"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 8,
+      "value": "Whether *request* forces an outcome on a model that can bind auto.",
+      "context": "literal"
+    },
+    {
+      "line_start": 102,
+      "line_end": 102,
+      "column": 8,
+      "value": "*request* on the auto-binding copy of its model.",
+      "context": "literal"
+    },
+    {
+      "line_start": 106,
+      "line_end": 106,
+      "column": 8,
+      "value": "Learn *request*'s model when *exc* is its forced-tool_choice 400; True to re-issue.",
+      "context": "literal"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 8,
+      "value": "*request* re-issued after *reply* with only the outcome tool, which langchain forces.",
+      "context": "literal"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 8,
+      "value": "Run the outcome-only *request* forced, or on auto for a model that rejects forcing.",
+      "context": "literal"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 8,
+      "value": "Async counterpart of :meth:`_force`.",
+      "context": "literal"
+    },
+    {
+      "line_start": 154,
+      "line_end": 154,
+      "column": 8,
+      "value": "Run the call on auto; if it ends the session without an outcome, force one.",
+      "context": "literal"
+    },
+    {
+      "line_start": 171,
+      "line_end": 171,
+      "column": 8,
+      "value": "Async counterpart of :meth:`wrap_model_call`.",
+      "context": "literal"
+    },
+    {
+      "line_start": 50,
+      "line_end": 50,
+      "column": 12,
+      "value": " or ",
+      "context": "literal"
+    },
+    {
+      "line_start": 52,
+      "line_end": 52,
+      "column": 10,
+      "value": "You have finished working. Report your outcome NOW by calling ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 52,
+      "line_end": 53,
+      "column": 79,
+      "value": " with the conclusion you just reached. Every other tool has been withdrawn.",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 50,
+      "line_end": 50,
+      "column": 26,
+      "value": "`",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 50,
+      "line_end": 50,
+      "column": 30,
+      "value": "`",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 43,
+      "value": "force_tool_choice",
+      "context": "literal"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 72,
+      "value": "force_tool_choice",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 41,
+      "text": "# Typing only: importing options.* here would cycle through options/streaming.py."
+    },
+    {
+      "line": 44,
+      "text": "#: Bumped once per session end the middleware turned into a forced outcome call."
+    },
+    {
+      "line": 78,
+      "text": "# The forced outcome call is one extra model call an outer ModelCallBudget does not count"
+    },
+    {
+      "line": 97,
+      "text": "# Duck-typed on ForcingChatAnthropic.force_tool_choice, for the import cycle above"
+    },
+    {
+      "line": 157,
+      "text": "# No regular tools: already outcome-only (ModelCallBudget's final turn), forced as it is"
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 23,
+      "line_end": 29,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 30,
+      "line_end": 30,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 31,
+      "line_end": 31,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 33,
+      "line_end": 37,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 38,
+      "line_end": 38,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "If",
+      "line_start": 40,
+      "line_end": 42,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 5
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 42,
+      "line_end": 42,
+      "column": 4,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "Assign",
+      "line_start": 45,
+      "line_end": 45,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 11
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 48,
+      "line_end": 54,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 12
+    },
+    {
+      "kind": "Expr",
+      "line_start": 49,
+      "line_end": 49,
+      "column": 4,
+      "owner": "_report_now",
+      "representation_line": 18
+    },
+    {
+      "kind": "Assign",
+      "line_start": 50,
+      "line_end": 50,
+      "column": 4,
+      "owner": "_report_now",
+      "representation_line": 18
+    },
+    {
+      "kind": "Return",
+      "line_start": 51,
+      "line_end": 54,
+      "column": 4,
+      "owner": "_report_now",
+      "representation_line": 19
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 57,
+      "line_end": 59,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 23
+    },
+    {
+      "kind": "Expr",
+      "line_start": 58,
+      "line_end": 58,
+      "column": 4,
+      "owner": "_forcing",
+      "representation_line": 29
+    },
+    {
+      "kind": "Return",
+      "line_start": 59,
+      "line_end": 59,
+      "column": 4,
+      "owner": "_forcing",
+      "representation_line": 30
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 62,
+      "line_end": 68,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 34
+    },
+    {
+      "kind": "Expr",
+      "line_start": 63,
+      "line_end": 63,
+      "column": 4,
+      "owner": "_reply",
+      "representation_line": 40
+    },
+    {
+      "kind": "If",
+      "line_start": 64,
+      "line_end": 65,
+      "column": 4,
+      "owner": "_reply",
+      "representation_line": 41
+    },
+    {
+      "kind": "Assign",
+      "line_start": 65,
+      "line_end": 65,
+      "column": 8,
+      "owner": "_reply",
+      "representation_line": 44
+    },
+    {
+      "kind": "Assign",
+      "line_start": 66,
+      "line_end": 66,
+      "column": 4,
+      "owner": "_reply",
+      "representation_line": 47
+    },
+    {
+      "kind": "Assign",
+      "line_start": 67,
+      "line_end": 67,
+      "column": 4,
+      "owner": "_reply",
+      "representation_line": 47
+    },
+    {
+      "kind": "Return",
+      "line_start": 68,
+      "line_end": 68,
+      "column": 4,
+      "owner": "_reply",
+      "representation_line": 48
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 71,
+      "line_end": 180,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 52
+    },
+    {
+      "kind": "Expr",
+      "line_start": 72,
+      "line_end": 77,
+      "column": 4,
+      "owner": "ForceVerdictOnly",
+      "representation_line": 57
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 80,
+      "line_end": 84,
+      "column": 4,
+      "owner": "ForceVerdictOnly",
+      "representation_line": 58
+    },
+    {
+      "kind": "Expr",
+      "line_start": 81,
+      "line_end": 81,
+      "column": 8,
+      "owner": "ForceVerdictOnly.__init__",
+      "representation_line": 64
+    },
+    {
+      "kind": "Expr",
+      "line_start": 82,
+      "line_end": 82,
+      "column": 8,
+      "owner": "ForceVerdictOnly.__init__",
+      "representation_line": 64
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 83,
+      "line_end": 83,
+      "column": 8,
+      "owner": "ForceVerdictOnly.__init__",
+      "representation_line": 64
+    },
+    {
+      "kind": "Assign",
+      "line_start": 84,
+      "line_end": 84,
+      "column": 8,
+      "owner": "ForceVerdictOnly.__init__",
+      "representation_line": 64
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 86,
+      "line_end": 92,
+      "column": 4,
+      "owner": "ForceVerdictOnly",
+      "representation_line": 67
+    },
+    {
+      "kind": "Expr",
+      "line_start": 87,
+      "line_end": 87,
+      "column": 8,
+      "owner": "ForceVerdictOnly._auto_model",
+      "representation_line": 73
+    },
+    {
+      "kind": "With",
+      "line_start": 88,
+      "line_end": 92,
+      "column": 8,
+      "owner": "ForceVerdictOnly._auto_model",
+      "representation_line": 74
+    },
+    {
+      "kind": "Assign",
+      "line_start": 89,
+      "line_end": 89,
+      "column": 12,
+      "owner": "ForceVerdictOnly._auto_model",
+      "representation_line": 77
+    },
+    {
+      "kind": "If",
+      "line_start": 90,
+      "line_end": 91,
+      "column": 12,
+      "owner": "ForceVerdictOnly._auto_model",
+      "representation_line": 78
+    },
+    {
+      "kind": "Assign",
+      "line_start": 91,
+      "line_end": 91,
+      "column": 16,
+      "owner": "ForceVerdictOnly._auto_model",
+      "representation_line": 81
+    },
+    {
+      "kind": "Return",
+      "line_start": 92,
+      "line_end": 92,
+      "column": 12,
+      "owner": "ForceVerdictOnly._auto_model",
+      "representation_line": 83
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 95,
+      "line_end": 99,
+      "column": 4,
+      "owner": "ForceVerdictOnly",
+      "representation_line": 89
+    },
+    {
+      "kind": "Expr",
+      "line_start": 96,
+      "line_end": 96,
+      "column": 8,
+      "owner": "ForceVerdictOnly._applies",
+      "representation_line": 98
+    },
+    {
+      "kind": "Return",
+      "line_start": 98,
+      "line_end": 99,
+      "column": 8,
+      "owner": "ForceVerdictOnly._applies",
+      "representation_line": 99
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 101,
+      "line_end": 103,
+      "column": 4,
+      "owner": "ForceVerdictOnly",
+      "representation_line": 104
+    },
+    {
+      "kind": "Expr",
+      "line_start": 102,
+      "line_end": 102,
+      "column": 8,
+      "owner": "ForceVerdictOnly._unforced",
+      "representation_line": 110
+    },
+    {
+      "kind": "Return",
+      "line_start": 103,
+      "line_end": 103,
+      "column": 8,
+      "owner": "ForceVerdictOnly._unforced",
+      "representation_line": 111
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 105,
+      "line_end": 110,
+      "column": 4,
+      "owner": "ForceVerdictOnly",
+      "representation_line": 115
+    },
+    {
+      "kind": "Expr",
+      "line_start": 106,
+      "line_end": 106,
+      "column": 8,
+      "owner": "ForceVerdictOnly._learn_rejection",
+      "representation_line": 121
+    },
+    {
+      "kind": "If",
+      "line_start": 107,
+      "line_end": 108,
+      "column": 8,
+      "owner": "ForceVerdictOnly._learn_rejection",
+      "representation_line": 122
+    },
+    {
+      "kind": "Return",
+      "line_start": 108,
+      "line_end": 108,
+      "column": 12,
+      "owner": "ForceVerdictOnly._learn_rejection",
+      "representation_line": 124
+    },
+    {
+      "kind": "Expr",
+      "line_start": 109,
+      "line_end": 109,
+      "column": 8,
+      "owner": "ForceVerdictOnly._learn_rejection",
+      "representation_line": 128
+    },
+    {
+      "kind": "Return",
+      "line_start": 110,
+      "line_end": 110,
+      "column": 8,
+      "owner": "ForceVerdictOnly._learn_rejection",
+      "representation_line": 129
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 113,
+      "line_end": 120,
+      "column": 4,
+      "owner": "ForceVerdictOnly",
+      "representation_line": 133
+    },
+    {
+      "kind": "Expr",
+      "line_start": 114,
+      "line_end": 114,
+      "column": 8,
+      "owner": "ForceVerdictOnly._forced",
+      "representation_line": 142
+    },
+    {
+      "kind": "Assign",
+      "line_start": 115,
+      "line_end": 115,
+      "column": 8,
+      "owner": "ForceVerdictOnly._forced",
+      "representation_line": 142
+    },
+    {
+      "kind": "Assign",
+      "line_start": 116,
+      "line_end": 117,
+      "column": 8,
+      "owner": "ForceVerdictOnly._forced",
+      "representation_line": 142
+    },
+    {
+      "kind": "Expr",
+      "line_start": 118,
+      "line_end": 118,
+      "column": 8,
+      "owner": "ForceVerdictOnly._forced",
+      "representation_line": 142
+    },
+    {
+      "kind": "Return",
+      "line_start": 119,
+      "line_end": 120,
+      "column": 8,
+      "owner": "ForceVerdictOnly._forced",
+      "representation_line": 143
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 122,
+      "line_end": 133,
+      "column": 4,
+      "owner": "ForceVerdictOnly",
+      "representation_line": 148
+    },
+    {
+      "kind": "Expr",
+      "line_start": 125,
+      "line_end": 125,
+      "column": 8,
+      "owner": "ForceVerdictOnly._force",
+      "representation_line": 154
+    },
+    {
+      "kind": "If",
+      "line_start": 126,
+      "line_end": 127,
+      "column": 8,
+      "owner": "ForceVerdictOnly._force",
+      "representation_line": 155
+    },
+    {
+      "kind": "Return",
+      "line_start": 127,
+      "line_end": 127,
+      "column": 12,
+      "owner": "ForceVerdictOnly._force",
+      "representation_line": 157
+    },
+    {
+      "kind": "Try",
+      "line_start": 128,
+      "line_end": 132,
+      "column": 8,
+      "owner": "ForceVerdictOnly._force",
+      "representation_line": 160
+    },
+    {
+      "kind": "Return",
+      "line_start": 129,
+      "line_end": 129,
+      "column": 12,
+      "owner": "ForceVerdictOnly._force",
+      "representation_line": 162
+    },
+    {
+      "kind": "If",
+      "line_start": 131,
+      "line_end": 132,
+      "column": 12,
+      "owner": "ForceVerdictOnly._force",
+      "representation_line": 167
+    },
+    {
+      "kind": "Raise",
+      "line_start": 132,
+      "line_end": 132,
+      "column": 16,
+      "owner": "ForceVerdictOnly._force",
+      "representation_line": 169
+    },
+    {
+      "kind": "Return",
+      "line_start": 133,
+      "line_end": 133,
+      "column": 8,
+      "owner": "ForceVerdictOnly._force",
+      "representation_line": 173
+    },
+    {
+      "kind": "AsyncFunctionDef",
+      "line_start": 135,
+      "line_end": 147,
+      "column": 4,
+      "owner": "ForceVerdictOnly",
+      "representation_line": 177
+    },
+    {
+      "kind": "Expr",
+      "line_start": 139,
+      "line_end": 139,
+      "column": 8,
+      "owner": "ForceVerdictOnly._aforce",
+      "representation_line": 184
+    },
+    {
+      "kind": "If",
+      "line_start": 140,
+      "line_end": 141,
+      "column": 8,
+      "owner": "ForceVerdictOnly._aforce",
+      "representation_line": 185
+    },
+    {
+      "kind": "Return",
+      "line_start": 141,
+      "line_end": 141,
+      "column": 12,
+      "owner": "ForceVerdictOnly._aforce",
+      "representation_line": 187
+    },
+    {
+      "kind": "Try",
+      "line_start": 142,
+      "line_end": 146,
+      "column": 8,
+      "owner": "ForceVerdictOnly._aforce",
+      "representation_line": 190
+    },
+    {
+      "kind": "Return",
+      "line_start": 143,
+      "line_end": 143,
+      "column": 12,
+      "owner": "ForceVerdictOnly._aforce",
+      "representation_line": 192
+    },
+    {
+      "kind": "If",
+      "line_start": 145,
+      "line_end": 146,
+      "column": 12,
+      "owner": "ForceVerdictOnly._aforce",
+      "representation_line": 197
+    },
+    {
+      "kind": "Raise",
+      "line_start": 146,
+      "line_end": 146,
+      "column": 16,
+      "owner": "ForceVerdictOnly._aforce",
+      "representation_line": 199
+    },
+    {
+      "kind": "Return",
+      "line_start": 147,
+      "line_end": 147,
+      "column": 8,
+      "owner": "ForceVerdictOnly._aforce",
+      "representation_line": 203
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 149,
+      "line_end": 164,
+      "column": 4,
+      "owner": "ForceVerdictOnly",
+      "representation_line": 207
+    },
+    {
+      "kind": "Expr",
+      "line_start": 154,
+      "line_end": 154,
+      "column": 8,
+      "owner": "ForceVerdictOnly.wrap_model_call",
+      "representation_line": 213
+    },
+    {
+      "kind": "If",
+      "line_start": 155,
+      "line_end": 156,
+      "column": 8,
+      "owner": "ForceVerdictOnly.wrap_model_call",
+      "representation_line": 214
+    },
+    {
+      "kind": "Return",
+      "line_start": 156,
+      "line_end": 156,
+      "column": 12,
+      "owner": "ForceVerdictOnly.wrap_model_call",
+      "representation_line": 216
+    },
+    {
+      "kind": "If",
+      "line_start": 158,
+      "line_end": 163,
+      "column": 8,
+      "owner": "ForceVerdictOnly.wrap_model_call",
+      "representation_line": 219
+    },
+    {
+      "kind": "Assign",
+      "line_start": 159,
+      "line_end": 159,
+      "column": 12,
+      "owner": "ForceVerdictOnly.wrap_model_call",
+      "representation_line": 222
+    },
+    {
+      "kind": "Assign",
+      "line_start": 160,
+      "line_end": 160,
+      "column": 12,
+      "owner": "ForceVerdictOnly.wrap_model_call",
+      "representation_line": 222
+    },
+    {
+      "kind": "If",
+      "line_start": 161,
+      "line_end": 162,
+      "column": 12,
+      "owner": "ForceVerdictOnly.wrap_model_call",
+      "representation_line": 223
+    },
+    {
+      "kind": "Return",
+      "line_start": 162,
+      "line_end": 162,
+      "column": 16,
+      "owner": "ForceVerdictOnly.wrap_model_call",
+      "representation_line": 225
+    },
+    {
+      "kind": "Assign",
+      "line_start": 163,
+      "line_end": 163,
+      "column": 12,
+      "owner": "ForceVerdictOnly.wrap_model_call",
+      "representation_line": 229
+    },
+    {
+      "kind": "Return",
+      "line_start": 164,
+      "line_end": 164,
+      "column": 8,
+      "owner": "ForceVerdictOnly.wrap_model_call",
+      "representation_line": 231
+    },
+    {
+      "kind": "AsyncFunctionDef",
+      "line_start": 166,
+      "line_end": 180,
+      "column": 4,
+      "owner": "ForceVerdictOnly",
+      "representation_line": 235
+    },
+    {
+      "kind": "Expr",
+      "line_start": 171,
+      "line_end": 171,
+      "column": 8,
+      "owner": "ForceVerdictOnly.awrap_model_call",
+      "representation_line": 242
+    },
+    {
+      "kind": "If",
+      "line_start": 172,
+      "line_end": 173,
+      "column": 8,
+      "owner": "ForceVerdictOnly.awrap_model_call",
+      "representation_line": 243
+    },
+    {
+      "kind": "Return",
+      "line_start": 173,
+      "line_end": 173,
+      "column": 12,
+      "owner": "ForceVerdictOnly.awrap_model_call",
+      "representation_line": 245
+    },
+    {
+      "kind": "If",
+      "line_start": 174,
+      "line_end": 179,
+      "column": 8,
+      "owner": "ForceVerdictOnly.awrap_model_call",
+      "representation_line": 248
+    },
+    {
+      "kind": "Assign",
+      "line_start": 175,
+      "line_end": 175,
+      "column": 12,
+      "owner": "ForceVerdictOnly.awrap_model_call",
+      "representation_line": 251
+    },
+    {
+      "kind": "Assign",
+      "line_start": 176,
+      "line_end": 176,
+      "column": 12,
+      "owner": "ForceVerdictOnly.awrap_model_call",
+      "representation_line": 251
+    },
+    {
+      "kind": "If",
+      "line_start": 177,
+      "line_end": 178,
+      "column": 12,
+      "owner": "ForceVerdictOnly.awrap_model_call",
+      "representation_line": 252
+    },
+    {
+      "kind": "Return",
+      "line_start": 178,
+      "line_end": 178,
+      "column": 16,
+      "owner": "ForceVerdictOnly.awrap_model_call",
+      "representation_line": 254
+    },
+    {
+      "kind": "Assign",
+      "line_start": 179,
+      "line_end": 179,
+      "column": 12,
+      "owner": "ForceVerdictOnly.awrap_model_call",
+      "representation_line": 258
+    },
+    {
+      "kind": "Return",
+      "line_start": 180,
+      "line_end": 180,
+      "column": 8,
+      "owner": "ForceVerdictOnly.awrap_model_call",
+      "representation_line": 260
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 3,
+      "kind": "Name",
+      "original_ast": "Name(id='TYPE_CHECKING', ctx=Load())",
+      "rendered": "TYPE_CHECKING"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 25,
+      "kind": "Constant",
+      "original_ast": "Constant(value='deepagents_verdict_forced_after_auto')",
+      "rendered": "'deepagents_verdict_forced_after_auto'"
+    },
+    {
+      "line_start": 50,
+      "line_end": 50,
+      "column": 12,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Attribute(value=Constant(value=' or '), attr='join', ctx=Load()), args=[GeneratorExp(elt=JoinedStr(values=[Constant(value='`'), FormattedValue(value=Name(id='n', ctx=Load()), conversion=-1), Constant(value='`')]), generators=[comprehension(target=Name(id='n', ctx=Store()), iter=Name(id='tool_names', ctx=Load()), ifs=[], is_async=0)])], keywords=[]), Constant(value='the outcome tool')])",
+      "rendered": "' or '.join((source_template_50_24 for n in tool_names)) or 'the outcome tool'"
+    },
+    {
+      "line_start": 51,
+      "line_end": 54,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='HumanMessage', ctx=Load()), args=[], keywords=[keyword(arg='content', value=JoinedStr(values=[Constant(value='You have finished working. Report your outcome NOW by calling '), FormattedValue(value=Name(id='names', ctx=Load()), conversion=-1), Constant(value=' with the conclusion you just reached. Every other tool has been withdrawn.')]))])",
+      "rendered": "HumanMessage(content=source_template_52_8)"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='cast', ctx=Load()), args=[Constant(value='ForcingChatAnthropic'), Attribute(value=Name(id='request', ctx=Load()), attr='model', ctx=Load())], keywords=[])",
+      "rendered": "cast('ForcingChatAnthropic', request.model)"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='result', ctx=Load()), Name(id='ExtendedModelResponse', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(result, ExtendedModelResponse)"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 17,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='result', ctx=Load()), attr='model_response', ctx=Load())",
+      "rendered": "result.model_response"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 15,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='result', ctx=Load()), Name(id='ModelResponse', ctx=Load())], keywords=[]), body=Attribute(value=Name(id='result', ctx=Load()), attr='result', ctx=Load()), orelse=List(elts=[Name(id='result', ctx=Load())], ctx=Load()))",
+      "rendered": "result.result if isinstance(result, ModelResponse) else [result]"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='messages', ctx=Load()), body=Subscript(value=Name(id='messages', ctx=Load()), slice=UnaryOp(op=USub(), operand=Constant(value=1)), ctx=Load()), orelse=Constant(value=None))",
+      "rendered": "messages[-1] if messages else None"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='last', ctx=Load()), Name(id='AIMessage', ctx=Load())], keywords=[]), body=Name(id='last', ctx=Load()), orelse=Constant(value=None))",
+      "rendered": "last if isinstance(last, AIMessage) else None"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='AgentMiddleware', ctx=Load())",
+      "rendered": "AgentMiddleware"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Name(id='super', ctx=Load()), args=[], keywords=[]), attr='__init__', ctx=Load()), args=[], keywords=[])",
+      "rendered": "super().__init__()"
+    },
+    {
+      "line_start": 83,
+      "line_end": 83,
+      "column": 54,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 84,
+      "line_end": 84,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='threading', ctx=Load()), attr='Lock', ctx=Load()), args=[], keywords=[])",
+      "rendered": "threading.Lock()"
+    },
+    {
+      "line_start": 88,
+      "line_end": 88,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_lock', ctx=Load())",
+      "rendered": "self._lock"
+    },
+    {
+      "line_start": 89,
+      "line_end": 89,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_auto', ctx=Load()), attr='get', ctx=Load()), args=[Call(func=Name(id='id', ctx=Load()), args=[Name(id='model', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "self._auto.get(id(model))"
+    },
+    {
+      "line_start": 90,
+      "line_end": 90,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='copy', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "copy is None"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 47,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='model', ctx=Load()), attr='model_copy', ctx=Load()), args=[], keywords=[keyword(arg='update', value=Dict(keys=[Constant(value='force_tool_choice')], values=[Constant(value=False)]))])",
+      "rendered": "model.model_copy(update={'force_tool_choice': False})"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='copy', ctx=Load())",
+      "rendered": "copy"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 5,
+      "kind": "Name",
+      "original_ast": "Name(id='staticmethod', ctx=Load())",
+      "rendered": "staticmethod"
+    },
+    {
+      "line_start": 98,
+      "line_end": 99,
+      "column": 16,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Call(func=Name(id='isinstance', ctx=Load()), args=[Attribute(value=Name(id='request', ctx=Load()), attr='response_format', ctx=Load()), Name(id='ToolStrategy', ctx=Load())], keywords=[]), Compare(left=Call(func=Name(id='getattr', ctx=Load()), args=[Attribute(value=Name(id='request', ctx=Load()), attr='model', ctx=Load()), Constant(value='force_tool_choice'), Constant(value=None)], keywords=[]), ops=[Is()], comparators=[Constant(value=True)])])",
+      "rendered": "isinstance(request.response_format, ToolStrategy) and getattr(request.model, 'force_tool_choice', None) is True"
+    },
+    {
+      "line_start": 103,
+      "line_end": 103,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='request', ctx=Load()), attr='override', ctx=Load()), args=[], keywords=[keyword(arg='model', value=Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_auto_model', ctx=Load()), args=[Call(func=Name(id='_forcing', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[])], keywords=[]))])",
+      "rendered": "request.override(model=self._auto_model(_forcing(request)))"
+    },
+    {
+      "line_start": 107,
+      "line_end": 107,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='is_tool_choice_unsupported_rejection', ctx=Load()), args=[Name(id='exc', ctx=Load())], keywords=[]))",
+      "rendered": "not is_tool_choice_unsupported_rejection(exc)"
+    },
+    {
+      "line_start": 108,
+      "line_end": 108,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='learn_tool_choice_unsupported', ctx=Load()), args=[Attribute(value=Call(func=Name(id='_forcing', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[]), attr='model', ctx=Load())], keywords=[])",
+      "rendered": "learn_tool_choice_unsupported(_forcing(request).model)"
+    },
+    {
+      "line_start": 110,
+      "line_end": 110,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 112,
+      "line_end": 112,
+      "column": 5,
+      "kind": "Name",
+      "original_ast": "Name(id='staticmethod', ctx=Load())",
+      "rendered": "staticmethod"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 19,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='request', ctx=Load()), attr='response_format', ctx=Load())",
+      "rendered": "request.response_format"
+    },
+    {
+      "line_start": 116,
+      "line_end": 117,
+      "column": 16,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='strategy', ctx=Load()), Name(id='ToolStrategy', ctx=Load())], keywords=[]), body=ListComp(elt=Attribute(value=Name(id='spec', ctx=Load()), attr='name', ctx=Load()), generators=[comprehension(target=Name(id='spec', ctx=Store()), iter=Attribute(value=Name(id='strategy', ctx=Load()), attr='schema_specs', ctx=Load()), ifs=[], is_async=0)]), orelse=List(elts=[], ctx=Load()))",
+      "rendered": "[spec.name for spec in strategy.schema_specs] if isinstance(strategy, ToolStrategy) else []"
+    },
+    {
+      "line_start": 118,
+      "line_end": 118,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Name(id='FORCED_VERDICT_COUNTER', ctx=Load())], keywords=[])",
+      "rendered": "COUNTERS.bump(FORCED_VERDICT_COUNTER)"
+    },
+    {
+      "line_start": 119,
+      "line_end": 120,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='request', ctx=Load()), attr='override', ctx=Load()), args=[], keywords=[keyword(arg='tools', value=List(elts=[], ctx=Load())), keyword(arg='messages', value=List(elts=[Starred(value=Attribute(value=Name(id='request', ctx=Load()), attr='messages', ctx=Load()), ctx=Load()), Name(id='reply', ctx=Load()), Call(func=Name(id='_report_now', ctx=Load()), args=[Name(id='names', ctx=Load())], keywords=[])], ctx=Load()))])",
+      "rendered": "request.override(tools=[], messages=[*request.messages, reply, _report_now(names)])"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Call(func=Name(id='_forcing', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[]), attr='model', ctx=Load()), ops=[In()], comparators=[Name(id='UNSUPPORTED_MODELS', ctx=Load())])",
+      "rendered": "_forcing(request).model in UNSUPPORTED_MODELS"
+    },
+    {
+      "line_start": 127,
+      "line_end": 127,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='handler', ctx=Load()), args=[Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_unforced', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "handler(self._unforced(request))"
+    },
+    {
+      "line_start": 129,
+      "line_end": 129,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='handler', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[])",
+      "rendered": "handler(request)"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 15,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_learn_rejection', ctx=Load()), args=[Name(id='request', ctx=Load()), Name(id='exc', ctx=Load())], keywords=[]))",
+      "rendered": "not self._learn_rejection(request, exc)"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='handler', ctx=Load()), args=[Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_unforced', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "handler(self._unforced(request))"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Call(func=Name(id='_forcing', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[]), attr='model', ctx=Load()), ops=[In()], comparators=[Name(id='UNSUPPORTED_MODELS', ctx=Load())])",
+      "rendered": "_forcing(request).model in UNSUPPORTED_MODELS"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 19,
+      "kind": "Await",
+      "original_ast": "Await(value=Call(func=Name(id='handler', ctx=Load()), args=[Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_unforced', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[])], keywords=[]))",
+      "rendered": "await handler(self._unforced(request))"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 19,
+      "kind": "Await",
+      "original_ast": "Await(value=Call(func=Name(id='handler', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[]))",
+      "rendered": "await handler(request)"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 145,
+      "line_end": 145,
+      "column": 15,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_learn_rejection', ctx=Load()), args=[Name(id='request', ctx=Load()), Name(id='exc', ctx=Load())], keywords=[]))",
+      "rendered": "not self._learn_rejection(request, exc)"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 15,
+      "kind": "Await",
+      "original_ast": "Await(value=Call(func=Name(id='handler', ctx=Load()), args=[Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_unforced', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[])], keywords=[]))",
+      "rendered": "await handler(self._unforced(request))"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_applies', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[]))",
+      "rendered": "not self._applies(request)"
+    },
+    {
+      "line_start": 156,
+      "line_end": 156,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='handler', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[])",
+      "rendered": "handler(request)"
+    },
+    {
+      "line_start": 158,
+      "line_end": 158,
+      "column": 11,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='request', ctx=Load()), attr='tools', ctx=Load())",
+      "rendered": "request.tools"
+    },
+    {
+      "line_start": 159,
+      "line_end": 159,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='handler', ctx=Load()), args=[Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_unforced', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "handler(self._unforced(request))"
+    },
+    {
+      "line_start": 160,
+      "line_end": 160,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_reply', ctx=Load()), args=[Name(id='result', ctx=Load())], keywords=[])",
+      "rendered": "_reply(result)"
+    },
+    {
+      "line_start": 161,
+      "line_end": 161,
+      "column": 15,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Compare(left=Name(id='reply', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)]), Attribute(value=Name(id='reply', ctx=Load()), attr='tool_calls', ctx=Load())])",
+      "rendered": "reply is None or reply.tool_calls"
+    },
+    {
+      "line_start": 162,
+      "line_end": 162,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='result', ctx=Load())",
+      "rendered": "result"
+    },
+    {
+      "line_start": 163,
+      "line_end": 163,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_forced', ctx=Load()), args=[Name(id='request', ctx=Load()), Name(id='reply', ctx=Load())], keywords=[])",
+      "rendered": "self._forced(request, reply)"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_force', ctx=Load()), args=[Name(id='request', ctx=Load()), Name(id='handler', ctx=Load())], keywords=[])",
+      "rendered": "self._force(request, handler)"
+    },
+    {
+      "line_start": 172,
+      "line_end": 172,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_applies', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[]))",
+      "rendered": "not self._applies(request)"
+    },
+    {
+      "line_start": 173,
+      "line_end": 173,
+      "column": 19,
+      "kind": "Await",
+      "original_ast": "Await(value=Call(func=Name(id='handler', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[]))",
+      "rendered": "await handler(request)"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 11,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='request', ctx=Load()), attr='tools', ctx=Load())",
+      "rendered": "request.tools"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 21,
+      "kind": "Await",
+      "original_ast": "Await(value=Call(func=Name(id='handler', ctx=Load()), args=[Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_unforced', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[])], keywords=[]))",
+      "rendered": "await handler(self._unforced(request))"
+    },
+    {
+      "line_start": 176,
+      "line_end": 176,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_reply', ctx=Load()), args=[Name(id='result', ctx=Load())], keywords=[])",
+      "rendered": "_reply(result)"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 15,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Compare(left=Name(id='reply', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)]), Attribute(value=Name(id='reply', ctx=Load()), attr='tool_calls', ctx=Load())])",
+      "rendered": "reply is None or reply.tool_calls"
+    },
+    {
+      "line_start": 178,
+      "line_end": 178,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='result', ctx=Load())",
+      "rendered": "result"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_forced', ctx=Load()), args=[Name(id='request', ctx=Load()), Name(id='reply', ctx=Load())], keywords=[])",
+      "rendered": "self._forced(request, reply)"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 15,
+      "kind": "Await",
+      "original_ast": "Await(value=Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_aforce', ctx=Load()), args=[Name(id='request', ctx=Load()), Name(id='handler', ctx=Load())], keywords=[]))",
+      "rendered": "await self._aforce(request, handler)"
+    }
+  ],
+  "calls": [
+    {
+      "line": 51,
+      "end_line": 54,
+      "callee": "HumanMessage",
+      "enclosing": "_report_now",
+      "expression": "HumanMessage(content=(\n        f\"You have finished working. Report your outcome NOW by calling {names} with the \"\n        \"conclusion you just reached. Every other tool has been withdrawn.\"\n    ))"
+    },
+    {
+      "line": 59,
+      "end_line": 59,
+      "callee": "cast",
+      "enclosing": "_forcing",
+      "expression": "cast(\"ForcingChatAnthropic\", request.model)"
+    },
+    {
+      "line": 64,
+      "end_line": 64,
+      "callee": "isinstance",
+      "enclosing": "_reply",
+      "expression": "isinstance(result, ExtendedModelResponse)"
+    },
+    {
+      "line": 50,
+      "end_line": 50,
+      "callee": "' or '.join",
+      "enclosing": "_report_now",
+      "expression": "\" or \".join(f\"`{n}`\" for n in tool_names)"
+    },
+    {
+      "line": 66,
+      "end_line": 66,
+      "callee": "isinstance",
+      "enclosing": "_reply",
+      "expression": "isinstance(result, ModelResponse)"
+    },
+    {
+      "line": 68,
+      "end_line": 68,
+      "callee": "isinstance",
+      "enclosing": "_reply",
+      "expression": "isinstance(last, AIMessage)"
+    },
+    {
+      "line": 82,
+      "end_line": 82,
+      "callee": "super().__init__",
+      "enclosing": "ForceVerdictOnly.__init__",
+      "expression": "super().__init__()"
+    },
+    {
+      "line": 84,
+      "end_line": 84,
+      "callee": "threading.Lock",
+      "enclosing": "ForceVerdictOnly.__init__",
+      "expression": "threading.Lock()"
+    },
+    {
+      "line": 103,
+      "end_line": 103,
+      "callee": "request.override",
+      "enclosing": "ForceVerdictOnly._unforced",
+      "expression": "request.override(model=self._auto_model(_forcing(request)))"
+    },
+    {
+      "line": 109,
+      "end_line": 109,
+      "callee": "learn_tool_choice_unsupported",
+      "enclosing": "ForceVerdictOnly._learn_rejection",
+      "expression": "learn_tool_choice_unsupported(_forcing(request).model)"
+    },
+    {
+      "line": 118,
+      "end_line": 118,
+      "callee": "COUNTERS.bump",
+      "enclosing": "ForceVerdictOnly._forced",
+      "expression": "COUNTERS.bump(FORCED_VERDICT_COUNTER)"
+    },
+    {
+      "line": 119,
+      "end_line": 120,
+      "callee": "request.override",
+      "enclosing": "ForceVerdictOnly._forced",
+      "expression": "request.override(tools=[],\n                                messages=[*request.messages, reply, _report_now(names)])"
+    },
+    {
+      "line": 133,
+      "end_line": 133,
+      "callee": "handler",
+      "enclosing": "ForceVerdictOnly._force",
+      "expression": "handler(self._unforced(request))"
+    },
+    {
+      "line": 164,
+      "end_line": 164,
+      "callee": "self._force",
+      "enclosing": "ForceVerdictOnly.wrap_model_call",
+      "expression": "self._force(request, handler)"
+    },
+    {
+      "line": 89,
+      "end_line": 89,
+      "callee": "self._auto.get",
+      "enclosing": "ForceVerdictOnly._auto_model",
+      "expression": "self._auto.get(id(model))"
+    },
+    {
+      "line": 98,
+      "end_line": 98,
+      "callee": "isinstance",
+      "enclosing": "ForceVerdictOnly._applies",
+      "expression": "isinstance(request.response_format, ToolStrategy)"
+    },
+    {
+      "line": 107,
+      "end_line": 107,
+      "callee": "is_tool_choice_unsupported_rejection",
+      "enclosing": "ForceVerdictOnly._learn_rejection",
+      "expression": "is_tool_choice_unsupported_rejection(exc)"
+    },
+    {
+      "line": 116,
+      "end_line": 117,
+      "callee": "isinstance",
+      "enclosing": "ForceVerdictOnly._forced",
+      "expression": "isinstance(\n            strategy, ToolStrategy)"
+    },
+    {
+      "line": 127,
+      "end_line": 127,
+      "callee": "handler",
+      "enclosing": "ForceVerdictOnly._force",
+      "expression": "handler(self._unforced(request))"
+    },
+    {
+      "line": 129,
+      "end_line": 129,
+      "callee": "handler",
+      "enclosing": "ForceVerdictOnly._force",
+      "expression": "handler(request)"
+    },
+    {
+      "line": 133,
+      "end_line": 133,
+      "callee": "self._unforced",
+      "enclosing": "ForceVerdictOnly._force",
+      "expression": "self._unforced(request)"
+    },
+    {
+      "line": 147,
+      "end_line": 147,
+      "callee": "handler",
+      "enclosing": "ForceVerdictOnly._aforce",
+      "expression": "handler(self._unforced(request))"
+    },
+    {
+      "line": 155,
+      "end_line": 155,
+      "callee": "self._applies",
+      "enclosing": "ForceVerdictOnly.wrap_model_call",
+      "expression": "self._applies(request)"
+    },
+    {
+      "line": 156,
+      "end_line": 156,
+      "callee": "handler",
+      "enclosing": "ForceVerdictOnly.wrap_model_call",
+      "expression": "handler(request)"
+    },
+    {
+      "line": 159,
+      "end_line": 159,
+      "callee": "handler",
+      "enclosing": "ForceVerdictOnly.wrap_model_call",
+      "expression": "handler(self._unforced(request))"
+    },
+    {
+      "line": 160,
+      "end_line": 160,
+      "callee": "_reply",
+      "enclosing": "ForceVerdictOnly.wrap_model_call",
+      "expression": "_reply(result)"
+    },
+    {
+      "line": 163,
+      "end_line": 163,
+      "callee": "self._forced",
+      "enclosing": "ForceVerdictOnly.wrap_model_call",
+      "expression": "self._forced(request, reply)"
+    },
+    {
+      "line": 172,
+      "end_line": 172,
+      "callee": "self._applies",
+      "enclosing": "ForceVerdictOnly.awrap_model_call",
+      "expression": "self._applies(request)"
+    },
+    {
+      "line": 176,
+      "end_line": 176,
+      "callee": "_reply",
+      "enclosing": "ForceVerdictOnly.awrap_model_call",
+      "expression": "_reply(result)"
+    },
+    {
+      "line": 179,
+      "end_line": 179,
+      "callee": "self._forced",
+      "enclosing": "ForceVerdictOnly.awrap_model_call",
+      "expression": "self._forced(request, reply)"
+    },
+    {
+      "line": 180,
+      "end_line": 180,
+      "callee": "self._aforce",
+      "enclosing": "ForceVerdictOnly.awrap_model_call",
+      "expression": "self._aforce(request, handler)"
+    },
+    {
+      "line": 82,
+      "end_line": 82,
+      "callee": "super",
+      "enclosing": "ForceVerdictOnly.__init__",
+      "expression": "super()"
+    },
+    {
+      "line": 89,
+      "end_line": 89,
+      "callee": "id",
+      "enclosing": "ForceVerdictOnly._auto_model",
+      "expression": "id(model)"
+    },
+    {
+      "line": 91,
+      "end_line": 91,
+      "callee": "model.model_copy",
+      "enclosing": "ForceVerdictOnly._auto_model",
+      "expression": "model.model_copy(update={\"force_tool_choice\": False})"
+    },
+    {
+      "line": 99,
+      "end_line": 99,
+      "callee": "getattr",
+      "enclosing": "ForceVerdictOnly._applies",
+      "expression": "getattr(request.model, \"force_tool_choice\", None)"
+    },
+    {
+      "line": 103,
+      "end_line": 103,
+      "callee": "self._auto_model",
+      "enclosing": "ForceVerdictOnly._unforced",
+      "expression": "self._auto_model(_forcing(request))"
+    },
+    {
+      "line": 109,
+      "end_line": 109,
+      "callee": "_forcing",
+      "enclosing": "ForceVerdictOnly._learn_rejection",
+      "expression": "_forcing(request)"
+    },
+    {
+      "line": 126,
+      "end_line": 126,
+      "callee": "_forcing",
+      "enclosing": "ForceVerdictOnly._force",
+      "expression": "_forcing(request)"
+    },
+    {
+      "line": 127,
+      "end_line": 127,
+      "callee": "self._unforced",
+      "enclosing": "ForceVerdictOnly._force",
+      "expression": "self._unforced(request)"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "_forcing",
+      "enclosing": "ForceVerdictOnly._aforce",
+      "expression": "_forcing(request)"
+    },
+    {
+      "line": 141,
+      "end_line": 141,
+      "callee": "handler",
+      "enclosing": "ForceVerdictOnly._aforce",
+      "expression": "handler(self._unforced(request))"
+    },
+    {
+      "line": 143,
+      "end_line": 143,
+      "callee": "handler",
+      "enclosing": "ForceVerdictOnly._aforce",
+      "expression": "handler(request)"
+    },
+    {
+      "line": 147,
+      "end_line": 147,
+      "callee": "self._unforced",
+      "enclosing": "ForceVerdictOnly._aforce",
+      "expression": "self._unforced(request)"
+    },
+    {
+      "line": 159,
+      "end_line": 159,
+      "callee": "self._unforced",
+      "enclosing": "ForceVerdictOnly.wrap_model_call",
+      "expression": "self._unforced(request)"
+    },
+    {
+      "line": 173,
+      "end_line": 173,
+      "callee": "handler",
+      "enclosing": "ForceVerdictOnly.awrap_model_call",
+      "expression": "handler(request)"
+    },
+    {
+      "line": 175,
+      "end_line": 175,
+      "callee": "handler",
+      "enclosing": "ForceVerdictOnly.awrap_model_call",
+      "expression": "handler(self._unforced(request))"
+    },
+    {
+      "line": 91,
+      "end_line": 91,
+      "callee": "id",
+      "enclosing": "ForceVerdictOnly._auto_model",
+      "expression": "id(model)"
+    },
+    {
+      "line": 103,
+      "end_line": 103,
+      "callee": "_forcing",
+      "enclosing": "ForceVerdictOnly._unforced",
+      "expression": "_forcing(request)"
+    },
+    {
+      "line": 120,
+      "end_line": 120,
+      "callee": "_report_now",
+      "enclosing": "ForceVerdictOnly._forced",
+      "expression": "_report_now(names)"
+    },
+    {
+      "line": 131,
+      "end_line": 131,
+      "callee": "self._learn_rejection",
+      "enclosing": "ForceVerdictOnly._force",
+      "expression": "self._learn_rejection(request, exc)"
+    },
+    {
+      "line": 141,
+      "end_line": 141,
+      "callee": "self._unforced",
+      "enclosing": "ForceVerdictOnly._aforce",
+      "expression": "self._unforced(request)"
+    },
+    {
+      "line": 145,
+      "end_line": 145,
+      "callee": "self._learn_rejection",
+      "enclosing": "ForceVerdictOnly._aforce",
+      "expression": "self._learn_rejection(request, exc)"
+    },
+    {
+      "line": 175,
+      "end_line": 175,
+      "callee": "self._unforced",
+      "enclosing": "ForceVerdictOnly.awrap_model_call",
+      "expression": "self._unforced(request)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 17,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "import threading",
+      "targets": [
+        "threading"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "from collections.abc import Awaitable, Callable",
+      "targets": [
+        "collections.abc",
+        "collections.abc.Awaitable",
+        "collections.abc.Callable"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "from typing import TYPE_CHECKING, cast",
+      "targets": [
+        "typing",
+        "typing.TYPE_CHECKING",
+        "typing.cast"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 23,
+      "source_expression": "from langchain.agents.middleware.types import AgentMiddleware, ExtendedModelResponse, ModelCallResult, ModelRequest, ModelResponse",
+      "targets": [
+        "langchain.agents.middleware.types",
+        "langchain.agents.middleware.types.AgentMiddleware",
+        "langchain.agents.middleware.types.ExtendedModelResponse",
+        "langchain.agents.middleware.types.ModelCallResult",
+        "langchain.agents.middleware.types.ModelRequest",
+        "langchain.agents.middleware.types.ModelResponse"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 30,
+      "source_expression": "from langchain.agents.structured_output import ToolStrategy",
+      "targets": [
+        "langchain.agents.structured_output",
+        "langchain.agents.structured_output.ToolStrategy"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 31,
+      "source_expression": "from langchain_core.messages import AIMessage, HumanMessage",
+      "targets": [
+        "langchain_core.messages",
+        "langchain_core.messages.AIMessage",
+        "langchain_core.messages.HumanMessage"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 33,
+      "source_expression": "from vvaharness.backends.harness.deepagents.tool_choice_rejection import UNSUPPORTED_MODELS, is_tool_choice_unsupported_rejection, learn_tool_choice_unsupported",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.tool_choice_rejection",
+        "vvaharness.backends.harness.deepagents.tool_choice_rejection.UNSUPPORTED_MODELS",
+        "vvaharness.backends.harness.deepagents.tool_choice_rejection.is_tool_choice_unsupported_rejection",
+        "vvaharness.backends.harness.deepagents.tool_choice_rejection.learn_tool_choice_unsupported"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/tool_choice_rejection.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 38,
+      "source_expression": "from vvaharness.util.counters import COUNTERS",
+      "targets": [
+        "vvaharness.util.counters",
+        "vvaharness.util.counters.COUNTERS"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/counters.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 42,
+      "source_expression": "from vvaharness.backends.harness.deepagents.options.forcing import ForcingChatAnthropic",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.options.forcing",
+        "vvaharness.backends.harness.deepagents.options.forcing.ForcingChatAnthropic"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/options/forcing.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

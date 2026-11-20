@@ -1,0 +1,3581 @@
+{
+  "source": "vvaharness/remediation_agent/plugin_runner/handoff.py",
+  "sha256": "4c51980f154704535fb4da44fa253549f8a46675b5ff1c4a287b52f8fd1fddad",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n# http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"S10's executor-side contract for dispatching work to the fixer subagent.\"\"\"\nfrom __future__ import annotations\nfrom vvaharness.util import logs\n\nimport json\nfrom collections.abc import Awaitable, Callable, Mapping, Sequence\nfrom typing import Any\n\nfrom langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest\nfrom langchain_core.messages import ToolMessage\nfrom langgraph.types import Command\n\nfrom vvaharness.remediation_agent.models import FixerResult\nfrom vvaharness.util import console\nfrom vvaharness.util.events import Event\n\nlog = logs.get_logger(__name__)\n\n_TASK_TOOL = \"task\"\n_FIXER = \"fixer\"\n_REQUIRED_SECTIONS = (\n    \"VULNERABILITY CONTEXT:\",\n    \"TARGET FILES:\",\n    \"EDIT INSTRUCTIONS:\",\n    \"SUCCESS CRITERIA:\",\n)\n\n\nclass FixerDispatchGuard(AgentMiddleware):\n    \"\"\"Validate, enrich, and bound S10 fixer dispatches at execution time.\"\"\"\n\n    def __init__(self, *, finding_context: str, primary_file: str = \"\") -> None:\n        super().__init__()\n        self._finding_context = finding_context\n        self._primary_file = primary_file\n        self._attempts = 0\n        self._retry_allowed = False\n        self._terminal = False\n        self._malformed_rejections = 0\n\n    def _refusal(self, request: ToolCallRequest, detail: str) -> ToolMessage:\n        log.warning(Event.FIXER_DISPATCH_REFUSED, detail=detail)\n        return ToolMessage(\n            content=f\"Fixer dispatch was not executed: {detail}\",\n            name=_TASK_TOOL,\n            tool_call_id=request.tool_call.get(\"id\") or \"\",\n            status=\"error\",\n        )\n\n    def _prepare(self, request: ToolCallRequest) -> ToolCallRequest | ToolMessage:\n        call = request.tool_call\n        if call.get(\"name\") != _TASK_TOOL:\n            return request\n        args = call.get(\"args\")\n        if not isinstance(args, Mapping):\n            self._terminal = True\n            return self._refusal(request, \"task arguments were not an object; return Not Fixed\")\n        if args.get(\"subagent_type\") != _FIXER:\n            self._terminal = True\n            return self._refusal(request, \"S10 permits only subagent_type='fixer'\")\n        if self._terminal:\n            return self._refusal(\n                request, \"the fixer already returned a completed result; do not retry\")\n        if self._attempts and not self._retry_allowed:\n            return self._refusal(\n                request, \"a retry is allowed only after an explicit transient tool error\")\n\n        description = args.get(\"description\")\n        problem = _invalid_spec(description, self._primary_file)\n        if problem:\n            # Malformed dispatch is no verdict (may name a non-SAST file): one re-dispatch allowed\n            self._malformed_rejections += 1\n            if self._malformed_rejections >= 2:\n                self._terminal = True\n                return self._refusal(\n                    request,\n                    f\"incomplete edit specification ({problem}); \"\n                    \"no further attempts permitted; return Not Fixed\")\n            return self._refusal(\n                request,\n                f\"incomplete edit specification ({problem}); \"\n                \"one corrected re-dispatch is permitted\")\n        assert isinstance(description, str)  # narrowed by _invalid_spec\n\n        self._attempts += 1\n        self._retry_allowed = False\n        enriched = (\n            f\"{description.rstrip()}\\n\\n\"\n            \"=== AUTHORITATIVE SAST FINDING CONTEXT ===\\n\"\n            f\"{self._finding_context.strip()}\\n\"\n            \"=== END AUTHORITATIVE CONTEXT ===\"\n        )\n        amended_args = {**args, \"description\": enriched}\n        console.write(\n            f\"  [remediation] dispatching complete fixer specification \"\n            f\"(attempt {self._attempts}/2, {len(enriched)} chars)\"\n        )\n        return request.override(tool_call={**call, \"args\": amended_args})\n\n    def _observe(self, result: ToolMessage | Command[Any]) -> None:\n        message = _result_message(result)\n        if message is None:\n            self._terminal = True\n            return\n        if getattr(message, \"status\", \"success\") == \"error\":\n            self._record_transient()\n            return\n        parsed = _fixer_result(message.content)\n        if parsed is not None and parsed.status == \"tool_error\" and parsed.retryable:\n            self._record_transient()\n            return\n        # Applied/already/not-applied/malformed/non-retryable are all terminal: no re-dispatch\n        self._terminal = True\n        if parsed is None:\n            log.warning(\n                \"fixer returned an invalid result; \"\n                \"no retry permitted\")\n        elif parsed.status != \"applied\":\n            log.warning(Event.FIXER_STATUS_NO_RETRY, status=parsed.status)\n\n    def _record_transient(self) -> None:\n        if self._attempts < 2:\n            self._retry_allowed = True\n            log.warning(\n                \"fixer reported a transient tool error — \"\n                \"one retry is permitted\")\n        else:\n            self._terminal = True\n            log.warning(\n                \"fixer transient retry exhausted — \"\n                \"return Not Fixed\")\n\n    def wrap_tool_call(\n        self,\n        request: ToolCallRequest,\n        handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],\n    ) -> ToolMessage | Command[Any]:\n        \"\"\"Apply the handoff contract around synchronous task execution.\"\"\"\n        if request.tool_call.get(\"name\") != _TASK_TOOL:\n            return handler(request)\n        prepared = self._prepare(request)\n        if isinstance(prepared, ToolMessage):\n            return prepared\n        try:\n            result = handler(prepared)\n        except Exception as exc:  # one bounded retry is intentional\n            self._record_transient()\n            return self._refusal(\n                request,\n                f\"transient fixer tool error ({type(exc).__name__}); \"\n                f\"{'retry once' if self._retry_allowed else 'retry exhausted'}\",\n            )\n        if request.tool_call.get(\"name\") == _TASK_TOOL:\n            self._observe(result)\n        return result\n\n    async def awrap_tool_call(\n        self,\n        request: ToolCallRequest,\n        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],\n    ) -> ToolMessage | Command[Any]:\n        \"\"\"Apply the handoff contract around asynchronous task execution.\"\"\"\n        if request.tool_call.get(\"name\") != _TASK_TOOL:\n            return await handler(request)\n        prepared = self._prepare(request)\n        if isinstance(prepared, ToolMessage):\n            return prepared\n        try:\n            result = await handler(prepared)\n        except Exception as exc:  # one bounded retry is intentional\n            self._record_transient()\n            return self._refusal(\n                request,\n                f\"transient fixer tool error ({type(exc).__name__}); \"\n                f\"{'retry once' if self._retry_allowed else 'retry exhausted'}\",\n            )\n        if request.tool_call.get(\"name\") == _TASK_TOOL:\n            self._observe(result)\n        return result\n\n\ndef _invalid_spec(description: object, primary_file: str) -> str:\n    \"\"\"Return why a task description is incomplete, or an empty string.\"\"\"\n    if not isinstance(description, str) or not description.strip():\n        return \"missing description\"\n    folded = description.casefold()\n    markers = [section.casefold() for section in _REQUIRED_SECTIONS]\n    missing = [section for section, marker in zip(_REQUIRED_SECTIONS, markers)\n               if marker not in folded]\n    if missing:\n        return f\"missing section(s): {', '.join(missing)}\"\n    positions = [folded.index(marker) for marker in markers]\n    if positions != sorted(positions):\n        return \"required sections are out of order\"\n    bodies: dict[str, str] = {}\n    for index, (section, marker) in enumerate(zip(_REQUIRED_SECTIONS, markers)):\n        start = positions[index] + len(marker)\n        end = positions[index + 1] if index + 1 < len(positions) else len(description)\n        bodies[section] = description[start:end].strip()\n        if not bodies[section]:\n            return f\"section {section} is empty\"\n    target_files = bodies[\"TARGET FILES:\"].casefold()\n    if primary_file and primary_file.casefold() not in target_files:\n        return f\"TARGET FILES does not name {primary_file}\"\n    for section in (\"VULNERABILITY CONTEXT:\", \"EDIT INSTRUCTIONS:\",\n                    \"SUCCESS CRITERIA:\"):\n        if len(bodies[section]) < 12:\n            return f\"section {section} is not substantive\"\n    return \"\"\n\n\ndef _result_message(result: ToolMessage | Command[Any]) -> ToolMessage | None:\n    if isinstance(result, ToolMessage):\n        return result\n    update = getattr(result, \"update\", None)\n    messages = update.get(\"messages\", []) if isinstance(update, Mapping) else []\n    if isinstance(messages, Sequence):\n        return next((m for m in reversed(messages) if isinstance(m, ToolMessage)), None)\n    return None\n\n\ndef _fixer_result(content: object) -> FixerResult | None:\n    if not isinstance(content, str):\n        return None\n    try:\n        return FixerResult.model_validate(json.loads(content))\n    except (ValueError, TypeError, json.JSONDecodeError):\n        return None\n\n\n__all__ = [\"FixerDispatchGuard\"]\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/remediation_agent/plugin_runner/handoff.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "S10's executor-side contract for dispatching work to the fixer subagent.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_44_4": {
+      "source": "vvaharness/remediation_agent/plugin_runner/handoff.py",
+      "line_start": 44,
+      "line_end": 44,
+      "value": "Validate, enrich, and bound S10 fixer dispatches at execution time.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_58_20": {
+      "source": "vvaharness/remediation_agent/plugin_runner/handoff.py",
+      "line_start": 58,
+      "line_end": 58,
+      "source_expression": "f\"Fixer dispatch was not executed: {detail}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_91_20": {
+      "source": "vvaharness/remediation_agent/plugin_runner/handoff.py",
+      "line_start": 91,
+      "line_end": 92,
+      "source_expression": "f\"incomplete edit specification ({problem}); \"\n                    \"no further attempts permitted; return Not Fixed\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_95_16": {
+      "source": "vvaharness/remediation_agent/plugin_runner/handoff.py",
+      "line_start": 95,
+      "line_end": 96,
+      "source_expression": "f\"incomplete edit specification ({problem}); \"\n                \"one corrected re-dispatch is permitted\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_102_12": {
+      "source": "vvaharness/remediation_agent/plugin_runner/handoff.py",
+      "line_start": 102,
+      "line_end": 105,
+      "source_expression": "f\"{description.rstrip()}\\n\\n\"\n            \"=== AUTHORITATIVE SAST FINDING CONTEXT ===\\n\"\n            f\"{self._finding_context.strip()}\\n\"\n            \"=== END AUTHORITATIVE CONTEXT ===\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_109_12": {
+      "source": "vvaharness/remediation_agent/plugin_runner/handoff.py",
+      "line_start": 109,
+      "line_end": 110,
+      "source_expression": "f\"  [remediation] dispatching complete fixer specification \"\n            f\"(attempt {self._attempts}/2, {len(enriched)} chars)\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_152_8": {
+      "source": "vvaharness/remediation_agent/plugin_runner/handoff.py",
+      "line_start": 152,
+      "line_end": 152,
+      "value": "Apply the handoff contract around synchronous task execution.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_164_16": {
+      "source": "vvaharness/remediation_agent/plugin_runner/handoff.py",
+      "line_start": 164,
+      "line_end": 165,
+      "source_expression": "f\"transient fixer tool error ({type(exc).__name__}); \"\n                f\"{'retry once' if self._retry_allowed else 'retry exhausted'}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_176_8": {
+      "source": "vvaharness/remediation_agent/plugin_runner/handoff.py",
+      "line_start": 176,
+      "line_end": 176,
+      "value": "Apply the handoff contract around asynchronous task execution.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_188_16": {
+      "source": "vvaharness/remediation_agent/plugin_runner/handoff.py",
+      "line_start": 188,
+      "line_end": 189,
+      "source_expression": "f\"transient fixer tool error ({type(exc).__name__}); \"\n                f\"{'retry once' if self._retry_allowed else 'retry exhausted'}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_197_4": {
+      "source": "vvaharness/remediation_agent/plugin_runner/handoff.py",
+      "line_start": 197,
+      "line_end": 197,
+      "value": "Return why a task description is incomplete, or an empty string.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_205_15": {
+      "source": "vvaharness/remediation_agent/plugin_runner/handoff.py",
+      "line_start": 205,
+      "line_end": 205,
+      "source_expression": "f\"missing section(s): {', '.join(missing)}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_215_19": {
+      "source": "vvaharness/remediation_agent/plugin_runner/handoff.py",
+      "line_start": 215,
+      "line_end": 215,
+      "source_expression": "f\"section {section} is empty\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_218_15": {
+      "source": "vvaharness/remediation_agent/plugin_runner/handoff.py",
+      "line_start": 218,
+      "line_end": 218,
+      "source_expression": "f\"TARGET FILES does not name {primary_file}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_222_19": {
+      "source": "vvaharness/remediation_agent/plugin_runner/handoff.py",
+      "line_start": 222,
+      "line_end": 222,
+      "source_expression": "f\"section {section} is not substantive\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "S10's executor-side contract for dispatching work to the fixer subagent.",
+      "context": "literal"
+    },
+    {
+      "line_start": 33,
+      "line_end": 33,
+      "column": 13,
+      "value": "task",
+      "context": "literal"
+    },
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 9,
+      "value": "fixer",
+      "context": "literal"
+    },
+    {
+      "line_start": 36,
+      "line_end": 36,
+      "column": 4,
+      "value": "VULNERABILITY CONTEXT:",
+      "context": "literal"
+    },
+    {
+      "line_start": 37,
+      "line_end": 37,
+      "column": 4,
+      "value": "TARGET FILES:",
+      "context": "literal"
+    },
+    {
+      "line_start": 38,
+      "line_end": 38,
+      "column": 4,
+      "value": "EDIT INSTRUCTIONS:",
+      "context": "literal"
+    },
+    {
+      "line_start": 39,
+      "line_end": 39,
+      "column": 4,
+      "value": "SUCCESS CRITERIA:",
+      "context": "literal"
+    },
+    {
+      "line_start": 44,
+      "line_end": 44,
+      "column": 4,
+      "value": "Validate, enrich, and bound S10 fixer dispatches at execution time.",
+      "context": "literal"
+    },
+    {
+      "line_start": 197,
+      "line_end": 197,
+      "column": 4,
+      "value": "Return why a task description is incomplete, or an empty string.",
+      "context": "literal"
+    },
+    {
+      "line_start": 223,
+      "line_end": 223,
+      "column": 11,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 245,
+      "line_end": 245,
+      "column": 11,
+      "value": "FixerDispatchGuard",
+      "context": "literal"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 68,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 152,
+      "line_end": 152,
+      "column": 8,
+      "value": "Apply the handoff contract around synchronous task execution.",
+      "context": "literal"
+    },
+    {
+      "line_start": 176,
+      "line_end": 176,
+      "column": 8,
+      "value": "Apply the handoff contract around asynchronous task execution.",
+      "context": "literal"
+    },
+    {
+      "line_start": 199,
+      "line_end": 199,
+      "column": 15,
+      "value": "missing description",
+      "context": "literal"
+    },
+    {
+      "line_start": 208,
+      "line_end": 208,
+      "column": 15,
+      "value": "required sections are out of order",
+      "context": "literal"
+    },
+    {
+      "line_start": 219,
+      "line_end": 219,
+      "column": 20,
+      "value": "VULNERABILITY CONTEXT:",
+      "context": "literal"
+    },
+    {
+      "line_start": 219,
+      "line_end": 219,
+      "column": 46,
+      "value": "EDIT INSTRUCTIONS:",
+      "context": "literal"
+    },
+    {
+      "line_start": 220,
+      "line_end": 220,
+      "column": 20,
+      "value": "SUCCESS CRITERIA:",
+      "context": "literal"
+    },
+    {
+      "line_start": 229,
+      "line_end": 229,
+      "column": 29,
+      "value": "update",
+      "context": "literal"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 24,
+      "value": "args",
+      "context": "literal"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 31,
+      "value": "description",
+      "context": "literal"
+    },
+    {
+      "line_start": 102,
+      "line_end": 103,
+      "column": 36,
+      "value": "\n\n=== AUTHORITATIVE SAST FINDING CONTEXT ===\n",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 104,
+      "line_end": 105,
+      "column": 45,
+      "value": "\n=== END AUTHORITATIVE CONTEXT ===",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 107,
+      "line_end": 107,
+      "column": 32,
+      "value": "description",
+      "context": "literal"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 52,
+      "value": "error",
+      "context": "literal"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 17,
+      "value": "missing section(s): ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 218,
+      "line_end": 218,
+      "column": 17,
+      "value": "TARGET FILES does not name ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 230,
+      "line_end": 230,
+      "column": 26,
+      "value": "messages",
+      "context": "literal"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 19,
+      "value": "error",
+      "context": "literal"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 20,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 42,
+      "value": "task arguments were not an object; return Not Fixed",
+      "context": "literal"
+    },
+    {
+      "line_start": 72,
+      "line_end": 72,
+      "column": 20,
+      "value": "subagent_type",
+      "context": "literal"
+    },
+    {
+      "line_start": 74,
+      "line_end": 74,
+      "column": 42,
+      "value": "S10 permits only subagent_type='fixer'",
+      "context": "literal"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 25,
+      "value": "the fixer already returned a completed result; do not retry",
+      "context": "literal"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 25,
+      "value": "a retry is allowed only after an explicit transient tool error",
+      "context": "literal"
+    },
+    {
+      "line_start": 109,
+      "line_end": 110,
+      "column": 14,
+      "value": "  [remediation] dispatching complete fixer specification (attempt ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 110,
+      "line_end": 110,
+      "column": 39,
+      "value": "/2, ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 110,
+      "line_end": 110,
+      "column": 58,
+      "value": " chars)",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 28,
+      "value": "status",
+      "context": "literal"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 38,
+      "value": "success",
+      "context": "literal"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 51,
+      "value": "tool_error",
+      "context": "literal"
+    },
+    {
+      "line_start": 130,
+      "line_end": 131,
+      "column": 16,
+      "value": "fixer returned an invalid result; no retry permitted",
+      "context": "literal"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 30,
+      "value": "applied",
+      "context": "literal"
+    },
+    {
+      "line_start": 139,
+      "line_end": 140,
+      "column": 16,
+      "value": "fixer reported a transient tool error — one retry is permitted",
+      "context": "literal"
+    },
+    {
+      "line_start": 144,
+      "line_end": 145,
+      "column": 16,
+      "value": "fixer transient retry exhausted — return Not Fixed",
+      "context": "literal"
+    },
+    {
+      "line_start": 153,
+      "line_end": 153,
+      "column": 33,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 33,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 33,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 33,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 215,
+      "line_end": 215,
+      "column": 21,
+      "value": "section ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 215,
+      "line_end": 215,
+      "column": 38,
+      "value": " is empty",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 216,
+      "line_end": 216,
+      "column": 26,
+      "value": "TARGET FILES:",
+      "context": "literal"
+    },
+    {
+      "line_start": 222,
+      "line_end": 222,
+      "column": 21,
+      "value": "section ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 222,
+      "line_end": 222,
+      "column": 38,
+      "value": " is not substantive",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 22,
+      "value": "Fixer dispatch was not executed: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 56,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 95,
+      "line_end": 95,
+      "column": 18,
+      "value": "incomplete edit specification (",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 95,
+      "line_end": 96,
+      "column": 58,
+      "value": "); one corrected re-dispatch is permitted",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 112,
+      "line_end": 112,
+      "column": 51,
+      "value": "args",
+      "context": "literal"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 47,
+      "value": "id",
+      "context": "literal"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 22,
+      "value": "incomplete edit specification (",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 91,
+      "line_end": 92,
+      "column": 62,
+      "value": "); no further attempts permitted; return Not Fixed",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 18,
+      "value": "transient fixer tool error (",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 66,
+      "value": "); ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 18,
+      "value": "transient fixer tool error (",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 66,
+      "value": "); ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 38,
+      "value": ", ",
+      "context": "literal"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 19,
+      "value": "retry once",
+      "context": "literal"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 60,
+      "value": "retry exhausted",
+      "context": "literal"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 19,
+      "value": "retry once",
+      "context": "literal"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 60,
+      "value": "retry exhausted",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "# http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 85,
+      "text": "# Malformed dispatch is no verdict (may name a non-SAST file): one re-dispatch allowed"
+    },
+    {
+      "line": 97,
+      "text": "# narrowed by _invalid_spec"
+    },
+    {
+      "line": 126,
+      "text": "# Applied/already/not-applied/malformed/non-retryable are all terminal: no re-dispatch"
+    },
+    {
+      "line": 160,
+      "text": "# one bounded retry is intentional"
+    },
+    {
+      "line": 184,
+      "text": "# one bounded retry is intentional"
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 23,
+      "line_end": 23,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 27,
+      "line_end": 27,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 28,
+      "line_end": 28,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 29,
+      "line_end": 29,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 31,
+      "line_end": 31,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 33,
+      "line_end": 33,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 34,
+      "line_end": 34,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 35,
+      "line_end": 40,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 43,
+      "line_end": 193,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 9
+    },
+    {
+      "kind": "Expr",
+      "line_start": 44,
+      "line_end": 44,
+      "column": 4,
+      "owner": "FixerDispatchGuard",
+      "representation_line": 14
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 46,
+      "line_end": 53,
+      "column": 4,
+      "owner": "FixerDispatchGuard",
+      "representation_line": 15
+    },
+    {
+      "kind": "Expr",
+      "line_start": 47,
+      "line_end": 47,
+      "column": 8,
+      "owner": "FixerDispatchGuard.__init__",
+      "representation_line": 21
+    },
+    {
+      "kind": "Assign",
+      "line_start": 48,
+      "line_end": 48,
+      "column": 8,
+      "owner": "FixerDispatchGuard.__init__",
+      "representation_line": 21
+    },
+    {
+      "kind": "Assign",
+      "line_start": 49,
+      "line_end": 49,
+      "column": 8,
+      "owner": "FixerDispatchGuard.__init__",
+      "representation_line": 21
+    },
+    {
+      "kind": "Assign",
+      "line_start": 50,
+      "line_end": 50,
+      "column": 8,
+      "owner": "FixerDispatchGuard.__init__",
+      "representation_line": 21
+    },
+    {
+      "kind": "Assign",
+      "line_start": 51,
+      "line_end": 51,
+      "column": 8,
+      "owner": "FixerDispatchGuard.__init__",
+      "representation_line": 21
+    },
+    {
+      "kind": "Assign",
+      "line_start": 52,
+      "line_end": 52,
+      "column": 8,
+      "owner": "FixerDispatchGuard.__init__",
+      "representation_line": 23
+    },
+    {
+      "kind": "Assign",
+      "line_start": 53,
+      "line_end": 53,
+      "column": 8,
+      "owner": "FixerDispatchGuard.__init__",
+      "representation_line": 23
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 55,
+      "line_end": 62,
+      "column": 4,
+      "owner": "FixerDispatchGuard",
+      "representation_line": 26
+    },
+    {
+      "kind": "Expr",
+      "line_start": 56,
+      "line_end": 56,
+      "column": 8,
+      "owner": "FixerDispatchGuard._refusal",
+      "representation_line": 32
+    },
+    {
+      "kind": "Return",
+      "line_start": 57,
+      "line_end": 62,
+      "column": 8,
+      "owner": "FixerDispatchGuard._refusal",
+      "representation_line": 33
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 64,
+      "line_end": 112,
+      "column": 4,
+      "owner": "FixerDispatchGuard",
+      "representation_line": 37
+    },
+    {
+      "kind": "Assign",
+      "line_start": 65,
+      "line_end": 65,
+      "column": 8,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 43
+    },
+    {
+      "kind": "If",
+      "line_start": 66,
+      "line_end": 67,
+      "column": 8,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 44
+    },
+    {
+      "kind": "Return",
+      "line_start": 67,
+      "line_end": 67,
+      "column": 12,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 46
+    },
+    {
+      "kind": "Assign",
+      "line_start": 68,
+      "line_end": 68,
+      "column": 8,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 50
+    },
+    {
+      "kind": "If",
+      "line_start": 69,
+      "line_end": 71,
+      "column": 8,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 51
+    },
+    {
+      "kind": "Assign",
+      "line_start": 70,
+      "line_end": 70,
+      "column": 12,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 54
+    },
+    {
+      "kind": "Return",
+      "line_start": 71,
+      "line_end": 71,
+      "column": 12,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 55
+    },
+    {
+      "kind": "If",
+      "line_start": 72,
+      "line_end": 74,
+      "column": 8,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 58
+    },
+    {
+      "kind": "Assign",
+      "line_start": 73,
+      "line_end": 73,
+      "column": 12,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 61
+    },
+    {
+      "kind": "Return",
+      "line_start": 74,
+      "line_end": 74,
+      "column": 12,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 62
+    },
+    {
+      "kind": "If",
+      "line_start": 75,
+      "line_end": 77,
+      "column": 8,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 65
+    },
+    {
+      "kind": "Return",
+      "line_start": 76,
+      "line_end": 77,
+      "column": 12,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 67
+    },
+    {
+      "kind": "If",
+      "line_start": 78,
+      "line_end": 80,
+      "column": 8,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 70
+    },
+    {
+      "kind": "Return",
+      "line_start": 79,
+      "line_end": 80,
+      "column": 12,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 72
+    },
+    {
+      "kind": "Assign",
+      "line_start": 82,
+      "line_end": 82,
+      "column": 8,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 76
+    },
+    {
+      "kind": "Assign",
+      "line_start": 83,
+      "line_end": 83,
+      "column": 8,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 76
+    },
+    {
+      "kind": "If",
+      "line_start": 84,
+      "line_end": 96,
+      "column": 8,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 77
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 86,
+      "line_end": 86,
+      "column": 12,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 80
+    },
+    {
+      "kind": "If",
+      "line_start": 87,
+      "line_end": 92,
+      "column": 12,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 81
+    },
+    {
+      "kind": "Assign",
+      "line_start": 88,
+      "line_end": 88,
+      "column": 16,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 84
+    },
+    {
+      "kind": "Return",
+      "line_start": 89,
+      "line_end": 92,
+      "column": 16,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 85
+    },
+    {
+      "kind": "Return",
+      "line_start": 93,
+      "line_end": 96,
+      "column": 12,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 88
+    },
+    {
+      "kind": "Assert",
+      "line_start": 97,
+      "line_end": 97,
+      "column": 8,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 91
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 99,
+      "line_end": 99,
+      "column": 8,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 94
+    },
+    {
+      "kind": "Assign",
+      "line_start": 100,
+      "line_end": 100,
+      "column": 8,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 94
+    },
+    {
+      "kind": "Assign",
+      "line_start": 101,
+      "line_end": 106,
+      "column": 8,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 94
+    },
+    {
+      "kind": "Assign",
+      "line_start": 107,
+      "line_end": 107,
+      "column": 8,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 94
+    },
+    {
+      "kind": "Expr",
+      "line_start": 108,
+      "line_end": 111,
+      "column": 8,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 94
+    },
+    {
+      "kind": "Return",
+      "line_start": 112,
+      "line_end": 112,
+      "column": 8,
+      "owner": "FixerDispatchGuard._prepare",
+      "representation_line": 95
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 114,
+      "line_end": 133,
+      "column": 4,
+      "owner": "FixerDispatchGuard",
+      "representation_line": 99
+    },
+    {
+      "kind": "Assign",
+      "line_start": 115,
+      "line_end": 115,
+      "column": 8,
+      "owner": "FixerDispatchGuard._observe",
+      "representation_line": 105
+    },
+    {
+      "kind": "If",
+      "line_start": 116,
+      "line_end": 118,
+      "column": 8,
+      "owner": "FixerDispatchGuard._observe",
+      "representation_line": 106
+    },
+    {
+      "kind": "Assign",
+      "line_start": 117,
+      "line_end": 117,
+      "column": 12,
+      "owner": "FixerDispatchGuard._observe",
+      "representation_line": 109
+    },
+    {
+      "kind": "Return",
+      "line_start": 118,
+      "line_end": 118,
+      "column": 12,
+      "owner": "FixerDispatchGuard._observe",
+      "representation_line": 110
+    },
+    {
+      "kind": "If",
+      "line_start": 119,
+      "line_end": 121,
+      "column": 8,
+      "owner": "FixerDispatchGuard._observe",
+      "representation_line": 113
+    },
+    {
+      "kind": "Expr",
+      "line_start": 120,
+      "line_end": 120,
+      "column": 12,
+      "owner": "FixerDispatchGuard._observe",
+      "representation_line": 116
+    },
+    {
+      "kind": "Return",
+      "line_start": 121,
+      "line_end": 121,
+      "column": 12,
+      "owner": "FixerDispatchGuard._observe",
+      "representation_line": 117
+    },
+    {
+      "kind": "Assign",
+      "line_start": 122,
+      "line_end": 122,
+      "column": 8,
+      "owner": "FixerDispatchGuard._observe",
+      "representation_line": 121
+    },
+    {
+      "kind": "If",
+      "line_start": 123,
+      "line_end": 125,
+      "column": 8,
+      "owner": "FixerDispatchGuard._observe",
+      "representation_line": 122
+    },
+    {
+      "kind": "Expr",
+      "line_start": 124,
+      "line_end": 124,
+      "column": 12,
+      "owner": "FixerDispatchGuard._observe",
+      "representation_line": 125
+    },
+    {
+      "kind": "Return",
+      "line_start": 125,
+      "line_end": 125,
+      "column": 12,
+      "owner": "FixerDispatchGuard._observe",
+      "representation_line": 126
+    },
+    {
+      "kind": "Assign",
+      "line_start": 127,
+      "line_end": 127,
+      "column": 8,
+      "owner": "FixerDispatchGuard._observe",
+      "representation_line": 130
+    },
+    {
+      "kind": "If",
+      "line_start": 128,
+      "line_end": 133,
+      "column": 8,
+      "owner": "FixerDispatchGuard._observe",
+      "representation_line": 131
+    },
+    {
+      "kind": "Expr",
+      "line_start": 129,
+      "line_end": 131,
+      "column": 12,
+      "owner": "FixerDispatchGuard._observe",
+      "representation_line": 134
+    },
+    {
+      "kind": "If",
+      "line_start": 132,
+      "line_end": 133,
+      "column": 8,
+      "owner": "FixerDispatchGuard._observe",
+      "representation_line": 137
+    },
+    {
+      "kind": "Expr",
+      "line_start": 133,
+      "line_end": 133,
+      "column": 12,
+      "owner": "FixerDispatchGuard._observe",
+      "representation_line": 140
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 135,
+      "line_end": 145,
+      "column": 4,
+      "owner": "FixerDispatchGuard",
+      "representation_line": 145
+    },
+    {
+      "kind": "If",
+      "line_start": 136,
+      "line_end": 145,
+      "column": 8,
+      "owner": "FixerDispatchGuard._record_transient",
+      "representation_line": 150
+    },
+    {
+      "kind": "Assign",
+      "line_start": 137,
+      "line_end": 137,
+      "column": 12,
+      "owner": "FixerDispatchGuard._record_transient",
+      "representation_line": 153
+    },
+    {
+      "kind": "Expr",
+      "line_start": 138,
+      "line_end": 140,
+      "column": 12,
+      "owner": "FixerDispatchGuard._record_transient",
+      "representation_line": 153
+    },
+    {
+      "kind": "Assign",
+      "line_start": 142,
+      "line_end": 142,
+      "column": 12,
+      "owner": "FixerDispatchGuard._record_transient",
+      "representation_line": 157
+    },
+    {
+      "kind": "Expr",
+      "line_start": 143,
+      "line_end": 145,
+      "column": 12,
+      "owner": "FixerDispatchGuard._record_transient",
+      "representation_line": 157
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 147,
+      "line_end": 169,
+      "column": 4,
+      "owner": "FixerDispatchGuard",
+      "representation_line": 161
+    },
+    {
+      "kind": "Expr",
+      "line_start": 152,
+      "line_end": 152,
+      "column": 8,
+      "owner": "FixerDispatchGuard.wrap_tool_call",
+      "representation_line": 167
+    },
+    {
+      "kind": "If",
+      "line_start": 153,
+      "line_end": 154,
+      "column": 8,
+      "owner": "FixerDispatchGuard.wrap_tool_call",
+      "representation_line": 168
+    },
+    {
+      "kind": "Return",
+      "line_start": 154,
+      "line_end": 154,
+      "column": 12,
+      "owner": "FixerDispatchGuard.wrap_tool_call",
+      "representation_line": 170
+    },
+    {
+      "kind": "Assign",
+      "line_start": 155,
+      "line_end": 155,
+      "column": 8,
+      "owner": "FixerDispatchGuard.wrap_tool_call",
+      "representation_line": 174
+    },
+    {
+      "kind": "If",
+      "line_start": 156,
+      "line_end": 157,
+      "column": 8,
+      "owner": "FixerDispatchGuard.wrap_tool_call",
+      "representation_line": 175
+    },
+    {
+      "kind": "Return",
+      "line_start": 157,
+      "line_end": 157,
+      "column": 12,
+      "owner": "FixerDispatchGuard.wrap_tool_call",
+      "representation_line": 177
+    },
+    {
+      "kind": "Try",
+      "line_start": 158,
+      "line_end": 166,
+      "column": 8,
+      "owner": "FixerDispatchGuard.wrap_tool_call",
+      "representation_line": 180
+    },
+    {
+      "kind": "Assign",
+      "line_start": 159,
+      "line_end": 159,
+      "column": 12,
+      "owner": "FixerDispatchGuard.wrap_tool_call",
+      "representation_line": 183
+    },
+    {
+      "kind": "Expr",
+      "line_start": 161,
+      "line_end": 161,
+      "column": 12,
+      "owner": "FixerDispatchGuard.wrap_tool_call",
+      "representation_line": 188
+    },
+    {
+      "kind": "Return",
+      "line_start": 162,
+      "line_end": 166,
+      "column": 12,
+      "owner": "FixerDispatchGuard.wrap_tool_call",
+      "representation_line": 189
+    },
+    {
+      "kind": "If",
+      "line_start": 167,
+      "line_end": 168,
+      "column": 8,
+      "owner": "FixerDispatchGuard.wrap_tool_call",
+      "representation_line": 192
+    },
+    {
+      "kind": "Expr",
+      "line_start": 168,
+      "line_end": 168,
+      "column": 12,
+      "owner": "FixerDispatchGuard.wrap_tool_call",
+      "representation_line": 195
+    },
+    {
+      "kind": "Return",
+      "line_start": 169,
+      "line_end": 169,
+      "column": 8,
+      "owner": "FixerDispatchGuard.wrap_tool_call",
+      "representation_line": 197
+    },
+    {
+      "kind": "AsyncFunctionDef",
+      "line_start": 171,
+      "line_end": 193,
+      "column": 4,
+      "owner": "FixerDispatchGuard",
+      "representation_line": 201
+    },
+    {
+      "kind": "Expr",
+      "line_start": 176,
+      "line_end": 176,
+      "column": 8,
+      "owner": "FixerDispatchGuard.awrap_tool_call",
+      "representation_line": 208
+    },
+    {
+      "kind": "If",
+      "line_start": 177,
+      "line_end": 178,
+      "column": 8,
+      "owner": "FixerDispatchGuard.awrap_tool_call",
+      "representation_line": 209
+    },
+    {
+      "kind": "Return",
+      "line_start": 178,
+      "line_end": 178,
+      "column": 12,
+      "owner": "FixerDispatchGuard.awrap_tool_call",
+      "representation_line": 211
+    },
+    {
+      "kind": "Assign",
+      "line_start": 179,
+      "line_end": 179,
+      "column": 8,
+      "owner": "FixerDispatchGuard.awrap_tool_call",
+      "representation_line": 215
+    },
+    {
+      "kind": "If",
+      "line_start": 180,
+      "line_end": 181,
+      "column": 8,
+      "owner": "FixerDispatchGuard.awrap_tool_call",
+      "representation_line": 216
+    },
+    {
+      "kind": "Return",
+      "line_start": 181,
+      "line_end": 181,
+      "column": 12,
+      "owner": "FixerDispatchGuard.awrap_tool_call",
+      "representation_line": 218
+    },
+    {
+      "kind": "Try",
+      "line_start": 182,
+      "line_end": 190,
+      "column": 8,
+      "owner": "FixerDispatchGuard.awrap_tool_call",
+      "representation_line": 221
+    },
+    {
+      "kind": "Assign",
+      "line_start": 183,
+      "line_end": 183,
+      "column": 12,
+      "owner": "FixerDispatchGuard.awrap_tool_call",
+      "representation_line": 224
+    },
+    {
+      "kind": "Expr",
+      "line_start": 185,
+      "line_end": 185,
+      "column": 12,
+      "owner": "FixerDispatchGuard.awrap_tool_call",
+      "representation_line": 229
+    },
+    {
+      "kind": "Return",
+      "line_start": 186,
+      "line_end": 190,
+      "column": 12,
+      "owner": "FixerDispatchGuard.awrap_tool_call",
+      "representation_line": 230
+    },
+    {
+      "kind": "If",
+      "line_start": 191,
+      "line_end": 192,
+      "column": 8,
+      "owner": "FixerDispatchGuard.awrap_tool_call",
+      "representation_line": 233
+    },
+    {
+      "kind": "Expr",
+      "line_start": 192,
+      "line_end": 192,
+      "column": 12,
+      "owner": "FixerDispatchGuard.awrap_tool_call",
+      "representation_line": 236
+    },
+    {
+      "kind": "Return",
+      "line_start": 193,
+      "line_end": 193,
+      "column": 8,
+      "owner": "FixerDispatchGuard.awrap_tool_call",
+      "representation_line": 238
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 196,
+      "line_end": 223,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 243
+    },
+    {
+      "kind": "Expr",
+      "line_start": 197,
+      "line_end": 197,
+      "column": 4,
+      "owner": "_invalid_spec",
+      "representation_line": 249
+    },
+    {
+      "kind": "If",
+      "line_start": 198,
+      "line_end": 199,
+      "column": 4,
+      "owner": "_invalid_spec",
+      "representation_line": 250
+    },
+    {
+      "kind": "Return",
+      "line_start": 199,
+      "line_end": 199,
+      "column": 8,
+      "owner": "_invalid_spec",
+      "representation_line": 252
+    },
+    {
+      "kind": "Assign",
+      "line_start": 200,
+      "line_end": 200,
+      "column": 4,
+      "owner": "_invalid_spec",
+      "representation_line": 256
+    },
+    {
+      "kind": "Assign",
+      "line_start": 201,
+      "line_end": 201,
+      "column": 4,
+      "owner": "_invalid_spec",
+      "representation_line": 256
+    },
+    {
+      "kind": "Assign",
+      "line_start": 202,
+      "line_end": 203,
+      "column": 4,
+      "owner": "_invalid_spec",
+      "representation_line": 256
+    },
+    {
+      "kind": "If",
+      "line_start": 204,
+      "line_end": 205,
+      "column": 4,
+      "owner": "_invalid_spec",
+      "representation_line": 257
+    },
+    {
+      "kind": "Return",
+      "line_start": 205,
+      "line_end": 205,
+      "column": 8,
+      "owner": "_invalid_spec",
+      "representation_line": 259
+    },
+    {
+      "kind": "Assign",
+      "line_start": 206,
+      "line_end": 206,
+      "column": 4,
+      "owner": "_invalid_spec",
+      "representation_line": 263
+    },
+    {
+      "kind": "If",
+      "line_start": 207,
+      "line_end": 208,
+      "column": 4,
+      "owner": "_invalid_spec",
+      "representation_line": 264
+    },
+    {
+      "kind": "Return",
+      "line_start": 208,
+      "line_end": 208,
+      "column": 8,
+      "owner": "_invalid_spec",
+      "representation_line": 266
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 209,
+      "line_end": 209,
+      "column": 4,
+      "owner": "_invalid_spec",
+      "representation_line": 270
+    },
+    {
+      "kind": "For",
+      "line_start": 210,
+      "line_end": 215,
+      "column": 4,
+      "owner": "_invalid_spec",
+      "representation_line": 271
+    },
+    {
+      "kind": "Assign",
+      "line_start": 211,
+      "line_end": 211,
+      "column": 8,
+      "owner": "_invalid_spec",
+      "representation_line": 274
+    },
+    {
+      "kind": "Assign",
+      "line_start": 212,
+      "line_end": 212,
+      "column": 8,
+      "owner": "_invalid_spec",
+      "representation_line": 274
+    },
+    {
+      "kind": "Assign",
+      "line_start": 213,
+      "line_end": 213,
+      "column": 8,
+      "owner": "_invalid_spec",
+      "representation_line": 274
+    },
+    {
+      "kind": "If",
+      "line_start": 214,
+      "line_end": 215,
+      "column": 8,
+      "owner": "_invalid_spec",
+      "representation_line": 275
+    },
+    {
+      "kind": "Return",
+      "line_start": 215,
+      "line_end": 215,
+      "column": 12,
+      "owner": "_invalid_spec",
+      "representation_line": 277
+    },
+    {
+      "kind": "Assign",
+      "line_start": 216,
+      "line_end": 216,
+      "column": 4,
+      "owner": "_invalid_spec",
+      "representation_line": 282
+    },
+    {
+      "kind": "If",
+      "line_start": 217,
+      "line_end": 218,
+      "column": 4,
+      "owner": "_invalid_spec",
+      "representation_line": 283
+    },
+    {
+      "kind": "Return",
+      "line_start": 218,
+      "line_end": 218,
+      "column": 8,
+      "owner": "_invalid_spec",
+      "representation_line": 285
+    },
+    {
+      "kind": "For",
+      "line_start": 219,
+      "line_end": 222,
+      "column": 4,
+      "owner": "_invalid_spec",
+      "representation_line": 288
+    },
+    {
+      "kind": "If",
+      "line_start": 221,
+      "line_end": 222,
+      "column": 8,
+      "owner": "_invalid_spec",
+      "representation_line": 290
+    },
+    {
+      "kind": "Return",
+      "line_start": 222,
+      "line_end": 222,
+      "column": 12,
+      "owner": "_invalid_spec",
+      "representation_line": 292
+    },
+    {
+      "kind": "Return",
+      "line_start": 223,
+      "line_end": 223,
+      "column": 4,
+      "owner": "_invalid_spec",
+      "representation_line": 296
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 226,
+      "line_end": 233,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 300
+    },
+    {
+      "kind": "If",
+      "line_start": 227,
+      "line_end": 228,
+      "column": 4,
+      "owner": "_result_message",
+      "representation_line": 305
+    },
+    {
+      "kind": "Return",
+      "line_start": 228,
+      "line_end": 228,
+      "column": 8,
+      "owner": "_result_message",
+      "representation_line": 307
+    },
+    {
+      "kind": "Assign",
+      "line_start": 229,
+      "line_end": 229,
+      "column": 4,
+      "owner": "_result_message",
+      "representation_line": 311
+    },
+    {
+      "kind": "Assign",
+      "line_start": 230,
+      "line_end": 230,
+      "column": 4,
+      "owner": "_result_message",
+      "representation_line": 311
+    },
+    {
+      "kind": "If",
+      "line_start": 231,
+      "line_end": 232,
+      "column": 4,
+      "owner": "_result_message",
+      "representation_line": 312
+    },
+    {
+      "kind": "Return",
+      "line_start": 232,
+      "line_end": 232,
+      "column": 8,
+      "owner": "_result_message",
+      "representation_line": 314
+    },
+    {
+      "kind": "Return",
+      "line_start": 233,
+      "line_end": 233,
+      "column": 4,
+      "owner": "_result_message",
+      "representation_line": 317
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 236,
+      "line_end": 242,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 321
+    },
+    {
+      "kind": "If",
+      "line_start": 237,
+      "line_end": 238,
+      "column": 4,
+      "owner": "_fixer_result",
+      "representation_line": 326
+    },
+    {
+      "kind": "Return",
+      "line_start": 238,
+      "line_end": 238,
+      "column": 8,
+      "owner": "_fixer_result",
+      "representation_line": 328
+    },
+    {
+      "kind": "Try",
+      "line_start": 239,
+      "line_end": 242,
+      "column": 4,
+      "owner": "_fixer_result",
+      "representation_line": 331
+    },
+    {
+      "kind": "Return",
+      "line_start": 240,
+      "line_end": 240,
+      "column": 8,
+      "owner": "_fixer_result",
+      "representation_line": 333
+    },
+    {
+      "kind": "Return",
+      "line_start": 242,
+      "line_end": 242,
+      "column": 8,
+      "owner": "_fixer_result",
+      "representation_line": 338
+    },
+    {
+      "kind": "Assign",
+      "line_start": 245,
+      "line_end": 245,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 344
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 31,
+      "line_end": 31,
+      "column": 6,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='logs', ctx=Load()), attr='get_logger', ctx=Load()), args=[Name(id='__name__', ctx=Load())], keywords=[])",
+      "rendered": "logs.get_logger(__name__)"
+    },
+    {
+      "line_start": 33,
+      "line_end": 33,
+      "column": 13,
+      "kind": "Constant",
+      "original_ast": "Constant(value='task')",
+      "rendered": "'task'"
+    },
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 9,
+      "kind": "Constant",
+      "original_ast": "Constant(value='fixer')",
+      "rendered": "'fixer'"
+    },
+    {
+      "line_start": 35,
+      "line_end": 40,
+      "column": 21,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value='VULNERABILITY CONTEXT:'), Constant(value='TARGET FILES:'), Constant(value='EDIT INSTRUCTIONS:'), Constant(value='SUCCESS CRITERIA:')], ctx=Load())",
+      "rendered": "('VULNERABILITY CONTEXT:', 'TARGET FILES:', 'EDIT INSTRUCTIONS:', 'SUCCESS CRITERIA:')"
+    },
+    {
+      "line_start": 43,
+      "line_end": 43,
+      "column": 25,
+      "kind": "Name",
+      "original_ast": "Name(id='AgentMiddleware', ctx=Load())",
+      "rendered": "AgentMiddleware"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Name(id='super', ctx=Load()), args=[], keywords=[]), attr='__init__', ctx=Load()), args=[], keywords=[])",
+      "rendered": "super().__init__()"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 32,
+      "kind": "Name",
+      "original_ast": "Name(id='finding_context', ctx=Load())",
+      "rendered": "finding_context"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 29,
+      "kind": "Name",
+      "original_ast": "Name(id='primary_file', ctx=Load())",
+      "rendered": "primary_file"
+    },
+    {
+      "line_start": 50,
+      "line_end": 50,
+      "column": 25,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 51,
+      "line_end": 51,
+      "column": 30,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 52,
+      "line_end": 52,
+      "column": 25,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 37,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 56,
+      "line_end": 56,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Attribute(value=Name(id='Event', ctx=Load()), attr='FIXER_DISPATCH_REFUSED', ctx=Load())], keywords=[keyword(arg='detail', value=Name(id='detail', ctx=Load()))])",
+      "rendered": "log.warning(Event.FIXER_DISPATCH_REFUSED, detail=detail)"
+    },
+    {
+      "line_start": 57,
+      "line_end": 62,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ToolMessage', ctx=Load()), args=[], keywords=[keyword(arg='content', value=JoinedStr(values=[Constant(value='Fixer dispatch was not executed: '), FormattedValue(value=Name(id='detail', ctx=Load()), conversion=-1)])), keyword(arg='name', value=Name(id='_TASK_TOOL', ctx=Load())), keyword(arg='tool_call_id', value=BoolOp(op=Or(), values=[Call(func=Attribute(value=Attribute(value=Name(id='request', ctx=Load()), attr='tool_call', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='id')], keywords=[]), Constant(value='')])), keyword(arg='status', value=Constant(value='error'))])",
+      "rendered": "ToolMessage(content=source_template_58_20, name=_TASK_TOOL, tool_call_id=request.tool_call.get('id') or '', status='error')"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 15,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='request', ctx=Load()), attr='tool_call', ctx=Load())",
+      "rendered": "request.tool_call"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Attribute(value=Name(id='call', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='name')], keywords=[]), ops=[NotEq()], comparators=[Name(id='_TASK_TOOL', ctx=Load())])",
+      "rendered": "call.get('name') != _TASK_TOOL"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='request', ctx=Load())",
+      "rendered": "request"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='call', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='args')], keywords=[])",
+      "rendered": "call.get('args')"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='args', ctx=Load()), Name(id='Mapping', ctx=Load())], keywords=[]))",
+      "rendered": "not isinstance(args, Mapping)"
+    },
+    {
+      "line_start": 70,
+      "line_end": 70,
+      "column": 29,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_refusal', ctx=Load()), args=[Name(id='request', ctx=Load()), Constant(value='task arguments were not an object; return Not Fixed')], keywords=[])",
+      "rendered": "self._refusal(request, 'task arguments were not an object; return Not Fixed')"
+    },
+    {
+      "line_start": 72,
+      "line_end": 72,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Attribute(value=Name(id='args', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='subagent_type')], keywords=[]), ops=[NotEq()], comparators=[Name(id='_FIXER', ctx=Load())])",
+      "rendered": "args.get('subagent_type') != _FIXER"
+    },
+    {
+      "line_start": 73,
+      "line_end": 73,
+      "column": 29,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 74,
+      "line_end": 74,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_refusal', ctx=Load()), args=[Name(id='request', ctx=Load()), Constant(value=\"S10 permits only subagent_type='fixer'\")], keywords=[])",
+      "rendered": "self._refusal(request, \"S10 permits only subagent_type='fixer'\")"
+    },
+    {
+      "line_start": 75,
+      "line_end": 75,
+      "column": 11,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_terminal', ctx=Load())",
+      "rendered": "self._terminal"
+    },
+    {
+      "line_start": 76,
+      "line_end": 77,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_refusal', ctx=Load()), args=[Name(id='request', ctx=Load()), Constant(value='the fixer already returned a completed result; do not retry')], keywords=[])",
+      "rendered": "self._refusal(request, 'the fixer already returned a completed result; do not retry')"
+    },
+    {
+      "line_start": 78,
+      "line_end": 78,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Attribute(value=Name(id='self', ctx=Load()), attr='_attempts', ctx=Load()), UnaryOp(op=Not(), operand=Attribute(value=Name(id='self', ctx=Load()), attr='_retry_allowed', ctx=Load()))])",
+      "rendered": "self._attempts and (not self._retry_allowed)"
+    },
+    {
+      "line_start": 79,
+      "line_end": 80,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_refusal', ctx=Load()), args=[Name(id='request', ctx=Load()), Constant(value='a retry is allowed only after an explicit transient tool error')], keywords=[])",
+      "rendered": "self._refusal(request, 'a retry is allowed only after an explicit transient tool error')"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='args', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='description')], keywords=[])",
+      "rendered": "args.get('description')"
+    },
+    {
+      "line_start": 83,
+      "line_end": 83,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_invalid_spec', ctx=Load()), args=[Name(id='description', ctx=Load()), Attribute(value=Name(id='self', ctx=Load()), attr='_primary_file', ctx=Load())], keywords=[])",
+      "rendered": "_invalid_spec(description, self._primary_file)"
+    },
+    {
+      "line_start": 84,
+      "line_end": 84,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='problem', ctx=Load())",
+      "rendered": "problem"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Attribute(value=Name(id='self', ctx=Load()), attr='_malformed_rejections', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "self._malformed_rejections += 1"
+    },
+    {
+      "line_start": 87,
+      "line_end": 87,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='self', ctx=Load()), attr='_malformed_rejections', ctx=Load()), ops=[GtE()], comparators=[Constant(value=2)])",
+      "rendered": "self._malformed_rejections >= 2"
+    },
+    {
+      "line_start": 88,
+      "line_end": 88,
+      "column": 33,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 89,
+      "line_end": 92,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_refusal', ctx=Load()), args=[Name(id='request', ctx=Load()), JoinedStr(values=[Constant(value='incomplete edit specification ('), FormattedValue(value=Name(id='problem', ctx=Load()), conversion=-1), Constant(value='); no further attempts permitted; return Not Fixed')])], keywords=[])",
+      "rendered": "self._refusal(request, source_template_91_20)"
+    },
+    {
+      "line_start": 93,
+      "line_end": 96,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_refusal', ctx=Load()), args=[Name(id='request', ctx=Load()), JoinedStr(values=[Constant(value='incomplete edit specification ('), FormattedValue(value=Name(id='problem', ctx=Load()), conversion=-1), Constant(value='); one corrected re-dispatch is permitted')])], keywords=[])",
+      "rendered": "self._refusal(request, source_template_95_16)"
+    },
+    {
+      "line_start": 97,
+      "line_end": 97,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='description', ctx=Load()), Name(id='str', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(description, str)"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Attribute(value=Name(id='self', ctx=Load()), attr='_attempts', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "self._attempts += 1"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 30,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 102,
+      "line_end": 105,
+      "column": 12,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[FormattedValue(value=Call(func=Attribute(value=Name(id='description', ctx=Load()), attr='rstrip', ctx=Load()), args=[], keywords=[]), conversion=-1), Constant(value='\\n\\n=== AUTHORITATIVE SAST FINDING CONTEXT ===\\n'), FormattedValue(value=Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_finding_context', ctx=Load()), attr='strip', ctx=Load()), args=[], keywords=[]), conversion=-1), Constant(value='\\n=== END AUTHORITATIVE CONTEXT ===')])",
+      "rendered": "source_template_102_12"
+    },
+    {
+      "line_start": 107,
+      "line_end": 107,
+      "column": 23,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[None, Constant(value='description')], values=[Name(id='args', ctx=Load()), Name(id='enriched', ctx=Load())])",
+      "rendered": "{**args, 'description': enriched}"
+    },
+    {
+      "line_start": 108,
+      "line_end": 111,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='  [remediation] dispatching complete fixer specification (attempt '), FormattedValue(value=Attribute(value=Name(id='self', ctx=Load()), attr='_attempts', ctx=Load()), conversion=-1), Constant(value='/2, '), FormattedValue(value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='enriched', ctx=Load())], keywords=[]), conversion=-1), Constant(value=' chars)')])], keywords=[])",
+      "rendered": "console.write(source_template_109_12)"
+    },
+    {
+      "line_start": 112,
+      "line_end": 112,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='request', ctx=Load()), attr='override', ctx=Load()), args=[], keywords=[keyword(arg='tool_call', value=Dict(keys=[None, Constant(value='args')], values=[Name(id='call', ctx=Load()), Name(id='amended_args', ctx=Load())]))])",
+      "rendered": "request.override(tool_call={**call, 'args': amended_args})"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_result_message', ctx=Load()), args=[Name(id='result', ctx=Load())], keywords=[])",
+      "rendered": "_result_message(result)"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='message', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "message is None"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 29,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='message', ctx=Load()), Constant(value='status'), Constant(value='success')], keywords=[]), ops=[Eq()], comparators=[Constant(value='error')])",
+      "rendered": "getattr(message, 'status', 'success') == 'error'"
+    },
+    {
+      "line_start": 120,
+      "line_end": 120,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_record_transient', ctx=Load()), args=[], keywords=[])",
+      "rendered": "self._record_transient()"
+    },
+    {
+      "line_start": 122,
+      "line_end": 122,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_fixer_result', ctx=Load()), args=[Attribute(value=Name(id='message', ctx=Load()), attr='content', ctx=Load())], keywords=[])",
+      "rendered": "_fixer_result(message.content)"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='parsed', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), Compare(left=Attribute(value=Name(id='parsed', ctx=Load()), attr='status', ctx=Load()), ops=[Eq()], comparators=[Constant(value='tool_error')]), Attribute(value=Name(id='parsed', ctx=Load()), attr='retryable', ctx=Load())])",
+      "rendered": "parsed is not None and parsed.status == 'tool_error' and parsed.retryable"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_record_transient', ctx=Load()), args=[], keywords=[])",
+      "rendered": "self._record_transient()"
+    },
+    {
+      "line_start": 127,
+      "line_end": 127,
+      "column": 25,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 128,
+      "line_end": 128,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='parsed', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "parsed is None"
+    },
+    {
+      "line_start": 129,
+      "line_end": 131,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Constant(value='fixer returned an invalid result; no retry permitted')], keywords=[])",
+      "rendered": "log.warning('fixer returned an invalid result; no retry permitted')"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 13,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='parsed', ctx=Load()), attr='status', ctx=Load()), ops=[NotEq()], comparators=[Constant(value='applied')])",
+      "rendered": "parsed.status != 'applied'"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Attribute(value=Name(id='Event', ctx=Load()), attr='FIXER_STATUS_NO_RETRY', ctx=Load())], keywords=[keyword(arg='status', value=Attribute(value=Name(id='parsed', ctx=Load()), attr='status', ctx=Load()))])",
+      "rendered": "log.warning(Event.FIXER_STATUS_NO_RETRY, status=parsed.status)"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='self', ctx=Load()), attr='_attempts', ctx=Load()), ops=[Lt()], comparators=[Constant(value=2)])",
+      "rendered": "self._attempts < 2"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 34,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 138,
+      "line_end": 140,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Constant(value='fixer reported a transient tool error — one retry is permitted')], keywords=[])",
+      "rendered": "log.warning('fixer reported a transient tool error — one retry is permitted')"
+    },
+    {
+      "line_start": 142,
+      "line_end": 142,
+      "column": 29,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 143,
+      "line_end": 145,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Constant(value='fixer transient retry exhausted — return Not Fixed')], keywords=[])",
+      "rendered": "log.warning('fixer transient retry exhausted — return Not Fixed')"
+    },
+    {
+      "line_start": 153,
+      "line_end": 153,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Attribute(value=Attribute(value=Name(id='request', ctx=Load()), attr='tool_call', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='name')], keywords=[]), ops=[NotEq()], comparators=[Name(id='_TASK_TOOL', ctx=Load())])",
+      "rendered": "request.tool_call.get('name') != _TASK_TOOL"
+    },
+    {
+      "line_start": 154,
+      "line_end": 154,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='handler', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[])",
+      "rendered": "handler(request)"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_prepare', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[])",
+      "rendered": "self._prepare(request)"
+    },
+    {
+      "line_start": 156,
+      "line_end": 156,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='prepared', ctx=Load()), Name(id='ToolMessage', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(prepared, ToolMessage)"
+    },
+    {
+      "line_start": 157,
+      "line_end": 157,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='prepared', ctx=Load())",
+      "rendered": "prepared"
+    },
+    {
+      "line_start": 159,
+      "line_end": 159,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='handler', ctx=Load()), args=[Name(id='prepared', ctx=Load())], keywords=[])",
+      "rendered": "handler(prepared)"
+    },
+    {
+      "line_start": 160,
+      "line_end": 160,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 161,
+      "line_end": 161,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_record_transient', ctx=Load()), args=[], keywords=[])",
+      "rendered": "self._record_transient()"
+    },
+    {
+      "line_start": 162,
+      "line_end": 166,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_refusal', ctx=Load()), args=[Name(id='request', ctx=Load()), JoinedStr(values=[Constant(value='transient fixer tool error ('), FormattedValue(value=Attribute(value=Call(func=Name(id='type', ctx=Load()), args=[Name(id='exc', ctx=Load())], keywords=[]), attr='__name__', ctx=Load()), conversion=-1), Constant(value='); '), FormattedValue(value=IfExp(test=Attribute(value=Name(id='self', ctx=Load()), attr='_retry_allowed', ctx=Load()), body=Constant(value='retry once'), orelse=Constant(value='retry exhausted')), conversion=-1)])], keywords=[])",
+      "rendered": "self._refusal(request, source_template_164_16)"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Attribute(value=Attribute(value=Name(id='request', ctx=Load()), attr='tool_call', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='name')], keywords=[]), ops=[Eq()], comparators=[Name(id='_TASK_TOOL', ctx=Load())])",
+      "rendered": "request.tool_call.get('name') == _TASK_TOOL"
+    },
+    {
+      "line_start": 168,
+      "line_end": 168,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_observe', ctx=Load()), args=[Name(id='result', ctx=Load())], keywords=[])",
+      "rendered": "self._observe(result)"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='result', ctx=Load())",
+      "rendered": "result"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Attribute(value=Attribute(value=Name(id='request', ctx=Load()), attr='tool_call', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='name')], keywords=[]), ops=[NotEq()], comparators=[Name(id='_TASK_TOOL', ctx=Load())])",
+      "rendered": "request.tool_call.get('name') != _TASK_TOOL"
+    },
+    {
+      "line_start": 178,
+      "line_end": 178,
+      "column": 19,
+      "kind": "Await",
+      "original_ast": "Await(value=Call(func=Name(id='handler', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[]))",
+      "rendered": "await handler(request)"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_prepare', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[])",
+      "rendered": "self._prepare(request)"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='prepared', ctx=Load()), Name(id='ToolMessage', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(prepared, ToolMessage)"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='prepared', ctx=Load())",
+      "rendered": "prepared"
+    },
+    {
+      "line_start": 183,
+      "line_end": 183,
+      "column": 21,
+      "kind": "Await",
+      "original_ast": "Await(value=Call(func=Name(id='handler', ctx=Load()), args=[Name(id='prepared', ctx=Load())], keywords=[]))",
+      "rendered": "await handler(prepared)"
+    },
+    {
+      "line_start": 184,
+      "line_end": 184,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 185,
+      "line_end": 185,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_record_transient', ctx=Load()), args=[], keywords=[])",
+      "rendered": "self._record_transient()"
+    },
+    {
+      "line_start": 186,
+      "line_end": 190,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_refusal', ctx=Load()), args=[Name(id='request', ctx=Load()), JoinedStr(values=[Constant(value='transient fixer tool error ('), FormattedValue(value=Attribute(value=Call(func=Name(id='type', ctx=Load()), args=[Name(id='exc', ctx=Load())], keywords=[]), attr='__name__', ctx=Load()), conversion=-1), Constant(value='); '), FormattedValue(value=IfExp(test=Attribute(value=Name(id='self', ctx=Load()), attr='_retry_allowed', ctx=Load()), body=Constant(value='retry once'), orelse=Constant(value='retry exhausted')), conversion=-1)])], keywords=[])",
+      "rendered": "self._refusal(request, source_template_188_16)"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Attribute(value=Attribute(value=Name(id='request', ctx=Load()), attr='tool_call', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='name')], keywords=[]), ops=[Eq()], comparators=[Name(id='_TASK_TOOL', ctx=Load())])",
+      "rendered": "request.tool_call.get('name') == _TASK_TOOL"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_observe', ctx=Load()), args=[Name(id='result', ctx=Load())], keywords=[])",
+      "rendered": "self._observe(result)"
+    },
+    {
+      "line_start": 193,
+      "line_end": 193,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='result', ctx=Load())",
+      "rendered": "result"
+    },
+    {
+      "line_start": 198,
+      "line_end": 198,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[UnaryOp(op=Not(), operand=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='description', ctx=Load()), Name(id='str', ctx=Load())], keywords=[])), UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='description', ctx=Load()), attr='strip', ctx=Load()), args=[], keywords=[]))])",
+      "rendered": "not isinstance(description, str) or not description.strip()"
+    },
+    {
+      "line_start": 199,
+      "line_end": 199,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value='missing description')",
+      "rendered": "'missing description'"
+    },
+    {
+      "line_start": 200,
+      "line_end": 200,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='description', ctx=Load()), attr='casefold', ctx=Load()), args=[], keywords=[])",
+      "rendered": "description.casefold()"
+    },
+    {
+      "line_start": 201,
+      "line_end": 201,
+      "column": 14,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Call(func=Attribute(value=Name(id='section', ctx=Load()), attr='casefold', ctx=Load()), args=[], keywords=[]), generators=[comprehension(target=Name(id='section', ctx=Store()), iter=Name(id='_REQUIRED_SECTIONS', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "[section.casefold() for section in _REQUIRED_SECTIONS]"
+    },
+    {
+      "line_start": 202,
+      "line_end": 203,
+      "column": 14,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='section', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='section', ctx=Store()), Name(id='marker', ctx=Store())], ctx=Store()), iter=Call(func=Name(id='zip', ctx=Load()), args=[Name(id='_REQUIRED_SECTIONS', ctx=Load()), Name(id='markers', ctx=Load())], keywords=[]), ifs=[Compare(left=Name(id='marker', ctx=Load()), ops=[NotIn()], comparators=[Name(id='folded', ctx=Load())])], is_async=0)])",
+      "rendered": "[section for section, marker in zip(_REQUIRED_SECTIONS, markers) if marker not in folded]"
+    },
+    {
+      "line_start": 204,
+      "line_end": 204,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='missing', ctx=Load())",
+      "rendered": "missing"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 15,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[Constant(value='missing section(s): '), FormattedValue(value=Call(func=Attribute(value=Constant(value=', '), attr='join', ctx=Load()), args=[Name(id='missing', ctx=Load())], keywords=[]), conversion=-1)])",
+      "rendered": "source_template_205_15"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 16,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Call(func=Attribute(value=Name(id='folded', ctx=Load()), attr='index', ctx=Load()), args=[Name(id='marker', ctx=Load())], keywords=[]), generators=[comprehension(target=Name(id='marker', ctx=Store()), iter=Name(id='markers', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "[folded.index(marker) for marker in markers]"
+    },
+    {
+      "line_start": 207,
+      "line_end": 207,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='positions', ctx=Load()), ops=[NotEq()], comparators=[Call(func=Name(id='sorted', ctx=Load()), args=[Name(id='positions', ctx=Load())], keywords=[])])",
+      "rendered": "positions != sorted(positions)"
+    },
+    {
+      "line_start": 208,
+      "line_end": 208,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value='required sections are out of order')",
+      "rendered": "'required sections are out of order'"
+    },
+    {
+      "line_start": 209,
+      "line_end": 209,
+      "column": 29,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 210,
+      "line_end": 210,
+      "column": 36,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='enumerate', ctx=Load()), args=[Call(func=Name(id='zip', ctx=Load()), args=[Name(id='_REQUIRED_SECTIONS', ctx=Load()), Name(id='markers', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "enumerate(zip(_REQUIRED_SECTIONS, markers))"
+    },
+    {
+      "line_start": 211,
+      "line_end": 211,
+      "column": 16,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Subscript(value=Name(id='positions', ctx=Load()), slice=Name(id='index', ctx=Load()), ctx=Load()), op=Add(), right=Call(func=Name(id='len', ctx=Load()), args=[Name(id='marker', ctx=Load())], keywords=[]))",
+      "rendered": "positions[index] + len(marker)"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 14,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=BinOp(left=Name(id='index', ctx=Load()), op=Add(), right=Constant(value=1)), ops=[Lt()], comparators=[Call(func=Name(id='len', ctx=Load()), args=[Name(id='positions', ctx=Load())], keywords=[])]), body=Subscript(value=Name(id='positions', ctx=Load()), slice=BinOp(left=Name(id='index', ctx=Load()), op=Add(), right=Constant(value=1)), ctx=Load()), orelse=Call(func=Name(id='len', ctx=Load()), args=[Name(id='description', ctx=Load())], keywords=[]))",
+      "rendered": "positions[index + 1] if index + 1 < len(positions) else len(description)"
+    },
+    {
+      "line_start": 213,
+      "line_end": 213,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Subscript(value=Name(id='description', ctx=Load()), slice=Slice(lower=Name(id='start', ctx=Load()), upper=Name(id='end', ctx=Load())), ctx=Load()), attr='strip', ctx=Load()), args=[], keywords=[])",
+      "rendered": "description[start:end].strip()"
+    },
+    {
+      "line_start": 214,
+      "line_end": 214,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Subscript(value=Name(id='bodies', ctx=Load()), slice=Name(id='section', ctx=Load()), ctx=Load()))",
+      "rendered": "not bodies[section]"
+    },
+    {
+      "line_start": 215,
+      "line_end": 215,
+      "column": 19,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[Constant(value='section '), FormattedValue(value=Name(id='section', ctx=Load()), conversion=-1), Constant(value=' is empty')])",
+      "rendered": "source_template_215_19"
+    },
+    {
+      "line_start": 216,
+      "line_end": 216,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Subscript(value=Name(id='bodies', ctx=Load()), slice=Constant(value='TARGET FILES:'), ctx=Load()), attr='casefold', ctx=Load()), args=[], keywords=[])",
+      "rendered": "bodies['TARGET FILES:'].casefold()"
+    },
+    {
+      "line_start": 217,
+      "line_end": 217,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Name(id='primary_file', ctx=Load()), Compare(left=Call(func=Attribute(value=Name(id='primary_file', ctx=Load()), attr='casefold', ctx=Load()), args=[], keywords=[]), ops=[NotIn()], comparators=[Name(id='target_files', ctx=Load())])])",
+      "rendered": "primary_file and primary_file.casefold() not in target_files"
+    },
+    {
+      "line_start": 218,
+      "line_end": 218,
+      "column": 15,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[Constant(value='TARGET FILES does not name '), FormattedValue(value=Name(id='primary_file', ctx=Load()), conversion=-1)])",
+      "rendered": "source_template_218_15"
+    },
+    {
+      "line_start": 219,
+      "line_end": 220,
+      "column": 19,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value='VULNERABILITY CONTEXT:'), Constant(value='EDIT INSTRUCTIONS:'), Constant(value='SUCCESS CRITERIA:')], ctx=Load())",
+      "rendered": "('VULNERABILITY CONTEXT:', 'EDIT INSTRUCTIONS:', 'SUCCESS CRITERIA:')"
+    },
+    {
+      "line_start": 221,
+      "line_end": 221,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Subscript(value=Name(id='bodies', ctx=Load()), slice=Name(id='section', ctx=Load()), ctx=Load())], keywords=[]), ops=[Lt()], comparators=[Constant(value=12)])",
+      "rendered": "len(bodies[section]) < 12"
+    },
+    {
+      "line_start": 222,
+      "line_end": 222,
+      "column": 19,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[Constant(value='section '), FormattedValue(value=Name(id='section', ctx=Load()), conversion=-1), Constant(value=' is not substantive')])",
+      "rendered": "source_template_222_19"
+    },
+    {
+      "line_start": 223,
+      "line_end": 223,
+      "column": 11,
+      "kind": "Constant",
+      "original_ast": "Constant(value='')",
+      "rendered": "''"
+    },
+    {
+      "line_start": 227,
+      "line_end": 227,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='result', ctx=Load()), Name(id='ToolMessage', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(result, ToolMessage)"
+    },
+    {
+      "line_start": 228,
+      "line_end": 228,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='result', ctx=Load())",
+      "rendered": "result"
+    },
+    {
+      "line_start": 229,
+      "line_end": 229,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='result', ctx=Load()), Constant(value='update'), Constant(value=None)], keywords=[])",
+      "rendered": "getattr(result, 'update', None)"
+    },
+    {
+      "line_start": 230,
+      "line_end": 230,
+      "column": 15,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='update', ctx=Load()), Name(id='Mapping', ctx=Load())], keywords=[]), body=Call(func=Attribute(value=Name(id='update', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='messages'), List(elts=[], ctx=Load())], keywords=[]), orelse=List(elts=[], ctx=Load()))",
+      "rendered": "update.get('messages', []) if isinstance(update, Mapping) else []"
+    },
+    {
+      "line_start": 231,
+      "line_end": 231,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='messages', ctx=Load()), Name(id='Sequence', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(messages, Sequence)"
+    },
+    {
+      "line_start": 232,
+      "line_end": 232,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='next', ctx=Load()), args=[GeneratorExp(elt=Name(id='m', ctx=Load()), generators=[comprehension(target=Name(id='m', ctx=Store()), iter=Call(func=Name(id='reversed', ctx=Load()), args=[Name(id='messages', ctx=Load())], keywords=[]), ifs=[Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='m', ctx=Load()), Name(id='ToolMessage', ctx=Load())], keywords=[])], is_async=0)]), Constant(value=None)], keywords=[])",
+      "rendered": "next((m for m in reversed(messages) if isinstance(m, ToolMessage)), None)"
+    },
+    {
+      "line_start": 233,
+      "line_end": 233,
+      "column": 11,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 237,
+      "line_end": 237,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='content', ctx=Load()), Name(id='str', ctx=Load())], keywords=[]))",
+      "rendered": "not isinstance(content, str)"
+    },
+    {
+      "line_start": 238,
+      "line_end": 238,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 240,
+      "line_end": 240,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='FixerResult', ctx=Load()), attr='model_validate', ctx=Load()), args=[Call(func=Attribute(value=Name(id='json', ctx=Load()), attr='loads', ctx=Load()), args=[Name(id='content', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "FixerResult.model_validate(json.loads(content))"
+    },
+    {
+      "line_start": 241,
+      "line_end": 241,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='ValueError', ctx=Load()), Name(id='TypeError', ctx=Load()), Attribute(value=Name(id='json', ctx=Load()), attr='JSONDecodeError', ctx=Load())], ctx=Load())",
+      "rendered": "(ValueError, TypeError, json.JSONDecodeError)"
+    },
+    {
+      "line_start": 242,
+      "line_end": 242,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 245,
+      "line_end": 245,
+      "column": 10,
+      "kind": "List",
+      "original_ast": "List(elts=[Constant(value='FixerDispatchGuard')], ctx=Load())",
+      "rendered": "['FixerDispatchGuard']"
+    }
+  ],
+  "calls": [
+    {
+      "line": 31,
+      "end_line": 31,
+      "callee": "logs.get_logger",
+      "enclosing": "module initialization",
+      "expression": "logs.get_logger(__name__)"
+    },
+    {
+      "line": 200,
+      "end_line": 200,
+      "callee": "description.casefold",
+      "enclosing": "_invalid_spec",
+      "expression": "description.casefold()"
+    },
+    {
+      "line": 210,
+      "end_line": 210,
+      "callee": "enumerate",
+      "enclosing": "_invalid_spec",
+      "expression": "enumerate(zip(_REQUIRED_SECTIONS, markers))"
+    },
+    {
+      "line": 216,
+      "end_line": 216,
+      "callee": "bodies['TARGET FILES:'].casefold",
+      "enclosing": "_invalid_spec",
+      "expression": "bodies[\"TARGET FILES:\"].casefold()"
+    },
+    {
+      "line": 227,
+      "end_line": 227,
+      "callee": "isinstance",
+      "enclosing": "_result_message",
+      "expression": "isinstance(result, ToolMessage)"
+    },
+    {
+      "line": 229,
+      "end_line": 229,
+      "callee": "getattr",
+      "enclosing": "_result_message",
+      "expression": "getattr(result, \"update\", None)"
+    },
+    {
+      "line": 231,
+      "end_line": 231,
+      "callee": "isinstance",
+      "enclosing": "_result_message",
+      "expression": "isinstance(messages, Sequence)"
+    },
+    {
+      "line": 47,
+      "end_line": 47,
+      "callee": "super().__init__",
+      "enclosing": "FixerDispatchGuard.__init__",
+      "expression": "super().__init__()"
+    },
+    {
+      "line": 56,
+      "end_line": 56,
+      "callee": "log.warning",
+      "enclosing": "FixerDispatchGuard._refusal",
+      "expression": "log.warning(Event.FIXER_DISPATCH_REFUSED, detail=detail)"
+    },
+    {
+      "line": 57,
+      "end_line": 62,
+      "callee": "ToolMessage",
+      "enclosing": "FixerDispatchGuard._refusal",
+      "expression": "ToolMessage(\n            content=f\"Fixer dispatch was not executed: {detail}\",\n            name=_TASK_TOOL,\n            tool_call_id=request.tool_call.get(\"id\") or \"\",\n            status=\"error\",\n        )"
+    },
+    {
+      "line": 68,
+      "end_line": 68,
+      "callee": "call.get",
+      "enclosing": "FixerDispatchGuard._prepare",
+      "expression": "call.get(\"args\")"
+    },
+    {
+      "line": 82,
+      "end_line": 82,
+      "callee": "args.get",
+      "enclosing": "FixerDispatchGuard._prepare",
+      "expression": "args.get(\"description\")"
+    },
+    {
+      "line": 83,
+      "end_line": 83,
+      "callee": "_invalid_spec",
+      "enclosing": "FixerDispatchGuard._prepare",
+      "expression": "_invalid_spec(description, self._primary_file)"
+    },
+    {
+      "line": 97,
+      "end_line": 97,
+      "callee": "isinstance",
+      "enclosing": "FixerDispatchGuard._prepare",
+      "expression": "isinstance(description, str)"
+    },
+    {
+      "line": 108,
+      "end_line": 111,
+      "callee": "console.write",
+      "enclosing": "FixerDispatchGuard._prepare",
+      "expression": "console.write(\n            f\"  [remediation] dispatching complete fixer specification \"\n            f\"(attempt {self._attempts}/2, {len(enriched)} chars)\"\n        )"
+    },
+    {
+      "line": 112,
+      "end_line": 112,
+      "callee": "request.override",
+      "enclosing": "FixerDispatchGuard._prepare",
+      "expression": "request.override(tool_call={**call, \"args\": amended_args})"
+    },
+    {
+      "line": 115,
+      "end_line": 115,
+      "callee": "_result_message",
+      "enclosing": "FixerDispatchGuard._observe",
+      "expression": "_result_message(result)"
+    },
+    {
+      "line": 122,
+      "end_line": 122,
+      "callee": "_fixer_result",
+      "enclosing": "FixerDispatchGuard._observe",
+      "expression": "_fixer_result(message.content)"
+    },
+    {
+      "line": 155,
+      "end_line": 155,
+      "callee": "self._prepare",
+      "enclosing": "FixerDispatchGuard.wrap_tool_call",
+      "expression": "self._prepare(request)"
+    },
+    {
+      "line": 156,
+      "end_line": 156,
+      "callee": "isinstance",
+      "enclosing": "FixerDispatchGuard.wrap_tool_call",
+      "expression": "isinstance(prepared, ToolMessage)"
+    },
+    {
+      "line": 179,
+      "end_line": 179,
+      "callee": "self._prepare",
+      "enclosing": "FixerDispatchGuard.awrap_tool_call",
+      "expression": "self._prepare(request)"
+    },
+    {
+      "line": 180,
+      "end_line": 180,
+      "callee": "isinstance",
+      "enclosing": "FixerDispatchGuard.awrap_tool_call",
+      "expression": "isinstance(prepared, ToolMessage)"
+    },
+    {
+      "line": 201,
+      "end_line": 201,
+      "callee": "section.casefold",
+      "enclosing": "_invalid_spec",
+      "expression": "section.casefold()"
+    },
+    {
+      "line": 206,
+      "end_line": 206,
+      "callee": "folded.index",
+      "enclosing": "_invalid_spec",
+      "expression": "folded.index(marker)"
+    },
+    {
+      "line": 207,
+      "end_line": 207,
+      "callee": "sorted",
+      "enclosing": "_invalid_spec",
+      "expression": "sorted(positions)"
+    },
+    {
+      "line": 210,
+      "end_line": 210,
+      "callee": "zip",
+      "enclosing": "_invalid_spec",
+      "expression": "zip(_REQUIRED_SECTIONS, markers)"
+    },
+    {
+      "line": 213,
+      "end_line": 213,
+      "callee": "description[start:end].strip",
+      "enclosing": "_invalid_spec",
+      "expression": "description[start:end].strip()"
+    },
+    {
+      "line": 230,
+      "end_line": 230,
+      "callee": "isinstance",
+      "enclosing": "_result_message",
+      "expression": "isinstance(update, Mapping)"
+    },
+    {
+      "line": 230,
+      "end_line": 230,
+      "callee": "update.get",
+      "enclosing": "_result_message",
+      "expression": "update.get(\"messages\", [])"
+    },
+    {
+      "line": 232,
+      "end_line": 232,
+      "callee": "next",
+      "enclosing": "_result_message",
+      "expression": "next((m for m in reversed(messages) if isinstance(m, ToolMessage)), None)"
+    },
+    {
+      "line": 237,
+      "end_line": 237,
+      "callee": "isinstance",
+      "enclosing": "_fixer_result",
+      "expression": "isinstance(content, str)"
+    },
+    {
+      "line": 240,
+      "end_line": 240,
+      "callee": "FixerResult.model_validate",
+      "enclosing": "_fixer_result",
+      "expression": "FixerResult.model_validate(json.loads(content))"
+    },
+    {
+      "line": 66,
+      "end_line": 66,
+      "callee": "call.get",
+      "enclosing": "FixerDispatchGuard._prepare",
+      "expression": "call.get(\"name\")"
+    },
+    {
+      "line": 69,
+      "end_line": 69,
+      "callee": "isinstance",
+      "enclosing": "FixerDispatchGuard._prepare",
+      "expression": "isinstance(args, Mapping)"
+    },
+    {
+      "line": 71,
+      "end_line": 71,
+      "callee": "self._refusal",
+      "enclosing": "FixerDispatchGuard._prepare",
+      "expression": "self._refusal(request, \"task arguments were not an object; return Not Fixed\")"
+    },
+    {
+      "line": 72,
+      "end_line": 72,
+      "callee": "args.get",
+      "enclosing": "FixerDispatchGuard._prepare",
+      "expression": "args.get(\"subagent_type\")"
+    },
+    {
+      "line": 74,
+      "end_line": 74,
+      "callee": "self._refusal",
+      "enclosing": "FixerDispatchGuard._prepare",
+      "expression": "self._refusal(request, \"S10 permits only subagent_type='fixer'\")"
+    },
+    {
+      "line": 76,
+      "end_line": 77,
+      "callee": "self._refusal",
+      "enclosing": "FixerDispatchGuard._prepare",
+      "expression": "self._refusal(\n                request, \"the fixer already returned a completed result; do not retry\")"
+    },
+    {
+      "line": 79,
+      "end_line": 80,
+      "callee": "self._refusal",
+      "enclosing": "FixerDispatchGuard._prepare",
+      "expression": "self._refusal(\n                request, \"a retry is allowed only after an explicit transient tool error\")"
+    },
+    {
+      "line": 93,
+      "end_line": 96,
+      "callee": "self._refusal",
+      "enclosing": "FixerDispatchGuard._prepare",
+      "expression": "self._refusal(\n                request,\n                f\"incomplete edit specification ({problem}); \"\n                \"one corrected re-dispatch is permitted\")"
+    },
+    {
+      "line": 119,
+      "end_line": 119,
+      "callee": "getattr",
+      "enclosing": "FixerDispatchGuard._observe",
+      "expression": "getattr(message, \"status\", \"success\")"
+    },
+    {
+      "line": 120,
+      "end_line": 120,
+      "callee": "self._record_transient",
+      "enclosing": "FixerDispatchGuard._observe",
+      "expression": "self._record_transient()"
+    },
+    {
+      "line": 124,
+      "end_line": 124,
+      "callee": "self._record_transient",
+      "enclosing": "FixerDispatchGuard._observe",
+      "expression": "self._record_transient()"
+    },
+    {
+      "line": 129,
+      "end_line": 131,
+      "callee": "log.warning",
+      "enclosing": "FixerDispatchGuard._observe",
+      "expression": "log.warning(\n                \"fixer returned an invalid result; \"\n                \"no retry permitted\")"
+    },
+    {
+      "line": 138,
+      "end_line": 140,
+      "callee": "log.warning",
+      "enclosing": "FixerDispatchGuard._record_transient",
+      "expression": "log.warning(\n                \"fixer reported a transient tool error — \"\n                \"one retry is permitted\")"
+    },
+    {
+      "line": 143,
+      "end_line": 145,
+      "callee": "log.warning",
+      "enclosing": "FixerDispatchGuard._record_transient",
+      "expression": "log.warning(\n                \"fixer transient retry exhausted — \"\n                \"return Not Fixed\")"
+    },
+    {
+      "line": 153,
+      "end_line": 153,
+      "callee": "request.tool_call.get",
+      "enclosing": "FixerDispatchGuard.wrap_tool_call",
+      "expression": "request.tool_call.get(\"name\")"
+    },
+    {
+      "line": 154,
+      "end_line": 154,
+      "callee": "handler",
+      "enclosing": "FixerDispatchGuard.wrap_tool_call",
+      "expression": "handler(request)"
+    },
+    {
+      "line": 159,
+      "end_line": 159,
+      "callee": "handler",
+      "enclosing": "FixerDispatchGuard.wrap_tool_call",
+      "expression": "handler(prepared)"
+    },
+    {
+      "line": 167,
+      "end_line": 167,
+      "callee": "request.tool_call.get",
+      "enclosing": "FixerDispatchGuard.wrap_tool_call",
+      "expression": "request.tool_call.get(\"name\")"
+    },
+    {
+      "line": 168,
+      "end_line": 168,
+      "callee": "self._observe",
+      "enclosing": "FixerDispatchGuard.wrap_tool_call",
+      "expression": "self._observe(result)"
+    },
+    {
+      "line": 177,
+      "end_line": 177,
+      "callee": "request.tool_call.get",
+      "enclosing": "FixerDispatchGuard.awrap_tool_call",
+      "expression": "request.tool_call.get(\"name\")"
+    },
+    {
+      "line": 191,
+      "end_line": 191,
+      "callee": "request.tool_call.get",
+      "enclosing": "FixerDispatchGuard.awrap_tool_call",
+      "expression": "request.tool_call.get(\"name\")"
+    },
+    {
+      "line": 192,
+      "end_line": 192,
+      "callee": "self._observe",
+      "enclosing": "FixerDispatchGuard.awrap_tool_call",
+      "expression": "self._observe(result)"
+    },
+    {
+      "line": 198,
+      "end_line": 198,
+      "callee": "isinstance",
+      "enclosing": "_invalid_spec",
+      "expression": "isinstance(description, str)"
+    },
+    {
+      "line": 198,
+      "end_line": 198,
+      "callee": "description.strip",
+      "enclosing": "_invalid_spec",
+      "expression": "description.strip()"
+    },
+    {
+      "line": 202,
+      "end_line": 202,
+      "callee": "zip",
+      "enclosing": "_invalid_spec",
+      "expression": "zip(_REQUIRED_SECTIONS, markers)"
+    },
+    {
+      "line": 211,
+      "end_line": 211,
+      "callee": "len",
+      "enclosing": "_invalid_spec",
+      "expression": "len(marker)"
+    },
+    {
+      "line": 212,
+      "end_line": 212,
+      "callee": "len",
+      "enclosing": "_invalid_spec",
+      "expression": "len(description)"
+    },
+    {
+      "line": 217,
+      "end_line": 217,
+      "callee": "primary_file.casefold",
+      "enclosing": "_invalid_spec",
+      "expression": "primary_file.casefold()"
+    },
+    {
+      "line": 221,
+      "end_line": 221,
+      "callee": "len",
+      "enclosing": "_invalid_spec",
+      "expression": "len(bodies[section])"
+    },
+    {
+      "line": 240,
+      "end_line": 240,
+      "callee": "json.loads",
+      "enclosing": "_fixer_result",
+      "expression": "json.loads(content)"
+    },
+    {
+      "line": 47,
+      "end_line": 47,
+      "callee": "super",
+      "enclosing": "FixerDispatchGuard.__init__",
+      "expression": "super()"
+    },
+    {
+      "line": 89,
+      "end_line": 92,
+      "callee": "self._refusal",
+      "enclosing": "FixerDispatchGuard._prepare",
+      "expression": "self._refusal(\n                    request,\n                    f\"incomplete edit specification ({problem}); \"\n                    \"no further attempts permitted; return Not Fixed\")"
+    },
+    {
+      "line": 102,
+      "end_line": 102,
+      "callee": "description.rstrip",
+      "enclosing": "FixerDispatchGuard._prepare",
+      "expression": "description.rstrip()"
+    },
+    {
+      "line": 104,
+      "end_line": 104,
+      "callee": "self._finding_context.strip",
+      "enclosing": "FixerDispatchGuard._prepare",
+      "expression": "self._finding_context.strip()"
+    },
+    {
+      "line": 133,
+      "end_line": 133,
+      "callee": "log.warning",
+      "enclosing": "FixerDispatchGuard._observe",
+      "expression": "log.warning(Event.FIXER_STATUS_NO_RETRY, status=parsed.status)"
+    },
+    {
+      "line": 161,
+      "end_line": 161,
+      "callee": "self._record_transient",
+      "enclosing": "FixerDispatchGuard.wrap_tool_call",
+      "expression": "self._record_transient()"
+    },
+    {
+      "line": 162,
+      "end_line": 166,
+      "callee": "self._refusal",
+      "enclosing": "FixerDispatchGuard.wrap_tool_call",
+      "expression": "self._refusal(\n                request,\n                f\"transient fixer tool error ({type(exc).__name__}); \"\n                f\"{'retry once' if self._retry_allowed else 'retry exhausted'}\",\n            )"
+    },
+    {
+      "line": 178,
+      "end_line": 178,
+      "callee": "handler",
+      "enclosing": "FixerDispatchGuard.awrap_tool_call",
+      "expression": "handler(request)"
+    },
+    {
+      "line": 183,
+      "end_line": 183,
+      "callee": "handler",
+      "enclosing": "FixerDispatchGuard.awrap_tool_call",
+      "expression": "handler(prepared)"
+    },
+    {
+      "line": 185,
+      "end_line": 185,
+      "callee": "self._record_transient",
+      "enclosing": "FixerDispatchGuard.awrap_tool_call",
+      "expression": "self._record_transient()"
+    },
+    {
+      "line": 186,
+      "end_line": 190,
+      "callee": "self._refusal",
+      "enclosing": "FixerDispatchGuard.awrap_tool_call",
+      "expression": "self._refusal(\n                request,\n                f\"transient fixer tool error ({type(exc).__name__}); \"\n                f\"{'retry once' if self._retry_allowed else 'retry exhausted'}\",\n            )"
+    },
+    {
+      "line": 205,
+      "end_line": 205,
+      "callee": "', '.join",
+      "enclosing": "_invalid_spec",
+      "expression": "', '.join(missing)"
+    },
+    {
+      "line": 212,
+      "end_line": 212,
+      "callee": "len",
+      "enclosing": "_invalid_spec",
+      "expression": "len(positions)"
+    },
+    {
+      "line": 60,
+      "end_line": 60,
+      "callee": "request.tool_call.get",
+      "enclosing": "FixerDispatchGuard._refusal",
+      "expression": "request.tool_call.get(\"id\")"
+    },
+    {
+      "line": 110,
+      "end_line": 110,
+      "callee": "len",
+      "enclosing": "FixerDispatchGuard._prepare",
+      "expression": "len(enriched)"
+    },
+    {
+      "line": 232,
+      "end_line": 232,
+      "callee": "reversed",
+      "enclosing": "_result_message",
+      "expression": "reversed(messages)"
+    },
+    {
+      "line": 232,
+      "end_line": 232,
+      "callee": "isinstance",
+      "enclosing": "_result_message",
+      "expression": "isinstance(m, ToolMessage)"
+    },
+    {
+      "line": 164,
+      "end_line": 164,
+      "callee": "type",
+      "enclosing": "FixerDispatchGuard.wrap_tool_call",
+      "expression": "type(exc)"
+    },
+    {
+      "line": 188,
+      "end_line": 188,
+      "callee": "type",
+      "enclosing": "FixerDispatchGuard.awrap_tool_call",
+      "expression": "type(exc)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 16,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 17,
+      "source_expression": "from vvaharness.util import logs",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.logs"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/logs.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 19,
+      "source_expression": "import json",
+      "targets": [
+        "json"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "from collections.abc import Awaitable, Callable, Mapping, Sequence",
+      "targets": [
+        "collections.abc",
+        "collections.abc.Awaitable",
+        "collections.abc.Callable",
+        "collections.abc.Mapping",
+        "collections.abc.Sequence"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "from typing import Any",
+      "targets": [
+        "typing",
+        "typing.Any"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 23,
+      "source_expression": "from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest",
+      "targets": [
+        "langchain.agents.middleware.types",
+        "langchain.agents.middleware.types.AgentMiddleware",
+        "langchain.agents.middleware.types.ToolCallRequest"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 24,
+      "source_expression": "from langchain_core.messages import ToolMessage",
+      "targets": [
+        "langchain_core.messages",
+        "langchain_core.messages.ToolMessage"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 25,
+      "source_expression": "from langgraph.types import Command",
+      "targets": [
+        "langgraph.types",
+        "langgraph.types.Command"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 27,
+      "source_expression": "from vvaharness.remediation_agent.models import FixerResult",
+      "targets": [
+        "vvaharness.remediation_agent.models",
+        "vvaharness.remediation_agent.models.FixerResult"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 28,
+      "source_expression": "from vvaharness.util import console",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.console"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/console.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 29,
+      "source_expression": "from vvaharness.util.events import Event",
+      "targets": [
+        "vvaharness.util.events",
+        "vvaharness.util.events.Event"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/events.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

@@ -1,0 +1,221 @@
+# vvaharness/pipeline/stages/s6/session.py
+
+One agentic verification session per batch of findings: the optional read-only graph tools with their per-finding budget and evidence gate, the model-call cap, the session itself under a batch deadline with a resume-or-replay fallback, one retry without the effort tier, one bounded JSON-repair re-ask, and the replay provenance stamp on every outcome.
+
+Source: `vvaharness/pipeline/stages/s6/session.py` (lines 1-364)
+Executor: mixed
+Called from: `vvaharness/pipeline/stages/s6_verify.py` (verify_batch submitted per batch)
+
+// src: vvaharness/pipeline/stages/s6/session.py:73-79
+_REPLAY_EFFORT = "low"          // the replay only restates a transcript
+_PRIMARY_MIN_CHARS = 40         // response-quality floors for the primary and repair calls of this stage
+_PRIMARY_MIN_TOKENS = 10
+_VERDICT_TOKENS = ("TRUE_POSITIVE", "FALSE_POSITIVE", "INCONCLUSIVE")
+
+// src: vvaharness/pipeline/stages/s6/session.py:296-356
+fn verify_batch(items, ctx, cfg, tools, abandoned = () => false, resend_refusal = false):executor=mixed {
+  // s6_verify passes resend_refusal only for a lone finding; a refused multi-finding batch is split there instead
+  ids = finding ids of items
+  tag = "s6 verify[${length(items)}] ${ids[0]}"
+  effort = _effort(cfg)
+  attempt = _Attempt()
+
+  // src: :312-319 — one resend without the effort tier when the effort tier left the outcome tool unforced
+  // (prose ended the session) or the reply clipped at a budget the route could not grow;
+  // no retry when effort is unset or the batch was abandoned; one identical resend of a refusal when resend_refusal
+  raw = dispatch_or_retry_unforced(
+    (drop_thinking) => _dispatch(items, ctx, cfg, tools, tag, drop_thinking, attempt),
+    tag, stage="s6",
+    effort=deepagents.droppable_effort(knob("models.verify"), effort, agentic=true),
+    may_retry=() => effort != null && !abandoned(),
+    resend_refusal,
+    may_resend_refusal=() => !abandoned() && !cli.aborted())   // external to this area: util/response_quality, backends/llm
+  outcomes = s6.outcomes.split_batch_reply(raw, ids)
+  if (outcomes is non-empty) return _stamped(outcomes, attempt.replayed)
+
+  // src: :324-326 — the stage already discards an abandoned thread's result, so no repair is spent on it
+  if (abandoned()) { COUNTERS.bump("s6_outcome_repair_skipped_abandoned"); return {} }
+
+  // src: :327-335 — the repair says "restate, do NOT reconsider", so a reply with no verdict would make it invent one
+  require _has_verdict_material(raw) => {
+    errlog.log("s6-verify", tag, "primary reply had no verdict material", reason="s6_outcome_repair_skipped_no_verdict", recovered=true)
+    COUNTERS.bump("s6_outcome_repair_skipped_no_verdict")
+    return {}   // every member is then resolved downstream as unverified
+  }
+
+  // src: :336-351 — one bounded repair re-ask, no tools
+  COUNTERS.bump("s6_outcome_repaired_attempt")
+  repair_tag = "$tag json-repair"
+  repaired = callModel({
+    role: "verify",
+    route: resolve_model(knob("models.verify")).via,   // backends/llm/deepagents.dispatch_prompt
+    prompt: s6.prompts.repair_prompt(raw, ids),
+    tools: [],
+    limits: {
+      max_tokens: knob("step6_verify.max_tokens", default=32000),   // full budget: the repair re-emits the whole outcome set
+      floors: stage_floors(repair_tag, min_chars=_PRIMARY_MIN_CHARS, min_tokens=_PRIMARY_MIN_TOKENS)
+    },
+    output: _response_model(cfg)
+  })
+  outcomes = s6.outcomes.split_batch_reply(repaired, ids)
+  if (outcomes is non-empty) COUNTERS.bump("s6_outcome_repaired_ok")
+  // the repair restates the primary reply, so it carries the primary's replay provenance
+  return _stamped(outcomes, attempt.replayed)   // may be empty: members not returned are handled by s6_verify
+}
+
+// src: vvaharness/pipeline/stages/s6/session.py:194-223
+fn _dispatch(items, ctx, cfg, tools, tag, drop_thinking=false, attempt?):executor=mixed {
+  attempt = attempt or _Attempt(); attempt.replayed = false   // reset per attempt: a resend must not inherit the first attempt's replay provenance
+  s6 = cfg.step6_verify
+  transcript = new Transcript
+  deadline = knob("step6_verify.batch_deadline", default=0) or 0   // 0 disables the deadline
+  session_id = session_id_for("s6", tag with spaces replaced by "-")
+  constraint OnEveryExit { release_pinned_session(session_id) }   // src: :222-223
+  try {
+    return run_with_deadline(() => _agentic_leg(items, ctx, cfg, tools, tag, transcript, session_id, drop_thinking),
+      seconds=deadline, stage=tag, effort=_effort(cfg))   // see pipeline/stages/replay.sudo
+  }
+  catch CallTimeoutError => {
+    // src: :211-221 — on the deadline, first try to resume the pinned session for the verdicts, else replay the transcript with no tools
+    return resume_or_replay(session_id,
+      replay = () => { attempt.replayed = true; return _replay_leg(items, ctx, cfg, tag, transcript, s6) },
+      model=knob("models.verify"), instruction=S6_REPLAY_INSTRUCTION, stage="s6", tag,
+      timeout=_cap_int(s6, "resume_timeout", 60))
+  }
+}
+
+// src: vvaharness/pipeline/stages/s6/session.py:250-293
+fn _agentic_leg(items, ctx, cfg, tools, tag, transcript, session_id, drop_thinking=false):executor=model {
+  s6 = cfg.step6_verify
+  files = distinct files of items, first-seen order
+  code = _load_code(files, ctx.repo_root, s6)
+  [tool_builder, fact_tools, middleware] = _tool_setup(ctx, cfg, s6, length(items))
+  middleware += RecordTranscript(transcript)
+  callModel({
+    role: "verify",
+    route: resolve_model(knob("models.verify")).via,   // backends/llm/deepagents.dispatch_agentic
+    system: s6.prompts.build_system_prompt(
+      graph = _graph_enabled(cfg, s6) && ctx.graph_handle != null && !graph_is_degenerate(ctx, cfg),   // never name graph tools without a real graph
+      trait_stamps = knob("step6_verify.trait_stamps", default=true),
+      reframe = knob("step6_verify.reframe_enabled", default=false)),
+    cache_prefix: s6.prompts.build_shared_context(ctx) or null,
+    prompt: s6.prompts.build_verify_prompt(items, ctx, code),
+    tools: [
+      ...tools,        // the allow list passed by s6_verify (allowed_tools)
+      ...fact_tools    // graph tool names, only when _graph_enabled
+    ],
+    limits: {
+      max_budget_usd: getattr(s6, "max_budget_usd", 10.0),
+      max_turns: getattr(s6, "max_turns", null),
+      max_output_tokens: knob("step6_verify.max_tokens", default=32000),
+      effort: if (drop_thinking) null else _effort(cfg),
+      timeout: deadline_bound(ceiling_secs(s6) or null, knob("step6_verify.batch_deadline", default=0) or 0,
+                              if (drop_thinking) null else _effort(cfg), via=resolve_model(knob("models.verify")).via),   // a disabled ceiling (<= 0) arrives as null
+      floors: stage_floors(tag, min_chars=_PRIMARY_MIN_CHARS, min_tokens=_PRIMARY_MIN_TOKENS),
+      middleware   // graph tool budget, evidence gate, model-call budget, transcript recorder
+    },
+    output: _response_model(cfg)
+  })
+}
+
+// src: vvaharness/pipeline/stages/s6/session.py:226-247
+fn _replay_leg(items, ctx, cfg, tag, transcript, s6):executor=model {
+  COUNTERS.bump("s6_deadline_replay")
+  code = _load_code(distinct files of items, ctx.repo_root, s6)
+  callModel({
+    role: "verify",
+    route: resolve_model(knob("models.verify")).via,   // backends/llm/deepagents.dispatch_prompt
+    prompt: replay_prompt(transcript, s6.prompts.build_verify_prompt(items, ctx, code), instruction=S6_REPLAY_INSTRUCTION, stage="s6"),
+    tools: [],
+    limits: {
+      max_tokens: knob("step6_verify.replay_max_tokens", default=12000),
+      timeout: knob("step6_verify.replay_timeout", default=60),
+      effort: _REPLAY_EFFORT
+    },
+    output: _response_model(cfg)
+  })
+}
+
+// src: vvaharness/pipeline/stages/s6/session.py:128-161
+fn _tool_setup(ctx, cfg, s6, members=1):executor=code {
+  middleware = []; builder = null; names = ()
+  if (_graph_enabled(cfg, s6)) {
+    builder = compose_tool_builders(build_graph_tool_builder(ctx))
+    names = graph_tool_names()
+    // src: :138-142 — graph tool calls capped per finding, scaled to the batch
+    limit = _cap_int(s6, "graph_tool_budget", 4)
+    if (limit > 0) middleware += ToolCallBudget(graph_tool_names(), limit=_per_item(limit, members), counter="s6_graph_tool_budget_exhausted")
+    // src: :143-159 — evidence gate on the verdict when step6_verify.require_graph
+    if (getattr(s6, "require_graph", false)) {
+      required_tools = GRAPH_TOOL_NAMES
+      if (graph_is_degenerate(ctx, cfg)) {
+        // an unsatisfiable requirement would reject every verdict (no TodoListMiddleware in Stage 6)
+        warn "step6_verify.require_graph is on but the code graph is absent or degenerate (zero edges, or fewer nodes than step0.min_graph_nodes_for_gate) — standing the graph-tool requirement down."   // once per process
+        COUNTERS.bump("evidence_gate_stood_down_degenerate_graph")
+        required_tools = {}
+      }
+      middleware += EvidenceGate(max_rejections=_per_item(_cap_int(s6, "evidence_gate_refusals", 3), members),
+                                 counter="s6_evidence_gate_rejected", required_tools)   // external: backends/harness/deepagents/evidence_gate
+    }
+  }
+  middleware += _call_budget(s6, members)   // null entries are dropped
+  return [builder, names, non-null middleware]
+}
+
+// src: vvaharness/pipeline/stages/s6/session.py:94-108
+fn _graph_enabled(cfg, s6):executor=code {
+  if (!getattr(s6, "graph_tools", false)) return false
+  // gated on the route too: naming tools the session cannot call invites fabricated tool output
+  via = resolve_model(knob("models.verify")).via
+  [ok, reason] = deepagents.route_carries_tools(cfg, via)
+  warn ok => "step6_verify.graph_tools is on but $reason — verifying without the graph tools, and NOT telling the model about tools it cannot call. Route models.verify via: deepagents, sdk or openai to use them."   // once per route per process
+  return ok
+}
+
+// src: vvaharness/pipeline/stages/s6/session.py:111-119
+fn _call_budget(s6, members):executor=code {
+  limit = _cap_int(s6, "max_model_calls", 0)
+  if (limit <= 0) return null   // no model-call cap
+  return ModelCallBudget(limit = limit + max(0, members - 1),
+                         outcome_tools = {"VerificationOutcomes", "VerificationOutcome"},
+                         counter = "s6_model_call_budget_final_turn")   // external: backends/harness/deepagents/model_call_budget
+}
+
+// src: vvaharness/pipeline/stages/s6/session.py:122-125
+fn _per_item(base, members):executor=code {
+  return base * max(1, members)   // configured per finding, spent per session
+}
+
+// src: vvaharness/pipeline/stages/s6/session.py:164-170
+fn _load_code(files, repo_root, s6):executor=code {
+  if (!getattr(s6, "inline_source", false)) return null
+  return s4_deepdive._load_files_full(files, repo_root, stage="s6")   // redacted whole-file text
+}
+
+// src: vvaharness/pipeline/stages/s6/session.py:176-179
+fn _response_model(cfg):executor=code {
+  return if (resolve_model(knob("models.verify")).via in RESPONSE_MODEL_VIAS) VerificationOutcomes else null   // structured output only on routes that honour it
+}
+
+// src: vvaharness/pipeline/stages/s6/session.py:182-184
+fn _effort(cfg):executor=code {
+  return knob("step6_verify.effort", default=null) or null   // unset: the backend default
+}
+
+// src: vvaharness/pipeline/stages/s6/session.py:82-84
+fn _has_verdict_material(raw):executor=code {
+  return raw is a string && raw contains any of _VERDICT_TOKENS
+}
+
+// src: vvaharness/pipeline/stages/s6/session.py:188-191
+_Attempt {
+  replayed: Boolean = false   // whether this attempt's verdicts came from the transcript replay
+}
+
+// src: vvaharness/pipeline/stages/s6/session.py:359-364
+fn _stamped(outcomes, replayed):executor=code {
+  for each outcome in outcomes, outcome.replayed = replayed;   // set from the attempt, never from the model's reply
+  return outcomes
+}
+
+// abstracted: session.py:87-91 the two warn-once sets (_WARNED_NO_GRAPH, _WARNED_DEGENERATE_GRAPH) and console lines at :212-213, :246; logging only.

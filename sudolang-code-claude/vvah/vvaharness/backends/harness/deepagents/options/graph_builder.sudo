@@ -1,0 +1,152 @@
+# vvaharness/backends/harness/deepagents/options/graph_builder.py
+
+`_create_agent`, the one graph builder shared by the streaming and one-shot graphs. It picks the checkpointer, builds the model, adjusts the system prompt (submit instruction, in-prompt reasoning), and assembles the parent middleware stack in a fixed order: redaction or delete-exclusion, the caller's middleware, invalid-argument repair, invalid-request logging, the output-token cap with one doubled truncation retry, the executor tool gate, prompt-cache markers, tool-call logging, and the connection retry. It then calls `deepagents.create_deep_agent` under a process-wide lock.
+
+Source: `vvaharness/backends/harness/deepagents/options/graph_builder.py` (lines 1-458)
+Executor: code (the graph it compiles makes the model calls when invoked)
+Called from: `vvaharness/backends/harness/deepagents/options/streaming.sudo` _build_streaming_graph; `vvaharness/backends/harness/deepagents/options/oneshot.sudo` _build_oneshot_graph
+
+// src: vvaharness/backends/harness/deepagents/options/graph_builder.py:358-458
+fn _create_agent(model_id, env, system_prompt, tools, name, skills, permissions,
+                 model_provider?, redact_reads=false, backend?, response_model?, response_format?,
+                 subagents?, extra_excluded_tools?, max_output_tokens?, output_cap?,
+                 permitted_tool_calls?, strip_harness_suffix=false, cache_markers=true, cache_tail=true,
+                 parent_middleware=[], effort?, use_responses_api?, think_in_prompt=false):executor=code {
+
+  // src: graph_builder.py:386-394 — checkpointer
+  if (response_model == null) checkpointer = MemorySaver()
+  else checkpointer = MemorySaver(serde=JsonPlusSerializer(allowed_msgpack_modules=_reachable_serde_classes(response_model)))
+
+  // src: graph_builder.py:395-401 — submit instruction when forcing is dropped
+  model = model_building.build_model_cached(model_id, env, model_provider, effort, use_responses_api)
+  system_prompt = response_format.submit_instructed_prompt(system_prompt, model, response_model, response_format)
+  profiles.register_vvah_harness_profiles()
+
+  // src: graph_builder.py:402-418
+  agent_model = model_building.build_model_cached(model_id, env, model_provider, effort, use_responses_api, think_in_prompt)
+  // preserved: the model used for the submit-instruction decision is built WITHOUT think_in_prompt; the model given to the agent is built WITH it (different cache keys, different thinking kwargs).
+  if (think_in_prompt && model_building.reasons_in_prompt(model_id, model_provider)) {
+    system_prompt = (system_prompt or "") + REASON_IN_PROMPT   // prompt text: see model_building.sudo REASON_IN_PROMPT
+  }
+  kwargs = { model: agent_model, system_prompt, tools, name, permissions, checkpointer }
+  if (skills != null) kwargs.skills = skills   // omitted, not empty: SkillsMiddleware injects about 1.9k characters even with zero skills
+
+  // src: graph_builder.py:419-449 — parent middleware stack, in this order
+  extra = extra_excluded_tools or []
+  if (redact_reads) {
+    middleware = [...redaction.read_only_middleware(extra), ...parent_middleware]
+    // read_only_middleware = [RedactToolResults(), ExcludeTools(NATIVE_WRITE_TOOLS union ["delete"] union extra)]  (redaction.py:94-100)
+  } else {
+    middleware = [ExcludeTools(["delete"] union extra), ...parent_middleware]   // a writing agent cannot redact: edit_file needs byte-exact old_string
+  }
+  // parent_middleware is where callers install EvidenceGate, ToolCallBudget, ModelCallBudget and similar (stage session code, backends/llm/deepagents.py); ForceVerdictOnly is appended to it by streaming.sudo when options.force_verdict_only.
+  middleware.append(invalid_tool_args.RepairInvalidToolArgs())   // always installed
+  middleware.append(LogInvalidRequestShape(tag=name))             // always installed
+  if (max_output_tokens != null) middleware.append(CapOutputTokens(max_output_tokens, tag=name, cap=output_cap))
+  if (permitted_tool_calls != null) middleware.append(permit_tools.PermitTools(permitted_tool_calls))   // null = NO executor gate
+  middleware.append(prompt_caching.BlockMarkerPromptCaching(enabled=cache_markers, mark_tail=cache_tail))   // always installed; replaces the deepagents auto-attached caching middleware of the same name
+  middleware.append(LogToolCalls(tag=name))   // always installed
+  if (!(name starts with "preflight")) middleware.append(_CONNECTION_RETRY_MIDDLEWARE)   // preflight probes must fail at once
+  kwargs.middleware = middleware
+
+  // src: graph_builder.py:450-455
+  if (response_format != null) kwargs.response_format = response_format
+  if (subagents != null) kwargs.subagents = subagents
+  if (backend != null) kwargs.backend = backend
+
+  // src: graph_builder.py:456-458
+  with _BUILD_LOCK, _restaged_harness_profiles(name, blank=strip_harness_suffix) {
+    return create_deep_agent(...kwargs)   // external: deepagents.create_deep_agent
+  }
+}
+
+// src: vvaharness/backends/harness/deepagents/options/graph_builder.py:105-114
+fn _connection_retryable(exc):executor=code {
+  return is_connection_failure(exc) && proxy_detail(exc) == null   // a dropped connection, not a TLS or proxy failure
+}
+_CONNECTION_RETRY_MIDDLEWARE = ModelRetryMiddleware(max_retries=3, initial_delay=5, backoff_factor=2, max_delay=60, retry_on=_connection_retryable, on_failure="error")
+// external: langchain.agents.middleware.ModelRetryMiddleware. One shared instance, also placed in every subagent spec (subagents.sudo _spec_middleware).
+
+// src: vvaharness/backends/harness/deepagents/options/graph_builder.py:174-284
+CapOutputTokens {
+  // Per-request output-token cap applied as a model_settings override; one doubled retry on truncation.
+  _max_tokens
+  _cap_ceiling = cap if cap != null else MODEL_MAX_OUTPUT_TOKENS   // 64000 (limits.py:36)
+
+  // src: graph_builder.py:250-265 (async twin 267-284 is identical)
+  fn wrap_model_call(request, handler):executor=code {
+    try {
+      result = handler(request with model_settings.max_tokens = _max_tokens)
+      retry_at = _truncation_retry_at(result)
+      if (retry_at == null) return result
+    }
+    catch StructuredOutputValidationError as exc => {
+      retry_at = _rejected(exc)   // native structured output is parsed inside the handler, so a clipped final surfaces as a parse failure
+      if (retry_at == null) throw exc
+    }
+    // exactly one retry; a second truncation is not retried here (the caller raises VVAH-E005)
+    try retried = handler(request with model_settings.max_tokens = retry_at);
+    catch StructuredOutputValidationError as exc2 => { bank usage of exc2.ai_message; throw exc2 }
+    if (!translate.reply_truncated(messages of retried)) COUNTERS.bump(TRUNCATED_RETRY_RECOVERED_COUNTER)
+    return retried
+  }
+
+  // src: graph_builder.py:213-220 (uses _retry_at, 191-192)
+  fn _truncation_retry_at(discarded):executor=code {
+    if (!translate.reply_truncated(messages of discarded)) return null
+    retry_at = truncation_retry_max(_max_tokens, cap=_cap_ceiling)
+    // truncation_retry_max (backends/llm/models.py:233-238): null when _max_tokens >= cap; else min(_max_tokens * 2, cap)
+    if (retry_at != null) _log_retry(retry_at, _bank(discarded))
+    return retry_at
+  }
+  // src: graph_builder.py:222-232
+  fn _rejected(exc):executor=code {
+    usage = _bank(exc.ai_message)   // a rejected final was still billed
+    if (!translate.reply_truncated([exc.ai_message])) return null
+    retry_at = truncation_retry_max(_max_tokens, cap=_cap_ceiling)
+    if (retry_at != null) _log_retry(retry_at, usage)
+    return retry_at
+  }
+  // src: graph_builder.py:194-211
+  fn _bank(discarded):executor=code { usage = aggregate_usage_metadata(messages of discarded); if (usage) TOKENS.add(usage); return usage }
+  fn _log_retry(retry_at, usage):executor=code {
+    COUNTERS.bump(TRUNCATED_RETRY_ATTEMPTED_COUNTER)
+    errlog row: "VVAH-E005 warning: model call truncated at max_tokens=$_max_tokens; retrying once at $retry_at", recovered=true
+  }
+}
+
+// src: vvaharness/backends/harness/deepagents/options/graph_builder.py:287-322
+LogInvalidRequestShape {
+  fn wrap_model_call(request, handler):executor=code {
+    try return handler(request);
+    catch ModelInvalidRequestError as exc => {
+      errlog row with _payload_shape(request messages, exc), reason="deepagents_invalid_request_shape", recovered=true   // diagnostic only
+      throw exc
+    }
+  }
+}
+
+// src: vvaharness/backends/harness/deepagents/options/graph_builder.py:117-145
+LogToolCalls {
+  fn wrap_tool_call(request, handler):executor=code {
+    result = handler(request)
+    if (!is_stage_only()) console: "      [deepagents] tool $name -> $n chars [$tag]"   // name and size only, never content
+    return result
+  }
+}
+
+// src: vvaharness/backends/harness/deepagents/options/graph_builder.py:148-162
+fn _restaged_harness_profiles(stage, blank):executor=code {
+  // Caller holds _BUILD_LOCK. Rewrites the system_prompt_suffix of every deepagents harness profile for the duration of the build.
+  saved = copy of _HARNESS_PROFILES   // external: deepagents.profiles.harness.harness_profiles
+  for each (key, profile) in saved {
+    suffix = if (blank) "" else profiles.stage_profile_suffix(stage, key)
+    if (suffix != null) _HARNESS_PROFILES[key] = profile with system_prompt_suffix = suffix
+  }
+  constraint OnEveryExit { restore _HARNESS_PROFILES to saved }
+}
+
+// src: vvaharness/backends/harness/deepagents/options/graph_builder.py:82-88, 100-101
+// The "tool_choice is forced but thinking is enabled" UserWarning is shown once per process; _BUILD_LOCK serializes every create_deep_agent call.
+
+// abstracted: graph_builder.py:165-171 (_result_messages unwraps the three ModelCallResult shapes), 325-355 (_leaf_serde_classes and _reachable_serde_classes walk the response model's fields for every nested BaseModel or Enum class to allow in the checkpoint serializer); type plumbing only.

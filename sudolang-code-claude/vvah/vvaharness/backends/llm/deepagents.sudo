@@ -1,0 +1,437 @@
+# vvaharness/backends/llm/deepagents.py
+
+The `deepagents` route, plus the dispatch seam every legacy stage call site goes through. `dispatch_prompt` and `dispatch_agentic` branch on the model's resolved `via`: for `deepagents` they run the DeepAgents (LangGraph) harness here; for `cli`, `sdk` and `openai` they translate the request (structured output, effort, output cap, caller tools) and hand it to `registry.prompt` / `registry.agentic`, or, for `cli` with caller tools, to the `cli_mcp` bridge. The deepagents leg refuses an oversized prompt before dispatch, wraps every harness call in one retry ladder that maps failures onto the harness error taxonomy, and raises typed errors for refusal and truncation. The tool loop itself (turn limit, tool budget, evidence gate, truncation retry middleware) lives in `vvaharness/backends/harness/deepagents/`, outside this batch.
+
+Source: `vvaharness/backends/llm/deepagents.py` (lines 1-1335)
+Executor: mixed (the code arms, bounds and classifies each session; the model runs inside the external harness)
+Called from: the stages (s1, s2, s3, s4, s6, s7, s8, preflight) through `dispatch_prompt` / `dispatch_agentic`; `resume_agentic` from the stage deadline handling
+
+// src: vvaharness/backends/llm/deepagents.py:17-28
+// Deliberately NOT registered in registry._BACKENDS: stages branch on the resolved via explicitly, so the registry never dispatches here.
+// INVARIANT 1: cwd is the host repository root and the harness roots its virtual filesystem there, so a model can emit a virtual absolute path ("/src/app.py"); every model-path entry point must resolve such paths against the inventory before any inventory check.
+// INVARIANT 2: TOKENS phase bucketing is correct only because callers block (_run_sync waits); concurrent calls across different phases would cross-contaminate buckets.
+// preserved: models.py line 17 says "the deepagents adapter has prompt() but NOT agentic()", yet this module defines agentic() and dispatch_agentic(); the remark appears to describe registry dispatch only
+
+## Tool grants and the event loop
+
+// src: vvaharness/backends/llm/deepagents.py:147-170
+fn _permitted_natives(granted, allow_shell = false):executor=code {
+  natives = native names for granted tools (LOGICAL_TO_NATIVE)
+  if (natives include a native read tool) natives = natives union NATIVE_IMPLIED_READS
+  if (allow_shell) natives += NATIVE_SHELL_TOOL
+  return natives   // the PermitTools allow list: only these native tools run; `task` is excluded
+}
+_DEFAULT_TOOLS = ("Read", "Glob", "Grep")
+_ACCEPTED_UNUSED_KW = { "betas", "json_schema", "max_budget_usd", "output_format", "permission_mode", "stream_cb", "temperature", "thinking_budget" }   // silently ignored; any other legacy keyword warns once
+
+// src: vvaharness/backends/llm/deepagents.py:177-205
+// abstracted: one persistent asyncio event loop on a daemon thread ("vvaharness-llm-deepagents"), started lazily under a lock and stopped at interpreter exit (join timeout 5.0 seconds)
+
+// src: vvaharness/backends/llm/deepagents.py:208-239
+fn _run_sync(awaitable, timeout?, tag?, effort?):executor=code {
+  require current thread is not the loop thread => throw RuntimeError("_run_sync called from the harness loop thread — this would deadlock")
+  future = schedule awaitable on the persistent loop
+  try result = future.result(timeout)   // blocking is load-bearing for TOKENS bucketing (invariant 2)
+  catch exc => {
+    cancelled = future.cancel()   // on Ctrl-C or a timeout the harness call must stop billing
+    if (exc is TimeoutError && cancelled) throw call_timeout_error(stage=tag, route="deepagents", budget_s=timeout, effort, cause_text="deepagents session exceeded ${timeout}s")   // VVAH-E008
+    throw exc
+  }
+  note_budget_use(elapsed, timeout, effort)
+  return result
+}
+
+## Failure classification and the retry ladder
+
+// src: vvaharness/backends/llm/deepagents.py:248-274
+_OVERSIZE_PROMPT_COUNTER = "deepagents_oversize_prompts"
+_TOOL_STATE_NOT_ROUNDTRIPPED_COUNTER = "deepagents_tool_state_not_roundtripped"
+fn _check_prompt_ceiling(text, tag):executor=code {
+  estimated = estimate_tokens(text)
+  require estimated <= DEEPAGENTS_MAX_PROMPT_TOKENS => { COUNTERS.bump(_OVERSIZE_PROMPT_COUNTER); throw OversizePromptError("refused before dispatch; reduce what this call packs (chunk sizing / per-call caps) and re-run", stage=tag, estimated_tokens=estimated, limit=150000) }   // VVAH-E004, before paying for the call
+}
+
+// src: vvaharness/backends/llm/deepagents.py:280-298
+fn _auth_failure(exc):executor=code {
+  for each link in exception_chain(exc) with an integer status_code {
+    body = link.message
+    if (status == 401 || sdk._AUTH_STATUS_RX matches body) return [status, body]
+  }
+  return null
+  // preserved: unlike sdk._auth_failure_sdk, a retryable status (for example a 503 whose body says "authentication_failed") still counts as authentication here
+}
+fn _proxy_failure(exc):executor=code {
+  return proxy_detail(first APIConnectionError link carrying a proxy or TLS signature) or null
+}
+
+// src: vvaharness/backends/llm/deepagents.py:301-337
+fn _classify_failure(exc, model_id, tag):executor=code {
+  // order matters: refusal first, before any arm that could re-send it; the missing-thought-signature arm last
+  refusal = model_refusal_from(exc, route="deepagents", stage=tag); if (refusal) return refusal
+  auth = _auth_failure(exc); if (auth) return AuthenticationError("<redacted body first 400 characters> (model=$model_id, stage=$tag)", status_code, backend="deepagents")   // VVAH-E001
+  detail = _proxy_failure(exc); if (detail) return ProxyError("<redacted detail first 400 characters> (...)", status_code = if (detail contains 407) 407 else null, backend="deepagents")   // VVAH-E002
+  if (deepagents.client._is_missing_thought_signature(exc)) {   // external to this batch
+    COUNTERS.bump(_TOOL_STATE_NOT_ROUNDTRIPPED_COUNTER)
+    return ToolStateNotRoundTrippedError("provider rejected a replayed tool call (...)", stage=tag, model_id)   // VVAH-E006
+  }
+  return null
+}
+
+// src: vvaharness/backends/llm/deepagents.py:340-381
+_UNHEALABLE_STATUS = {401, 403}
+_TRANSIENT_ATTEMPTS = 3   // matches sdk.prompt attempts
+_TRANSIENT_WAIT_SECONDS = 60
+_RETRY_AFTER_MAX_SECONDS = 300.0   // a gateway advertising 86400 seconds must not park a scan for a day
+fn _transient_failure(exc):executor=code {
+  transient = false
+  for each link in exception_chain(exc) {
+    if (link.status_code in _UNHEALABLE_STATUS) return false   // an unhealable status anywhere in the chain vetoes
+    transient = transient || link.status_code in RETRYABLE_STATUS || RATE_LIMIT_TRANSIENT_RX matches body || SERVER_ERROR_TRANSIENT_RX matches body
+  }
+  return transient
+}
+fn _retry_after_seconds(exc):executor=code {
+  return min(first positive numeric "retry-after" header in the chain, 300.0) or null
+}
+
+// src: vvaharness/backends/llm/deepagents.py:391-400
+fn _transient_wait(exc, session_t0, budget, tag):executor=code {
+  wait = _retry_after_seconds(exc) or, when absent, jittered_delay(60)   // retry-after is honoured without jitter; the flat fallback is jittered
+  require wait_overrun(wait, session_t0, budget, stage=tag, route="deepagents", effort=null) == null => throw CallTimeoutError
+  return wait
+}
+
+// src: vvaharness/backends/llm/deepagents.py:403-431
+fn _call_classified(call, model_id, tag, budget?):executor=code {
+  // THE retry ladder of this route; it stacks on each client library's 2 retries, so the worst case is 3x3 = 9 sends (x2 on a fallback)
+  attempt = 0; session_t0 = now; remaining = budget
+  loop {
+    attempt += 1
+    try return call(remaining)
+    catch exc => {
+      mapped = _classify_failure(exc, model_id, tag)
+      if (mapped != null) {
+        if (mapped is not ModelRefusal) throw mapped   // chained to exc
+        refusal = mapped; break   // raised outside the handler, unchained, so a TimeoutError link is not read as a timeout
+      }
+      if (attempt >= _TRANSIENT_ATTEMPTS || !_transient_failure(exc)) throw exc
+      wait = _transient_wait(exc, session_t0, budget, tag)
+      sleep(wait)
+      remaining = if (budget == null) null else turn_timeout(session_t0, budget, budget)   // the retry gets only what the session clock has left (floor 1 second)
+    }
+  }
+  throw refusal
+}
+
+// abstracted: deepagents.py:434-489 — _warn_no_usage (once per stage when a call records no token usage), _warn_dropped_model_knobs (once per models-entry tunable this route never sends: temperature, thinking_budget, betas), _warn_max_budget_unenforced ("max_budget_usd=... is accepted but not enforced on the deepagents route ..."), _usage_of and _output_tokens. Warnings only.
+
+// src: vvaharness/backends/llm/deepagents.py:492-514
+fn build_harness_env(model_id, provider, sdk_cfg, openai_cfg, cfg_dir?):executor=code {
+  return process environment + provider_routing.credential_env_overrides(...) + model_building.tls_carriers_for(...)   // external to this batch
+}
+
+// src: vvaharness/backends/llm/deepagents.py:517-527
+fn map_allowed_tools(allowed_tools):executor=code {
+  if (allowed_tools == null) return [_DEFAULT_TOOLS, []]
+  names = allowed_tools without duplicates
+  return [names in READ_TOOLS, names not in READ_TOOLS]   // granted, stripped; stripping is never an error here, the caller warns
+}
+
+## Session draining
+
+// src: vvaharness/backends/llm/deepagents.py:609-629
+// _consume (the inner stream loop) is at vvaharness/backends/llm/deepagents.py:530-541
+fn _drain(user_prompt, options, tag?):executor=code {
+  seen = []; transcript = open_transcript(tag, model, graph_name)
+  constraint OnEveryExit { close the transcript, so a session that dies mid-stream still leaves one }
+  try {
+    for each message in get_harness("deepagents").run_streaming(user_prompt, options) {   // external: vvaharness/backends/harness/deepagents (the tool loop and its middleware)
+      transcript.add(message); if (message is HarnessResult) seen.append(message)
+    }
+  }
+  catch HarnessProcessError exc => {
+    // GraphRecursionError salvage: the legacy force-finalize
+    if (!(exc.recursion_limited || "GraphRecursionError" in str(exc)) || seen is empty) throw exc
+    return [last of seen, exc]
+  }
+  return [last of seen or null, null]
+}
+
+// src: vvaharness/backends/llm/deepagents.py:632-650
+fn drain_streaming(user_prompt, options, tag?, timeout?):executor=code {
+  [terminal, recursion_error] = _run_sync(_drain(user_prompt, options, tag), timeout, tag, effort=options.effort)
+  require terminal != null => throw RuntimeError("DeepAgents session ended without a terminal result")
+  require !(terminal.is_error && recursion_error == null) => throw RuntimeError("DeepAgents session failed: ${terminal.subtype || \"unknown error\"}")
+  if (recursion_error) { warn AGENTIC_TURN_LIMIT; COUNTERS.bump("llm_turn_cap_exhausted") }   // the last terminal before the recursion limit is accepted as the answer
+  return terminal
+}
+
+// src: vvaharness/backends/llm/deepagents.py:543-569 — session pinning
+// abstracted: _PINNED maps session_id to the StreamingOptions it was armed with (under a lock, only when session_id is non-empty) so resume_agentic can re-enter the same LangGraph thread; release_pinned_session forgets it on this route, in deepagents.options, and in the `cli` session store.
+// src: vvaharness/backends/llm/deepagents.py:572-606 — resume draining (_consume_resume 572-581, _drain_resume 584-596, drain_resume 599-606)
+// abstracted: _drain_resume / drain_resume are the resume twins of _drain / drain_streaming: one more turn on the same thread via get_harness("deepagents").resume_streaming, transcript closed on every exit, RuntimeError "DeepAgents resume ended without a terminal result" when none arrives. Unlike _drain there is no GraphRecursionError salvage and no is_error check.
+
+// src: vvaharness/backends/llm/deepagents.py:653-661
+fn run_oneshot(user_prompt, options, tag?, timeout?):executor=code {
+  return _run_sync(get_harness("deepagents").run_oneshot(user_prompt, options), timeout, tag, effort=options.effort)   // external: parser-only single-turn invocation
+}
+
+// src: vvaharness/backends/llm/deepagents.py:664-684
+fn _run_oneshot_with_truncation_retry(user_prompt, options, model_id, tag, timeout?):executor=code {
+  requested = options.max_output_tokens || MODEL_MAX_OUTPUT_TOKENS
+  cap_ceiling = options.output_cap or, when absent, MODEL_MAX_OUTPUT_TOKENS
+  retry_at = truncation_retry_max(requested, cap=cap_ceiling)
+  result = _call_classified(remaining => run_oneshot(user_prompt, options, tag, timeout=remaining), model_id, tag, budget=timeout)
+  raise_if_refused(result, tag)
+  if (!result.truncated) return result
+  throw cli._truncation_error(requested, retried=retry_at or 0, tag, retry_at, produced=output_tokens_for_gate(result.usage))
+  // the doubled-budget retry itself happens inside the external middleware (CapOutputTokens) before this sees the truncation
+}
+
+// src: vvaharness/backends/llm/deepagents.py:687-708
+fn raise_if_refused(result, tag):executor=code {
+  if (result.refused) throw model_refusal(route="deepagents", stage=tag, category=result.refusal_category)   // usage is already banked
+}
+fn drain_classified(user_prompt, options, model_id, tag, timeout?):executor=code {
+  terminal = _call_classified(remaining => drain_streaming(user_prompt, options, tag, timeout=remaining), model_id, tag, budget=timeout)
+  raise_if_refused(terminal, tag)
+  return terminal
+}
+fn terminal_text(result):executor=code { return result.result_text or "" }   // IS the structured channel (JSON) when response_model was set
+
+## agentic(): one DeepAgents tool-using session
+
+// src: vvaharness/backends/llm/deepagents.py:711-821
+fn agentic(user_prompt, model, system_prompt?, allowed_tools?, cwd, max_budget_usd?, permission_mode = "auto", max_turns?, tag?, graph_name = DEFAULT_GRAPH_NAME, sdk_cfg?, openai_cfg?, cfg_dir?, tool_builder?, fact_tools = [], response_model?, parent_middleware = [], skill_root?, cache_prefix?, max_output_tokens?, effort?, agents?, allow_shell = false, timeout?, session_id = "", think_in_prompt = false):executor=mixed {
+  // max_turns here is the LangGraph recursion limit with +900 applied by the harness: 40 is about 470 turns; on `sdk` and `cli` max_turns is a HARD turn cap
+  // settled: streaming route sets recursion_limit = (max_turns or 50) + RECURSION_HEADROOM (900); one-shot path uses max_turns + 5; LangGraph counts supersteps (~2*turns+3)
+  // src: vvaharness/backends/harness/deepagents/options/streaming.py:141
+  // src: vvaharness/backends/harness/deepagents/limits.py:19-30
+  [model_id, via, extras] = registry.resolve(model)
+  _warn_dropped_model_knobs(model_id, extras); _warn_max_budget_unenforced(max_budget_usd)
+  provider = registry.provider_of(model); output_cap = registry.output_cap_of(model)
+  effective_max_output_tokens = max_output_tokens || AGENTIC_MAX_TOKENS   // 16000 per turn, parity with `sdk` and `openai`; otherwise this route inherits 64k
+  if (output_cap != null) effective_max_output_tokens = registry.clamp_output_tokens(effective_max_output_tokens, model, tag)
+  prefix = cache_prefix or ""
+  if (prefix && !(routes_to_anthropic(model_id, provider) && markers_on(sdk_cfg))) { user_prompt = prefix + user_prompt; prefix = "" }   // content is never dropped
+  _check_prompt_ceiling(prefix + user_prompt, tag)
+  [granted, stripped] = map_allowed_tools(allowed_tools)
+  if (stripped) warn TOOLS_UNSUPPORTED_ON_ROUTE   // non-read tools are stripped, not refused
+
+  options = StreamingOptions {
+    model: model_id; model_provider: provider; use_responses_api: registry.use_responses_api_of(model)
+    cwd; env: build_harness_env(...)
+    max_turns; max_budget_usd; system_prompt
+    tool_policy: ToolPolicy(allowed_tools=granted, disallowed_tools=stripped)
+    graph_name; skill_root; effort; agents
+    permitted_tool_calls: _permitted_natives(granted, allow_shell)   // PermitTools gate
+    allow_shell
+    max_output_tokens: effective_max_output_tokens; output_cap
+    cache_markers: markers_on(sdk_cfg); cache_prefix: prefix or null   // the fourth and last Anthropic breakpoint
+    tool_builder; fact_tools; response_model; parent_middleware
+    session_id   // pinned so resume_agentic can continue this conversation after a deadline kill
+    think_in_prompt   // reasoning asked for in the prompt instead of an API thinking block; langchain then keeps the forced tool_choice natively
+  }
+  _pin_session(options)
+  session_timeout = effort_scaled_seconds(timeout, effort, kind=SESSION)
+
+  terminal = callModel({ role: tag, route: "deepagents", system: system_prompt, prompt: user_prompt, tools: granted + caller fact_tools (+ shell if allow_shell), limits: { max_turns, max_output_tokens: effective_max_output_tokens, session: session_timeout }, output: response_model or "text" })
+    // made by drain_classified(user_prompt, options, model_id, tag, timeout=session_timeout); the tool loop, turn accounting, evidence gate and tool budgets run inside the external harness
+
+  usage = terminal.usage
+  if (terminal.truncated) {
+    // the CapOutputTokens middleware already spent the one doubled retry; usage is session-cumulative, so it is never passed as produced
+    COUNTERS.bump(TRUNCATED_REPLIES_COUNTER)
+    throw TruncatedResponseError("final assistant turn hit the per-turn output budget; the one doubled-budget retry (CapOutputTokens) also came back truncated, or there was no useful doubling left", requested=effective_max_output_tokens, retried=truncation_retry_max(effective_max_output_tokens, cap=output_cap or, when absent, MODEL_MAX_OUTPUT_TOKENS) or 0)
+  }
+  _warn_no_usage(usage, model_id, tag)
+  text = terminal_text(terminal)
+  check_response_quality(trim(text), stage=tag, output_tokens=output_tokens_for_gate(usage))   // external: vvaharness/util/response_quality.py
+  return text
+  // preserved: the structured result is returned as raw text; unlike `sdk` and `openai`, no validation against response_model happens in this module
+}
+
+// src: vvaharness/backends/llm/deepagents.py:824-831
+fn markers_on(sdk_cfg):executor=code { return cache.markers_enabled({ cache_markers: sdk_cfg.cache_markers }) }   // the `sdk` block's kill switch governs this route too
+
+## prompt(): one parser-only call
+
+// src: vvaharness/backends/llm/deepagents.py:834-917
+fn prompt(user_prompt, model, system_prompt?, max_tokens?, cwd, tag?, graph_name = DEFAULT_GRAPH_NAME, sdk_cfg?, openai_cfg?, cfg_dir?, cache_prefix?, response_model?, tool_builder?, fact_tools = [], parent_middleware = [], max_turns?, effort?, timeout?, think_in_prompt = false):executor=mixed {
+  // max_tokens null: 64k on Anthropic, UNCAPPED on OpenAI gateways
+  [model_id, via, extras] = registry.resolve(model); _warn_dropped_model_knobs(model_id, extras)
+  if (max_tokens != null) max_tokens = registry.clamp_output_tokens(max_tokens, model, tag)
+  flat = registry._flatten_blocks(user_prompt)
+  prefix = cache_prefix or ""
+  if (prefix && !(routes_to_anthropic(model_id, provider) && markers_on(sdk_cfg))) { flat = prefix + flat; prefix = "" }
+  _check_prompt_ceiling(prefix + flat, tag)   // over the full user-turn content: a marked prefix is still sent
+  options = OneShotOptions {
+    model: model_id; model_provider; use_responses_api; cwd; env: build_harness_env(...)
+    system_prompt; tool_policy: ToolPolicy()   // empty: excludes the native filesystem tools
+    graph_name; max_output_tokens: max_tokens; output_cap: registry.output_cap_of(model)
+    cache_prefix: prefix or null; cache_markers: markers_on(sdk_cfg)
+    response_model; tool_builder; fact_tools; parent_middleware
+    max_turns: if (max_turns == null) 15 else max_turns
+    effort; think_in_prompt
+  }
+  request_timeout = effort_scaled_seconds(timeout, effort, kind=REQUEST)   // a one-shot has no tool loop
+  result = callModel({ role: tag, route: "deepagents", system: system_prompt, prompt: flat, tools: caller fact_tools only (no filesystem tools), limits: { max_turns: options.max_turns, max_output_tokens: max_tokens, timeout: request_timeout }, output: response_model or "text" })
+    // made by _run_oneshot_with_truncation_retry(flat, options, model_id, tag, timeout=request_timeout)
+  _warn_no_usage(result.usage, model_id, tag)
+  text = result.result_text or ""
+  check_response_quality(trim(text), stage=tag, output_tokens=output_tokens_for_gate(result.usage))
+  return text
+}
+
+## The dispatch seam
+
+// src: vvaharness/backends/llm/deepagents.py:923-961
+fn _screen_legacy_kwargs(legacy_kw, route = "deepagents"):executor=code {
+  prefix = remove legacy_kw.cache_prefix   // carries content, so it is returned, never dropped
+  for each name in legacy_kw not in _ACCEPTED_UNUSED_KW, warn once "WARN [$route]: legacy kwarg `$name` is not supported on the $route route — ignored"
+  return if (prefix is a list) non-empty parts joined by "\n\n" else str(prefix) or ""
+}
+fn think_in_prompt_enabled(cfg):executor=code { return knob(cfg, "think_in_prompt", default=true) }
+fn _json_schema_of(response_model):executor=code { return response_model.model_json_schema() without "title" and "$schema" }   // the CLI rejects newer schema dialects at startup
+
+// src: vvaharness/backends/llm/deepagents.py:964-1025
+fn dispatch_prompt(user_prompt, model, cfg, cwd, system_prompt?, max_tokens?, tag?, graph_name?, response_model?, tool_builder?, fact_tools = [], parent_middleware = [], max_turns?, effort?, ...legacy_kw):executor=code {
+  via = registry.resolve(model).via
+  if (via != "deepagents") {
+    if (tool_builder || fact_tools || parent_middleware) warn once "WARN [$via]: dispatch_prompt has no tool seam on this route — tool_builder/fact_tools/parent_middleware are accepted but ignored."
+    if (effort != null) legacy_kw.effort = effort
+    if (response_model != null) {
+      match (via) {
+        case "cli" | "openai" => legacy_kw.json_schema = _json_schema_of(response_model)   // `openai` sends it as response_format json_schema; `cli` as its own schema option
+        case "sdk" => legacy_kw.response_model = response_model   // a forced submit tool
+        default => throw ValueError("dispatch_prompt: response_model is not supported on via=$via (only deepagents/sdk/cli/openai)")
+      }
+    }
+    return registry.prompt(user_prompt, model, system_prompt, max_tokens, tag, ...legacy_kw)   // see backends/llm/sdk.sudo prompt and backends/llm/openai.sudo prompt
+  }
+  timeout = legacy_kw.timeout if > 0 else null   // 0 or negative means no timeout, not abort immediately
+  prefix = _screen_legacy_kwargs(legacy_kw)
+  return prompt(user_prompt, model, system_prompt, max_tokens, cwd, tag, graph_name, sdk_cfg, openai_cfg, cfg_dir, cache_prefix=prefix, response_model, tool_builder, fact_tools, parent_middleware, max_turns, effort, timeout, think_in_prompt=think_in_prompt_enabled(cfg))
+}
+
+// src: vvaharness/backends/llm/deepagents.py:1028-1047
+fn route_carries_tools(cfg, via, agentic = true):executor=code {
+  // the single truth table for every stage's tool gate
+  if (!agentic && via != "deepagents") return [false, "dispatch_prompt has no tool seam on this route"]
+  match (via) {
+    case "deepagents" | "sdk" | "openai" => return [true, ""]
+    case "cli" => {
+      if (!knob(cfg, "cli.mcp_tools", default=true)) return [false, "cli.mcp_tools is off"]
+      if (!cli_mcp.available()) return [false, "the Claude Agent SDK the via: cli tool bridge needs is not importable"]
+      return [true, ""]
+    }
+    default => return [false, "via: $via has no tool seam"]
+  }
+}
+
+// src: vvaharness/backends/llm/deepagents.py:1050-1063
+fn droppable_effort(model, effort, agentic):executor=code {
+  // the effort a drop_thinking resend actually removes
+  if (effort == null) return null
+  [model_id, via, extras] = registry.resolve(model)
+  if (via == "cli" || (via == "sdk" && !agentic && "thinking_budget" in extras)) return null   // the resend would still carry a thinking or effort field
+  return effort
+}
+
+// src: vvaharness/backends/llm/deepagents.py:1066-1118
+// abstracted: _warn_dropped_middleware warns once per (via, stage) that a leg with no tool stack drops ModelCallBudget ("`max_model_calls` does not bound this session on this route — `max_turns` does") and EvidenceGate ("the evidence gate's tool-call requirement cannot apply with no tool stack"); _warn_model_call_budget_not_metered warns that a tool stack meters EvidenceGate but never ModelCallBudget.
+
+// src: vvaharness/backends/llm/deepagents.py:1121-1158
+fn _adapt_tools(tool_builder, model_id, cwd, fact_tools, parent_middleware, legacy_kw, tag, via):executor=code {
+  // materializes the caller's fact tools into `sdk` / `openai` agentic keyword arguments
+  if (tool_builder == null || !fact_tools) { _warn_dropped_middleware(parent_middleware, via, tag); return null }
+  stack = tool_adapter.build(tool_builder, model=model_id, cwd, fact_tools, parent_middleware)   // external to this batch: vvaharness/backends/llm/tool_adapter.py
+  if (stack == null) { warn once "... supplied a tool_builder for $fact_tools but it produced no tools (the fact they read is absent — e.g. no code graph was built) — running without them."; return null }
+  _warn_model_call_budget_not_metered(parent_middleware, via, tag)
+  legacy_kw.extra_tools = [...stack.schemas, ...caller extra_tools]
+  legacy_kw.extra_dispatch = (name, args) => stack.dispatch(name, args, tag) or, when absent, caller extra_dispatch(name, args) or, when absent, null   // chained: the stack first, then the caller's own
+  legacy_kw.submit_guard = stack.submit_guard   // delegates to the caller's own EvidenceGate, so limits and counters are shared
+  legacy_kw.exhausted_tools = stack.exhausted_tools   // withdraws an exhausted tool from the offered list
+  return stack
+}
+
+// src: vvaharness/backends/llm/deepagents.py:1161-1200
+fn _resume_agentic_deepagents(session_id, instruction, model, tag, timeout):executor=mixed {
+  held = pinned options for session_id
+  require held != null => throw SessionNotResumableError("session $session_id was never pinned or has been released")
+  timeout = if (timeout > 0) timeout else null
+  session_timeout = effort_scaled_seconds(timeout, held.effort, kind=SESSION)
+  for each middleware mw in held.parent_middleware with grant_resume_turn, mw.grant_resume_turn()   // otherwise a budget already past its forced final turn rejects the resume (VVAH-E007)
+  terminal = callModel({ role: tag, route: "deepagents", prompt: instruction appended to the checkpointed thread, tools: as pinned, limits: { session: session_timeout }, output: held.response_model or "text" })
+    // made by _call_classified(remaining => drain_resume(instruction, held, tag, timeout=remaining), ...)
+  raise_if_refused(terminal, tag)
+  return terminal_text(terminal)
+}
+fn resume_agentic(session_id, instruction, model, cfg, tag?, timeout?):executor=code {
+  via = registry.resolve(model).via
+  match (via) {
+    case "cli" => return cli.session.resume_agentic(session_id, instruction, timeout, tag)
+    case "deepagents" => return _resume_agentic_deepagents(session_id, instruction, model, tag, timeout)
+    default => throw SessionNotResumableError("resume_agentic: no session to resume on via=$via")   // the stage then replays the transcript instead
+  }
+}
+
+// src: vvaharness/backends/llm/deepagents.py:1203-1335
+fn dispatch_agentic(user_prompt, model, cfg, cwd, system_prompt?, allowed_tools?, max_turns?, max_budget_usd?, tag?, graph_name?, tool_builder?, fact_tools = [], response_model?, parent_middleware = [], max_output_tokens?, skill_root?, effort?, agents?, allow_shell = false, session_id = "", ...legacy_kw):executor=code {
+  via = registry.resolve(model).via
+  if (via != "deepagents") {
+    // the deepagents middleware is approximated off-loop; todos and subagents are deepagents-only
+    mcp_bridged = via == "cli" && tool_builder && fact_tools && knob(cfg, "cli.mcp_tools", default=true)
+    tokens = if (max_output_tokens) registry.clamp_output_tokens(int(max_output_tokens), model, tag) else null
+    if (response_model != null) {
+      match (via) {
+        case "cli" => legacy_kw.json_schema = _json_schema_of(response_model)
+        case "sdk" | "openai" => legacy_kw.response_model = response_model   // the submit tool inside the agentic loop
+        default => throw ValueError("dispatch_agentic: response_model is not supported on via=$via (only deepagents/sdk/openai/cli)")
+      }
+    }
+    if (mcp_bridged) {
+      timeout = remove legacy_kw.timeout
+      bridge_prefix = _screen_legacy_kwargs(legacy_kw, route="cli"); if (bridge_prefix) user_prompt = bridge_prefix + user_prompt   // always folded in on this leg
+      remove legacy_kw.stream_cb, legacy_kw.permission_mode (the bridge's gate owns policy), legacy_kw.json_schema (the bridge lowers it itself)
+      return cli_mcp.agentic_with_tools(user_prompt, model=model_id, system_prompt, allowed_tools, cwd, tool_builder, fact_tools, parent_middleware, max_turns, max_budget_usd, max_tokens=tokens, effort, allow_shell, response_model, tag, timeout)   // external to this batch: vvaharness/backends/llm/cli_mcp.py
+    }
+    if (via == "cli") {
+      if (skill_root || allow_shell) warn once "WARN [cli]: ... configured skill_root/allow_shell, but the plain via: cli leg forwards neither — not enforced on this route."
+      if (effort != null) legacy_kw.effort = effort   // overrides the process-global cli.effort
+      if (tokens) legacy_kw.max_tokens = tokens
+      if (session_id) legacy_kw.session_id = session_id
+      _warn_dropped_middleware(parent_middleware, via, tag)
+    }
+    stack = null
+    if (via in ["sdk", "openai"]) {
+      if (tokens) legacy_kw.max_output_tokens = tokens
+      legacy_kw.effort = effort
+      stack = _adapt_tools(tool_builder, model_id, cwd, fact_tools, parent_middleware, legacy_kw, tag, via)
+      // preserved: allow_shell, skill_root, agents and session_id are not forwarded on `sdk` and `openai`, and no warning names them
+    }
+    text = registry.agentic(user_prompt, model, system_prompt, allowed_tools, cwd, max_budget_usd, max_turns, tag, ...legacy_kw)   // see backends/llm/sdk.sudo agentic and backends/llm/openai.sudo agentic
+    if (stack) stack.report_evidence_degradation(tag, label=via)
+    return text
+  }
+  timeout = legacy_kw.timeout if > 0 else null
+  prefix = _screen_legacy_kwargs(legacy_kw)
+  return agentic(user_prompt, model, system_prompt, allowed_tools, cwd, max_budget_usd, max_turns, tag, graph_name, sdk_cfg, openai_cfg, cfg_dir, tool_builder, fact_tools, response_model, parent_middleware, cache_prefix=prefix /* its own block, so a sibling prefix stays cacheable */, max_output_tokens, skill_root, effort, agents, allow_shell, timeout, session_id, think_in_prompt=think_in_prompt_enabled(cfg))
+}
+
+## Differences between the model routes
+
+// src: vvaharness/backends/llm/sdk.py:993-994, 1243, 1408-1410; vvaharness/backends/llm/openai.py:391, 1107, 1651, 1813-1815; vvaharness/backends/llm/deepagents.py:741, 902
+| Aspect | `sdk` | `openai` | `deepagents` |
+|---|---|---|---|
+| Default agentic turn cap | 40 (hard) | 25 (hard) | `max_turns` passed to the harness as a LangGraph recursion limit (+900: 40 is about 470 turns); one-shot default 15 |
+| Per-turn output cap | 16000 | 16000, also capped by declared and learned output caps | 16000, clamped to the declared output cap |
+| Transient retries inside an agentic turn | 4, waits min(60, 20 x n) jittered | 4, waits min(60, 10 x n) jittered | 3 attempts per whole session call, retry-after (cap 300 seconds) or jittered 60 seconds |
+| prompt() retries | 3 attempts (up to 6 with drop grants), flat 60 seconds jittered, authentication 2/4/8 seconds | same as `sdk` | 3 attempts, same ladder as agentic |
+| Mutating or unsupported tool requested | Bash refused; other unsupported tools delegate to the Agent SDK | NotImplementedError | stripped with a warning; shell only with allow_shell |
+| Structured output in agentic | submit tool, tool_choice "any" unless blocked; at most 2 rejected submits then the raw submit is returned | submit tool, never forced in the loop; at most 2 rejected submits then raw | response_model handed to the harness; the result text is returned unvalidated here |
+| Forced final at the turn cap | full tool list kept, tool_choice forces the submit tool (or none); a prose final raises | only the submit tool kept (or no tools); a malformed submit falls back to prose | GraphRecursionError salvage: the last terminal result is accepted |
+| Prose re-ask | once, never on the last turn | once, also on the last turn | none in this module |
+| Refusal detection | stop_reason "refusal" | finish_reason "content_filter", a refusal-only reply, or a cyber-policy 400 | refused terminal result, or a refusal anywhere in the exception chain |
+| Context overflow | evict oldest tool result over 1200 characters, at most 16 per turn | same | not handled in this module |
+| Authentication in agentic | raise at once | raise at once | raise at once; a retryable status with authentication prose still counts as authentication |

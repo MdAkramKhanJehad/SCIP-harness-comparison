@@ -1,0 +1,2840 @@
+{
+  "source": "vendor/context_graph_sdk/src/context_graph_sdk/_process.py",
+  "sha256": "8dd7cfefe5d459d494ff2f885f680e7e885a1968c0f37b9889f22e2db1f1f7ef",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Private no-fork subprocess transport for native-runtime workers.\"\"\"\n\nfrom __future__ import annotations\n\nimport os\nimport struct\nimport subprocess\nimport sys\nimport threading\nfrom collections import deque\nfrom collections.abc import Callable\nfrom contextlib import suppress\nfrom typing import BinaryIO, Protocol, cast\n\n_FRAME_HEADER = struct.Struct(\"!I\")\n_MAX_FRAME_BYTES = (1 << (_FRAME_HEADER.size * 8)) - 1\n\n\nclass ByteReader(Protocol):\n    def recv_bytes(self, maximum: int) -> bytes: ...\n\n    def close(self) -> None: ...\n\n\nclass ByteWriter(Protocol):\n    def send_bytes(self, payload: bytes) -> None: ...\n\n    def close(self) -> None: ...\n\n\nclass FrameReader:\n    \"\"\"Read bounded length-prefixed frames from one binary stream.\"\"\"\n\n    def __init__(self, stream: BinaryIO) -> None:\n        self._stream = stream\n\n    def recv_bytes(self, maximum: int) -> bytes:\n        header = _read_exact(self._stream, _FRAME_HEADER.size)\n        size = _FRAME_HEADER.unpack(header)[0]\n        if size > maximum:\n            raise OSError(f\"message length {size} exceeds {maximum} byte bound\")\n        return _read_exact(self._stream, size)\n\n    def close(self) -> None:\n        self._stream.close()\n\n\nclass FrameWriter:\n    \"\"\"Write length-prefixed frames to one binary stream.\"\"\"\n\n    def __init__(self, stream: BinaryIO) -> None:\n        self._stream = stream\n        self._lock = threading.Lock()\n\n    def send_bytes(self, payload: bytes) -> None:\n        if len(payload) > _MAX_FRAME_BYTES:\n            raise ValueError(\"payload exceeds framing limit\")\n        with self._lock:\n            _write_all(self._stream, _FRAME_HEADER.pack(len(payload)))\n            _write_all(self._stream, payload)\n            self._stream.flush()\n\n    def close(self) -> None:\n        self._stream.close()\n\n\nclass StdioChannel:\n    \"\"\"Asynchronous framed requests and responses over a child's standard streams.\"\"\"\n\n    def __init__(\n        self,\n        request_stream: BinaryIO,\n        response_stream: BinaryIO,\n        maximum_response_bytes: int,\n        on_response: Callable[[StdioChannel], None] | None = None,\n    ) -> None:\n        self._request = FrameWriter(request_stream)\n        self._response = FrameReader(response_stream)\n        self._maximum_response_bytes = maximum_response_bytes\n        self._on_response = on_response\n        self._condition = threading.Condition()\n        self._messages: deque[bytes | BaseException] = deque()\n        self._closed = False\n        self._reader = threading.Thread(\n            target=self._read_responses,\n            name=\"context-graph-worker-reader\",\n            daemon=True,\n        )\n        self._reader.start()\n\n    def send_bytes(self, payload: bytes) -> None:\n        self._request.send_bytes(payload)\n\n    def poll(self, timeout: float) -> bool:\n        with self._condition:\n            return self._condition.wait_for(lambda: bool(self._messages), timeout)\n\n    def recv_bytes(self, maximum: int) -> bytes:\n        with self._condition:\n            if not self._messages:\n                raise BlockingIOError(\"worker response is not ready\")\n            message = self._messages.popleft()\n        if isinstance(message, BaseException):\n            raise message\n        if len(message) > maximum:\n            raise OSError(f\"message length {len(message)} exceeds {maximum} byte bound\")\n        return message\n\n    def close_request(self) -> None:\n        with suppress(OSError):\n            self._request.close()\n\n    def close(self) -> None:\n        with self._condition:\n            if self._closed:\n                return\n            self._closed = True\n        self.close_request()\n        with suppress(OSError):\n            self._response.close()\n        if threading.current_thread() is not self._reader:\n            self._reader.join(2.0)\n\n    def _read_responses(self) -> None:\n        while True:\n            try:\n                message: bytes | BaseException = self._response.recv_bytes(\n                    self._maximum_response_bytes\n                )\n            except BaseException as error:\n                message = error\n            with self._condition:\n                if self._closed:\n                    return\n                if self._messages:\n                    message = OSError(\"worker produced more than one pending response\")\n                    self._messages.clear()\n                self._messages.append(message)\n                self._condition.notify_all()\n            if self._on_response is not None:\n                with suppress(Exception):\n                    self._on_response(self)\n            if isinstance(message, BaseException):\n                return\n\n\ndef spawn_stdio_worker(\n    module: str,\n    *arguments: str,\n    maximum_response_bytes: int = 64 * 1024 * 1024,\n    on_response: Callable[[StdioChannel], None] | None = None,\n) -> tuple[subprocess.Popen[bytes], StdioChannel]:\n    \"\"\"Launch through the safest native subprocess path on each platform.\n\n    POSIX keeps ``close_fds=False`` and passes no descriptors explicitly so\n    CPython can use ``posix_spawn`` instead of ``fork_exec``. Forking after the\n    host has initialized Tree-sitter or the embedded JVM is unsafe on macOS.\n    Python-created descriptors are non-inheritable by default, and all worker\n    traffic remains on standard input/output.\n\n    Windows has no fork hazard, so ``close_fds=True`` prevents unrelated\n    inheritable handles from an embedding host such as VVAH reaching workers.\n    The framed stream transport deliberately uses the ``Popen`` file objects\n    rather than treating their CRT descriptors as multiprocessing sockets.\n    \"\"\"\n    process = subprocess.Popen(\n        [sys.executable, \"-m\", module, *arguments],\n        stdin=subprocess.PIPE,\n        stdout=subprocess.PIPE,\n        close_fds=os.name == \"nt\",\n        bufsize=0,\n    )\n    if process.stdin is None or process.stdout is None:\n        _terminate_failed_spawn(process)\n        raise RuntimeError(\"worker standard streams were not created\")\n    try:\n        channel = StdioChannel(\n            cast(BinaryIO, process.stdin),\n            cast(BinaryIO, process.stdout),\n            maximum_response_bytes,\n            on_response,\n        )\n    except Exception:\n        process.stdin.close()\n        process.stdout.close()\n        _terminate_failed_spawn(process)\n        raise\n    return process, channel\n\n\ndef _read_exact(stream: BinaryIO, size: int) -> bytes:\n    chunks: list[bytes] = []\n    remaining = size\n    while remaining:\n        chunk = stream.read(remaining)\n        if not chunk:\n            raise EOFError\n        chunks.append(chunk)\n        remaining -= len(chunk)\n    return b\"\".join(chunks)\n\n\ndef _write_all(stream: BinaryIO, payload: bytes) -> None:\n    view = memoryview(payload)\n    while view:\n        written = stream.write(view)\n        if written is None or written <= 0:\n            raise BrokenPipeError(\"worker stream closed during write\")\n        view = view[written:]\n\n\ndef _terminate_failed_spawn(process: subprocess.Popen[bytes]) -> None:\n    if process.poll() is not None:\n        return\n    process.terminate()\n    with suppress(subprocess.TimeoutExpired):\n        process.wait(5.0)\n    if process.poll() is None:\n        process.kill()\n        with suppress(subprocess.TimeoutExpired):\n            process.wait(2.0)\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/_process.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "Private no-fork subprocess transport for native-runtime workers.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_46_4": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/_process.py",
+      "line_start": 46,
+      "line_end": 46,
+      "value": "Read bounded length-prefixed frames from one binary stream.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_55_26": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/_process.py",
+      "line_start": 55,
+      "line_end": 55,
+      "source_expression": "f\"message length {size} exceeds {maximum} byte bound\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_63_4": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/_process.py",
+      "line_start": 63,
+      "line_end": 63,
+      "value": "Write length-prefixed frames to one binary stream.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_82_4": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/_process.py",
+      "line_start": 82,
+      "line_end": 82,
+      "value": "Asynchronous framed requests and responses over a child's standard streams.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_120_26": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/_process.py",
+      "line_start": 120,
+      "line_end": 120,
+      "source_expression": "f\"message length {len(message)} exceeds {maximum} byte bound\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_167_4": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/_process.py",
+      "line_start": 167,
+      "line_end": 179,
+      "value": "Launch through the safest native subprocess path on each platform.\n\n    POSIX keeps ``close_fds=False`` and passes no descriptors explicitly so\n    CPython can use ``posix_spawn`` instead of ``fork_exec``. Forking after the\n    host has initialized Tree-sitter or the embedded JVM is unsafe on macOS.\n    Python-created descriptors are non-inheritable by default, and all worker\n    traffic remains on standard input/output.\n\n    Windows has no fork hazard, so ``close_fds=True`` prevents unrelated\n    inheritable handles from an embedding host such as VVAH reaching workers.\n    The framed stream transport deliberately uses the ``Popen`` file objects\n    rather than treating their CRT descriptors as multiprocessing sockets.\n    ",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "Private no-fork subprocess transport for native-runtime workers.",
+      "context": "literal"
+    },
+    {
+      "line_start": 29,
+      "line_end": 29,
+      "column": 30,
+      "value": "!I",
+      "context": "literal"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 4,
+      "value": "Read bounded length-prefixed frames from one binary stream.",
+      "context": "literal"
+    },
+    {
+      "line_start": 63,
+      "line_end": 63,
+      "column": 4,
+      "value": "Write length-prefixed frames to one binary stream.",
+      "context": "literal"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 4,
+      "value": "Asynchronous framed requests and responses over a child's standard streams.",
+      "context": "literal"
+    },
+    {
+      "line_start": 167,
+      "line_end": 179,
+      "column": 4,
+      "value": "Launch through the safest native subprocess path on each platform.\n\n    POSIX keeps ``close_fds=False`` and passes no descriptors explicitly so\n    CPython can use ``posix_spawn`` instead of ``fork_exec``. Forking after the\n    host has initialized Tree-sitter or the embedded JVM is unsafe on macOS.\n    Python-created descriptors are non-inheritable by default, and all worker\n    traffic remains on standard input/output.\n\n    Windows has no fork hazard, so ``close_fds=True`` prevents unrelated\n    inheritable handles from an embedding host such as VVAH reaching workers.\n    The framed stream transport deliberately uses the ``Popen`` file objects\n    rather than treating their CRT descriptors as multiprocessing sockets.\n    ",
+      "context": "literal"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 25,
+      "value": "-m",
+      "context": "literal"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 27,
+      "value": "worker standard streams were not created",
+      "context": "literal"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 29,
+      "value": "payload exceeds framing limit",
+      "context": "literal"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 17,
+      "value": "context-graph-worker-reader",
+      "context": "literal"
+    },
+    {
+      "line_start": 184,
+      "line_end": 184,
+      "column": 29,
+      "value": "nt",
+      "context": "literal"
+    },
+    {
+      "line_start": 222,
+      "line_end": 222,
+      "column": 34,
+      "value": "worker stream closed during write",
+      "context": "literal"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 28,
+      "value": "message length ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 49,
+      "value": " exceeds ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 67,
+      "value": " byte bound",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 38,
+      "value": "worker response is not ready",
+      "context": "literal"
+    },
+    {
+      "line_start": 120,
+      "line_end": 120,
+      "column": 28,
+      "value": "message length ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 120,
+      "line_end": 120,
+      "column": 57,
+      "value": " exceeds ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 120,
+      "line_end": 120,
+      "column": 75,
+      "value": " byte bound",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 38,
+      "value": "worker produced more than one pending response",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "Import",
+      "line_start": 23,
+      "line_end": 23,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 26,
+      "line_end": 26,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 27,
+      "line_end": 27,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 29,
+      "line_end": 29,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 30,
+      "line_end": 30,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 33,
+      "line_end": 36,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 7
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 34,
+      "line_end": 34,
+      "column": 4,
+      "owner": "ByteReader",
+      "representation_line": 11
+    },
+    {
+      "kind": "Expr",
+      "line_start": 34,
+      "line_end": 34,
+      "column": 49,
+      "owner": "ByteReader.recv_bytes",
+      "representation_line": 17
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 36,
+      "line_end": 36,
+      "column": 4,
+      "owner": "ByteReader",
+      "representation_line": 20
+    },
+    {
+      "kind": "Expr",
+      "line_start": 36,
+      "line_end": 36,
+      "column": 29,
+      "owner": "ByteReader.close",
+      "representation_line": 26
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 39,
+      "line_end": 42,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 30
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 40,
+      "line_end": 40,
+      "column": 4,
+      "owner": "ByteWriter",
+      "representation_line": 34
+    },
+    {
+      "kind": "Expr",
+      "line_start": 40,
+      "line_end": 40,
+      "column": 50,
+      "owner": "ByteWriter.send_bytes",
+      "representation_line": 40
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 42,
+      "line_end": 42,
+      "column": 4,
+      "owner": "ByteWriter",
+      "representation_line": 43
+    },
+    {
+      "kind": "Expr",
+      "line_start": 42,
+      "line_end": 42,
+      "column": 29,
+      "owner": "ByteWriter.close",
+      "representation_line": 49
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 45,
+      "line_end": 59,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 53
+    },
+    {
+      "kind": "Expr",
+      "line_start": 46,
+      "line_end": 46,
+      "column": 4,
+      "owner": "FrameReader",
+      "representation_line": 58
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 48,
+      "line_end": 49,
+      "column": 4,
+      "owner": "FrameReader",
+      "representation_line": 59
+    },
+    {
+      "kind": "Assign",
+      "line_start": 49,
+      "line_end": 49,
+      "column": 8,
+      "owner": "FrameReader.__init__",
+      "representation_line": 65
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 51,
+      "line_end": 56,
+      "column": 4,
+      "owner": "FrameReader",
+      "representation_line": 68
+    },
+    {
+      "kind": "Assign",
+      "line_start": 52,
+      "line_end": 52,
+      "column": 8,
+      "owner": "FrameReader.recv_bytes",
+      "representation_line": 74
+    },
+    {
+      "kind": "Assign",
+      "line_start": 53,
+      "line_end": 53,
+      "column": 8,
+      "owner": "FrameReader.recv_bytes",
+      "representation_line": 74
+    },
+    {
+      "kind": "If",
+      "line_start": 54,
+      "line_end": 55,
+      "column": 8,
+      "owner": "FrameReader.recv_bytes",
+      "representation_line": 75
+    },
+    {
+      "kind": "Raise",
+      "line_start": 55,
+      "line_end": 55,
+      "column": 12,
+      "owner": "FrameReader.recv_bytes",
+      "representation_line": 77
+    },
+    {
+      "kind": "Return",
+      "line_start": 56,
+      "line_end": 56,
+      "column": 8,
+      "owner": "FrameReader.recv_bytes",
+      "representation_line": 80
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 58,
+      "line_end": 59,
+      "column": 4,
+      "owner": "FrameReader",
+      "representation_line": 84
+    },
+    {
+      "kind": "Expr",
+      "line_start": 59,
+      "line_end": 59,
+      "column": 8,
+      "owner": "FrameReader.close",
+      "representation_line": 90
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 62,
+      "line_end": 78,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 94
+    },
+    {
+      "kind": "Expr",
+      "line_start": 63,
+      "line_end": 63,
+      "column": 4,
+      "owner": "FrameWriter",
+      "representation_line": 99
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 65,
+      "line_end": 67,
+      "column": 4,
+      "owner": "FrameWriter",
+      "representation_line": 100
+    },
+    {
+      "kind": "Assign",
+      "line_start": 66,
+      "line_end": 66,
+      "column": 8,
+      "owner": "FrameWriter.__init__",
+      "representation_line": 106
+    },
+    {
+      "kind": "Assign",
+      "line_start": 67,
+      "line_end": 67,
+      "column": 8,
+      "owner": "FrameWriter.__init__",
+      "representation_line": 106
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 69,
+      "line_end": 75,
+      "column": 4,
+      "owner": "FrameWriter",
+      "representation_line": 109
+    },
+    {
+      "kind": "If",
+      "line_start": 70,
+      "line_end": 71,
+      "column": 8,
+      "owner": "FrameWriter.send_bytes",
+      "representation_line": 114
+    },
+    {
+      "kind": "Raise",
+      "line_start": 71,
+      "line_end": 71,
+      "column": 12,
+      "owner": "FrameWriter.send_bytes",
+      "representation_line": 116
+    },
+    {
+      "kind": "With",
+      "line_start": 72,
+      "line_end": 75,
+      "column": 8,
+      "owner": "FrameWriter.send_bytes",
+      "representation_line": 119
+    },
+    {
+      "kind": "Expr",
+      "line_start": 73,
+      "line_end": 73,
+      "column": 12,
+      "owner": "FrameWriter.send_bytes",
+      "representation_line": 122
+    },
+    {
+      "kind": "Expr",
+      "line_start": 74,
+      "line_end": 74,
+      "column": 12,
+      "owner": "FrameWriter.send_bytes",
+      "representation_line": 122
+    },
+    {
+      "kind": "Expr",
+      "line_start": 75,
+      "line_end": 75,
+      "column": 12,
+      "owner": "FrameWriter.send_bytes",
+      "representation_line": 122
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 77,
+      "line_end": 78,
+      "column": 4,
+      "owner": "FrameWriter",
+      "representation_line": 127
+    },
+    {
+      "kind": "Expr",
+      "line_start": 78,
+      "line_end": 78,
+      "column": 8,
+      "owner": "FrameWriter.close",
+      "representation_line": 133
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 81,
+      "line_end": 158,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 137
+    },
+    {
+      "kind": "Expr",
+      "line_start": 82,
+      "line_end": 82,
+      "column": 4,
+      "owner": "StdioChannel",
+      "representation_line": 142
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 84,
+      "line_end": 103,
+      "column": 4,
+      "owner": "StdioChannel",
+      "representation_line": 143
+    },
+    {
+      "kind": "Assign",
+      "line_start": 91,
+      "line_end": 91,
+      "column": 8,
+      "owner": "StdioChannel.__init__",
+      "representation_line": 149
+    },
+    {
+      "kind": "Assign",
+      "line_start": 92,
+      "line_end": 92,
+      "column": 8,
+      "owner": "StdioChannel.__init__",
+      "representation_line": 149
+    },
+    {
+      "kind": "Assign",
+      "line_start": 93,
+      "line_end": 93,
+      "column": 8,
+      "owner": "StdioChannel.__init__",
+      "representation_line": 149
+    },
+    {
+      "kind": "Assign",
+      "line_start": 94,
+      "line_end": 94,
+      "column": 8,
+      "owner": "StdioChannel.__init__",
+      "representation_line": 149
+    },
+    {
+      "kind": "Assign",
+      "line_start": 95,
+      "line_end": 95,
+      "column": 8,
+      "owner": "StdioChannel.__init__",
+      "representation_line": 149
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 96,
+      "line_end": 96,
+      "column": 8,
+      "owner": "StdioChannel.__init__",
+      "representation_line": 151
+    },
+    {
+      "kind": "Assign",
+      "line_start": 97,
+      "line_end": 97,
+      "column": 8,
+      "owner": "StdioChannel.__init__",
+      "representation_line": 151
+    },
+    {
+      "kind": "Assign",
+      "line_start": 98,
+      "line_end": 102,
+      "column": 8,
+      "owner": "StdioChannel.__init__",
+      "representation_line": 151
+    },
+    {
+      "kind": "Expr",
+      "line_start": 103,
+      "line_end": 103,
+      "column": 8,
+      "owner": "StdioChannel.__init__",
+      "representation_line": 151
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 105,
+      "line_end": 106,
+      "column": 4,
+      "owner": "StdioChannel",
+      "representation_line": 154
+    },
+    {
+      "kind": "Expr",
+      "line_start": 106,
+      "line_end": 106,
+      "column": 8,
+      "owner": "StdioChannel.send_bytes",
+      "representation_line": 160
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 108,
+      "line_end": 110,
+      "column": 4,
+      "owner": "StdioChannel",
+      "representation_line": 163
+    },
+    {
+      "kind": "With",
+      "line_start": 109,
+      "line_end": 110,
+      "column": 8,
+      "owner": "StdioChannel.poll",
+      "representation_line": 168
+    },
+    {
+      "kind": "Return",
+      "line_start": 110,
+      "line_end": 110,
+      "column": 12,
+      "owner": "StdioChannel.poll",
+      "representation_line": 170
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 112,
+      "line_end": 121,
+      "column": 4,
+      "owner": "StdioChannel",
+      "representation_line": 176
+    },
+    {
+      "kind": "With",
+      "line_start": 113,
+      "line_end": 116,
+      "column": 8,
+      "owner": "StdioChannel.recv_bytes",
+      "representation_line": 181
+    },
+    {
+      "kind": "If",
+      "line_start": 114,
+      "line_end": 115,
+      "column": 12,
+      "owner": "StdioChannel.recv_bytes",
+      "representation_line": 183
+    },
+    {
+      "kind": "Raise",
+      "line_start": 115,
+      "line_end": 115,
+      "column": 16,
+      "owner": "StdioChannel.recv_bytes",
+      "representation_line": 185
+    },
+    {
+      "kind": "Assign",
+      "line_start": 116,
+      "line_end": 116,
+      "column": 12,
+      "owner": "StdioChannel.recv_bytes",
+      "representation_line": 189
+    },
+    {
+      "kind": "If",
+      "line_start": 117,
+      "line_end": 118,
+      "column": 8,
+      "owner": "StdioChannel.recv_bytes",
+      "representation_line": 192
+    },
+    {
+      "kind": "Raise",
+      "line_start": 118,
+      "line_end": 118,
+      "column": 12,
+      "owner": "StdioChannel.recv_bytes",
+      "representation_line": 194
+    },
+    {
+      "kind": "If",
+      "line_start": 119,
+      "line_end": 120,
+      "column": 8,
+      "owner": "StdioChannel.recv_bytes",
+      "representation_line": 197
+    },
+    {
+      "kind": "Raise",
+      "line_start": 120,
+      "line_end": 120,
+      "column": 12,
+      "owner": "StdioChannel.recv_bytes",
+      "representation_line": 199
+    },
+    {
+      "kind": "Return",
+      "line_start": 121,
+      "line_end": 121,
+      "column": 8,
+      "owner": "StdioChannel.recv_bytes",
+      "representation_line": 202
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 123,
+      "line_end": 125,
+      "column": 4,
+      "owner": "StdioChannel",
+      "representation_line": 206
+    },
+    {
+      "kind": "With",
+      "line_start": 124,
+      "line_end": 125,
+      "column": 8,
+      "owner": "StdioChannel.close_request",
+      "representation_line": 211
+    },
+    {
+      "kind": "Expr",
+      "line_start": 125,
+      "line_end": 125,
+      "column": 12,
+      "owner": "StdioChannel.close_request",
+      "representation_line": 214
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 127,
+      "line_end": 136,
+      "column": 4,
+      "owner": "StdioChannel",
+      "representation_line": 219
+    },
+    {
+      "kind": "With",
+      "line_start": 128,
+      "line_end": 131,
+      "column": 8,
+      "owner": "StdioChannel.close",
+      "representation_line": 224
+    },
+    {
+      "kind": "If",
+      "line_start": 129,
+      "line_end": 130,
+      "column": 12,
+      "owner": "StdioChannel.close",
+      "representation_line": 226
+    },
+    {
+      "kind": "Return",
+      "line_start": 130,
+      "line_end": 130,
+      "column": 16,
+      "owner": "StdioChannel.close",
+      "representation_line": 228
+    },
+    {
+      "kind": "Assign",
+      "line_start": 131,
+      "line_end": 131,
+      "column": 12,
+      "owner": "StdioChannel.close",
+      "representation_line": 232
+    },
+    {
+      "kind": "Expr",
+      "line_start": 132,
+      "line_end": 132,
+      "column": 8,
+      "owner": "StdioChannel.close",
+      "representation_line": 236
+    },
+    {
+      "kind": "With",
+      "line_start": 133,
+      "line_end": 134,
+      "column": 8,
+      "owner": "StdioChannel.close",
+      "representation_line": 237
+    },
+    {
+      "kind": "Expr",
+      "line_start": 134,
+      "line_end": 134,
+      "column": 12,
+      "owner": "StdioChannel.close",
+      "representation_line": 240
+    },
+    {
+      "kind": "If",
+      "line_start": 135,
+      "line_end": 136,
+      "column": 8,
+      "owner": "StdioChannel.close",
+      "representation_line": 243
+    },
+    {
+      "kind": "Expr",
+      "line_start": 136,
+      "line_end": 136,
+      "column": 12,
+      "owner": "StdioChannel.close",
+      "representation_line": 246
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 138,
+      "line_end": 158,
+      "column": 4,
+      "owner": "StdioChannel",
+      "representation_line": 250
+    },
+    {
+      "kind": "While",
+      "line_start": 139,
+      "line_end": 158,
+      "column": 8,
+      "owner": "StdioChannel._read_responses",
+      "representation_line": 255
+    },
+    {
+      "kind": "Try",
+      "line_start": 140,
+      "line_end": 145,
+      "column": 12,
+      "owner": "StdioChannel._read_responses",
+      "representation_line": 257
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 141,
+      "line_end": 143,
+      "column": 16,
+      "owner": "StdioChannel._read_responses",
+      "representation_line": 260
+    },
+    {
+      "kind": "Assign",
+      "line_start": 145,
+      "line_end": 145,
+      "column": 16,
+      "owner": "StdioChannel._read_responses",
+      "representation_line": 265
+    },
+    {
+      "kind": "With",
+      "line_start": 146,
+      "line_end": 153,
+      "column": 12,
+      "owner": "StdioChannel._read_responses",
+      "representation_line": 267
+    },
+    {
+      "kind": "If",
+      "line_start": 147,
+      "line_end": 148,
+      "column": 16,
+      "owner": "StdioChannel._read_responses",
+      "representation_line": 269
+    },
+    {
+      "kind": "Return",
+      "line_start": 148,
+      "line_end": 148,
+      "column": 20,
+      "owner": "StdioChannel._read_responses",
+      "representation_line": 271
+    },
+    {
+      "kind": "If",
+      "line_start": 149,
+      "line_end": 151,
+      "column": 16,
+      "owner": "StdioChannel._read_responses",
+      "representation_line": 274
+    },
+    {
+      "kind": "Assign",
+      "line_start": 150,
+      "line_end": 150,
+      "column": 20,
+      "owner": "StdioChannel._read_responses",
+      "representation_line": 277
+    },
+    {
+      "kind": "Expr",
+      "line_start": 151,
+      "line_end": 151,
+      "column": 20,
+      "owner": "StdioChannel._read_responses",
+      "representation_line": 277
+    },
+    {
+      "kind": "Expr",
+      "line_start": 152,
+      "line_end": 152,
+      "column": 16,
+      "owner": "StdioChannel._read_responses",
+      "representation_line": 280
+    },
+    {
+      "kind": "Expr",
+      "line_start": 153,
+      "line_end": 153,
+      "column": 16,
+      "owner": "StdioChannel._read_responses",
+      "representation_line": 280
+    },
+    {
+      "kind": "If",
+      "line_start": 154,
+      "line_end": 156,
+      "column": 12,
+      "owner": "StdioChannel._read_responses",
+      "representation_line": 283
+    },
+    {
+      "kind": "With",
+      "line_start": 155,
+      "line_end": 156,
+      "column": 16,
+      "owner": "StdioChannel._read_responses",
+      "representation_line": 285
+    },
+    {
+      "kind": "Expr",
+      "line_start": 156,
+      "line_end": 156,
+      "column": 20,
+      "owner": "StdioChannel._read_responses",
+      "representation_line": 288
+    },
+    {
+      "kind": "If",
+      "line_start": 157,
+      "line_end": 158,
+      "column": 12,
+      "owner": "StdioChannel._read_responses",
+      "representation_line": 292
+    },
+    {
+      "kind": "Return",
+      "line_start": 158,
+      "line_end": 158,
+      "column": 16,
+      "owner": "StdioChannel._read_responses",
+      "representation_line": 294
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 161,
+      "line_end": 202,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 301
+    },
+    {
+      "kind": "Expr",
+      "line_start": 167,
+      "line_end": 179,
+      "column": 4,
+      "owner": "spawn_stdio_worker",
+      "representation_line": 307
+    },
+    {
+      "kind": "Assign",
+      "line_start": 180,
+      "line_end": 186,
+      "column": 4,
+      "owner": "spawn_stdio_worker",
+      "representation_line": 307
+    },
+    {
+      "kind": "If",
+      "line_start": 187,
+      "line_end": 189,
+      "column": 4,
+      "owner": "spawn_stdio_worker",
+      "representation_line": 308
+    },
+    {
+      "kind": "Expr",
+      "line_start": 188,
+      "line_end": 188,
+      "column": 8,
+      "owner": "spawn_stdio_worker",
+      "representation_line": 311
+    },
+    {
+      "kind": "Raise",
+      "line_start": 189,
+      "line_end": 189,
+      "column": 8,
+      "owner": "spawn_stdio_worker",
+      "representation_line": 312
+    },
+    {
+      "kind": "Try",
+      "line_start": 190,
+      "line_end": 201,
+      "column": 4,
+      "owner": "spawn_stdio_worker",
+      "representation_line": 315
+    },
+    {
+      "kind": "Assign",
+      "line_start": 191,
+      "line_end": 196,
+      "column": 8,
+      "owner": "spawn_stdio_worker",
+      "representation_line": 318
+    },
+    {
+      "kind": "Expr",
+      "line_start": 198,
+      "line_end": 198,
+      "column": 8,
+      "owner": "spawn_stdio_worker",
+      "representation_line": 323
+    },
+    {
+      "kind": "Expr",
+      "line_start": 199,
+      "line_end": 199,
+      "column": 8,
+      "owner": "spawn_stdio_worker",
+      "representation_line": 323
+    },
+    {
+      "kind": "Expr",
+      "line_start": 200,
+      "line_end": 200,
+      "column": 8,
+      "owner": "spawn_stdio_worker",
+      "representation_line": 323
+    },
+    {
+      "kind": "Raise",
+      "line_start": 201,
+      "line_end": 201,
+      "column": 8,
+      "owner": "spawn_stdio_worker",
+      "representation_line": 324
+    },
+    {
+      "kind": "Return",
+      "line_start": 202,
+      "line_end": 202,
+      "column": 4,
+      "owner": "spawn_stdio_worker",
+      "representation_line": 327
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 205,
+      "line_end": 214,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 331
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 206,
+      "line_end": 206,
+      "column": 4,
+      "owner": "_read_exact",
+      "representation_line": 337
+    },
+    {
+      "kind": "Assign",
+      "line_start": 207,
+      "line_end": 207,
+      "column": 4,
+      "owner": "_read_exact",
+      "representation_line": 337
+    },
+    {
+      "kind": "While",
+      "line_start": 208,
+      "line_end": 213,
+      "column": 4,
+      "owner": "_read_exact",
+      "representation_line": 338
+    },
+    {
+      "kind": "Assign",
+      "line_start": 209,
+      "line_end": 209,
+      "column": 8,
+      "owner": "_read_exact",
+      "representation_line": 341
+    },
+    {
+      "kind": "If",
+      "line_start": 210,
+      "line_end": 211,
+      "column": 8,
+      "owner": "_read_exact",
+      "representation_line": 342
+    },
+    {
+      "kind": "Raise",
+      "line_start": 211,
+      "line_end": 211,
+      "column": 12,
+      "owner": "_read_exact",
+      "representation_line": 344
+    },
+    {
+      "kind": "Expr",
+      "line_start": 212,
+      "line_end": 212,
+      "column": 8,
+      "owner": "_read_exact",
+      "representation_line": 348
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 213,
+      "line_end": 213,
+      "column": 8,
+      "owner": "_read_exact",
+      "representation_line": 348
+    },
+    {
+      "kind": "Return",
+      "line_start": 214,
+      "line_end": 214,
+      "column": 4,
+      "owner": "_read_exact",
+      "representation_line": 350
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 217,
+      "line_end": 223,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 354
+    },
+    {
+      "kind": "Assign",
+      "line_start": 218,
+      "line_end": 218,
+      "column": 4,
+      "owner": "_write_all",
+      "representation_line": 360
+    },
+    {
+      "kind": "While",
+      "line_start": 219,
+      "line_end": 223,
+      "column": 4,
+      "owner": "_write_all",
+      "representation_line": 361
+    },
+    {
+      "kind": "Assign",
+      "line_start": 220,
+      "line_end": 220,
+      "column": 8,
+      "owner": "_write_all",
+      "representation_line": 364
+    },
+    {
+      "kind": "If",
+      "line_start": 221,
+      "line_end": 222,
+      "column": 8,
+      "owner": "_write_all",
+      "representation_line": 365
+    },
+    {
+      "kind": "Raise",
+      "line_start": 222,
+      "line_end": 222,
+      "column": 12,
+      "owner": "_write_all",
+      "representation_line": 367
+    },
+    {
+      "kind": "Assign",
+      "line_start": 223,
+      "line_end": 223,
+      "column": 8,
+      "owner": "_write_all",
+      "representation_line": 371
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 226,
+      "line_end": 235,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 375
+    },
+    {
+      "kind": "If",
+      "line_start": 227,
+      "line_end": 228,
+      "column": 4,
+      "owner": "_terminate_failed_spawn",
+      "representation_line": 380
+    },
+    {
+      "kind": "Return",
+      "line_start": 228,
+      "line_end": 228,
+      "column": 8,
+      "owner": "_terminate_failed_spawn",
+      "representation_line": 382
+    },
+    {
+      "kind": "Expr",
+      "line_start": 229,
+      "line_end": 229,
+      "column": 4,
+      "owner": "_terminate_failed_spawn",
+      "representation_line": 386
+    },
+    {
+      "kind": "With",
+      "line_start": 230,
+      "line_end": 231,
+      "column": 4,
+      "owner": "_terminate_failed_spawn",
+      "representation_line": 387
+    },
+    {
+      "kind": "Expr",
+      "line_start": 231,
+      "line_end": 231,
+      "column": 8,
+      "owner": "_terminate_failed_spawn",
+      "representation_line": 390
+    },
+    {
+      "kind": "If",
+      "line_start": 232,
+      "line_end": 235,
+      "column": 4,
+      "owner": "_terminate_failed_spawn",
+      "representation_line": 393
+    },
+    {
+      "kind": "Expr",
+      "line_start": 233,
+      "line_end": 233,
+      "column": 8,
+      "owner": "_terminate_failed_spawn",
+      "representation_line": 396
+    },
+    {
+      "kind": "With",
+      "line_start": 234,
+      "line_end": 235,
+      "column": 8,
+      "owner": "_terminate_failed_spawn",
+      "representation_line": 397
+    },
+    {
+      "kind": "Expr",
+      "line_start": 235,
+      "line_end": 235,
+      "column": 12,
+      "owner": "_terminate_failed_spawn",
+      "representation_line": 400
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 29,
+      "line_end": 29,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='struct', ctx=Load()), attr='Struct', ctx=Load()), args=[Constant(value='!I')], keywords=[])",
+      "rendered": "struct.Struct('!I')"
+    },
+    {
+      "line_start": 30,
+      "line_end": 30,
+      "column": 19,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=BinOp(left=Constant(value=1), op=LShift(), right=BinOp(left=Attribute(value=Name(id='_FRAME_HEADER', ctx=Load()), attr='size', ctx=Load()), op=Mult(), right=Constant(value=8))), op=Sub(), right=Constant(value=1))",
+      "rendered": "(1 << _FRAME_HEADER.size * 8) - 1"
+    },
+    {
+      "line_start": 33,
+      "line_end": 33,
+      "column": 17,
+      "kind": "Name",
+      "original_ast": "Name(id='Protocol', ctx=Load())",
+      "rendered": "Protocol"
+    },
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 49,
+      "kind": "Constant",
+      "original_ast": "Constant(value=Ellipsis)",
+      "rendered": "..."
+    },
+    {
+      "line_start": 36,
+      "line_end": 36,
+      "column": 29,
+      "kind": "Constant",
+      "original_ast": "Constant(value=Ellipsis)",
+      "rendered": "..."
+    },
+    {
+      "line_start": 39,
+      "line_end": 39,
+      "column": 17,
+      "kind": "Name",
+      "original_ast": "Name(id='Protocol', ctx=Load())",
+      "rendered": "Protocol"
+    },
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 50,
+      "kind": "Constant",
+      "original_ast": "Constant(value=Ellipsis)",
+      "rendered": "..."
+    },
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 29,
+      "kind": "Constant",
+      "original_ast": "Constant(value=Ellipsis)",
+      "rendered": "..."
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='stream', ctx=Load())",
+      "rendered": "stream"
+    },
+    {
+      "line_start": 52,
+      "line_end": 52,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_read_exact', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='_stream', ctx=Load()), Attribute(value=Name(id='_FRAME_HEADER', ctx=Load()), attr='size', ctx=Load())], keywords=[])",
+      "rendered": "_read_exact(self._stream, _FRAME_HEADER.size)"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 15,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Call(func=Attribute(value=Name(id='_FRAME_HEADER', ctx=Load()), attr='unpack', ctx=Load()), args=[Name(id='header', ctx=Load())], keywords=[]), slice=Constant(value=0), ctx=Load())",
+      "rendered": "_FRAME_HEADER.unpack(header)[0]"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='size', ctx=Load()), ops=[Gt()], comparators=[Name(id='maximum', ctx=Load())])",
+      "rendered": "size > maximum"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='OSError', ctx=Load()), args=[JoinedStr(values=[Constant(value='message length '), FormattedValue(value=Name(id='size', ctx=Load()), conversion=-1), Constant(value=' exceeds '), FormattedValue(value=Name(id='maximum', ctx=Load()), conversion=-1), Constant(value=' byte bound')])], keywords=[])",
+      "rendered": "OSError(source_template_55_26)"
+    },
+    {
+      "line_start": 56,
+      "line_end": 56,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_read_exact', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='_stream', ctx=Load()), Name(id='size', ctx=Load())], keywords=[])",
+      "rendered": "_read_exact(self._stream, size)"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_stream', ctx=Load()), attr='close', ctx=Load()), args=[], keywords=[])",
+      "rendered": "self._stream.close()"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='stream', ctx=Load())",
+      "rendered": "stream"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='threading', ctx=Load()), attr='Lock', ctx=Load()), args=[], keywords=[])",
+      "rendered": "threading.Lock()"
+    },
+    {
+      "line_start": 70,
+      "line_end": 70,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='payload', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Name(id='_MAX_FRAME_BYTES', ctx=Load())])",
+      "rendered": "len(payload) > _MAX_FRAME_BYTES"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ValueError', ctx=Load()), args=[Constant(value='payload exceeds framing limit')], keywords=[])",
+      "rendered": "ValueError('payload exceeds framing limit')"
+    },
+    {
+      "line_start": 72,
+      "line_end": 72,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_lock', ctx=Load())",
+      "rendered": "self._lock"
+    },
+    {
+      "line_start": 73,
+      "line_end": 73,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_write_all', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='_stream', ctx=Load()), Call(func=Attribute(value=Name(id='_FRAME_HEADER', ctx=Load()), attr='pack', ctx=Load()), args=[Call(func=Name(id='len', ctx=Load()), args=[Name(id='payload', ctx=Load())], keywords=[])], keywords=[])], keywords=[])",
+      "rendered": "_write_all(self._stream, _FRAME_HEADER.pack(len(payload)))"
+    },
+    {
+      "line_start": 74,
+      "line_end": 74,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_write_all', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='_stream', ctx=Load()), Name(id='payload', ctx=Load())], keywords=[])",
+      "rendered": "_write_all(self._stream, payload)"
+    },
+    {
+      "line_start": 75,
+      "line_end": 75,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_stream', ctx=Load()), attr='flush', ctx=Load()), args=[], keywords=[])",
+      "rendered": "self._stream.flush()"
+    },
+    {
+      "line_start": 78,
+      "line_end": 78,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_stream', ctx=Load()), attr='close', ctx=Load()), args=[], keywords=[])",
+      "rendered": "self._stream.close()"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 24,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='FrameWriter', ctx=Load()), args=[Name(id='request_stream', ctx=Load())], keywords=[])",
+      "rendered": "FrameWriter(request_stream)"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 25,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='FrameReader', ctx=Load()), args=[Name(id='response_stream', ctx=Load())], keywords=[])",
+      "rendered": "FrameReader(response_stream)"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 39,
+      "kind": "Name",
+      "original_ast": "Name(id='maximum_response_bytes', ctx=Load())",
+      "rendered": "maximum_response_bytes"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 28,
+      "kind": "Name",
+      "original_ast": "Name(id='on_response', ctx=Load())",
+      "rendered": "on_response"
+    },
+    {
+      "line_start": 95,
+      "line_end": 95,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='threading', ctx=Load()), attr='Condition', ctx=Load()), args=[], keywords=[])",
+      "rendered": "threading.Condition()"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 55,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='deque', ctx=Load()), args=[], keywords=[])",
+      "rendered": "deque()"
+    },
+    {
+      "line_start": 97,
+      "line_end": 97,
+      "column": 23,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 98,
+      "line_end": 102,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='threading', ctx=Load()), attr='Thread', ctx=Load()), args=[], keywords=[keyword(arg='target', value=Attribute(value=Name(id='self', ctx=Load()), attr='_read_responses', ctx=Load())), keyword(arg='name', value=Constant(value='context-graph-worker-reader')), keyword(arg='daemon', value=Constant(value=True))])",
+      "rendered": "threading.Thread(target=self._read_responses, name='context-graph-worker-reader', daemon=True)"
+    },
+    {
+      "line_start": 103,
+      "line_end": 103,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_reader', ctx=Load()), attr='start', ctx=Load()), args=[], keywords=[])",
+      "rendered": "self._reader.start()"
+    },
+    {
+      "line_start": 106,
+      "line_end": 106,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_request', ctx=Load()), attr='send_bytes', ctx=Load()), args=[Name(id='payload', ctx=Load())], keywords=[])",
+      "rendered": "self._request.send_bytes(payload)"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_condition', ctx=Load())",
+      "rendered": "self._condition"
+    },
+    {
+      "line_start": 110,
+      "line_end": 110,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_condition', ctx=Load()), attr='wait_for', ctx=Load()), args=[Lambda(args=arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]), body=Call(func=Name(id='bool', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='_messages', ctx=Load())], keywords=[])), Name(id='timeout', ctx=Load())], keywords=[])",
+      "rendered": "self._condition.wait_for(lambda: bool(self._messages), timeout)"
+    },
+    {
+      "line_start": 113,
+      "line_end": 113,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_condition', ctx=Load())",
+      "rendered": "self._condition"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 15,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Attribute(value=Name(id='self', ctx=Load()), attr='_messages', ctx=Load()))",
+      "rendered": "not self._messages"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='BlockingIOError', ctx=Load()), args=[Constant(value='worker response is not ready')], keywords=[])",
+      "rendered": "BlockingIOError('worker response is not ready')"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_messages', ctx=Load()), attr='popleft', ctx=Load()), args=[], keywords=[])",
+      "rendered": "self._messages.popleft()"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='message', ctx=Load()), Name(id='BaseException', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(message, BaseException)"
+    },
+    {
+      "line_start": 118,
+      "line_end": 118,
+      "column": 18,
+      "kind": "Name",
+      "original_ast": "Name(id='message', ctx=Load())",
+      "rendered": "message"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='message', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Name(id='maximum', ctx=Load())])",
+      "rendered": "len(message) > maximum"
+    },
+    {
+      "line_start": 120,
+      "line_end": 120,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='OSError', ctx=Load()), args=[JoinedStr(values=[Constant(value='message length '), FormattedValue(value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='message', ctx=Load())], keywords=[]), conversion=-1), Constant(value=' exceeds '), FormattedValue(value=Name(id='maximum', ctx=Load()), conversion=-1), Constant(value=' byte bound')])], keywords=[])",
+      "rendered": "OSError(source_template_120_26)"
+    },
+    {
+      "line_start": 121,
+      "line_end": 121,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='message', ctx=Load())",
+      "rendered": "message"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='suppress', ctx=Load()), args=[Name(id='OSError', ctx=Load())], keywords=[])",
+      "rendered": "suppress(OSError)"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_request', ctx=Load()), attr='close', ctx=Load()), args=[], keywords=[])",
+      "rendered": "self._request.close()"
+    },
+    {
+      "line_start": 128,
+      "line_end": 128,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_condition', ctx=Load())",
+      "rendered": "self._condition"
+    },
+    {
+      "line_start": 129,
+      "line_end": 129,
+      "column": 15,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_closed', ctx=Load())",
+      "rendered": "self._closed"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 27,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='close_request', ctx=Load()), args=[], keywords=[])",
+      "rendered": "self.close_request()"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='suppress', ctx=Load()), args=[Name(id='OSError', ctx=Load())], keywords=[])",
+      "rendered": "suppress(OSError)"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_response', ctx=Load()), attr='close', ctx=Load()), args=[], keywords=[])",
+      "rendered": "self._response.close()"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Attribute(value=Name(id='threading', ctx=Load()), attr='current_thread', ctx=Load()), args=[], keywords=[]), ops=[IsNot()], comparators=[Attribute(value=Name(id='self', ctx=Load()), attr='_reader', ctx=Load())])",
+      "rendered": "threading.current_thread() is not self._reader"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_reader', ctx=Load()), attr='join', ctx=Load()), args=[Constant(value=2.0)], keywords=[])",
+      "rendered": "self._reader.join(2.0)"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 14,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 141,
+      "line_end": 143,
+      "column": 49,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_response', ctx=Load()), attr='recv_bytes', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='_maximum_response_bytes', ctx=Load())], keywords=[])",
+      "rendered": "self._response.recv_bytes(self._maximum_response_bytes)"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='BaseException', ctx=Load())",
+      "rendered": "BaseException"
+    },
+    {
+      "line_start": 145,
+      "line_end": 145,
+      "column": 26,
+      "kind": "Name",
+      "original_ast": "Name(id='error', ctx=Load())",
+      "rendered": "error"
+    },
+    {
+      "line_start": 146,
+      "line_end": 146,
+      "column": 17,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_condition', ctx=Load())",
+      "rendered": "self._condition"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 19,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_closed', ctx=Load())",
+      "rendered": "self._closed"
+    },
+    {
+      "line_start": 149,
+      "line_end": 149,
+      "column": 19,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_messages', ctx=Load())",
+      "rendered": "self._messages"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 30,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='OSError', ctx=Load()), args=[Constant(value='worker produced more than one pending response')], keywords=[])",
+      "rendered": "OSError('worker produced more than one pending response')"
+    },
+    {
+      "line_start": 151,
+      "line_end": 151,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_messages', ctx=Load()), attr='clear', ctx=Load()), args=[], keywords=[])",
+      "rendered": "self._messages.clear()"
+    },
+    {
+      "line_start": 152,
+      "line_end": 152,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_messages', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='message', ctx=Load())], keywords=[])",
+      "rendered": "self._messages.append(message)"
+    },
+    {
+      "line_start": 153,
+      "line_end": 153,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_condition', ctx=Load()), attr='notify_all', ctx=Load()), args=[], keywords=[])",
+      "rendered": "self._condition.notify_all()"
+    },
+    {
+      "line_start": 154,
+      "line_end": 154,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='self', ctx=Load()), attr='_on_response', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "self._on_response is not None"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='suppress', ctx=Load()), args=[Name(id='Exception', ctx=Load())], keywords=[])",
+      "rendered": "suppress(Exception)"
+    },
+    {
+      "line_start": 156,
+      "line_end": 156,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_on_response', ctx=Load()), args=[Name(id='self', ctx=Load())], keywords=[])",
+      "rendered": "self._on_response(self)"
+    },
+    {
+      "line_start": 157,
+      "line_end": 157,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='message', ctx=Load()), Name(id='BaseException', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(message, BaseException)"
+    },
+    {
+      "line_start": 180,
+      "line_end": 186,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='subprocess', ctx=Load()), attr='Popen', ctx=Load()), args=[List(elts=[Attribute(value=Name(id='sys', ctx=Load()), attr='executable', ctx=Load()), Constant(value='-m'), Name(id='module', ctx=Load()), Starred(value=Name(id='arguments', ctx=Load()), ctx=Load())], ctx=Load())], keywords=[keyword(arg='stdin', value=Attribute(value=Name(id='subprocess', ctx=Load()), attr='PIPE', ctx=Load())), keyword(arg='stdout', value=Attribute(value=Name(id='subprocess', ctx=Load()), attr='PIPE', ctx=Load())), keyword(arg='close_fds', value=Compare(left=Attribute(value=Name(id='os', ctx=Load()), attr='name', ctx=Load()), ops=[Eq()], comparators=[Constant(value='nt')])), keyword(arg='bufsize', value=Constant(value=0))])",
+      "rendered": "subprocess.Popen([sys.executable, '-m', module, *arguments], stdin=subprocess.PIPE, stdout=subprocess.PIPE, close_fds=os.name == 'nt', bufsize=0)"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Compare(left=Attribute(value=Name(id='process', ctx=Load()), attr='stdin', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)]), Compare(left=Attribute(value=Name(id='process', ctx=Load()), attr='stdout', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])])",
+      "rendered": "process.stdin is None or process.stdout is None"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_terminate_failed_spawn', ctx=Load()), args=[Name(id='process', ctx=Load())], keywords=[])",
+      "rendered": "_terminate_failed_spawn(process)"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='RuntimeError', ctx=Load()), args=[Constant(value='worker standard streams were not created')], keywords=[])",
+      "rendered": "RuntimeError('worker standard streams were not created')"
+    },
+    {
+      "line_start": 191,
+      "line_end": 196,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='StdioChannel', ctx=Load()), args=[Call(func=Name(id='cast', ctx=Load()), args=[Name(id='BinaryIO', ctx=Load()), Attribute(value=Name(id='process', ctx=Load()), attr='stdin', ctx=Load())], keywords=[]), Call(func=Name(id='cast', ctx=Load()), args=[Name(id='BinaryIO', ctx=Load()), Attribute(value=Name(id='process', ctx=Load()), attr='stdout', ctx=Load())], keywords=[]), Name(id='maximum_response_bytes', ctx=Load()), Name(id='on_response', ctx=Load())], keywords=[])",
+      "rendered": "StdioChannel(cast(BinaryIO, process.stdin), cast(BinaryIO, process.stdout), maximum_response_bytes, on_response)"
+    },
+    {
+      "line_start": 197,
+      "line_end": 197,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 198,
+      "line_end": 198,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='process', ctx=Load()), attr='stdin', ctx=Load()), attr='close', ctx=Load()), args=[], keywords=[])",
+      "rendered": "process.stdin.close()"
+    },
+    {
+      "line_start": 199,
+      "line_end": 199,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='process', ctx=Load()), attr='stdout', ctx=Load()), attr='close', ctx=Load()), args=[], keywords=[])",
+      "rendered": "process.stdout.close()"
+    },
+    {
+      "line_start": 200,
+      "line_end": 200,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_terminate_failed_spawn', ctx=Load()), args=[Name(id='process', ctx=Load())], keywords=[])",
+      "rendered": "_terminate_failed_spawn(process)"
+    },
+    {
+      "line_start": 202,
+      "line_end": 202,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='process', ctx=Load()), Name(id='channel', ctx=Load())], ctx=Load())",
+      "rendered": "(process, channel)"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 26,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 207,
+      "line_end": 207,
+      "column": 16,
+      "kind": "Name",
+      "original_ast": "Name(id='size', ctx=Load())",
+      "rendered": "size"
+    },
+    {
+      "line_start": 208,
+      "line_end": 208,
+      "column": 10,
+      "kind": "Name",
+      "original_ast": "Name(id='remaining', ctx=Load())",
+      "rendered": "remaining"
+    },
+    {
+      "line_start": 209,
+      "line_end": 209,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='stream', ctx=Load()), attr='read', ctx=Load()), args=[Name(id='remaining', ctx=Load())], keywords=[])",
+      "rendered": "stream.read(remaining)"
+    },
+    {
+      "line_start": 210,
+      "line_end": 210,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='chunk', ctx=Load()))",
+      "rendered": "not chunk"
+    },
+    {
+      "line_start": 211,
+      "line_end": 211,
+      "column": 18,
+      "kind": "Name",
+      "original_ast": "Name(id='EOFError', ctx=Load())",
+      "rendered": "EOFError"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='chunks', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='chunk', ctx=Load())], keywords=[])",
+      "rendered": "chunks.append(chunk)"
+    },
+    {
+      "line_start": 213,
+      "line_end": 213,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='remaining', ctx=Store()), op=Sub(), value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='chunk', ctx=Load())], keywords=[]))",
+      "rendered": "remaining -= len(chunk)"
+    },
+    {
+      "line_start": 214,
+      "line_end": 214,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Constant(value=b''), attr='join', ctx=Load()), args=[Name(id='chunks', ctx=Load())], keywords=[])",
+      "rendered": "b''.join(chunks)"
+    },
+    {
+      "line_start": 218,
+      "line_end": 218,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='memoryview', ctx=Load()), args=[Name(id='payload', ctx=Load())], keywords=[])",
+      "rendered": "memoryview(payload)"
+    },
+    {
+      "line_start": 219,
+      "line_end": 219,
+      "column": 10,
+      "kind": "Name",
+      "original_ast": "Name(id='view', ctx=Load())",
+      "rendered": "view"
+    },
+    {
+      "line_start": 220,
+      "line_end": 220,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='stream', ctx=Load()), attr='write', ctx=Load()), args=[Name(id='view', ctx=Load())], keywords=[])",
+      "rendered": "stream.write(view)"
+    },
+    {
+      "line_start": 221,
+      "line_end": 221,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Compare(left=Name(id='written', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)]), Compare(left=Name(id='written', ctx=Load()), ops=[LtE()], comparators=[Constant(value=0)])])",
+      "rendered": "written is None or written <= 0"
+    },
+    {
+      "line_start": 222,
+      "line_end": 222,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='BrokenPipeError', ctx=Load()), args=[Constant(value='worker stream closed during write')], keywords=[])",
+      "rendered": "BrokenPipeError('worker stream closed during write')"
+    },
+    {
+      "line_start": 223,
+      "line_end": 223,
+      "column": 15,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Name(id='view', ctx=Load()), slice=Slice(lower=Name(id='written', ctx=Load())), ctx=Load())",
+      "rendered": "view[written:]"
+    },
+    {
+      "line_start": 227,
+      "line_end": 227,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Attribute(value=Name(id='process', ctx=Load()), attr='poll', ctx=Load()), args=[], keywords=[]), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "process.poll() is not None"
+    },
+    {
+      "line_start": 229,
+      "line_end": 229,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='process', ctx=Load()), attr='terminate', ctx=Load()), args=[], keywords=[])",
+      "rendered": "process.terminate()"
+    },
+    {
+      "line_start": 230,
+      "line_end": 230,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='suppress', ctx=Load()), args=[Attribute(value=Name(id='subprocess', ctx=Load()), attr='TimeoutExpired', ctx=Load())], keywords=[])",
+      "rendered": "suppress(subprocess.TimeoutExpired)"
+    },
+    {
+      "line_start": 231,
+      "line_end": 231,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='process', ctx=Load()), attr='wait', ctx=Load()), args=[Constant(value=5.0)], keywords=[])",
+      "rendered": "process.wait(5.0)"
+    },
+    {
+      "line_start": 232,
+      "line_end": 232,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Attribute(value=Name(id='process', ctx=Load()), attr='poll', ctx=Load()), args=[], keywords=[]), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "process.poll() is None"
+    },
+    {
+      "line_start": 233,
+      "line_end": 233,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='process', ctx=Load()), attr='kill', ctx=Load()), args=[], keywords=[])",
+      "rendered": "process.kill()"
+    },
+    {
+      "line_start": 234,
+      "line_end": 234,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='suppress', ctx=Load()), args=[Attribute(value=Name(id='subprocess', ctx=Load()), attr='TimeoutExpired', ctx=Load())], keywords=[])",
+      "rendered": "suppress(subprocess.TimeoutExpired)"
+    },
+    {
+      "line_start": 235,
+      "line_end": 235,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='process', ctx=Load()), attr='wait', ctx=Load()), args=[Constant(value=2.0)], keywords=[])",
+      "rendered": "process.wait(2.0)"
+    }
+  ],
+  "calls": [
+    {
+      "line": 29,
+      "end_line": 29,
+      "callee": "struct.Struct",
+      "enclosing": "module initialization",
+      "expression": "struct.Struct(\"!I\")"
+    },
+    {
+      "line": 180,
+      "end_line": 186,
+      "callee": "subprocess.Popen",
+      "enclosing": "spawn_stdio_worker",
+      "expression": "subprocess.Popen(\n        [sys.executable, \"-m\", module, *arguments],\n        stdin=subprocess.PIPE,\n        stdout=subprocess.PIPE,\n        close_fds=os.name == \"nt\",\n        bufsize=0,\n    )"
+    },
+    {
+      "line": 214,
+      "end_line": 214,
+      "callee": "b''.join",
+      "enclosing": "_read_exact",
+      "expression": "b\"\".join(chunks)"
+    },
+    {
+      "line": 218,
+      "end_line": 218,
+      "callee": "memoryview",
+      "enclosing": "_write_all",
+      "expression": "memoryview(payload)"
+    },
+    {
+      "line": 229,
+      "end_line": 229,
+      "callee": "process.terminate",
+      "enclosing": "_terminate_failed_spawn",
+      "expression": "process.terminate()"
+    },
+    {
+      "line": 52,
+      "end_line": 52,
+      "callee": "_read_exact",
+      "enclosing": "FrameReader.recv_bytes",
+      "expression": "_read_exact(self._stream, _FRAME_HEADER.size)"
+    },
+    {
+      "line": 56,
+      "end_line": 56,
+      "callee": "_read_exact",
+      "enclosing": "FrameReader.recv_bytes",
+      "expression": "_read_exact(self._stream, size)"
+    },
+    {
+      "line": 59,
+      "end_line": 59,
+      "callee": "self._stream.close",
+      "enclosing": "FrameReader.close",
+      "expression": "self._stream.close()"
+    },
+    {
+      "line": 67,
+      "end_line": 67,
+      "callee": "threading.Lock",
+      "enclosing": "FrameWriter.__init__",
+      "expression": "threading.Lock()"
+    },
+    {
+      "line": 78,
+      "end_line": 78,
+      "callee": "self._stream.close",
+      "enclosing": "FrameWriter.close",
+      "expression": "self._stream.close()"
+    },
+    {
+      "line": 91,
+      "end_line": 91,
+      "callee": "FrameWriter",
+      "enclosing": "StdioChannel.__init__",
+      "expression": "FrameWriter(request_stream)"
+    },
+    {
+      "line": 92,
+      "end_line": 92,
+      "callee": "FrameReader",
+      "enclosing": "StdioChannel.__init__",
+      "expression": "FrameReader(response_stream)"
+    },
+    {
+      "line": 95,
+      "end_line": 95,
+      "callee": "threading.Condition",
+      "enclosing": "StdioChannel.__init__",
+      "expression": "threading.Condition()"
+    },
+    {
+      "line": 96,
+      "end_line": 96,
+      "callee": "deque",
+      "enclosing": "StdioChannel.__init__",
+      "expression": "deque()"
+    },
+    {
+      "line": 98,
+      "end_line": 102,
+      "callee": "threading.Thread",
+      "enclosing": "StdioChannel.__init__",
+      "expression": "threading.Thread(\n            target=self._read_responses,\n            name=\"context-graph-worker-reader\",\n            daemon=True,\n        )"
+    },
+    {
+      "line": 103,
+      "end_line": 103,
+      "callee": "self._reader.start",
+      "enclosing": "StdioChannel.__init__",
+      "expression": "self._reader.start()"
+    },
+    {
+      "line": 106,
+      "end_line": 106,
+      "callee": "self._request.send_bytes",
+      "enclosing": "StdioChannel.send_bytes",
+      "expression": "self._request.send_bytes(payload)"
+    },
+    {
+      "line": 117,
+      "end_line": 117,
+      "callee": "isinstance",
+      "enclosing": "StdioChannel.recv_bytes",
+      "expression": "isinstance(message, BaseException)"
+    },
+    {
+      "line": 132,
+      "end_line": 132,
+      "callee": "self.close_request",
+      "enclosing": "StdioChannel.close",
+      "expression": "self.close_request()"
+    },
+    {
+      "line": 188,
+      "end_line": 188,
+      "callee": "_terminate_failed_spawn",
+      "enclosing": "spawn_stdio_worker",
+      "expression": "_terminate_failed_spawn(process)"
+    },
+    {
+      "line": 189,
+      "end_line": 189,
+      "callee": "RuntimeError",
+      "enclosing": "spawn_stdio_worker",
+      "expression": "RuntimeError(\"worker standard streams were not created\")"
+    },
+    {
+      "line": 191,
+      "end_line": 196,
+      "callee": "StdioChannel",
+      "enclosing": "spawn_stdio_worker",
+      "expression": "StdioChannel(\n            cast(BinaryIO, process.stdin),\n            cast(BinaryIO, process.stdout),\n            maximum_response_bytes,\n            on_response,\n        )"
+    },
+    {
+      "line": 209,
+      "end_line": 209,
+      "callee": "stream.read",
+      "enclosing": "_read_exact",
+      "expression": "stream.read(remaining)"
+    },
+    {
+      "line": 212,
+      "end_line": 212,
+      "callee": "chunks.append",
+      "enclosing": "_read_exact",
+      "expression": "chunks.append(chunk)"
+    },
+    {
+      "line": 213,
+      "end_line": 213,
+      "callee": "len",
+      "enclosing": "_read_exact",
+      "expression": "len(chunk)"
+    },
+    {
+      "line": 220,
+      "end_line": 220,
+      "callee": "stream.write",
+      "enclosing": "_write_all",
+      "expression": "stream.write(view)"
+    },
+    {
+      "line": 227,
+      "end_line": 227,
+      "callee": "process.poll",
+      "enclosing": "_terminate_failed_spawn",
+      "expression": "process.poll()"
+    },
+    {
+      "line": 230,
+      "end_line": 230,
+      "callee": "suppress",
+      "enclosing": "_terminate_failed_spawn",
+      "expression": "suppress(subprocess.TimeoutExpired)"
+    },
+    {
+      "line": 231,
+      "end_line": 231,
+      "callee": "process.wait",
+      "enclosing": "_terminate_failed_spawn",
+      "expression": "process.wait(5.0)"
+    },
+    {
+      "line": 232,
+      "end_line": 232,
+      "callee": "process.poll",
+      "enclosing": "_terminate_failed_spawn",
+      "expression": "process.poll()"
+    },
+    {
+      "line": 233,
+      "end_line": 233,
+      "callee": "process.kill",
+      "enclosing": "_terminate_failed_spawn",
+      "expression": "process.kill()"
+    },
+    {
+      "line": 53,
+      "end_line": 53,
+      "callee": "_FRAME_HEADER.unpack",
+      "enclosing": "FrameReader.recv_bytes",
+      "expression": "_FRAME_HEADER.unpack(header)"
+    },
+    {
+      "line": 55,
+      "end_line": 55,
+      "callee": "OSError",
+      "enclosing": "FrameReader.recv_bytes",
+      "expression": "OSError(f\"message length {size} exceeds {maximum} byte bound\")"
+    },
+    {
+      "line": 70,
+      "end_line": 70,
+      "callee": "len",
+      "enclosing": "FrameWriter.send_bytes",
+      "expression": "len(payload)"
+    },
+    {
+      "line": 71,
+      "end_line": 71,
+      "callee": "ValueError",
+      "enclosing": "FrameWriter.send_bytes",
+      "expression": "ValueError(\"payload exceeds framing limit\")"
+    },
+    {
+      "line": 73,
+      "end_line": 73,
+      "callee": "_write_all",
+      "enclosing": "FrameWriter.send_bytes",
+      "expression": "_write_all(self._stream, _FRAME_HEADER.pack(len(payload)))"
+    },
+    {
+      "line": 74,
+      "end_line": 74,
+      "callee": "_write_all",
+      "enclosing": "FrameWriter.send_bytes",
+      "expression": "_write_all(self._stream, payload)"
+    },
+    {
+      "line": 75,
+      "end_line": 75,
+      "callee": "self._stream.flush",
+      "enclosing": "FrameWriter.send_bytes",
+      "expression": "self._stream.flush()"
+    },
+    {
+      "line": 110,
+      "end_line": 110,
+      "callee": "self._condition.wait_for",
+      "enclosing": "StdioChannel.poll",
+      "expression": "self._condition.wait_for(lambda: bool(self._messages), timeout)"
+    },
+    {
+      "line": 116,
+      "end_line": 116,
+      "callee": "self._messages.popleft",
+      "enclosing": "StdioChannel.recv_bytes",
+      "expression": "self._messages.popleft()"
+    },
+    {
+      "line": 119,
+      "end_line": 119,
+      "callee": "len",
+      "enclosing": "StdioChannel.recv_bytes",
+      "expression": "len(message)"
+    },
+    {
+      "line": 120,
+      "end_line": 120,
+      "callee": "OSError",
+      "enclosing": "StdioChannel.recv_bytes",
+      "expression": "OSError(f\"message length {len(message)} exceeds {maximum} byte bound\")"
+    },
+    {
+      "line": 124,
+      "end_line": 124,
+      "callee": "suppress",
+      "enclosing": "StdioChannel.close_request",
+      "expression": "suppress(OSError)"
+    },
+    {
+      "line": 125,
+      "end_line": 125,
+      "callee": "self._request.close",
+      "enclosing": "StdioChannel.close_request",
+      "expression": "self._request.close()"
+    },
+    {
+      "line": 133,
+      "end_line": 133,
+      "callee": "suppress",
+      "enclosing": "StdioChannel.close",
+      "expression": "suppress(OSError)"
+    },
+    {
+      "line": 134,
+      "end_line": 134,
+      "callee": "self._response.close",
+      "enclosing": "StdioChannel.close",
+      "expression": "self._response.close()"
+    },
+    {
+      "line": 135,
+      "end_line": 135,
+      "callee": "threading.current_thread",
+      "enclosing": "StdioChannel.close",
+      "expression": "threading.current_thread()"
+    },
+    {
+      "line": 136,
+      "end_line": 136,
+      "callee": "self._reader.join",
+      "enclosing": "StdioChannel.close",
+      "expression": "self._reader.join(2.0)"
+    },
+    {
+      "line": 157,
+      "end_line": 157,
+      "callee": "isinstance",
+      "enclosing": "StdioChannel._read_responses",
+      "expression": "isinstance(message, BaseException)"
+    },
+    {
+      "line": 192,
+      "end_line": 192,
+      "callee": "cast",
+      "enclosing": "spawn_stdio_worker",
+      "expression": "cast(BinaryIO, process.stdin)"
+    },
+    {
+      "line": 193,
+      "end_line": 193,
+      "callee": "cast",
+      "enclosing": "spawn_stdio_worker",
+      "expression": "cast(BinaryIO, process.stdout)"
+    },
+    {
+      "line": 198,
+      "end_line": 198,
+      "callee": "process.stdin.close",
+      "enclosing": "spawn_stdio_worker",
+      "expression": "process.stdin.close()"
+    },
+    {
+      "line": 199,
+      "end_line": 199,
+      "callee": "process.stdout.close",
+      "enclosing": "spawn_stdio_worker",
+      "expression": "process.stdout.close()"
+    },
+    {
+      "line": 200,
+      "end_line": 200,
+      "callee": "_terminate_failed_spawn",
+      "enclosing": "spawn_stdio_worker",
+      "expression": "_terminate_failed_spawn(process)"
+    },
+    {
+      "line": 222,
+      "end_line": 222,
+      "callee": "BrokenPipeError",
+      "enclosing": "_write_all",
+      "expression": "BrokenPipeError(\"worker stream closed during write\")"
+    },
+    {
+      "line": 234,
+      "end_line": 234,
+      "callee": "suppress",
+      "enclosing": "_terminate_failed_spawn",
+      "expression": "suppress(subprocess.TimeoutExpired)"
+    },
+    {
+      "line": 235,
+      "end_line": 235,
+      "callee": "process.wait",
+      "enclosing": "_terminate_failed_spawn",
+      "expression": "process.wait(2.0)"
+    },
+    {
+      "line": 73,
+      "end_line": 73,
+      "callee": "_FRAME_HEADER.pack",
+      "enclosing": "FrameWriter.send_bytes",
+      "expression": "_FRAME_HEADER.pack(len(payload))"
+    },
+    {
+      "line": 115,
+      "end_line": 115,
+      "callee": "BlockingIOError",
+      "enclosing": "StdioChannel.recv_bytes",
+      "expression": "BlockingIOError(\"worker response is not ready\")"
+    },
+    {
+      "line": 141,
+      "end_line": 143,
+      "callee": "self._response.recv_bytes",
+      "enclosing": "StdioChannel._read_responses",
+      "expression": "self._response.recv_bytes(\n                    self._maximum_response_bytes\n                )"
+    },
+    {
+      "line": 152,
+      "end_line": 152,
+      "callee": "self._messages.append",
+      "enclosing": "StdioChannel._read_responses",
+      "expression": "self._messages.append(message)"
+    },
+    {
+      "line": 153,
+      "end_line": 153,
+      "callee": "self._condition.notify_all",
+      "enclosing": "StdioChannel._read_responses",
+      "expression": "self._condition.notify_all()"
+    },
+    {
+      "line": 73,
+      "end_line": 73,
+      "callee": "len",
+      "enclosing": "FrameWriter.send_bytes",
+      "expression": "len(payload)"
+    },
+    {
+      "line": 110,
+      "end_line": 110,
+      "callee": "bool",
+      "enclosing": "StdioChannel.poll",
+      "expression": "bool(self._messages)"
+    },
+    {
+      "line": 150,
+      "end_line": 150,
+      "callee": "OSError",
+      "enclosing": "StdioChannel._read_responses",
+      "expression": "OSError(\"worker produced more than one pending response\")"
+    },
+    {
+      "line": 151,
+      "end_line": 151,
+      "callee": "self._messages.clear",
+      "enclosing": "StdioChannel._read_responses",
+      "expression": "self._messages.clear()"
+    },
+    {
+      "line": 155,
+      "end_line": 155,
+      "callee": "suppress",
+      "enclosing": "StdioChannel._read_responses",
+      "expression": "suppress(Exception)"
+    },
+    {
+      "line": 156,
+      "end_line": 156,
+      "callee": "self._on_response",
+      "enclosing": "StdioChannel._read_responses",
+      "expression": "self._on_response(self)"
+    },
+    {
+      "line": 120,
+      "end_line": 120,
+      "callee": "len",
+      "enclosing": "StdioChannel.recv_bytes",
+      "expression": "len(message)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 17,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "import os",
+      "targets": [
+        "os"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "import struct",
+      "targets": [
+        "struct"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "import subprocess",
+      "targets": [
+        "subprocess"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "import sys",
+      "targets": [
+        "sys"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 23,
+      "source_expression": "import threading",
+      "targets": [
+        "threading"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 24,
+      "source_expression": "from collections import deque",
+      "targets": [
+        "collections",
+        "collections.deque"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 25,
+      "source_expression": "from collections.abc import Callable",
+      "targets": [
+        "collections.abc",
+        "collections.abc.Callable"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 26,
+      "source_expression": "from contextlib import suppress",
+      "targets": [
+        "contextlib",
+        "contextlib.suppress"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 27,
+      "source_expression": "from typing import BinaryIO, Protocol, cast",
+      "targets": [
+        "typing",
+        "typing.BinaryIO",
+        "typing.Protocol",
+        "typing.cast"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    }
+  ]
+}

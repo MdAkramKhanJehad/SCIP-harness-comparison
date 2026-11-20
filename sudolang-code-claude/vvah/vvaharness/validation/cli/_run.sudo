@@ -1,0 +1,167 @@
+# vvaharness/validation/cli/_run.py
+
+The per-run validation loop. It selects the validatable cases that this machine's Stage 10 wrote, then validates each case in sequence: refuse a case with no attempt or whose remediation is not applied, stage a workspace, run the session, score the verdict on the host, write it back into the case file and checkpoint the row. With `--resume` a matching checkpoint row is reused. At the end it writes results into the combined report and removes the staging tree.
+
+Source: `vvaharness/validation/cli/_run.py` (lines 1-434)
+Executor: code (each session it runs contains the model calls)
+Called from: `vvaharness/validation/cli/__init__.sudo` _run_validation_cleaning_up
+
+// src: vvaharness/validation/cli/_run.py:67-68
+VALIDATION_ENGINE_ID = "vvaharness.validation"   // "mirrors plugin_runner.ENGINE_ID"
+
+// src: vvaharness/validation/cli/_run.py:71-92
+SessionLogPaths { source: Path; destination: Path }
+ValidatedCase { loaded: LoadedCase; verdict: Verdict; row: ValidationResult; session_failed: Boolean }
+ValidationRunResult { exit_code: Number; verdicts: [Verdict]; metadata: RunMetadata }
+
+// src: vvaharness/validation/cli/_run.py:280-299
+Selection { case_ids: [String] | null = null; max_findings: Number | null = null; resume: Boolean = false }
+ValidationRun { repo; workspace_root; config; run_id; provenance; policy; resume: Boolean = false }   // shared state of one run
+
+// src: vvaharness/validation/cli/_run.py:375-434
+fn run_validation(repo, selection, workspace_root, config, report_md?):executor=code {
+  meta = RunMetadata()
+  run_id = orchestrator.checkpoints.run_id_for(repo)
+  orchestrator.store.register_run(run_id, repo_root=resolved repo)
+  owned = remediation_agent.provenance.owned_cases(run_id)   // a case is trusted only when THIS run_id's S10 wrote it (state store, outside the repository)
+  try cases = ingest.case_loader.select_cases(repo, selection.case_ids, selection.max_findings, owned=owned)
+  catch IngestError, UnsafeArtifactDir as exc => {
+    console: "ingest error: $exc"; append exc to meta.errors
+    return ValidationRunResult(1, [], meta)   // preserved: this early return skips _cleanup_workspace; the caller removes only a workspace it created
+  }
+  if (cases is empty) return ValidationRunResult(_empty_selection_rc(repo, owned), [], meta)
+  [model, backend] = _engine_identity(config)
+  _prune_orphans(repo, run_id, model, backend)
+  run = ValidationRun { repo, workspace_root, config, run_id, provenance: _provenance_for(config), policy: constants.scoring.FIX_POLICY, resume: selection.resume }
+  [failures, validated] = _run_cases(cases, run)
+  meta.total_findings = length(cases); meta.findings_processed = length(validated); meta.findings_failed = failures
+  report.augment.augment_reports(repo, [ValidatedFinding(item.loaded.case.finding, item.row, item.session_failed) for each item in validated], report_md)   // best effort
+  _cleanup_workspace(workspace_root)   // "checkpoints live in SQLite, so this is safe for --resume"
+  verdicts = verdict of each item in validated
+  // "A session failure outranks a verdict, so a broken run is never reported as clean"
+  exit_code = if (failures > 0) 1 else orchestrator.case_rollup.rc_for_verdicts(verdicts)   // rc_for_verdicts: EXIT_NOT_REMEDIATED only when nothing VALIDATED and something FAILED, else 0
+  return ValidationRunResult(exit_code, verdicts, meta)
+}
+
+// src: vvaharness/validation/cli/_run.py:261-277
+fn _run_cases(cases, run):executor=code {
+  failures = 0; validated = []
+  for each loaded in cases {   // sequential, one session at a time
+    result = _process_case(loaded, run)
+    if (result == null) { failures += 1; continue }   // refused before validation
+    if (result.session_failed) {
+      console: "FAILED: <case_id> — <row.reason_for_decision>"   // "A session/agent error — surface as FAILED, not a normal verdict."
+      failures += 1
+    } else {
+      _print_result(result.row)   // "[<tracking_id>] verdict=<reason_for_decision> score=<fix_confidence>" and the justification when present
+    }
+    validated.append(result)   // a failed session still enters the report and the verdict list
+  }
+  return [failures, validated]
+}
+
+// src: vvaharness/validation/cli/_run.py:221-237
+fn _process_case(loaded, run):executor=code {
+  [model, backend] = _engine_identity(run.config)
+  step = _step_key(loaded.case_id, model, backend)
+  if (run.resume) {
+    cached = orchestrator.checkpoints.load_ckpt(run.workspace_root, run.run_id, step)   // _resume_hit, src: _run.py:215-218
+    if (cached != null && cached.tracking_id == loaded.case_id) {   // "Reuse only when the cached row matches THIS case; else re-validate."
+      console: "  [s11] resume: <case_id> already validated"
+      return _resumed(loaded, cached)
+    }
+  }
+  validated = _validate_one(loaded, run)
+  if (validated != null) orchestrator.checkpoints.save_ckpt(run.workspace_root, run.run_id, step, validated.row)
+  return validated
+  // preserved: a row is checkpointed even when its session failed, so a later --resume reuses it; _resumed then sets session_failed only when the case file holds no verdict
+}
+
+// src: vvaharness/validation/cli/_run.py:100-110
+fn _engine_identity(config):executor=code = [config.agent.model, "${ HARNESS_REGISTRY }:${ config.agent.via }"]
+fn _step_key(case_id, model, backend):executor=code = orchestrator.checkpoints.step_key_for("validate_", engine_id=VALIDATION_ENGINE_ID, engine_version=vvaharness version, case_id, model, backend)
+// the resume key changes when the model, backend or harness version changes
+
+// src: vvaharness/validation/cli/_run.py:240-258
+fn _resumed(loaded, cached):executor=code {
+  verdict = verdict of the case's latest attempt, or null
+  if (verdict == null) return ValidatedCase(loaded, _no_verdict(), cached, session_failed=true)
+  return ValidatedCase(loaded, verdict, cached, session_failed=false)
+}
+fn _no_verdict():executor=code = Verdict { decision: INCONCLUSIVE, rationale: "resumed from a checkpoint, but the case file records no verdict", score: null, produced_by: Provenance(engine=VALIDATION_ENGINE_ID, engine_version=version) }
+
+// src: vvaharness/validation/cli/_run.py:198-212
+fn _validate_one(loaded, run):executor=code {
+  require loaded.case.attempts is non-empty => { console: "refusing <case_id>: no remediation attempt to validate"; return null }
+  workspace = "${ run.workspace_root }/${ _safe(loaded.case_id) }"
+  try ingest.workspace.assert_remediation_applied(run.repo, loaded.case.attempts[-1].remediation.files_touched)
+  catch IngestError as exc => { console: "refusing <case_id>: $exc"; return null }
+  constraint OnEveryExit { remove workspace (ignoring errors) }
+  return _run_plan(loaded, run, workspace)
+}
+
+// src: vvaharness/validation/cli/_run.py:145-175
+fn _run_plan(loaded, run, workspace):executor=code {
+  started = now (UTC); spend_before = TOKENS.spend(); session_id = new random hexadecimal id
+  ingest.workspace.stage_workspace(run.repo, workspace, loaded.case.attempts[-1].remediation.diff)
+  plan = FixValidationPlan { case_id: loaded.case_id, session_id, manifest: ingest.manifest_builder.build_manifest(loaded.case, session_id), workspace_dir: workspace, output_dir: workspace, provenance: run.provenance, policy: run.policy }
+  outcome = execution.pipeline.execute_plan(plan, run.config, post_results=false, meta=RunMetadata(total_findings=1))   // run to completion with asyncio.run
+  collected = outcome.findings[0]
+  verdict = io.case_writeback.build_verdict(loaded.case, workspace, provenance=_measured(run.provenance, started, spend_before), policy=run.policy, session_failed=outcome.session_failed)
+  _record(loaded, verdict, workspace)
+  return ValidatedCase(loaded, verdict, collected.row, outcome.session_failed)
+}
+
+// src: vvaharness/validation/cli/_run.py:178-182
+fn _measured(base, started, spend_before):executor=code = base with { started, ended: now (UTC), usd and turns spent since spend_before }   // "safe: cases run sequentially"
+
+// src: vvaharness/validation/cli/_run.py:185-195
+fn _record(loaded, verdict, workspace):executor=code {
+  record = _persist_session_log(workspace, loaded)
+  if (record) console: "  [s11] session log → $record"
+  judged = io.case_writeback.write_back_verdict(loaded.case, verdict, loaded.path)
+  if (judged) console: "  [s11] case updated → <case_id>: state=<judged.state>"
+}
+
+// src: vvaharness/validation/cli/_run.py:95-97, 113-135
+fn _safe(case_id):executor=code = first 80 characters (CMD_PREVIEW_LEN) of case_id with each _UNSAFE character replaced by "_"
+fn _persist_session_log(workspace, loaded):executor=code {
+  src = "$workspace/logging/orchestrator/session.jsonl"
+  if (src does not exist) return null
+  dest = "<directory of the case file>/validation_session_${ _safe(loaded.case_id) }.jsonl"
+  try write report.redact.redact(text of src) to dest   // the transcript is redacted before it is kept next to the case file
+  catch OSError, ValueError => { delete dest if present; return null }
+  return dest
+}
+
+// src: vvaharness/validation/cli/_run.py:326-349
+fn _empty_selection_rc(repo, owned?):executor=code {
+  discovered = ingest.case_loader.discover_cases(repo)
+  if (discovered is empty) { console: "validation cannot run: no findings in a validatable state (<states>) under $repo"; return 1 }
+  if (owned != null && !_any_owned(discovered, owned)) {
+    console: "validation cannot run: no case under $repo has an S10 record in this machine's state store (not written by this machine's remediation)"
+    return 1
+  }
+  console: "validation: nothing to validate — all findings under $repo are already in a terminal state"
+  return 0
+}
+
+// src: vvaharness/validation/cli/_run.py:314-323
+fn _any_owned(paths, owned):executor=code = some path whose loaded case_id paired with its resolved parent directory is in owned (unreadable case files are skipped)
+
+// src: vvaharness/validation/cli/_run.py:352-360
+fn _prune_orphans(repo, run_id, model, backend):executor=code {
+  case_ids = ingest.case_loader.all_case_ids(repo)
+  if (case_ids == null) return
+  orchestrator.checkpoints.prune_stale_steps(run_id, "validate_", [_step_key(cid, model, backend) for each cid in case_ids])   // live set is every case on disk, not only the --finding selection
+}
+
+// src: vvaharness/validation/cli/_run.py:363-372
+fn _provenance_for(config):executor=code = Provenance { engine: VALIDATION_ENGINE_ID, engine_version: version, model, backend }   // from _engine_identity
+
+// src: vvaharness/validation/cli/_run.py:302-311
+fn _cleanup_workspace(workspace_root):executor=code {
+  try remove workspace_root recursively
+  catch FileNotFoundError => ()
+  catch OSError as exc => console: "  [s11] WARN: could not remove workspace $workspace_root: $exc"
+}

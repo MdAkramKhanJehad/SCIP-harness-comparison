@@ -1,0 +1,273 @@
+# vvaharness/orchestrator/batch.py
+
+Batch mode (`--repo-file`). It parses and validates a manifest of repositories, filters out names that match skip patterns, then acquires (clones or copies) each repository and calls `scan_repo` on it, one at a time. With `--group-by-app` it stages every repository of one application under one directory and runs one scan per application. It writes `batch_summary.md` and folds the per-repository outcomes into one exit code.
+
+Source: `vvaharness/orchestrator/batch.py` (lines 1-693)
+Executor: code
+Called from: `vvaharness/orchestrator/entry.py` main (when `--repo-file` is given)
+
+// src: vvaharness/orchestrator/batch.py:133-134
+_MANIFEST_MAX_BYTES = 64 * 1024 * 1024   // 64 MiB on disk
+_MANIFEST_MAX_ROWS = 200000              // data rows or physical lines
+
+// src: vvaharness/orchestrator/batch.py:380-504
+fn run_batch(list_file, args, cfg):executor=code {
+  git_token = knob("batch.git_token", default=null)
+  git_base = knob("batch.git_base_url", default=null)
+
+  // src: batch.py:384-391 — the whole manifest is validated before any clone or scan
+  try entries = if (list_file suffix (case-insensitive) == ".csv") _parse_repo_csv(list_file, git_base) else _parse_repo_file(list_file);
+  catch ValueError => { log BATCH_ROW_INVALID; return 2 }
+
+  // src: batch.py:393-413 — skip filter: case-insensitive fnmatch globs against RepoName, before cloning
+  skip_pats = lowercase each of knob("batch.skip_repo_patterns", default=[])
+  if (skip_pats) {
+    entries = entries where no pattern in skip_pats fnmatches lowercase(repo_name)   // each skipped name is printed with the matching pattern
+    require entries is non-empty => { log BATCH_ALL_ROWS_SKIPPED; return 2 }
+  }
+
+  workspace = Path(args.workspace)
+  if (args.group_by_app) return _run_batch_grouped(entries, workspace, git_token, args, cfg, list_file)
+
+  // src: batch.py:421-479 — repositories are scanned SEQUENTIALLY in manifest order; there is no parallelism across repositories
+  results = []
+  for each [i, entry] in entries (numbered from 1) {
+    { ref, repo_name, application_id: app_id } = entry
+    // src: batch.py:430-439 — process-global state is reset so repository N does not inherit repository N-1's state
+    TOKENS.reset(); STAGES.reset(); COUNTERS.reset(); CACHED_PROVENANCE.reset()
+    _reset_quality_counters(); _reset_warn_once()
+    _reset_redact_known_values()   // otherwise the previous repository's secrets would leak into redaction state
+    cli.reset_abort()              // a prior repository's guardrail abort must not poison this one
+    cloned = null
+    constraint OnEveryExit {
+      // src: batch.py:477-479
+      if (cloned && !args.keep_clones && args.stop_after != "clone") cleanup._purge_clone(cloned, cleanup._preserve_set(cfg))
+      // only remote clones are purged; a local path is scanned in place and never deleted
+    }
+    try {
+      local = _acquire_repo(ref, workspace, git_token, dest_name=repo_name)
+      if (_is_remote(ref)) cloned = local
+      if (args.stop_after == "clone") { results += { ref, module: repo_name, app_id, status: "OK", findings: 0, report: local }; continue }
+      outcome = scan.scan_repo(local, repo_name, app_id, args, cfg, path_prefix=repo_name)
+      // preserved: no ev_collection_in is passed; exploit verification is single-repository only
+      results += { ref, module: repo_name, app_id, ..._outcome_status(outcome) }
+    }
+    catch error => match (error) {
+      case KeyboardInterrupt => { results += { status: "ABORTED", error: "interrupted by user" }; throw error }
+      case AuthenticationError | ProxyError | StoreError => throw error   // environment-wide: every remaining repository would fail the same way, so the batch stops
+      default => {
+        errlog.log("batch", repo_name, error, app_id, ref)
+        results += { ref, module: repo_name, app_id, status: "FAILED", findings: 0, error: first 500 characters of error }   // repository-scoped: the batch continues
+      }
+    }
+  }
+
+  // src: batch.py:481-504
+  write _render_batch_summary(results, list_file, elapsed) to "$workspace/batch_summary.md"
+  [unremediated, failed] = _split_non_ok(results)
+  if (!unremediated && !failed) return 0
+  if (failed) return 1                                  // health outranks outcome
+  return case_rollup.EXIT_NOT_REMEDIATED
+}
+
+// src: vvaharness/orchestrator/batch.py:545-647
+fn _run_batch_grouped(entries, workspace, git_token, args, cfg, list_file):executor=code {
+  groups = entries grouped by application_id
+  results = []
+  // src: batch.py:556-624 — one scan per application, applications in sorted application_id order, sequentially
+  for each [n, [app_id, repos]] in sorted(groups) {
+    safe_app = app_id with every character outside [alphanumeric . _ -] replaced by "_", leading and trailing "." stripped, or "app" if empty
+    app_dir = "$workspace/$safe_app"
+    slugs = _assign_slugs(repos)
+    reset the same process-global state as run_batch (TOKENS, STAGES, COUNTERS, CACHED_PROVENANCE, quality counters, warn-once, redaction known values, cli abort)
+    constraint OnEveryExit {
+      // src: batch.py:622-624
+      if (!args.keep_clones && args.stop_after != "clone") cleanup._purge_clone(app_dir, cleanup._preserve_set(cfg))
+      // preserved: the whole app_dir is purged, including copies of local repositories
+    }
+    try {
+      staged = []
+      for each [r, slug] in zip(repos, slugs) {
+        try { _stage_repo(r.ref, app_dir, slug, git_token); staged += slug }
+        catch error => match (error) {
+          case StoreError => throw error   // the state store is shared, not a per-repository failure
+          default => { warn BATCH_REPO_SKIPPED; errlog.log("batch.clone", slug, error, app_id) }   // that repository is left out of the scan
+        }
+      }
+      require staged is non-empty => throw RuntimeError("all <n> repo(s) failed to stage for app $app_id")
+      // a partially staged application is still scanned ("staged k/n repos ... continuing scan")
+      module = _app_module_name(app_id, repos)
+      if (args.stop_after == "clone") { results += { ref: "<n> repos", module, app_id, status: "OK", findings: 0, report: app_dir }; continue }
+      outcome = scan.scan_repo(app_dir, module, app_id, args, cfg)   // no path_prefix in grouped mode
+      results += { ref: "<n> repos", module, app_id, ..._outcome_status(outcome) }
+    }
+    catch error => match (error) {
+      case KeyboardInterrupt => { results += { module: app_id, status: "ABORTED", error: "interrupted by user" }; throw error }
+      case AuthenticationError | ProxyError | StoreError => throw error   // environment-wide
+      default => { errlog.log("batch", "app_$app_id", error); results += { module: app_id, status: "FAILED", findings: 0, error: first 500 characters } }
+    }
+  }
+  // src: batch.py:626-647 — same summary and exit code fold as run_batch
+  write _render_batch_summary(results, list_file, elapsed) to "$workspace/batch_summary.md"
+  [unremediated, failed] = _split_non_ok(results)
+  if (!unremediated && !failed) return 0
+  if (failed) return 1
+  return case_rollup.EXIT_NOT_REMEDIATED
+}
+
+// src: vvaharness/orchestrator/batch.py:150-226
+fn _parse_repo_csv(list_file, git_base_url):executor=code {
+  _check_manifest_size(list_file)
+  header = first row (UTF-8 with optional byte order mark); require header exists => throw ValueError("empty file")
+  // case-insensitive column aliases
+  i_app = column named one of ["appid", "application_id", "app_id", "applicationid"]
+  i_repo = column named one of ["reponame", "repository_name", "repo_name", "repo"]
+  i_path = column named one of ["path", "url", "repo_url", "ref"]
+  require i_app && i_repo => throw ValueError("header must contain AppID and RepoName columns ...")
+  require i_path || git_base_url => throw ValueError("no Path column and batch.git_base_url is not set — cannot derive clone URLs")
+  entries = []; errors = []; seen = {}
+  for each [lineno from 2, row] in remaining rows {
+    require lineno - 1 <= _MANIFEST_MAX_ROWS => throw ValueError("over 200000 data rows — split the batch ...")
+    [app_id, repo_name, ref] = trimmed cells
+    if (!app_id && !repo_name) continue   // blank row
+    if (!app_id || !repo_name) { errors += "row $lineno: AppID and RepoName are both required"; continue }
+    if (!ref) {
+      if (!git_base_url) { errors += "row $lineno: Path is blank and batch.git_base_url is not set ..."; continue }
+      ref = _clone_url_for(repo_name, git_base_url)   // "{base}/{repo_name}.git"
+    }
+    if (ref (left-trimmed) starts with "-") { errors += "row $lineno: path ... may not start with '-'"; continue }   // would be read by git clone as an option
+    if (!_is_remote(ref) && ref is not an existing directory) { errors += "... neither a git URL nor an existing local directory"; continue }
+    if (ref in seen) { errors += "row $lineno: duplicate path ..."; continue }
+    seen += ref; entries += { application_id: app_id, repo_name, ref }
+  }
+  require errors is empty => throw ValueError("<n> validation error(s): ...")   // one bad row fails the whole batch before any scan
+  require entries is non-empty => throw ValueError("no repo entries found")
+  return entries
+}
+
+// src: vvaharness/orchestrator/batch.py:229-287
+fn _parse_repo_file(list_file):executor=code {
+  _check_manifest_size(list_file)
+  for each [lineno from 1, raw] in lines {
+    require lineno <= _MANIFEST_MAX_ROWS => throw ValueError("over 200000 lines ...")
+    line = trimmed raw; if (line is empty || line starts with "#") continue
+    parts = line split on "," and trimmed
+    if (length(parts) != 3) { errors += "expected 3 comma-separated fields (application_id,repository_name,path)"; continue }
+    [app_id, repo_name, ref] = parts
+    each empty field adds its own error; if any is empty, continue
+    same checks as _parse_repo_csv: no leading "-", remote URL or existing directory, no duplicate ref
+    entries += { application_id: app_id, repo_name, ref }
+  }
+  require errors is empty => throw ValueError
+  require entries is non-empty => throw ValueError("no repo entries found")
+  return entries
+}
+
+// src: vvaharness/orchestrator/batch.py:137-147
+fn _check_manifest_size(list_file):executor=code {
+  require stat succeeds => throw ValueError("cannot stat manifest")
+  require size <= _MANIFEST_MAX_BYTES => throw ValueError("manifest is <size> bytes, over the 64 MiB cap — split the batch ...")
+}
+
+// src: vvaharness/orchestrator/batch.py:297-350
+fn _acquire_repo(ref, workspace, git_token, dest_name?):executor=code {
+  if (!_is_remote(ref)) {
+    require ref is a directory => throw RuntimeError("local path does not exist")
+    return ref   // local paths are used in place, not copied
+  }
+  workspace.mkdir(parents=true)
+  safe = (dest_name || _module_name_from(ref)) with every character outside [alphanumeric . _ -] replaced by "_"
+  require safe not in [".", ".."] && safe is not only dots => throw RuntimeError("refusing unsafe clone dest name ...")   // would escape the workspace and _purge_clone would delete the parent
+  dest = "$workspace/$safe"
+  if (dest exists) {
+    has_content = dest contains anything other than ".git"
+    // reuse only a non-empty directory bound by a state-directory marker to THIS ref
+    if (has_content && _stage_dir_bound(dest, ref)) return dest
+    cleanup._rmtree_rw(dest)
+    if (dest still exists) return dest   // preserved: "could not remove; reusing as-is" — the unverified directory is then scanned
+  }
+  clone_url = _with_token(ref, git_token)
+  // src: batch.py:331-341 — shallow clone with a 600-second cap, interactive prompts disabled
+  try r = run ["git", "-c", "core.longpaths=true", "clone", "--depth", "1", "--", clone_url, dest] with GIT_TERMINAL_PROMPT=0, timeout=600;
+  catch TimeoutExpired => throw RuntimeError("git clone timed out after 600s ...")
+  require r.returncode == 0 => throw RuntimeError("git clone failed: <stderr with the token replaced by *** and URL userinfo scrubbed>")
+  _write_stage_marker(dest, ref, "remote")
+  return dest
+}
+
+// src: vvaharness/orchestrator/batch.py:507-532
+fn _stage_repo(ref, app_dir, slug, git_token):executor=code {
+  if (_is_remote(ref)) { _acquire_repo(ref, app_dir, git_token, dest_name=slug); return }
+  require ref is a directory => throw RuntimeError("local path does not exist")
+  dest = "$app_dir/$slug"
+  if (dest exists) {
+    if (_stage_dir_bound(dest, ref)) return   // reuse a verified local copy
+    cleanup._rmtree_rw(dest)
+    if (dest still exists) return   // preserved: reused as-is
+  }
+  copy ref to dest with symlinks kept as links (not dereferenced) and ".git" ignored   // a dereferencing copy would pull in files such as ~/.ssh keys
+  _write_stage_marker(dest, ref, "local")
+}
+
+// src: vvaharness/orchestrator/batch.py:85-113 (marker path 90-92, check 107-113)
+fn _stage_dir_bound(dest, ref):executor=code {
+  // the marker lives in the operator-private state directory, so a writer who controls only the workspace cannot forge reuse
+  marker = state_root() + "/stage-markers/" + sha256(resolved dest)[:32] + ".json"
+  try data = json(marker); catch (OSError | ValueError) => return false
+  return data is a dict && data.ref_id == sha256(ref)[:32]
+}
+
+// src: vvaharness/orchestrator/batch.py:95-104
+fn _write_stage_marker(dest, ref, kind):executor=code {
+  try { store.ensure_state_dir("stage-markers"); write { v: 1, kind, ref_id: sha256(ref)[:32] } to the marker }
+  catch OSError => warn BATCH_MARKER_WRITE_FAILED   // best effort: the next run re-stages
+}
+
+// src: vvaharness/orchestrator/batch.py:116-129
+fn _assign_slugs(repos):executor=code {
+  // unique staging slug per repository so two names with the same tail do not share one directory
+  for each r in repos {
+    slug = _module_name_from(r.repo_name); salt = r.repo_name
+    while (slug in used) { slug = "$base-" + sha1(salt)[:8]; salt = slug + r.repo_name }
+    used += slug
+  }
+  return slugs
+}
+
+// src: vvaharness/orchestrator/batch.py:535-542
+fn _app_module_name(app_id, repos):executor=code {
+  [profile, _] = cmdb._load_app_profile(app_id)
+  if (profile && profile.name) return sanitized profile.name || "app_$app_id"
+  if (length(repos) == 1) return _module_name_from(repos[0].repo_name)
+  return "app_$app_id"
+}
+
+// src: vvaharness/orchestrator/batch.py:353-369
+fn _outcome_status(outcome):executor=code {
+  match (outcome.exit_code) {
+    case 0 => status = "OK"
+    case case_rollup.EXIT_NOT_REMEDIATED => { status = "NOT_REMEDIATED"; error = "the scan completed but nothing it remediated validated as fixed" }   // an outcome claim, not a health claim
+    default => { status = "DEGRADED"; error = "a scan stage exited <code>; see the per-repo log" }
+  }
+  return { status, findings: outcome.finding_count, report: outcome.report_path || "", error }
+}
+
+// src: vvaharness/orchestrator/batch.py:372-377
+fn _split_non_ok(results):executor=code {
+  unremediated = results where status == "NOT_REMEDIATED"
+  failures = results where status not in ["OK", "NOT_REMEDIATED"]   // deny list: DEGRADED, FAILED, ABORTED and any unknown status count as failures
+  return [unremediated, failures]
+}
+
+// src: vvaharness/orchestrator/batch.py:54-58
+fn _module_name_from(ref):executor=code { return last path segment of ref (case-insensitive ".git" suffix removed), or "repo" }
+// src: vvaharness/orchestrator/batch.py:61-62
+fn _is_remote(ref):executor=code { return ref starts with one of ["http://", "https://", "git@", "ssh://"] || ref ends with ".git" }
+// src: vvaharness/orchestrator/batch.py:290-294
+fn _with_token(url, token):executor=code {
+  // inject the token only into an http(s) URL that has no "@" anywhere after "//"
+  if (!token || url does not start with "http://" or "https://" || "@" in the part of url after the first "//") return url
+  return "scheme://x-access-token:$token@rest"
+}
+
+// abstracted: batch.py:65-72 (_scrub_url_secrets rewrites scheme://user:token@ to scheme://***@ in every printed or summarized string), 650-693 (_render_batch_summary: Markdown table of results with operator fields neutralised by models._md_cell, plus "Not remediated" and "Failures" sections; counts use _split_non_ok so the summary agrees with the exit code). Formatting only.

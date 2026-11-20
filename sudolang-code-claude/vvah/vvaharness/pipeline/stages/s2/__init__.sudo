@@ -1,0 +1,97 @@
+# vvaharness/pipeline/stages/s2/__init__.py
+
+Stage 2 entry point (threat model). Gathers structural evidence, builds the baseline block and user prompt, makes the agentic threat-model call (with one resend for clipped or schema-rejected replies), repairs an unparseable reply once, finalizes threat ids and surface files, retries once with no tools when the result is hollow, audits baseline dispositions, and caps the output sizes.
+
+Source: `vvaharness/pipeline/stages/s2/__init__.py` (lines 1-272)
+Executor: mixed (model calls are made through `s2/session.py`; parsing, retries, audits and caps are code)
+Called from: `vvaharness/orchestrator/scan.py` scan_repo (Stage 2 — "always attempted")
+
+// src: vvaharness/pipeline/stages/s2/__init__.py:127-272
+fn run(repo_root, repo_name, cfg, known_cves, controls, ctx?, app_profile?):executor=mixed {
+  // src: s2/__init__.py:137-145
+  ev = evidence.gather(repo_root, cfg, ctx)   // see evidence/gather.sudo; caps on every block
+
+  // src: s2/__init__.py:147-150
+  baseline_mode = knob("step2.baseline", default="auto")
+  [kinds, baseline] = s2.prompts._baseline_block(ev, ctx, baseline_mode)
+
+  // src: s2/__init__.py:152-154
+  user = s2.prompts._build_user_prompt(repo_name, ev, known_cves, controls, app_profile, baseline_block=baseline)
+
+  // src: s2/__init__.py:158-176 — primary call, at most one resend
+  effort = knob("step2.effort", default=null) || null
+  try {
+    raw = dispatch_or_retry_unforced(
+      drop_thinking => s2.session._threatmodel_call(user, cfg, repo_root, ctx, drop_thinking, require_tool_call = ev.file_count > 0),
+      label=repo_name, stage="s2",
+      effort=deepagents.droppable_effort(knob("models.threatmodel"), effort, agentic=true),
+      may_retry=() => Boolean(knob("step2.empty_retry", default=true)),
+      resend_refusal=refusal_resend_allowed(cfg, knob("models.threatmodel")))
+    // external: vvaharness/util/response_quality.py — one resend with drop_thinking=true when the first reply is a clip the backend could not grow (only when an effort tier was sent) or a structured-output failure, and only if may_retry() is true; the first model refusal gets one identical resend when resend_refusal is true
+  } catch error => {
+    log S2_CALL_FAILED; errlog.log("s2", repo_name, error, reason="threat_model_call_failed")
+    throw error   // record then raise, never swallowed
+  }
+
+  // src: s2/__init__.py:180-215 — one repair retry for an unparseable reply
+  try tm = s2.outcomes._parse_threat_model(raw);
+  catch parse_err => {
+    COUNTERS.bump("s2_parse_repair_attempted")   // deliberately not errlogged
+    repaired = null
+    try {
+      repaired = callModel({
+        role: "threatmodel",
+        route: resolve_model(knob("models.threatmodel")).via,   // deepagents.dispatch_prompt
+        system: s2.prompts.SYSTEM,
+        prompt: s2.prompts._repair_json_prompt(raw, parse_err),
+        tools: [],
+        limits: { max_tokens: knob("step2.max_tokens", default=64000), timeout: knob("step2.timeout", default=1800), tag: "s2 threatmodel json-repair" },
+        output: free text JSON
+      })
+      tm = s2.outcomes._parse_threat_model(repaired)
+    } catch error => {
+      log S2_RESPONSE_UNPARSEABLE
+      errlog.log("s2", repo_name, error, reason="threat_model_parse_failed", raw_head=first 500 characters of redact(repaired or raw), note="s2 JSON extraction or model validation failed after one repair retry; s3–s8 will receive no threat context")
+      throw error   // the orchestrator records s2 as degraded
+    }
+    COUNTERS.bump("s2_parse_repair_recovered")
+  }
+  // preserved: the primary call reads step2.max_tokens through knob() (a null overlay gives 64000), the repair call reads it with getattr (a null overlay passes null through)
+
+  // src: s2/__init__.py:217-219
+  s2.outcomes._finalize_threats(tm, ctx)
+  tm = s2.session._retry_if_hollow(tm, ev, user, cfg, repo_root, ctx)   // may raise S2HollowAfterRetry, which stops the scan
+
+  // src: s2/__init__.py:221-230 — zero threats after the hollow retry is recorded, not raised
+  if (!tm.threats) {
+    errlog.log("s2", "threatmodel", "zero threats — s3's per-threat annotator has nothing to annotate; the run proceeds with no threat-derived targeting")   // deliberately unmarked
+    if (ev.file_count > 0) COUNTERS.bump("s2_degraded")
+  }
+
+  // src: s2/__init__.py:232-242 — baseline audit runs BEFORE the caps (baseline threats rank last and would be truncated)
+  undisposed = s2.baseline._baseline_audit(tm, kinds)
+  max_threats = knob("step2.max_threats", default=50)              // read through _cap_int: a non-negative integer, else the default
+  max_assets = knob("step2.max_assets", default=40)
+  max_boundaries = knob("step2.max_trust_boundaries", default=60)
+  raw_counts = [length(tm.threats), length(tm.assets), length(tm.trust_boundaries)]
+  tm = models._cap_threats(tm, max_threats)
+    // external: vvaharness/models/scan/threat.py — threats are always sorted by a rank key; when over the cap, the top max_threats are kept and lower-ranked threats are promoted (by evicting another) so every trust boundary keeps at least one covering threat
+  tm = models._cap_assets(tm, max_assets)          // over the cap: sorted by sensitivity descending, then name; first max_assets kept
+  tm = models._cap_boundaries(tm, max_boundaries)  // over the cap: sorted by number of reachable assets descending, then entry point; first max_boundaries kept
+  s2.outcomes._warn_output_caps(raw_counts, tm, [max_threats, max_assets, max_boundaries])
+
+  // src: s2/__init__.py:245-266
+  if (undisposed) {
+    disposed = s2.baseline._required_baselines(kinds) - undisposed
+    all_covered_elsewhere = every bid in undisposed satisfies s2.baseline._category_covered_elsewhere(bid, tm.threats, disposed)
+    if (all_covered_elsewhere) {
+      errlog.log("s2", repo_name, "baseline items undisposed", reason="baseline_items_undisposed", recovered=true)
+      COUNTERS.bump("s2_baseline_undisposed_recovered")
+    } else {
+      errlog.log("s2", repo_name, "baseline items undisposed", reason="baseline_items_undisposed")   // deliberately unmarked: a real gap, Stage 3 targets units off baseline threats
+    }
+    warn S2_BASELINE_UNDISPOSED
+  }
+  return tm
+  // abstracted: s2/__init__.py:131-145, 149-150, 155-156, 177-178, 184-185, 268-271 progress notes, console and log lines
+}

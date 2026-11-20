@@ -1,0 +1,5528 @@
+{
+  "source": "vvaharness/validation/report/augment.py",
+  "sha256": "8b44eb81035a7c776f969555ad6e928c24d6dfc8c6b36b744cf03de44c7497ac",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Augment the combined SARIF + MD report with validation results; best-effort, never fails.\"\"\"\nfrom __future__ import annotations\n\nimport json\nimport re\nfrom collections.abc import Mapping\nfrom pathlib import Path\nfrom typing import TYPE_CHECKING, cast\n\n# One definition of the invisible-char defence; no cycle (vvaharness.models imports no validation).\nfrom vvaharness.models import _MD_INVISIBLE_RX, _MD_LINEBREAK_RX\n\n# The documented cross-artifact join key; no cycle — s9 imports nothing from validation.\nfrom vvaharness.pipeline.stages.s9.typed_sarif import (\n    FINGERPRINT_KEY,\n    record_result_block,\n    result_fingerprint,\n    result_identifies,\n)\nfrom vvaharness.util import console, logs\nfrom vvaharness.validation.constants.artifacts import (\n    REMEDIATION_DIRNAME,\n    SCAN_REPORT_GLOB,\n)\nfrom vvaharness.validation.models.results import SarifLocation\nfrom vvaharness.validation.report.models import (\n    CombinedReportPaths,\n    SarifResult,\n    SarifValidationBlock,\n    ValidatedFinding,\n)\n\nif TYPE_CHECKING:\n    from vvaharness.models import Finding\n    from vvaharness.validation.models import ValidationResult\n\nlog = logs.get_logger(__name__)\n\n# Finding heading in the markdown report, e.g. ``### 1. [HIGH] Some title``.\n_FINDING_RE = re.compile(r\"(?m)^### \\d+\\. \\[[^\\]]*\\]\\s*(.+?)\\s*$\")\n# A previously-appended ``### Validation`` block, anchored to the end of a finding segment.\n_EXISTING_VALIDATION_RE = re.compile(r\"(?s)\\n+### Validation\\n.*\\Z\")\n# ``## `` ends a finding segment: ``### Validation`` must stay above report-level sections\n_LEVEL2_HEADING_RE = re.compile(r\"(?m)^## \")\n\n# Under properties: SARIF 2.1.0 forbids extra result keys; aliases key S9-folded twins by case id\nBLOCK_KEY = \"validation\"\nALIAS_BLOCK_KEY = \"validationAliases\"\n\n\ndef augment_reports(\n    repo: Path, pairs: list[ValidatedFinding], report_md: Path | None = None\n) -> None:\n    \"\"\"Add validation results to the report under ``security-remediation/``, logging failures.\"\"\"\n    try:\n        _augment(repo, pairs, report_md)\n    except Exception as exc:  # report augmentation must never fail the validation run\n        log.warning(\n            \"report augmentation skipped (results not written to combined report): %s: %s\",\n            type(exc).__name__, exc,\n        )\n\n\ndef _augment(repo: Path, pairs: list[ValidatedFinding], report_md: Path | None) -> None:\n    \"\"\"Resolve the combined report in ``security-remediation/`` and augment SARIF + MD in place.\"\"\"\n    located = _locate_combined_report(repo, report_md)\n    if located is None:\n        log.warning(\"no combined report under %s/%s — skipping report augmentation\",\n                    repo, REMEDIATION_DIRNAME)\n        return\n    sarif_dst, md_dst = located\n    _augment_sarif(sarif_dst, pairs)\n    _augment_md(md_dst, pairs)\n    log.info(\"validation results written to combined report under %s\", sarif_dst.parent)\n\n\ndef _locate_combined_report(\n    repo: Path, report_md: Path | None = None,\n) -> CombinedReportPaths | None:\n    \"\"\"Pick the ``(*_report.sarif, *_report.md)`` pair to enrich; explicit wins, else newest.\"\"\"\n    if report_md is not None:\n        md = repo / REMEDIATION_DIRNAME / Path(report_md).with_suffix(\".md\").name\n        sarif = md.with_suffix(\".sarif\")\n        return CombinedReportPaths(sarif, md) if (md.exists() and sarif.exists()) else None\n    sarifs = sorted((repo / REMEDIATION_DIRNAME).glob(SCAN_REPORT_GLOB))\n    if not sarifs:\n        return None\n    sarif = sarifs[-1]\n    md = sarif.with_suffix(\".md\")\n    return CombinedReportPaths(sarif, md) if md.exists() else None\n\n\n# value helpers\n\n\ndef _status_label(result: ValidationResult, *, session_failed: bool = False) -> str:\n    \"\"\"Map the tri-state result to the report's ``validationStatus`` enum; a crashed session or an honest no-clear-decision result both read \"inconclusive\", never the false \"not_fixed\" either used to collapse into.\"\"\"\n    if session_failed:\n        return \"inconclusive\"\n    if result.fixed == \"Yes\":\n        return \"fixed\"\n    if result.partially_fixed == \"Yes\":\n        return \"partially_fixed\"\n    if result.not_fixed == \"Yes\":\n        return \"not_fixed\"\n    return \"inconclusive\"\n\n\ndef _status_word(result: ValidationResult, *, session_failed: bool = False) -> str:\n    \"\"\"Human-readable status for the markdown section.\"\"\"\n    return {\"fixed\": \"Fixed\", \"partially_fixed\": \"Partially Fixed\",\n            \"not_fixed\": \"Not Fixed\", \"inconclusive\": \"Inconclusive\"\n            }[_status_label(result, session_failed=session_failed)]\n\n\ndef _parse_gates(raw_json: str) -> dict[str, object]:\n    \"\"\"Parse the gate-scores JSON blob, returning {} on absence/error.\"\"\"\n    if not raw_json:\n        return {}\n    try:\n        parsed = json.loads(raw_json)\n    except (ValueError, TypeError):\n        return {}\n    return parsed if isinstance(parsed, dict) else {}\n\n\ndef _validation_block(result: ValidationResult,\n                      *, session_failed: bool = False) -> SarifValidationBlock:\n    \"\"\"Build the SARIF per-result ``validation`` object.\"\"\"\n    reason = (result.reason_for_decision or result.justification or \"\").strip()\n    if session_failed and not reason:\n        reason = \"validation session failed; no verdict was reached\"\n    return {\n        \"validationStatus\": _status_label(result, session_failed=session_failed),\n        \"validationReason\": reason[:2000],\n        \"weightedScore\": result.fix_confidence,\n        \"mergeReadiness\": result.pr_merge_readiness,\n        \"gateScores\": _parse_gates(result.gate_results_json),\n    }\n\n\n# SARIF augmentation\n\n\ndef _norm_path(path_text: str) -> str:\n    \"\"\"Fold Windows separators to POSIX so a separator mismatch can't defeat location matching.\"\"\"\n    return path_text.replace(\"\\\\\", \"/\")\n\n\ndef _result_loc(sarif_result: SarifResult) -> SarifLocation | None:\n    \"\"\"Return the SARIF result's physical location, or None when unavailable.\"\"\"\n    try:\n        locations = cast(list[object], sarif_result[\"locations\"])\n        first_location = cast(SarifResult, locations[0])\n        physical = cast(SarifResult, first_location[\"physicalLocation\"])\n        artifact = cast(SarifResult, physical[\"artifactLocation\"])\n        region = cast(SarifResult, physical[\"region\"])\n        uri = _norm_path(str(artifact[\"uri\"]))\n        start_line = int(cast(int, region[\"startLine\"]))\n        return SarifLocation(uri, start_line)\n    except (KeyError, IndexError, TypeError, ValueError):\n        return None\n\n\ndef _match_by_loc(results: list[SarifResult], file: str, line: int) -> SarifResult | None:\n    \"\"\"Return the result whose physical location is exactly (file, line).\"\"\"\n    target = SarifLocation(_norm_path(file), line)\n    for result in results:\n        if _result_loc(result) == target:\n            return result\n    return None\n\n\ndef _message_text(result: SarifResult) -> str:\n    \"\"\"Return a SARIF result's ``message.text``, or empty string when absent.\"\"\"\n    message = cast(SarifResult, result.get(\"message\") or {})\n    return str(message.get(\"text\", \"\"))\n\n\ndef _match_by_title(results: list[SarifResult], title: str) -> SarifResult | None:\n    \"\"\"Return the result whose message text starts with *title* — only when exactly one does.\"\"\"\n    hits = [result for result in results if _message_text(result).startswith(title)]\n    return hits[0] if len(hits) == 1 else None\n\n\ndef _match_by_fingerprint(results: list[SarifResult],\n                          case_id: str) -> SarifResult | None:\n    if not case_id:\n        return None\n    for result in results:\n        if result_identifies(result, case_id):\n            return result\n    return None\n\n\ndef _match_sarif(results: list[SarifResult], finding: Finding,\n                 case_id: str = \"\") -> SarifResult | None:\n    \"\"\"Match a SARIF result to a finding.\"\"\"\n    # Fingerprint wins (survives multi-CWE pileups); loc/title exclude foreign fingerprints\n    hit = _match_by_fingerprint(results, case_id)\n    if hit is not None:\n        return hit\n    candidates = [r for r in results\n                  if not case_id or not result_fingerprint(r)\n                  or result_identifies(r, case_id)]\n    by_loc = (_match_by_loc(candidates, finding.file, finding.line_start)\n              if finding.file else None)\n    if by_loc is not None:\n        return by_loc\n    title = (finding.title or \"\").strip()\n    return _match_by_title(candidates, title) if title else None\n\n\ndef _augment_sarif(path: Path, pairs: list[ValidatedFinding]) -> None:\n    \"\"\"Add a ``properties.validation`` block to each matching SARIF result.\"\"\"\n    document = json.loads(path.read_text(encoding=\"utf-8\"))\n    runs = document.get(\"runs\") or [{}]\n    results = runs[0].get(\"results\", []) if runs else []\n    by_print = matched = aliased = 0\n    for finding, row, session_failed in pairs:\n        # Harness id first: tracking_id is model output, a hallucination poisons the exclusion\n        case_id = str(finding.case_id or row.tracking_id or \"\")\n        match = _match_sarif(results, finding, case_id)\n        if match is None:\n            continue\n        matched += 1\n        if case_id and result_identifies(match, case_id):\n            by_print += 1\n        block = _validation_block(row, session_failed=session_failed)\n        if not record_result_block(match, case_id, block,\n                                   key=BLOCK_KEY, alias_key=ALIAS_BLOCK_KEY):\n            aliased += 1\n    # Print coverage so a stale SARIF copy degrading to loc/title matching is visible, not inferred\n    console.write(f\"  [s11] SARIF augment: matched {matched}/{len(pairs)} finding(s), \"\n                  f\"{by_print} by {FINGERPRINT_KEY}\"\n                  + (f\", {aliased} recorded under {ALIAS_BLOCK_KEY}\" if aliased else \"\"))\n    path.write_text(json.dumps(document, indent=2) + \"\\n\", encoding=\"utf-8\")\n\n\n# Markdown augmentation\n\n\n# Escapes Markdown/HTML metacharacters per-character; mirrors remediation_agent mdsafe.py.\n_MD_ESCAPE: dict[str, str] = {\n    \"\\\\\": \"\\\\\\\\\", \"`\": \"\\\\`\", \"*\": \"\\\\*\", \"_\": \"\\\\_\",\n    \"[\": \"\\\\[\", \"]\": \"\\\\]\", \"|\": \"\\\\|\", \"#\": \"\\\\#\",\n    \"<\": \"&lt;\", \">\": \"&gt;\", \"&\": \"&amp;\",\n}\n\n\ndef _trim_dangling_escape(text: str) -> str:\n    \"\"\"Drop a trailing lone backslash left by truncation; an odd run cut an escaped pair.\"\"\"\n    if (len(text) - len(text.rstrip(\"\\\\\"))) % 2:\n        return text[:-1]\n    return text\n\n\ndef _md_escape(text: object, limit: int = 2000) -> str:\n    \"\"\"Neutralize agent text for inline Markdown, bounding length to a real caller-usable bound.\"\"\"\n    if text is None:\n        return \"\"\n    cleaned = _MD_LINEBREAK_RX.sub(\" \", str(text))\n    cleaned = _MD_INVISIBLE_RX.sub(\"\", cleaned)\n    cleaned = \"\".join(_MD_ESCAPE.get(char, char) for char in cleaned)\n    return _trim_dangling_escape(cleaned[:limit])\n\n\n#: The only weighted-score key any producer emits; a `weighted` fallback here was dead.\n_WEIGHTED_SCORE_KEY = \"weighted_score\"\n\n\ndef _md_cell(text: object) -> str:\n    \"\"\"Escape a value for a Markdown table cell (``|`` is part of the escape map).\"\"\"\n    return _md_escape(text, limit=200)\n\n\ndef _gate_rows(gates: Mapping[str, object]) -> list[str]:\n    \"\"\"Render gate-score rows as markdown table lines, handling any persisted blob shape.\"\"\"\n    rows: list[str] = []\n    for name, entry in gates.items():\n        if isinstance(entry, dict):\n            status = entry.get(\"status\", \"\")\n            weight = entry.get(\"weight\", \"\")\n            weighted = entry.get(_WEIGHTED_SCORE_KEY, \"\")\n            cells = \" | \".join(_md_cell(field) for field in (name, status, weight, weighted))\n            rows.append(f\"  | {cells} |\")\n        else:\n            rows.append(f\"  | {_md_cell(name)} | {_md_cell(entry)} | | |\")\n    return rows\n\n\ndef _md_validation_section(result: ValidationResult, *, session_failed: bool = False) -> str:\n    \"\"\"Render the ``### Validation`` markdown section for one finding.\"\"\"\n    lines = [\n        \"### Validation\",\n        f\"- **Status:** {_status_word(result, session_failed=session_failed)}\",\n        f\"- **Weighted score:** {result.fix_confidence}\"\n        f\"  (merge readiness: {result.pr_merge_readiness or 'n/a'})\",\n    ]\n    summary = (result.justification or result.reason_for_decision or \"\").strip()\n    if not summary and session_failed:\n        summary = \"validation session failed; no verdict was reached\"\n    if summary:\n        lines.append(f\"- **Summary:** {_md_escape(summary)}\")\n    gates = _parse_gates(result.gate_results_json)\n    rows = _gate_rows(gates)\n    if rows:\n        lines += [\"- **Gate scores:**\", \"\", \"  | gate | status | weight | weighted |\",\n                  \"  |---|---|---|---|\", *rows]\n    return \"\\n\".join(lines) + \"\\n\"\n\n\ndef _ftitle(pair: ValidatedFinding) -> str:\n    \"\"\"Return the pair's finding title, folded for matching.\"\"\"\n    return (pair.finding.title or pair.row.finding_title or \"\").strip().lower()\n\n\ndef _only(pairs: list[ValidatedFinding]) -> ValidatedFinding | None:\n    \"\"\"The single pair when *pairs* is unambiguous, else None (fail closed on 0 or >1).\"\"\"\n    return pairs[0] if len(pairs) == 1 else None\n\n\ndef _best_md_match(title: str, pairs: list[ValidatedFinding]) -> ValidatedFinding | None:\n    \"\"\"Match an MD heading title to a pair, failing closed to None on ambiguity (CWE-345).\"\"\"\n    norm = title.strip().lower()\n    if not norm:\n        return None\n    exact = [pair for pair in pairs if _ftitle(pair) == norm]\n    if exact:\n        return _only(exact)\n    return _only([\n        pair for pair in pairs\n        if (pair_title := _ftitle(pair)) and (pair_title in norm or norm in pair_title)\n    ])\n\n\ndef _augment_md(path: Path, pairs: list[ValidatedFinding]) -> None:\n    \"\"\"Insert/replace a ``### Validation`` section at each finding's end.\"\"\"\n    text = path.read_text(encoding=\"utf-8\")\n    matches = list(_FINDING_RE.finditer(text))\n    if not matches:\n        return\n    bounds = [heading_match.start() for heading_match in matches] + [len(text)]\n    rebuilt = [text[: bounds[0]]]\n    for index, heading_match in enumerate(matches):\n        start, end = bounds[index], bounds[index + 1]\n        cut = _LEVEL2_HEADING_RE.search(text, heading_match.end(), end)\n        seg_end = cut.start() if cut else end\n        pair = _best_md_match(heading_match.group(1), pairs)\n        rebuilt.append(_augment_segment(text[start:seg_end], pair))\n        rebuilt.append(text[seg_end:end])  # ``## `` material stays below the block\n    path.write_text(\"\".join(rebuilt), encoding=\"utf-8\")\n\n\ndef _augment_segment(segment: str, pair: ValidatedFinding | None) -> str:\n    \"\"\"Replace any prior ``### Validation`` block in *segment* and append the current one.\"\"\"\n    if pair is None:\n        return segment\n    stripped = _EXISTING_VALIDATION_RE.sub(\"\", segment)\n    section = _md_validation_section(pair.row, session_failed=pair.session_failed)\n    return stripped.rstrip() + \"\\n\\n\" + section + \"\\n\"\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "Augment the combined SARIF + MD report with validation results; best-effort, never fails.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_68_4": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 68,
+      "line_end": 68,
+      "value": "Add validation results to the report under ``security-remediation/``, logging failures.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_79_4": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 79,
+      "line_end": 79,
+      "value": "Resolve the combined report in ``security-remediation/`` and augment SARIF + MD in place.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_94_4": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 94,
+      "line_end": 94,
+      "value": "Pick the ``(*_report.sarif, *_report.md)`` pair to enrich; explicit wins, else newest.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_111_4": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 111,
+      "line_end": 111,
+      "value": "Map the tri-state result to the report's ``validationStatus`` enum; a crashed session or an honest no-clear-decision result both read \"inconclusive\", never the false \"not_fixed\" either used to collapse into.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_124_4": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 124,
+      "line_end": 124,
+      "value": "Human-readable status for the markdown section.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_131_4": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 131,
+      "line_end": 131,
+      "value": "Parse the gate-scores JSON blob, returning {} on absence/error.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_143_4": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 143,
+      "line_end": 143,
+      "value": "Build the SARIF per-result ``validation`` object.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_160_4": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 160,
+      "line_end": 160,
+      "value": "Fold Windows separators to POSIX so a separator mismatch can't defeat location matching.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_165_4": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 165,
+      "line_end": 165,
+      "value": "Return the SARIF result's physical location, or None when unavailable.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_180_4": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 180,
+      "line_end": 180,
+      "value": "Return the result whose physical location is exactly (file, line).",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_189_4": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 189,
+      "line_end": 189,
+      "value": "Return a SARIF result's ``message.text``, or empty string when absent.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_195_4": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 195,
+      "line_end": 195,
+      "value": "Return the result whose message text starts with *title* — only when exactly one does.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_212_4": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 212,
+      "line_end": 212,
+      "value": "Match a SARIF result to a finding.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_229_4": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 229,
+      "line_end": 229,
+      "value": "Add a ``properties.validation`` block to each matching SARIF result.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_248_18": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 248,
+      "line_end": 249,
+      "source_expression": "f\"  [s11] SARIF augment: matched {matched}/{len(pairs)} finding(s), \"\n                  f\"{by_print} by {FINGERPRINT_KEY}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_250_21": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 250,
+      "line_end": 250,
+      "source_expression": "f\", {aliased} recorded under {ALIAS_BLOCK_KEY}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_251_53": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 251,
+      "line_end": 251,
+      "value": "\n",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_266_4": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 266,
+      "line_end": 266,
+      "value": "Drop a trailing lone backslash left by truncation; an odd run cut an escaped pair.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_273_4": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 273,
+      "line_end": 273,
+      "value": "Neutralize agent text for inline Markdown, bounding length to a real caller-usable bound.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_287_4": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 287,
+      "line_end": 287,
+      "value": "Escape a value for a Markdown table cell (``|`` is part of the escape map).",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_292_4": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 292,
+      "line_end": 292,
+      "value": "Render gate-score rows as markdown table lines, handling any persisted blob shape.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_300_24": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 300,
+      "line_end": 300,
+      "source_expression": "f\"  | {cells} |\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_302_24": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 302,
+      "line_end": 302,
+      "source_expression": "f\"  | {_md_cell(name)} | {_md_cell(entry)} | | |\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_307_4": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 307,
+      "line_end": 307,
+      "value": "Render the ``### Validation`` markdown section for one finding.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_310_8": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 310,
+      "line_end": 310,
+      "source_expression": "f\"- **Status:** {_status_word(result, session_failed=session_failed)}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_311_8": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 311,
+      "line_end": 312,
+      "source_expression": "f\"- **Weighted score:** {result.fix_confidence}\"\n        f\"  (merge readiness: {result.pr_merge_readiness or 'n/a'})\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_318_21": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 318,
+      "line_end": 318,
+      "source_expression": "f\"- **Summary:** {_md_escape(summary)}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_324_11": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 324,
+      "line_end": 324,
+      "value": "\n",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_324_30": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 324,
+      "line_end": 324,
+      "value": "\n",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_328_4": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 328,
+      "line_end": 328,
+      "value": "Return the pair's finding title, folded for matching.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_333_4": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 333,
+      "line_end": 333,
+      "value": "The single pair when *pairs* is unambiguous, else None (fail closed on 0 or >1).",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_338_4": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 338,
+      "line_end": 338,
+      "value": "Match an MD heading title to a pair, failing closed to None on ambiguity (CWE-345).",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_352_4": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 352,
+      "line_end": 352,
+      "value": "Insert/replace a ``### Validation`` section at each finding's end.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_370_4": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 370,
+      "line_end": 370,
+      "value": "Replace any prior ``### Validation`` block in *segment* and append the current one.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_375_31": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 375,
+      "line_end": 375,
+      "value": "\n\n",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_375_50": {
+      "source": "vvaharness/validation/report/augment.py",
+      "line_start": 375,
+      "line_end": 375,
+      "value": "\n",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "Augment the combined SARIF + MD report with validation results; best-effort, never fails.",
+      "context": "literal"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 12,
+      "value": "validation",
+      "context": "literal"
+    },
+    {
+      "line_start": 62,
+      "line_end": 62,
+      "column": 18,
+      "value": "validationAliases",
+      "context": "literal"
+    },
+    {
+      "line_start": 283,
+      "line_end": 283,
+      "column": 22,
+      "value": "weighted_score",
+      "context": "literal"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 25,
+      "value": "(?m)^### \\d+\\. \\[[^\\]]*\\]\\s*(.+?)\\s*$",
+      "context": "literal"
+    },
+    {
+      "line_start": 56,
+      "line_end": 56,
+      "column": 37,
+      "value": "(?s)\\n+### Validation\\n.*\\Z",
+      "context": "literal"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 32,
+      "value": "(?m)^## ",
+      "context": "literal"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 4,
+      "value": "Add validation results to the report under ``security-remediation/``, logging failures.",
+      "context": "literal"
+    },
+    {
+      "line_start": 79,
+      "line_end": 79,
+      "column": 4,
+      "value": "Resolve the combined report in ``security-remediation/`` and augment SARIF + MD in place.",
+      "context": "literal"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 4,
+      "value": "Pick the ``(*_report.sarif, *_report.md)`` pair to enrich; explicit wins, else newest.",
+      "context": "literal"
+    },
+    {
+      "line_start": 111,
+      "line_end": 111,
+      "column": 4,
+      "value": "Map the tri-state result to the report's ``validationStatus`` enum; a crashed session or an honest no-clear-decision result both read \"inconclusive\", never the false \"not_fixed\" either used to collapse into.",
+      "context": "literal"
+    },
+    {
+      "line_start": 120,
+      "line_end": 120,
+      "column": 11,
+      "value": "inconclusive",
+      "context": "literal"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 4,
+      "value": "Human-readable status for the markdown section.",
+      "context": "literal"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 4,
+      "value": "Parse the gate-scores JSON blob, returning {} on absence/error.",
+      "context": "literal"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 4,
+      "value": "Build the SARIF per-result ``validation`` object.",
+      "context": "literal"
+    },
+    {
+      "line_start": 160,
+      "line_end": 160,
+      "column": 4,
+      "value": "Fold Windows separators to POSIX so a separator mismatch can't defeat location matching.",
+      "context": "literal"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 4,
+      "value": "Return the SARIF result's physical location, or None when unavailable.",
+      "context": "literal"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 4,
+      "value": "Return the result whose physical location is exactly (file, line).",
+      "context": "literal"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 4,
+      "value": "Return a SARIF result's ``message.text``, or empty string when absent.",
+      "context": "literal"
+    },
+    {
+      "line_start": 195,
+      "line_end": 195,
+      "column": 4,
+      "value": "Return the result whose message text starts with *title* — only when exactly one does.",
+      "context": "literal"
+    },
+    {
+      "line_start": 211,
+      "line_end": 211,
+      "column": 32,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 4,
+      "value": "Match a SARIF result to a finding.",
+      "context": "literal"
+    },
+    {
+      "line_start": 229,
+      "line_end": 229,
+      "column": 4,
+      "value": "Add a ``properties.validation`` block to each matching SARIF result.",
+      "context": "literal"
+    },
+    {
+      "line_start": 259,
+      "line_end": 259,
+      "column": 4,
+      "value": "\\",
+      "context": "literal"
+    },
+    {
+      "line_start": 259,
+      "line_end": 259,
+      "column": 18,
+      "value": "`",
+      "context": "literal"
+    },
+    {
+      "line_start": 259,
+      "line_end": 259,
+      "column": 30,
+      "value": "*",
+      "context": "literal"
+    },
+    {
+      "line_start": 259,
+      "line_end": 259,
+      "column": 42,
+      "value": "_",
+      "context": "literal"
+    },
+    {
+      "line_start": 260,
+      "line_end": 260,
+      "column": 4,
+      "value": "[",
+      "context": "literal"
+    },
+    {
+      "line_start": 260,
+      "line_end": 260,
+      "column": 16,
+      "value": "]",
+      "context": "literal"
+    },
+    {
+      "line_start": 260,
+      "line_end": 260,
+      "column": 28,
+      "value": "|",
+      "context": "literal"
+    },
+    {
+      "line_start": 260,
+      "line_end": 260,
+      "column": 40,
+      "value": "#",
+      "context": "literal"
+    },
+    {
+      "line_start": 261,
+      "line_end": 261,
+      "column": 4,
+      "value": "<",
+      "context": "literal"
+    },
+    {
+      "line_start": 261,
+      "line_end": 261,
+      "column": 17,
+      "value": ">",
+      "context": "literal"
+    },
+    {
+      "line_start": 261,
+      "line_end": 261,
+      "column": 30,
+      "value": "&",
+      "context": "literal"
+    },
+    {
+      "line_start": 259,
+      "line_end": 259,
+      "column": 10,
+      "value": "\\\\",
+      "context": "literal"
+    },
+    {
+      "line_start": 259,
+      "line_end": 259,
+      "column": 23,
+      "value": "\\`",
+      "context": "literal"
+    },
+    {
+      "line_start": 259,
+      "line_end": 259,
+      "column": 35,
+      "value": "\\*",
+      "context": "literal"
+    },
+    {
+      "line_start": 259,
+      "line_end": 259,
+      "column": 47,
+      "value": "\\_",
+      "context": "literal"
+    },
+    {
+      "line_start": 260,
+      "line_end": 260,
+      "column": 9,
+      "value": "\\[",
+      "context": "literal"
+    },
+    {
+      "line_start": 260,
+      "line_end": 260,
+      "column": 21,
+      "value": "\\]",
+      "context": "literal"
+    },
+    {
+      "line_start": 260,
+      "line_end": 260,
+      "column": 33,
+      "value": "\\|",
+      "context": "literal"
+    },
+    {
+      "line_start": 260,
+      "line_end": 260,
+      "column": 45,
+      "value": "\\#",
+      "context": "literal"
+    },
+    {
+      "line_start": 261,
+      "line_end": 261,
+      "column": 9,
+      "value": "&lt;",
+      "context": "literal"
+    },
+    {
+      "line_start": 261,
+      "line_end": 261,
+      "column": 22,
+      "value": "&gt;",
+      "context": "literal"
+    },
+    {
+      "line_start": 261,
+      "line_end": 261,
+      "column": 35,
+      "value": "&amp;",
+      "context": "literal"
+    },
+    {
+      "line_start": 266,
+      "line_end": 266,
+      "column": 4,
+      "value": "Drop a trailing lone backslash left by truncation; an odd run cut an escaped pair.",
+      "context": "literal"
+    },
+    {
+      "line_start": 273,
+      "line_end": 273,
+      "column": 4,
+      "value": "Neutralize agent text for inline Markdown, bounding length to a real caller-usable bound.",
+      "context": "literal"
+    },
+    {
+      "line_start": 287,
+      "line_end": 287,
+      "column": 4,
+      "value": "Escape a value for a Markdown table cell (``|`` is part of the escape map).",
+      "context": "literal"
+    },
+    {
+      "line_start": 292,
+      "line_end": 292,
+      "column": 4,
+      "value": "Render gate-score rows as markdown table lines, handling any persisted blob shape.",
+      "context": "literal"
+    },
+    {
+      "line_start": 307,
+      "line_end": 307,
+      "column": 4,
+      "value": "Render the ``### Validation`` markdown section for one finding.",
+      "context": "literal"
+    },
+    {
+      "line_start": 328,
+      "line_end": 328,
+      "column": 4,
+      "value": "Return the pair's finding title, folded for matching.",
+      "context": "literal"
+    },
+    {
+      "line_start": 333,
+      "line_end": 333,
+      "column": 4,
+      "value": "The single pair when *pairs* is unambiguous, else None (fail closed on 0 or >1).",
+      "context": "literal"
+    },
+    {
+      "line_start": 338,
+      "line_end": 338,
+      "column": 4,
+      "value": "Match an MD heading title to a pair, failing closed to None on ambiguity (CWE-345).",
+      "context": "literal"
+    },
+    {
+      "line_start": 352,
+      "line_end": 352,
+      "column": 4,
+      "value": "Insert/replace a ``### Validation`` section at each finding's end.",
+      "context": "literal"
+    },
+    {
+      "line_start": 370,
+      "line_end": 370,
+      "column": 4,
+      "value": "Replace any prior ``### Validation`` block in *segment* and append the current one.",
+      "context": "literal"
+    },
+    {
+      "line_start": 88,
+      "line_end": 88,
+      "column": 13,
+      "value": "validation results written to combined report under %s",
+      "context": "literal"
+    },
+    {
+      "line_start": 103,
+      "line_end": 103,
+      "column": 27,
+      "value": ".md",
+      "context": "literal"
+    },
+    {
+      "line_start": 113,
+      "line_end": 113,
+      "column": 15,
+      "value": "inconclusive",
+      "context": "literal"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 23,
+      "value": "Yes",
+      "context": "literal"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 15,
+      "value": "fixed",
+      "context": "literal"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 33,
+      "value": "Yes",
+      "context": "literal"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 15,
+      "value": "partially_fixed",
+      "context": "literal"
+    },
+    {
+      "line_start": 118,
+      "line_end": 118,
+      "column": 27,
+      "value": "Yes",
+      "context": "literal"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 15,
+      "value": "not_fixed",
+      "context": "literal"
+    },
+    {
+      "line_start": 146,
+      "line_end": 146,
+      "column": 17,
+      "value": "validation session failed; no verdict was reached",
+      "context": "literal"
+    },
+    {
+      "line_start": 148,
+      "line_end": 148,
+      "column": 8,
+      "value": "validationStatus",
+      "context": "literal"
+    },
+    {
+      "line_start": 149,
+      "line_end": 149,
+      "column": 8,
+      "value": "validationReason",
+      "context": "literal"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 8,
+      "value": "weightedScore",
+      "context": "literal"
+    },
+    {
+      "line_start": 151,
+      "line_end": 151,
+      "column": 8,
+      "value": "mergeReadiness",
+      "context": "literal"
+    },
+    {
+      "line_start": 152,
+      "line_end": 152,
+      "column": 8,
+      "value": "gateScores",
+      "context": "literal"
+    },
+    {
+      "line_start": 161,
+      "line_end": 161,
+      "column": 29,
+      "value": "\\",
+      "context": "literal"
+    },
+    {
+      "line_start": 161,
+      "line_end": 161,
+      "column": 35,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 275,
+      "line_end": 275,
+      "column": 15,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 276,
+      "line_end": 276,
+      "column": 35,
+      "value": " ",
+      "context": "literal"
+    },
+    {
+      "line_start": 277,
+      "line_end": 277,
+      "column": 35,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 309,
+      "line_end": 309,
+      "column": 8,
+      "value": "### Validation",
+      "context": "literal"
+    },
+    {
+      "line_start": 316,
+      "line_end": 316,
+      "column": 18,
+      "value": "validation session failed; no verdict was reached",
+      "context": "literal"
+    },
+    {
+      "line_start": 324,
+      "line_end": 324,
+      "column": 30,
+      "value": "\n",
+      "context": "literal"
+    },
+    {
+      "line_start": 373,
+      "line_end": 373,
+      "column": 43,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 375,
+      "line_end": 375,
+      "column": 50,
+      "value": "\n",
+      "context": "literal"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 20,
+      "value": "no combined report under %s/%s — skipping report augmentation",
+      "context": "literal"
+    },
+    {
+      "line_start": 97,
+      "line_end": 97,
+      "column": 31,
+      "value": ".sarif",
+      "context": "literal"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 12,
+      "value": "fixed",
+      "context": "literal"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 30,
+      "value": "partially_fixed",
+      "context": "literal"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 12,
+      "value": "not_fixed",
+      "context": "literal"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 38,
+      "value": "inconclusive",
+      "context": "literal"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 21,
+      "value": "Fixed",
+      "context": "literal"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 49,
+      "value": "Partially Fixed",
+      "context": "literal"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 25,
+      "value": "Not Fixed",
+      "context": "literal"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 54,
+      "value": "Inconclusive",
+      "context": "literal"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 27,
+      "value": "text",
+      "context": "literal"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 35,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 231,
+      "line_end": 231,
+      "column": 24,
+      "value": "runs",
+      "context": "literal"
+    },
+    {
+      "line_start": 232,
+      "line_end": 232,
+      "column": 26,
+      "value": "results",
+      "context": "literal"
+    },
+    {
+      "line_start": 251,
+      "line_end": 251,
+      "column": 53,
+      "value": "\n",
+      "context": "literal"
+    },
+    {
+      "line_start": 251,
+      "line_end": 251,
+      "column": 68,
+      "value": "utf-8",
+      "context": "literal"
+    },
+    {
+      "line_start": 278,
+      "line_end": 278,
+      "column": 14,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 310,
+      "line_end": 310,
+      "column": 10,
+      "value": "- **Status:** ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 311,
+      "line_end": 311,
+      "column": 10,
+      "value": "- **Weighted score:** ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 312,
+      "line_end": 312,
+      "column": 10,
+      "value": "  (merge readiness: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 312,
+      "line_end": 312,
+      "column": 66,
+      "value": ")",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 322,
+      "line_end": 322,
+      "column": 18,
+      "value": "- **Gate scores:**",
+      "context": "literal"
+    },
+    {
+      "line_start": 322,
+      "line_end": 322,
+      "column": 40,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 322,
+      "line_end": 322,
+      "column": 44,
+      "value": "  | gate | status | weight | weighted |",
+      "context": "literal"
+    },
+    {
+      "line_start": 323,
+      "line_end": 323,
+      "column": 18,
+      "value": "  |---|---|---|---|",
+      "context": "literal"
+    },
+    {
+      "line_start": 353,
+      "line_end": 353,
+      "column": 35,
+      "value": "utf-8",
+      "context": "literal"
+    },
+    {
+      "line_start": 366,
+      "line_end": 366,
+      "column": 47,
+      "value": "utf-8",
+      "context": "literal"
+    },
+    {
+      "line_start": 73,
+      "line_end": 73,
+      "column": 12,
+      "value": "report augmentation skipped (results not written to combined report): %s: %s",
+      "context": "literal"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 68,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 52,
+      "value": "locations",
+      "context": "literal"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 52,
+      "value": "physicalLocation",
+      "context": "literal"
+    },
+    {
+      "line_start": 170,
+      "line_end": 170,
+      "column": 46,
+      "value": "artifactLocation",
+      "context": "literal"
+    },
+    {
+      "line_start": 171,
+      "line_end": 171,
+      "column": 44,
+      "value": "region",
+      "context": "literal"
+    },
+    {
+      "line_start": 190,
+      "line_end": 190,
+      "column": 43,
+      "value": "message",
+      "context": "literal"
+    },
+    {
+      "line_start": 224,
+      "line_end": 224,
+      "column": 30,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 230,
+      "line_end": 230,
+      "column": 50,
+      "value": "utf-8",
+      "context": "literal"
+    },
+    {
+      "line_start": 236,
+      "line_end": 236,
+      "column": 60,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 248,
+      "line_end": 248,
+      "column": 20,
+      "value": "  [s11] SARIF augment: matched ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 248,
+      "line_end": 248,
+      "column": 60,
+      "value": "/",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 248,
+      "line_end": 248,
+      "column": 73,
+      "value": " finding(s), ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 249,
+      "line_end": 249,
+      "column": 30,
+      "value": " by ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 250,
+      "line_end": 250,
+      "column": 85,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 296,
+      "line_end": 296,
+      "column": 31,
+      "value": "status",
+      "context": "literal"
+    },
+    {
+      "line_start": 296,
+      "line_end": 296,
+      "column": 41,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 297,
+      "line_end": 297,
+      "column": 31,
+      "value": "weight",
+      "context": "literal"
+    },
+    {
+      "line_start": 297,
+      "line_end": 297,
+      "column": 41,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 298,
+      "line_end": 298,
+      "column": 54,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 314,
+      "line_end": 314,
+      "column": 69,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 318,
+      "line_end": 318,
+      "column": 23,
+      "value": "- **Summary:** ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 324,
+      "line_end": 324,
+      "column": 11,
+      "value": "\n",
+      "context": "literal"
+    },
+    {
+      "line_start": 366,
+      "line_end": 366,
+      "column": 20,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 375,
+      "line_end": 375,
+      "column": 31,
+      "value": "\n\n",
+      "context": "literal"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 70,
+      "value": ".md",
+      "context": "literal"
+    },
+    {
+      "line_start": 172,
+      "line_end": 172,
+      "column": 38,
+      "value": "uri",
+      "context": "literal"
+    },
+    {
+      "line_start": 173,
+      "line_end": 173,
+      "column": 42,
+      "value": "startLine",
+      "context": "literal"
+    },
+    {
+      "line_start": 250,
+      "line_end": 250,
+      "column": 23,
+      "value": ", ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 250,
+      "line_end": 250,
+      "column": 34,
+      "value": " recorded under ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 267,
+      "line_end": 267,
+      "column": 36,
+      "value": "\\",
+      "context": "literal"
+    },
+    {
+      "line_start": 299,
+      "line_end": 299,
+      "column": 20,
+      "value": " | ",
+      "context": "literal"
+    },
+    {
+      "line_start": 300,
+      "line_end": 300,
+      "column": 26,
+      "value": "  | ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 300,
+      "line_end": 300,
+      "column": 37,
+      "value": " |",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 302,
+      "line_end": 302,
+      "column": 26,
+      "value": "  | ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 302,
+      "line_end": 302,
+      "column": 46,
+      "value": " | ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 302,
+      "line_end": 302,
+      "column": 66,
+      "value": " | | |",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 312,
+      "line_end": 312,
+      "column": 60,
+      "value": "n/a",
+      "context": "literal"
+    },
+    {
+      "line_start": 329,
+      "line_end": 329,
+      "column": 60,
+      "value": "",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 24,
+      "text": "# One definition of the invisible-char defence; no cycle (vvaharness.models imports no validation)."
+    },
+    {
+      "line": 27,
+      "text": "# The documented cross-artifact join key; no cycle — s9 imports nothing from validation."
+    },
+    {
+      "line": 53,
+      "text": "# Finding heading in the markdown report, e.g. ``### 1. [HIGH] Some title``."
+    },
+    {
+      "line": 55,
+      "text": "# A previously-appended ``### Validation`` block, anchored to the end of a finding segment."
+    },
+    {
+      "line": 57,
+      "text": "# ``## `` ends a finding segment: ``### Validation`` must stay above report-level sections"
+    },
+    {
+      "line": 60,
+      "text": "# Under properties: SARIF 2.1.0 forbids extra result keys; aliases key S9-folded twins by case id"
+    },
+    {
+      "line": 71,
+      "text": "# report augmentation must never fail the validation run"
+    },
+    {
+      "line": 107,
+      "text": "# value helpers"
+    },
+    {
+      "line": 156,
+      "text": "# SARIF augmentation"
+    },
+    {
+      "line": 213,
+      "text": "# Fingerprint wins (survives multi-CWE pileups); loc/title exclude foreign fingerprints"
+    },
+    {
+      "line": 235,
+      "text": "# Harness id first: tracking_id is model output, a hallucination poisons the exclusion"
+    },
+    {
+      "line": 247,
+      "text": "# Print coverage so a stale SARIF copy degrading to loc/title matching is visible, not inferred"
+    },
+    {
+      "line": 254,
+      "text": "# Markdown augmentation"
+    },
+    {
+      "line": 257,
+      "text": "# Escapes Markdown/HTML metacharacters per-character; mirrors remediation_agent mdsafe.py."
+    },
+    {
+      "line": 282,
+      "text": "#: The only weighted-score key any producer emits; a `weighted` fallback here was dead."
+    },
+    {
+      "line": 365,
+      "text": "# ``## `` material stays below the block"
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 18,
+      "line_end": 18,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 28,
+      "line_end": 33,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 34,
+      "line_end": 34,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 35,
+      "line_end": 38,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 39,
+      "line_end": 39,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 40,
+      "line_end": 45,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "If",
+      "line_start": 47,
+      "line_end": 49,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 7
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 48,
+      "line_end": 48,
+      "column": 4,
+      "owner": "module initialization",
+      "representation_line": 10
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 49,
+      "line_end": 49,
+      "column": 4,
+      "owner": "module initialization",
+      "representation_line": 10
+    },
+    {
+      "kind": "Assign",
+      "line_start": 51,
+      "line_end": 51,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 13
+    },
+    {
+      "kind": "Assign",
+      "line_start": 54,
+      "line_end": 54,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 13
+    },
+    {
+      "kind": "Assign",
+      "line_start": 56,
+      "line_end": 56,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 13
+    },
+    {
+      "kind": "Assign",
+      "line_start": 58,
+      "line_end": 58,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 13
+    },
+    {
+      "kind": "Assign",
+      "line_start": 61,
+      "line_end": 61,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 13
+    },
+    {
+      "kind": "Assign",
+      "line_start": 62,
+      "line_end": 62,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 15
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 65,
+      "line_end": 75,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 16
+    },
+    {
+      "kind": "Expr",
+      "line_start": 68,
+      "line_end": 68,
+      "column": 4,
+      "owner": "augment_reports",
+      "representation_line": 22
+    },
+    {
+      "kind": "Try",
+      "line_start": 69,
+      "line_end": 75,
+      "column": 4,
+      "owner": "augment_reports",
+      "representation_line": 23
+    },
+    {
+      "kind": "Expr",
+      "line_start": 70,
+      "line_end": 70,
+      "column": 8,
+      "owner": "augment_reports",
+      "representation_line": 26
+    },
+    {
+      "kind": "Expr",
+      "line_start": 72,
+      "line_end": 75,
+      "column": 8,
+      "owner": "augment_reports",
+      "representation_line": 31
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 78,
+      "line_end": 88,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 35
+    },
+    {
+      "kind": "Expr",
+      "line_start": 79,
+      "line_end": 79,
+      "column": 4,
+      "owner": "_augment",
+      "representation_line": 41
+    },
+    {
+      "kind": "Assign",
+      "line_start": 80,
+      "line_end": 80,
+      "column": 4,
+      "owner": "_augment",
+      "representation_line": 41
+    },
+    {
+      "kind": "If",
+      "line_start": 81,
+      "line_end": 84,
+      "column": 4,
+      "owner": "_augment",
+      "representation_line": 42
+    },
+    {
+      "kind": "Expr",
+      "line_start": 82,
+      "line_end": 83,
+      "column": 8,
+      "owner": "_augment",
+      "representation_line": 45
+    },
+    {
+      "kind": "Return",
+      "line_start": 84,
+      "line_end": 84,
+      "column": 8,
+      "owner": "_augment",
+      "representation_line": 46
+    },
+    {
+      "kind": "Assign",
+      "line_start": 85,
+      "line_end": 85,
+      "column": 4,
+      "owner": "_augment",
+      "representation_line": 50
+    },
+    {
+      "kind": "Expr",
+      "line_start": 86,
+      "line_end": 86,
+      "column": 4,
+      "owner": "_augment",
+      "representation_line": 50
+    },
+    {
+      "kind": "Expr",
+      "line_start": 87,
+      "line_end": 87,
+      "column": 4,
+      "owner": "_augment",
+      "representation_line": 50
+    },
+    {
+      "kind": "Expr",
+      "line_start": 88,
+      "line_end": 88,
+      "column": 4,
+      "owner": "_augment",
+      "representation_line": 50
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 91,
+      "line_end": 104,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 53
+    },
+    {
+      "kind": "Expr",
+      "line_start": 94,
+      "line_end": 94,
+      "column": 4,
+      "owner": "_locate_combined_report",
+      "representation_line": 59
+    },
+    {
+      "kind": "If",
+      "line_start": 95,
+      "line_end": 98,
+      "column": 4,
+      "owner": "_locate_combined_report",
+      "representation_line": 60
+    },
+    {
+      "kind": "Assign",
+      "line_start": 96,
+      "line_end": 96,
+      "column": 8,
+      "owner": "_locate_combined_report",
+      "representation_line": 63
+    },
+    {
+      "kind": "Assign",
+      "line_start": 97,
+      "line_end": 97,
+      "column": 8,
+      "owner": "_locate_combined_report",
+      "representation_line": 63
+    },
+    {
+      "kind": "Return",
+      "line_start": 98,
+      "line_end": 98,
+      "column": 8,
+      "owner": "_locate_combined_report",
+      "representation_line": 64
+    },
+    {
+      "kind": "Assign",
+      "line_start": 99,
+      "line_end": 99,
+      "column": 4,
+      "owner": "_locate_combined_report",
+      "representation_line": 68
+    },
+    {
+      "kind": "If",
+      "line_start": 100,
+      "line_end": 101,
+      "column": 4,
+      "owner": "_locate_combined_report",
+      "representation_line": 69
+    },
+    {
+      "kind": "Return",
+      "line_start": 101,
+      "line_end": 101,
+      "column": 8,
+      "owner": "_locate_combined_report",
+      "representation_line": 71
+    },
+    {
+      "kind": "Assign",
+      "line_start": 102,
+      "line_end": 102,
+      "column": 4,
+      "owner": "_locate_combined_report",
+      "representation_line": 75
+    },
+    {
+      "kind": "Assign",
+      "line_start": 103,
+      "line_end": 103,
+      "column": 4,
+      "owner": "_locate_combined_report",
+      "representation_line": 75
+    },
+    {
+      "kind": "Return",
+      "line_start": 104,
+      "line_end": 104,
+      "column": 4,
+      "owner": "_locate_combined_report",
+      "representation_line": 76
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 110,
+      "line_end": 120,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 80
+    },
+    {
+      "kind": "Expr",
+      "line_start": 111,
+      "line_end": 111,
+      "column": 4,
+      "owner": "_status_label",
+      "representation_line": 86
+    },
+    {
+      "kind": "If",
+      "line_start": 112,
+      "line_end": 113,
+      "column": 4,
+      "owner": "_status_label",
+      "representation_line": 87
+    },
+    {
+      "kind": "Return",
+      "line_start": 113,
+      "line_end": 113,
+      "column": 8,
+      "owner": "_status_label",
+      "representation_line": 89
+    },
+    {
+      "kind": "If",
+      "line_start": 114,
+      "line_end": 115,
+      "column": 4,
+      "owner": "_status_label",
+      "representation_line": 92
+    },
+    {
+      "kind": "Return",
+      "line_start": 115,
+      "line_end": 115,
+      "column": 8,
+      "owner": "_status_label",
+      "representation_line": 94
+    },
+    {
+      "kind": "If",
+      "line_start": 116,
+      "line_end": 117,
+      "column": 4,
+      "owner": "_status_label",
+      "representation_line": 97
+    },
+    {
+      "kind": "Return",
+      "line_start": 117,
+      "line_end": 117,
+      "column": 8,
+      "owner": "_status_label",
+      "representation_line": 99
+    },
+    {
+      "kind": "If",
+      "line_start": 118,
+      "line_end": 119,
+      "column": 4,
+      "owner": "_status_label",
+      "representation_line": 102
+    },
+    {
+      "kind": "Return",
+      "line_start": 119,
+      "line_end": 119,
+      "column": 8,
+      "owner": "_status_label",
+      "representation_line": 104
+    },
+    {
+      "kind": "Return",
+      "line_start": 120,
+      "line_end": 120,
+      "column": 4,
+      "owner": "_status_label",
+      "representation_line": 107
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 123,
+      "line_end": 127,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 111
+    },
+    {
+      "kind": "Expr",
+      "line_start": 124,
+      "line_end": 124,
+      "column": 4,
+      "owner": "_status_word",
+      "representation_line": 117
+    },
+    {
+      "kind": "Return",
+      "line_start": 125,
+      "line_end": 127,
+      "column": 4,
+      "owner": "_status_word",
+      "representation_line": 118
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 130,
+      "line_end": 138,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 122
+    },
+    {
+      "kind": "Expr",
+      "line_start": 131,
+      "line_end": 131,
+      "column": 4,
+      "owner": "_parse_gates",
+      "representation_line": 128
+    },
+    {
+      "kind": "If",
+      "line_start": 132,
+      "line_end": 133,
+      "column": 4,
+      "owner": "_parse_gates",
+      "representation_line": 129
+    },
+    {
+      "kind": "Return",
+      "line_start": 133,
+      "line_end": 133,
+      "column": 8,
+      "owner": "_parse_gates",
+      "representation_line": 131
+    },
+    {
+      "kind": "Try",
+      "line_start": 134,
+      "line_end": 137,
+      "column": 4,
+      "owner": "_parse_gates",
+      "representation_line": 134
+    },
+    {
+      "kind": "Assign",
+      "line_start": 135,
+      "line_end": 135,
+      "column": 8,
+      "owner": "_parse_gates",
+      "representation_line": 137
+    },
+    {
+      "kind": "Return",
+      "line_start": 137,
+      "line_end": 137,
+      "column": 8,
+      "owner": "_parse_gates",
+      "representation_line": 141
+    },
+    {
+      "kind": "Return",
+      "line_start": 138,
+      "line_end": 138,
+      "column": 4,
+      "owner": "_parse_gates",
+      "representation_line": 144
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 141,
+      "line_end": 153,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 148
+    },
+    {
+      "kind": "Expr",
+      "line_start": 143,
+      "line_end": 143,
+      "column": 4,
+      "owner": "_validation_block",
+      "representation_line": 154
+    },
+    {
+      "kind": "Assign",
+      "line_start": 144,
+      "line_end": 144,
+      "column": 4,
+      "owner": "_validation_block",
+      "representation_line": 154
+    },
+    {
+      "kind": "If",
+      "line_start": 145,
+      "line_end": 146,
+      "column": 4,
+      "owner": "_validation_block",
+      "representation_line": 155
+    },
+    {
+      "kind": "Assign",
+      "line_start": 146,
+      "line_end": 146,
+      "column": 8,
+      "owner": "_validation_block",
+      "representation_line": 158
+    },
+    {
+      "kind": "Return",
+      "line_start": 147,
+      "line_end": 153,
+      "column": 4,
+      "owner": "_validation_block",
+      "representation_line": 160
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 159,
+      "line_end": 161,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 164
+    },
+    {
+      "kind": "Expr",
+      "line_start": 160,
+      "line_end": 160,
+      "column": 4,
+      "owner": "_norm_path",
+      "representation_line": 170
+    },
+    {
+      "kind": "Return",
+      "line_start": 161,
+      "line_end": 161,
+      "column": 4,
+      "owner": "_norm_path",
+      "representation_line": 171
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 164,
+      "line_end": 176,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 175
+    },
+    {
+      "kind": "Expr",
+      "line_start": 165,
+      "line_end": 165,
+      "column": 4,
+      "owner": "_result_loc",
+      "representation_line": 181
+    },
+    {
+      "kind": "Try",
+      "line_start": 166,
+      "line_end": 176,
+      "column": 4,
+      "owner": "_result_loc",
+      "representation_line": 182
+    },
+    {
+      "kind": "Assign",
+      "line_start": 167,
+      "line_end": 167,
+      "column": 8,
+      "owner": "_result_loc",
+      "representation_line": 185
+    },
+    {
+      "kind": "Assign",
+      "line_start": 168,
+      "line_end": 168,
+      "column": 8,
+      "owner": "_result_loc",
+      "representation_line": 185
+    },
+    {
+      "kind": "Assign",
+      "line_start": 169,
+      "line_end": 169,
+      "column": 8,
+      "owner": "_result_loc",
+      "representation_line": 185
+    },
+    {
+      "kind": "Assign",
+      "line_start": 170,
+      "line_end": 170,
+      "column": 8,
+      "owner": "_result_loc",
+      "representation_line": 185
+    },
+    {
+      "kind": "Assign",
+      "line_start": 171,
+      "line_end": 171,
+      "column": 8,
+      "owner": "_result_loc",
+      "representation_line": 185
+    },
+    {
+      "kind": "Assign",
+      "line_start": 172,
+      "line_end": 172,
+      "column": 8,
+      "owner": "_result_loc",
+      "representation_line": 187
+    },
+    {
+      "kind": "Assign",
+      "line_start": 173,
+      "line_end": 173,
+      "column": 8,
+      "owner": "_result_loc",
+      "representation_line": 187
+    },
+    {
+      "kind": "Return",
+      "line_start": 174,
+      "line_end": 174,
+      "column": 8,
+      "owner": "_result_loc",
+      "representation_line": 188
+    },
+    {
+      "kind": "Return",
+      "line_start": 176,
+      "line_end": 176,
+      "column": 8,
+      "owner": "_result_loc",
+      "representation_line": 193
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 179,
+      "line_end": 185,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 198
+    },
+    {
+      "kind": "Expr",
+      "line_start": 180,
+      "line_end": 180,
+      "column": 4,
+      "owner": "_match_by_loc",
+      "representation_line": 204
+    },
+    {
+      "kind": "Assign",
+      "line_start": 181,
+      "line_end": 181,
+      "column": 4,
+      "owner": "_match_by_loc",
+      "representation_line": 204
+    },
+    {
+      "kind": "For",
+      "line_start": 182,
+      "line_end": 184,
+      "column": 4,
+      "owner": "_match_by_loc",
+      "representation_line": 205
+    },
+    {
+      "kind": "If",
+      "line_start": 183,
+      "line_end": 184,
+      "column": 8,
+      "owner": "_match_by_loc",
+      "representation_line": 207
+    },
+    {
+      "kind": "Return",
+      "line_start": 184,
+      "line_end": 184,
+      "column": 12,
+      "owner": "_match_by_loc",
+      "representation_line": 209
+    },
+    {
+      "kind": "Return",
+      "line_start": 185,
+      "line_end": 185,
+      "column": 4,
+      "owner": "_match_by_loc",
+      "representation_line": 213
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 188,
+      "line_end": 191,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 217
+    },
+    {
+      "kind": "Expr",
+      "line_start": 189,
+      "line_end": 189,
+      "column": 4,
+      "owner": "_message_text",
+      "representation_line": 223
+    },
+    {
+      "kind": "Assign",
+      "line_start": 190,
+      "line_end": 190,
+      "column": 4,
+      "owner": "_message_text",
+      "representation_line": 223
+    },
+    {
+      "kind": "Return",
+      "line_start": 191,
+      "line_end": 191,
+      "column": 4,
+      "owner": "_message_text",
+      "representation_line": 224
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 194,
+      "line_end": 197,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 228
+    },
+    {
+      "kind": "Expr",
+      "line_start": 195,
+      "line_end": 195,
+      "column": 4,
+      "owner": "_match_by_title",
+      "representation_line": 234
+    },
+    {
+      "kind": "Assign",
+      "line_start": 196,
+      "line_end": 196,
+      "column": 4,
+      "owner": "_match_by_title",
+      "representation_line": 234
+    },
+    {
+      "kind": "Return",
+      "line_start": 197,
+      "line_end": 197,
+      "column": 4,
+      "owner": "_match_by_title",
+      "representation_line": 235
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 200,
+      "line_end": 207,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 239
+    },
+    {
+      "kind": "If",
+      "line_start": 202,
+      "line_end": 203,
+      "column": 4,
+      "owner": "_match_by_fingerprint",
+      "representation_line": 244
+    },
+    {
+      "kind": "Return",
+      "line_start": 203,
+      "line_end": 203,
+      "column": 8,
+      "owner": "_match_by_fingerprint",
+      "representation_line": 246
+    },
+    {
+      "kind": "For",
+      "line_start": 204,
+      "line_end": 206,
+      "column": 4,
+      "owner": "_match_by_fingerprint",
+      "representation_line": 249
+    },
+    {
+      "kind": "If",
+      "line_start": 205,
+      "line_end": 206,
+      "column": 8,
+      "owner": "_match_by_fingerprint",
+      "representation_line": 251
+    },
+    {
+      "kind": "Return",
+      "line_start": 206,
+      "line_end": 206,
+      "column": 12,
+      "owner": "_match_by_fingerprint",
+      "representation_line": 253
+    },
+    {
+      "kind": "Return",
+      "line_start": 207,
+      "line_end": 207,
+      "column": 4,
+      "owner": "_match_by_fingerprint",
+      "representation_line": 257
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 210,
+      "line_end": 225,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 261
+    },
+    {
+      "kind": "Expr",
+      "line_start": 212,
+      "line_end": 212,
+      "column": 4,
+      "owner": "_match_sarif",
+      "representation_line": 267
+    },
+    {
+      "kind": "Assign",
+      "line_start": 214,
+      "line_end": 214,
+      "column": 4,
+      "owner": "_match_sarif",
+      "representation_line": 267
+    },
+    {
+      "kind": "If",
+      "line_start": 215,
+      "line_end": 216,
+      "column": 4,
+      "owner": "_match_sarif",
+      "representation_line": 268
+    },
+    {
+      "kind": "Return",
+      "line_start": 216,
+      "line_end": 216,
+      "column": 8,
+      "owner": "_match_sarif",
+      "representation_line": 270
+    },
+    {
+      "kind": "Assign",
+      "line_start": 217,
+      "line_end": 219,
+      "column": 4,
+      "owner": "_match_sarif",
+      "representation_line": 274
+    },
+    {
+      "kind": "Assign",
+      "line_start": 220,
+      "line_end": 221,
+      "column": 4,
+      "owner": "_match_sarif",
+      "representation_line": 274
+    },
+    {
+      "kind": "If",
+      "line_start": 222,
+      "line_end": 223,
+      "column": 4,
+      "owner": "_match_sarif",
+      "representation_line": 275
+    },
+    {
+      "kind": "Return",
+      "line_start": 223,
+      "line_end": 223,
+      "column": 8,
+      "owner": "_match_sarif",
+      "representation_line": 277
+    },
+    {
+      "kind": "Assign",
+      "line_start": 224,
+      "line_end": 224,
+      "column": 4,
+      "owner": "_match_sarif",
+      "representation_line": 281
+    },
+    {
+      "kind": "Return",
+      "line_start": 225,
+      "line_end": 225,
+      "column": 4,
+      "owner": "_match_sarif",
+      "representation_line": 282
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 228,
+      "line_end": 251,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 286
+    },
+    {
+      "kind": "Expr",
+      "line_start": 229,
+      "line_end": 229,
+      "column": 4,
+      "owner": "_augment_sarif",
+      "representation_line": 292
+    },
+    {
+      "kind": "Assign",
+      "line_start": 230,
+      "line_end": 230,
+      "column": 4,
+      "owner": "_augment_sarif",
+      "representation_line": 292
+    },
+    {
+      "kind": "Assign",
+      "line_start": 231,
+      "line_end": 231,
+      "column": 4,
+      "owner": "_augment_sarif",
+      "representation_line": 292
+    },
+    {
+      "kind": "Assign",
+      "line_start": 232,
+      "line_end": 232,
+      "column": 4,
+      "owner": "_augment_sarif",
+      "representation_line": 292
+    },
+    {
+      "kind": "Assign",
+      "line_start": 233,
+      "line_end": 233,
+      "column": 4,
+      "owner": "_augment_sarif",
+      "representation_line": 292
+    },
+    {
+      "kind": "For",
+      "line_start": 234,
+      "line_end": 246,
+      "column": 4,
+      "owner": "_augment_sarif",
+      "representation_line": 293
+    },
+    {
+      "kind": "Assign",
+      "line_start": 236,
+      "line_end": 236,
+      "column": 8,
+      "owner": "_augment_sarif",
+      "representation_line": 296
+    },
+    {
+      "kind": "Assign",
+      "line_start": 237,
+      "line_end": 237,
+      "column": 8,
+      "owner": "_augment_sarif",
+      "representation_line": 296
+    },
+    {
+      "kind": "If",
+      "line_start": 238,
+      "line_end": 239,
+      "column": 8,
+      "owner": "_augment_sarif",
+      "representation_line": 297
+    },
+    {
+      "kind": "Continue",
+      "line_start": 239,
+      "line_end": 239,
+      "column": 12,
+      "owner": "_augment_sarif",
+      "representation_line": 299
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 240,
+      "line_end": 240,
+      "column": 8,
+      "owner": "_augment_sarif",
+      "representation_line": 303
+    },
+    {
+      "kind": "If",
+      "line_start": 241,
+      "line_end": 242,
+      "column": 8,
+      "owner": "_augment_sarif",
+      "representation_line": 304
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 242,
+      "line_end": 242,
+      "column": 12,
+      "owner": "_augment_sarif",
+      "representation_line": 307
+    },
+    {
+      "kind": "Assign",
+      "line_start": 243,
+      "line_end": 243,
+      "column": 8,
+      "owner": "_augment_sarif",
+      "representation_line": 310
+    },
+    {
+      "kind": "If",
+      "line_start": 244,
+      "line_end": 246,
+      "column": 8,
+      "owner": "_augment_sarif",
+      "representation_line": 311
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 246,
+      "line_end": 246,
+      "column": 12,
+      "owner": "_augment_sarif",
+      "representation_line": 314
+    },
+    {
+      "kind": "Expr",
+      "line_start": 248,
+      "line_end": 250,
+      "column": 4,
+      "owner": "_augment_sarif",
+      "representation_line": 318
+    },
+    {
+      "kind": "Expr",
+      "line_start": 251,
+      "line_end": 251,
+      "column": 4,
+      "owner": "_augment_sarif",
+      "representation_line": 318
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 258,
+      "line_end": 262,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 322
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 265,
+      "line_end": 269,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 323
+    },
+    {
+      "kind": "Expr",
+      "line_start": 266,
+      "line_end": 266,
+      "column": 4,
+      "owner": "_trim_dangling_escape",
+      "representation_line": 329
+    },
+    {
+      "kind": "If",
+      "line_start": 267,
+      "line_end": 268,
+      "column": 4,
+      "owner": "_trim_dangling_escape",
+      "representation_line": 330
+    },
+    {
+      "kind": "Return",
+      "line_start": 268,
+      "line_end": 268,
+      "column": 8,
+      "owner": "_trim_dangling_escape",
+      "representation_line": 332
+    },
+    {
+      "kind": "Return",
+      "line_start": 269,
+      "line_end": 269,
+      "column": 4,
+      "owner": "_trim_dangling_escape",
+      "representation_line": 335
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 272,
+      "line_end": 279,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 339
+    },
+    {
+      "kind": "Expr",
+      "line_start": 273,
+      "line_end": 273,
+      "column": 4,
+      "owner": "_md_escape",
+      "representation_line": 345
+    },
+    {
+      "kind": "If",
+      "line_start": 274,
+      "line_end": 275,
+      "column": 4,
+      "owner": "_md_escape",
+      "representation_line": 346
+    },
+    {
+      "kind": "Return",
+      "line_start": 275,
+      "line_end": 275,
+      "column": 8,
+      "owner": "_md_escape",
+      "representation_line": 348
+    },
+    {
+      "kind": "Assign",
+      "line_start": 276,
+      "line_end": 276,
+      "column": 4,
+      "owner": "_md_escape",
+      "representation_line": 352
+    },
+    {
+      "kind": "Assign",
+      "line_start": 277,
+      "line_end": 277,
+      "column": 4,
+      "owner": "_md_escape",
+      "representation_line": 352
+    },
+    {
+      "kind": "Assign",
+      "line_start": 278,
+      "line_end": 278,
+      "column": 4,
+      "owner": "_md_escape",
+      "representation_line": 352
+    },
+    {
+      "kind": "Return",
+      "line_start": 279,
+      "line_end": 279,
+      "column": 4,
+      "owner": "_md_escape",
+      "representation_line": 353
+    },
+    {
+      "kind": "Assign",
+      "line_start": 283,
+      "line_end": 283,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 358
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 286,
+      "line_end": 288,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 359
+    },
+    {
+      "kind": "Expr",
+      "line_start": 287,
+      "line_end": 287,
+      "column": 4,
+      "owner": "_md_cell",
+      "representation_line": 365
+    },
+    {
+      "kind": "Return",
+      "line_start": 288,
+      "line_end": 288,
+      "column": 4,
+      "owner": "_md_cell",
+      "representation_line": 366
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 291,
+      "line_end": 303,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 370
+    },
+    {
+      "kind": "Expr",
+      "line_start": 292,
+      "line_end": 292,
+      "column": 4,
+      "owner": "_gate_rows",
+      "representation_line": 376
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 293,
+      "line_end": 293,
+      "column": 4,
+      "owner": "_gate_rows",
+      "representation_line": 376
+    },
+    {
+      "kind": "For",
+      "line_start": 294,
+      "line_end": 302,
+      "column": 4,
+      "owner": "_gate_rows",
+      "representation_line": 377
+    },
+    {
+      "kind": "If",
+      "line_start": 295,
+      "line_end": 302,
+      "column": 8,
+      "owner": "_gate_rows",
+      "representation_line": 379
+    },
+    {
+      "kind": "Assign",
+      "line_start": 296,
+      "line_end": 296,
+      "column": 12,
+      "owner": "_gate_rows",
+      "representation_line": 382
+    },
+    {
+      "kind": "Assign",
+      "line_start": 297,
+      "line_end": 297,
+      "column": 12,
+      "owner": "_gate_rows",
+      "representation_line": 382
+    },
+    {
+      "kind": "Assign",
+      "line_start": 298,
+      "line_end": 298,
+      "column": 12,
+      "owner": "_gate_rows",
+      "representation_line": 382
+    },
+    {
+      "kind": "Assign",
+      "line_start": 299,
+      "line_end": 299,
+      "column": 12,
+      "owner": "_gate_rows",
+      "representation_line": 382
+    },
+    {
+      "kind": "Expr",
+      "line_start": 300,
+      "line_end": 300,
+      "column": 12,
+      "owner": "_gate_rows",
+      "representation_line": 382
+    },
+    {
+      "kind": "Expr",
+      "line_start": 302,
+      "line_end": 302,
+      "column": 12,
+      "owner": "_gate_rows",
+      "representation_line": 386
+    },
+    {
+      "kind": "Return",
+      "line_start": 303,
+      "line_end": 303,
+      "column": 4,
+      "owner": "_gate_rows",
+      "representation_line": 389
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 306,
+      "line_end": 324,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 393
+    },
+    {
+      "kind": "Expr",
+      "line_start": 307,
+      "line_end": 307,
+      "column": 4,
+      "owner": "_md_validation_section",
+      "representation_line": 399
+    },
+    {
+      "kind": "Assign",
+      "line_start": 308,
+      "line_end": 313,
+      "column": 4,
+      "owner": "_md_validation_section",
+      "representation_line": 399
+    },
+    {
+      "kind": "Assign",
+      "line_start": 314,
+      "line_end": 314,
+      "column": 4,
+      "owner": "_md_validation_section",
+      "representation_line": 399
+    },
+    {
+      "kind": "If",
+      "line_start": 315,
+      "line_end": 316,
+      "column": 4,
+      "owner": "_md_validation_section",
+      "representation_line": 400
+    },
+    {
+      "kind": "Assign",
+      "line_start": 316,
+      "line_end": 316,
+      "column": 8,
+      "owner": "_md_validation_section",
+      "representation_line": 403
+    },
+    {
+      "kind": "If",
+      "line_start": 317,
+      "line_end": 318,
+      "column": 4,
+      "owner": "_md_validation_section",
+      "representation_line": 405
+    },
+    {
+      "kind": "Expr",
+      "line_start": 318,
+      "line_end": 318,
+      "column": 8,
+      "owner": "_md_validation_section",
+      "representation_line": 408
+    },
+    {
+      "kind": "Assign",
+      "line_start": 319,
+      "line_end": 319,
+      "column": 4,
+      "owner": "_md_validation_section",
+      "representation_line": 411
+    },
+    {
+      "kind": "Assign",
+      "line_start": 320,
+      "line_end": 320,
+      "column": 4,
+      "owner": "_md_validation_section",
+      "representation_line": 411
+    },
+    {
+      "kind": "If",
+      "line_start": 321,
+      "line_end": 323,
+      "column": 4,
+      "owner": "_md_validation_section",
+      "representation_line": 412
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 322,
+      "line_end": 323,
+      "column": 8,
+      "owner": "_md_validation_section",
+      "representation_line": 415
+    },
+    {
+      "kind": "Return",
+      "line_start": 324,
+      "line_end": 324,
+      "column": 4,
+      "owner": "_md_validation_section",
+      "representation_line": 417
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 327,
+      "line_end": 329,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 421
+    },
+    {
+      "kind": "Expr",
+      "line_start": 328,
+      "line_end": 328,
+      "column": 4,
+      "owner": "_ftitle",
+      "representation_line": 427
+    },
+    {
+      "kind": "Return",
+      "line_start": 329,
+      "line_end": 329,
+      "column": 4,
+      "owner": "_ftitle",
+      "representation_line": 428
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 332,
+      "line_end": 334,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 432
+    },
+    {
+      "kind": "Expr",
+      "line_start": 333,
+      "line_end": 333,
+      "column": 4,
+      "owner": "_only",
+      "representation_line": 438
+    },
+    {
+      "kind": "Return",
+      "line_start": 334,
+      "line_end": 334,
+      "column": 4,
+      "owner": "_only",
+      "representation_line": 439
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 337,
+      "line_end": 348,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 443
+    },
+    {
+      "kind": "Expr",
+      "line_start": 338,
+      "line_end": 338,
+      "column": 4,
+      "owner": "_best_md_match",
+      "representation_line": 449
+    },
+    {
+      "kind": "Assign",
+      "line_start": 339,
+      "line_end": 339,
+      "column": 4,
+      "owner": "_best_md_match",
+      "representation_line": 449
+    },
+    {
+      "kind": "If",
+      "line_start": 340,
+      "line_end": 341,
+      "column": 4,
+      "owner": "_best_md_match",
+      "representation_line": 450
+    },
+    {
+      "kind": "Return",
+      "line_start": 341,
+      "line_end": 341,
+      "column": 8,
+      "owner": "_best_md_match",
+      "representation_line": 452
+    },
+    {
+      "kind": "Assign",
+      "line_start": 342,
+      "line_end": 342,
+      "column": 4,
+      "owner": "_best_md_match",
+      "representation_line": 456
+    },
+    {
+      "kind": "If",
+      "line_start": 343,
+      "line_end": 344,
+      "column": 4,
+      "owner": "_best_md_match",
+      "representation_line": 457
+    },
+    {
+      "kind": "Return",
+      "line_start": 344,
+      "line_end": 344,
+      "column": 8,
+      "owner": "_best_md_match",
+      "representation_line": 459
+    },
+    {
+      "kind": "Return",
+      "line_start": 345,
+      "line_end": 348,
+      "column": 4,
+      "owner": "_best_md_match",
+      "representation_line": 462
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 351,
+      "line_end": 366,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 466
+    },
+    {
+      "kind": "Expr",
+      "line_start": 352,
+      "line_end": 352,
+      "column": 4,
+      "owner": "_augment_md",
+      "representation_line": 472
+    },
+    {
+      "kind": "Assign",
+      "line_start": 353,
+      "line_end": 353,
+      "column": 4,
+      "owner": "_augment_md",
+      "representation_line": 472
+    },
+    {
+      "kind": "Assign",
+      "line_start": 354,
+      "line_end": 354,
+      "column": 4,
+      "owner": "_augment_md",
+      "representation_line": 472
+    },
+    {
+      "kind": "If",
+      "line_start": 355,
+      "line_end": 356,
+      "column": 4,
+      "owner": "_augment_md",
+      "representation_line": 473
+    },
+    {
+      "kind": "Return",
+      "line_start": 356,
+      "line_end": 356,
+      "column": 8,
+      "owner": "_augment_md",
+      "representation_line": 475
+    },
+    {
+      "kind": "Assign",
+      "line_start": 357,
+      "line_end": 357,
+      "column": 4,
+      "owner": "_augment_md",
+      "representation_line": 479
+    },
+    {
+      "kind": "Assign",
+      "line_start": 358,
+      "line_end": 358,
+      "column": 4,
+      "owner": "_augment_md",
+      "representation_line": 479
+    },
+    {
+      "kind": "For",
+      "line_start": 359,
+      "line_end": 365,
+      "column": 4,
+      "owner": "_augment_md",
+      "representation_line": 480
+    },
+    {
+      "kind": "Assign",
+      "line_start": 360,
+      "line_end": 360,
+      "column": 8,
+      "owner": "_augment_md",
+      "representation_line": 483
+    },
+    {
+      "kind": "Assign",
+      "line_start": 361,
+      "line_end": 361,
+      "column": 8,
+      "owner": "_augment_md",
+      "representation_line": 483
+    },
+    {
+      "kind": "Assign",
+      "line_start": 362,
+      "line_end": 362,
+      "column": 8,
+      "owner": "_augment_md",
+      "representation_line": 483
+    },
+    {
+      "kind": "Assign",
+      "line_start": 363,
+      "line_end": 363,
+      "column": 8,
+      "owner": "_augment_md",
+      "representation_line": 483
+    },
+    {
+      "kind": "Expr",
+      "line_start": 364,
+      "line_end": 364,
+      "column": 8,
+      "owner": "_augment_md",
+      "representation_line": 483
+    },
+    {
+      "kind": "Expr",
+      "line_start": 365,
+      "line_end": 365,
+      "column": 8,
+      "owner": "_augment_md",
+      "representation_line": 485
+    },
+    {
+      "kind": "Expr",
+      "line_start": 366,
+      "line_end": 366,
+      "column": 4,
+      "owner": "_augment_md",
+      "representation_line": 488
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 369,
+      "line_end": 375,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 491
+    },
+    {
+      "kind": "Expr",
+      "line_start": 370,
+      "line_end": 370,
+      "column": 4,
+      "owner": "_augment_segment",
+      "representation_line": 497
+    },
+    {
+      "kind": "If",
+      "line_start": 371,
+      "line_end": 372,
+      "column": 4,
+      "owner": "_augment_segment",
+      "representation_line": 498
+    },
+    {
+      "kind": "Return",
+      "line_start": 372,
+      "line_end": 372,
+      "column": 8,
+      "owner": "_augment_segment",
+      "representation_line": 500
+    },
+    {
+      "kind": "Assign",
+      "line_start": 373,
+      "line_end": 373,
+      "column": 4,
+      "owner": "_augment_segment",
+      "representation_line": 504
+    },
+    {
+      "kind": "Assign",
+      "line_start": 374,
+      "line_end": 374,
+      "column": 4,
+      "owner": "_augment_segment",
+      "representation_line": 504
+    },
+    {
+      "kind": "Return",
+      "line_start": 375,
+      "line_end": 375,
+      "column": 4,
+      "owner": "_augment_segment",
+      "representation_line": 505
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 3,
+      "kind": "Name",
+      "original_ast": "Name(id='TYPE_CHECKING', ctx=Load())",
+      "rendered": "TYPE_CHECKING"
+    },
+    {
+      "line_start": 51,
+      "line_end": 51,
+      "column": 6,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='logs', ctx=Load()), attr='get_logger', ctx=Load()), args=[Name(id='__name__', ctx=Load())], keywords=[])",
+      "rendered": "logs.get_logger(__name__)"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='re', ctx=Load()), attr='compile', ctx=Load()), args=[Constant(value='(?m)^### \\\\d+\\\\. \\\\[[^\\\\]]*\\\\]\\\\s*(.+?)\\\\s*$')], keywords=[])",
+      "rendered": "re.compile('(?m)^### \\\\d+\\\\. \\\\[[^\\\\]]*\\\\]\\\\s*(.+?)\\\\s*$')"
+    },
+    {
+      "line_start": 56,
+      "line_end": 56,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='re', ctx=Load()), attr='compile', ctx=Load()), args=[Constant(value='(?s)\\\\n+### Validation\\\\n.*\\\\Z')], keywords=[])",
+      "rendered": "re.compile('(?s)\\\\n+### Validation\\\\n.*\\\\Z')"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='re', ctx=Load()), attr='compile', ctx=Load()), args=[Constant(value='(?m)^## ')], keywords=[])",
+      "rendered": "re.compile('(?m)^## ')"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 12,
+      "kind": "Constant",
+      "original_ast": "Constant(value='validation')",
+      "rendered": "'validation'"
+    },
+    {
+      "line_start": 62,
+      "line_end": 62,
+      "column": 18,
+      "kind": "Constant",
+      "original_ast": "Constant(value='validationAliases')",
+      "rendered": "'validationAliases'"
+    },
+    {
+      "line_start": 70,
+      "line_end": 70,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_augment', ctx=Load()), args=[Name(id='repo', ctx=Load()), Name(id='pairs', ctx=Load()), Name(id='report_md', ctx=Load())], keywords=[])",
+      "rendered": "_augment(repo, pairs, report_md)"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 72,
+      "line_end": 75,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Constant(value='report augmentation skipped (results not written to combined report): %s: %s'), Attribute(value=Call(func=Name(id='type', ctx=Load()), args=[Name(id='exc', ctx=Load())], keywords=[]), attr='__name__', ctx=Load()), Name(id='exc', ctx=Load())], keywords=[])",
+      "rendered": "log.warning('report augmentation skipped (results not written to combined report): %s: %s', type(exc).__name__, exc)"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_locate_combined_report', ctx=Load()), args=[Name(id='repo', ctx=Load()), Name(id='report_md', ctx=Load())], keywords=[])",
+      "rendered": "_locate_combined_report(repo, report_md)"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='located', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "located is None"
+    },
+    {
+      "line_start": 82,
+      "line_end": 83,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Constant(value='no combined report under %s/%s — skipping report augmentation'), Name(id='repo', ctx=Load()), Name(id='REMEDIATION_DIRNAME', ctx=Load())], keywords=[])",
+      "rendered": "log.warning('no combined report under %s/%s — skipping report augmentation', repo, REMEDIATION_DIRNAME)"
+    },
+    {
+      "line_start": 85,
+      "line_end": 85,
+      "column": 24,
+      "kind": "Name",
+      "original_ast": "Name(id='located', ctx=Load())",
+      "rendered": "located"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_augment_sarif', ctx=Load()), args=[Name(id='sarif_dst', ctx=Load()), Name(id='pairs', ctx=Load())], keywords=[])",
+      "rendered": "_augment_sarif(sarif_dst, pairs)"
+    },
+    {
+      "line_start": 87,
+      "line_end": 87,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_augment_md', ctx=Load()), args=[Name(id='md_dst', ctx=Load()), Name(id='pairs', ctx=Load())], keywords=[])",
+      "rendered": "_augment_md(md_dst, pairs)"
+    },
+    {
+      "line_start": 88,
+      "line_end": 88,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='info', ctx=Load()), args=[Constant(value='validation results written to combined report under %s'), Attribute(value=Name(id='sarif_dst', ctx=Load()), attr='parent', ctx=Load())], keywords=[])",
+      "rendered": "log.info('validation results written to combined report under %s', sarif_dst.parent)"
+    },
+    {
+      "line_start": 95,
+      "line_end": 95,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='report_md', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "report_md is not None"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 13,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=BinOp(left=Name(id='repo', ctx=Load()), op=Div(), right=Name(id='REMEDIATION_DIRNAME', ctx=Load())), op=Div(), right=Attribute(value=Call(func=Attribute(value=Call(func=Name(id='Path', ctx=Load()), args=[Name(id='report_md', ctx=Load())], keywords=[]), attr='with_suffix', ctx=Load()), args=[Constant(value='.md')], keywords=[]), attr='name', ctx=Load()))",
+      "rendered": "repo / REMEDIATION_DIRNAME / Path(report_md).with_suffix('.md').name"
+    },
+    {
+      "line_start": 97,
+      "line_end": 97,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='md', ctx=Load()), attr='with_suffix', ctx=Load()), args=[Constant(value='.sarif')], keywords=[])",
+      "rendered": "md.with_suffix('.sarif')"
+    },
+    {
+      "line_start": 98,
+      "line_end": 98,
+      "column": 15,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=BoolOp(op=And(), values=[Call(func=Attribute(value=Name(id='md', ctx=Load()), attr='exists', ctx=Load()), args=[], keywords=[]), Call(func=Attribute(value=Name(id='sarif', ctx=Load()), attr='exists', ctx=Load()), args=[], keywords=[])]), body=Call(func=Name(id='CombinedReportPaths', ctx=Load()), args=[Name(id='sarif', ctx=Load()), Name(id='md', ctx=Load())], keywords=[]), orelse=Constant(value=None))",
+      "rendered": "CombinedReportPaths(sarif, md) if md.exists() and sarif.exists() else None"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[Call(func=Attribute(value=BinOp(left=Name(id='repo', ctx=Load()), op=Div(), right=Name(id='REMEDIATION_DIRNAME', ctx=Load())), attr='glob', ctx=Load()), args=[Name(id='SCAN_REPORT_GLOB', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "sorted((repo / REMEDIATION_DIRNAME).glob(SCAN_REPORT_GLOB))"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='sarifs', ctx=Load()))",
+      "rendered": "not sarifs"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 102,
+      "line_end": 102,
+      "column": 12,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Name(id='sarifs', ctx=Load()), slice=UnaryOp(op=USub(), operand=Constant(value=1)), ctx=Load())",
+      "rendered": "sarifs[-1]"
+    },
+    {
+      "line_start": 103,
+      "line_end": 103,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='sarif', ctx=Load()), attr='with_suffix', ctx=Load()), args=[Constant(value='.md')], keywords=[])",
+      "rendered": "sarif.with_suffix('.md')"
+    },
+    {
+      "line_start": 104,
+      "line_end": 104,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Attribute(value=Name(id='md', ctx=Load()), attr='exists', ctx=Load()), args=[], keywords=[]), body=Call(func=Name(id='CombinedReportPaths', ctx=Load()), args=[Name(id='sarif', ctx=Load()), Name(id='md', ctx=Load())], keywords=[]), orelse=Constant(value=None))",
+      "rendered": "CombinedReportPaths(sarif, md) if md.exists() else None"
+    },
+    {
+      "line_start": 112,
+      "line_end": 112,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='session_failed', ctx=Load())",
+      "rendered": "session_failed"
+    },
+    {
+      "line_start": 113,
+      "line_end": 113,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value='inconclusive')",
+      "rendered": "'inconclusive'"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='result', ctx=Load()), attr='fixed', ctx=Load()), ops=[Eq()], comparators=[Constant(value='Yes')])",
+      "rendered": "result.fixed == 'Yes'"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value='fixed')",
+      "rendered": "'fixed'"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='result', ctx=Load()), attr='partially_fixed', ctx=Load()), ops=[Eq()], comparators=[Constant(value='Yes')])",
+      "rendered": "result.partially_fixed == 'Yes'"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value='partially_fixed')",
+      "rendered": "'partially_fixed'"
+    },
+    {
+      "line_start": 118,
+      "line_end": 118,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='result', ctx=Load()), attr='not_fixed', ctx=Load()), ops=[Eq()], comparators=[Constant(value='Yes')])",
+      "rendered": "result.not_fixed == 'Yes'"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value='not_fixed')",
+      "rendered": "'not_fixed'"
+    },
+    {
+      "line_start": 120,
+      "line_end": 120,
+      "column": 11,
+      "kind": "Constant",
+      "original_ast": "Constant(value='inconclusive')",
+      "rendered": "'inconclusive'"
+    },
+    {
+      "line_start": 125,
+      "line_end": 127,
+      "column": 11,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Dict(keys=[Constant(value='fixed'), Constant(value='partially_fixed'), Constant(value='not_fixed'), Constant(value='inconclusive')], values=[Constant(value='Fixed'), Constant(value='Partially Fixed'), Constant(value='Not Fixed'), Constant(value='Inconclusive')]), slice=Call(func=Name(id='_status_label', ctx=Load()), args=[Name(id='result', ctx=Load())], keywords=[keyword(arg='session_failed', value=Name(id='session_failed', ctx=Load()))]), ctx=Load())",
+      "rendered": "{'fixed': 'Fixed', 'partially_fixed': 'Partially Fixed', 'not_fixed': 'Not Fixed', 'inconclusive': 'Inconclusive'}[_status_label(result, session_failed=session_failed)]"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='raw_json', ctx=Load()))",
+      "rendered": "not raw_json"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 15,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='json', ctx=Load()), attr='loads', ctx=Load()), args=[Name(id='raw_json', ctx=Load())], keywords=[])",
+      "rendered": "json.loads(raw_json)"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='ValueError', ctx=Load()), Name(id='TypeError', ctx=Load())], ctx=Load())",
+      "rendered": "(ValueError, TypeError)"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 15,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='parsed', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[]), body=Name(id='parsed', ctx=Load()), orelse=Dict(keys=[], values=[]))",
+      "rendered": "parsed if isinstance(parsed, dict) else {}"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=BoolOp(op=Or(), values=[Attribute(value=Name(id='result', ctx=Load()), attr='reason_for_decision', ctx=Load()), Attribute(value=Name(id='result', ctx=Load()), attr='justification', ctx=Load()), Constant(value='')]), attr='strip', ctx=Load()), args=[], keywords=[])",
+      "rendered": "(result.reason_for_decision or result.justification or '').strip()"
+    },
+    {
+      "line_start": 145,
+      "line_end": 145,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Name(id='session_failed', ctx=Load()), UnaryOp(op=Not(), operand=Name(id='reason', ctx=Load()))])",
+      "rendered": "session_failed and (not reason)"
+    },
+    {
+      "line_start": 146,
+      "line_end": 146,
+      "column": 17,
+      "kind": "Constant",
+      "original_ast": "Constant(value='validation session failed; no verdict was reached')",
+      "rendered": "'validation session failed; no verdict was reached'"
+    },
+    {
+      "line_start": 147,
+      "line_end": 153,
+      "column": 11,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='validationStatus'), Constant(value='validationReason'), Constant(value='weightedScore'), Constant(value='mergeReadiness'), Constant(value='gateScores')], values=[Call(func=Name(id='_status_label', ctx=Load()), args=[Name(id='result', ctx=Load())], keywords=[keyword(arg='session_failed', value=Name(id='session_failed', ctx=Load()))]), Subscript(value=Name(id='reason', ctx=Load()), slice=Slice(upper=Constant(value=2000)), ctx=Load()), Attribute(value=Name(id='result', ctx=Load()), attr='fix_confidence', ctx=Load()), Attribute(value=Name(id='result', ctx=Load()), attr='pr_merge_readiness', ctx=Load()), Call(func=Name(id='_parse_gates', ctx=Load()), args=[Attribute(value=Name(id='result', ctx=Load()), attr='gate_results_json', ctx=Load())], keywords=[])])",
+      "rendered": "{'validationStatus': _status_label(result, session_failed=session_failed), 'validationReason': reason[:2000], 'weightedScore': result.fix_confidence, 'mergeReadiness': result.pr_merge_readiness, 'gateScores': _parse_gates(result.gate_results_json)}"
+    },
+    {
+      "line_start": 161,
+      "line_end": 161,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='path_text', ctx=Load()), attr='replace', ctx=Load()), args=[Constant(value='\\\\'), Constant(value='/')], keywords=[])",
+      "rendered": "path_text.replace('\\\\', '/')"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='cast', ctx=Load()), args=[Subscript(value=Name(id='list', ctx=Load()), slice=Name(id='object', ctx=Load()), ctx=Load()), Subscript(value=Name(id='sarif_result', ctx=Load()), slice=Constant(value='locations'), ctx=Load())], keywords=[])",
+      "rendered": "cast(list[object], sarif_result['locations'])"
+    },
+    {
+      "line_start": 168,
+      "line_end": 168,
+      "column": 25,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='cast', ctx=Load()), args=[Name(id='SarifResult', ctx=Load()), Subscript(value=Name(id='locations', ctx=Load()), slice=Constant(value=0), ctx=Load())], keywords=[])",
+      "rendered": "cast(SarifResult, locations[0])"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='cast', ctx=Load()), args=[Name(id='SarifResult', ctx=Load()), Subscript(value=Name(id='first_location', ctx=Load()), slice=Constant(value='physicalLocation'), ctx=Load())], keywords=[])",
+      "rendered": "cast(SarifResult, first_location['physicalLocation'])"
+    },
+    {
+      "line_start": 170,
+      "line_end": 170,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='cast', ctx=Load()), args=[Name(id='SarifResult', ctx=Load()), Subscript(value=Name(id='physical', ctx=Load()), slice=Constant(value='artifactLocation'), ctx=Load())], keywords=[])",
+      "rendered": "cast(SarifResult, physical['artifactLocation'])"
+    },
+    {
+      "line_start": 171,
+      "line_end": 171,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='cast', ctx=Load()), args=[Name(id='SarifResult', ctx=Load()), Subscript(value=Name(id='physical', ctx=Load()), slice=Constant(value='region'), ctx=Load())], keywords=[])",
+      "rendered": "cast(SarifResult, physical['region'])"
+    },
+    {
+      "line_start": 172,
+      "line_end": 172,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_norm_path', ctx=Load()), args=[Call(func=Name(id='str', ctx=Load()), args=[Subscript(value=Name(id='artifact', ctx=Load()), slice=Constant(value='uri'), ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "_norm_path(str(artifact['uri']))"
+    },
+    {
+      "line_start": 173,
+      "line_end": 173,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='int', ctx=Load()), args=[Call(func=Name(id='cast', ctx=Load()), args=[Name(id='int', ctx=Load()), Subscript(value=Name(id='region', ctx=Load()), slice=Constant(value='startLine'), ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "int(cast(int, region['startLine']))"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='SarifLocation', ctx=Load()), args=[Name(id='uri', ctx=Load()), Name(id='start_line', ctx=Load())], keywords=[])",
+      "rendered": "SarifLocation(uri, start_line)"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='KeyError', ctx=Load()), Name(id='IndexError', ctx=Load()), Name(id='TypeError', ctx=Load()), Name(id='ValueError', ctx=Load())], ctx=Load())",
+      "rendered": "(KeyError, IndexError, TypeError, ValueError)"
+    },
+    {
+      "line_start": 176,
+      "line_end": 176,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='SarifLocation', ctx=Load()), args=[Call(func=Name(id='_norm_path', ctx=Load()), args=[Name(id='file', ctx=Load())], keywords=[]), Name(id='line', ctx=Load())], keywords=[])",
+      "rendered": "SarifLocation(_norm_path(file), line)"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 18,
+      "kind": "Name",
+      "original_ast": "Name(id='results', ctx=Load())",
+      "rendered": "results"
+    },
+    {
+      "line_start": 183,
+      "line_end": 183,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='_result_loc', ctx=Load()), args=[Name(id='result', ctx=Load())], keywords=[]), ops=[Eq()], comparators=[Name(id='target', ctx=Load())])",
+      "rendered": "_result_loc(result) == target"
+    },
+    {
+      "line_start": 184,
+      "line_end": 184,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='result', ctx=Load())",
+      "rendered": "result"
+    },
+    {
+      "line_start": 185,
+      "line_end": 185,
+      "column": 11,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 190,
+      "line_end": 190,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='cast', ctx=Load()), args=[Name(id='SarifResult', ctx=Load()), BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='result', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='message')], keywords=[]), Dict(keys=[], values=[])])], keywords=[])",
+      "rendered": "cast(SarifResult, result.get('message') or {})"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='str', ctx=Load()), args=[Call(func=Attribute(value=Name(id='message', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='text'), Constant(value='')], keywords=[])], keywords=[])",
+      "rendered": "str(message.get('text', ''))"
+    },
+    {
+      "line_start": 196,
+      "line_end": 196,
+      "column": 11,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='result', ctx=Load()), generators=[comprehension(target=Name(id='result', ctx=Store()), iter=Name(id='results', ctx=Load()), ifs=[Call(func=Attribute(value=Call(func=Name(id='_message_text', ctx=Load()), args=[Name(id='result', ctx=Load())], keywords=[]), attr='startswith', ctx=Load()), args=[Name(id='title', ctx=Load())], keywords=[])], is_async=0)])",
+      "rendered": "[result for result in results if _message_text(result).startswith(title)]"
+    },
+    {
+      "line_start": 197,
+      "line_end": 197,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='hits', ctx=Load())], keywords=[]), ops=[Eq()], comparators=[Constant(value=1)]), body=Subscript(value=Name(id='hits', ctx=Load()), slice=Constant(value=0), ctx=Load()), orelse=Constant(value=None))",
+      "rendered": "hits[0] if len(hits) == 1 else None"
+    },
+    {
+      "line_start": 202,
+      "line_end": 202,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='case_id', ctx=Load()))",
+      "rendered": "not case_id"
+    },
+    {
+      "line_start": 203,
+      "line_end": 203,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 204,
+      "line_end": 204,
+      "column": 18,
+      "kind": "Name",
+      "original_ast": "Name(id='results', ctx=Load())",
+      "rendered": "results"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='result_identifies', ctx=Load()), args=[Name(id='result', ctx=Load()), Name(id='case_id', ctx=Load())], keywords=[])",
+      "rendered": "result_identifies(result, case_id)"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='result', ctx=Load())",
+      "rendered": "result"
+    },
+    {
+      "line_start": 207,
+      "line_end": 207,
+      "column": 11,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 214,
+      "line_end": 214,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_match_by_fingerprint', ctx=Load()), args=[Name(id='results', ctx=Load()), Name(id='case_id', ctx=Load())], keywords=[])",
+      "rendered": "_match_by_fingerprint(results, case_id)"
+    },
+    {
+      "line_start": 215,
+      "line_end": 215,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='hit', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "hit is not None"
+    },
+    {
+      "line_start": 216,
+      "line_end": 216,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='hit', ctx=Load())",
+      "rendered": "hit"
+    },
+    {
+      "line_start": 217,
+      "line_end": 219,
+      "column": 17,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='r', ctx=Load()), generators=[comprehension(target=Name(id='r', ctx=Store()), iter=Name(id='results', ctx=Load()), ifs=[BoolOp(op=Or(), values=[UnaryOp(op=Not(), operand=Name(id='case_id', ctx=Load())), UnaryOp(op=Not(), operand=Call(func=Name(id='result_fingerprint', ctx=Load()), args=[Name(id='r', ctx=Load())], keywords=[])), Call(func=Name(id='result_identifies', ctx=Load()), args=[Name(id='r', ctx=Load()), Name(id='case_id', ctx=Load())], keywords=[])])], is_async=0)])",
+      "rendered": "[r for r in results if not case_id or not result_fingerprint(r) or result_identifies(r, case_id)]"
+    },
+    {
+      "line_start": 220,
+      "line_end": 221,
+      "column": 14,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Attribute(value=Name(id='finding', ctx=Load()), attr='file', ctx=Load()), body=Call(func=Name(id='_match_by_loc', ctx=Load()), args=[Name(id='candidates', ctx=Load()), Attribute(value=Name(id='finding', ctx=Load()), attr='file', ctx=Load()), Attribute(value=Name(id='finding', ctx=Load()), attr='line_start', ctx=Load())], keywords=[]), orelse=Constant(value=None))",
+      "rendered": "_match_by_loc(candidates, finding.file, finding.line_start) if finding.file else None"
+    },
+    {
+      "line_start": 222,
+      "line_end": 222,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='by_loc', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "by_loc is not None"
+    },
+    {
+      "line_start": 223,
+      "line_end": 223,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='by_loc', ctx=Load())",
+      "rendered": "by_loc"
+    },
+    {
+      "line_start": 224,
+      "line_end": 224,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=BoolOp(op=Or(), values=[Attribute(value=Name(id='finding', ctx=Load()), attr='title', ctx=Load()), Constant(value='')]), attr='strip', ctx=Load()), args=[], keywords=[])",
+      "rendered": "(finding.title or '').strip()"
+    },
+    {
+      "line_start": 225,
+      "line_end": 225,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='title', ctx=Load()), body=Call(func=Name(id='_match_by_title', ctx=Load()), args=[Name(id='candidates', ctx=Load()), Name(id='title', ctx=Load())], keywords=[]), orelse=Constant(value=None))",
+      "rendered": "_match_by_title(candidates, title) if title else None"
+    },
+    {
+      "line_start": 230,
+      "line_end": 230,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='json', ctx=Load()), attr='loads', ctx=Load()), args=[Call(func=Attribute(value=Name(id='path', ctx=Load()), attr='read_text', ctx=Load()), args=[], keywords=[keyword(arg='encoding', value=Constant(value='utf-8'))])], keywords=[])",
+      "rendered": "json.loads(path.read_text(encoding='utf-8'))"
+    },
+    {
+      "line_start": 231,
+      "line_end": 231,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='document', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='runs')], keywords=[]), List(elts=[Dict(keys=[], values=[])], ctx=Load())])",
+      "rendered": "document.get('runs') or [{}]"
+    },
+    {
+      "line_start": 232,
+      "line_end": 232,
+      "column": 14,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='runs', ctx=Load()), body=Call(func=Attribute(value=Subscript(value=Name(id='runs', ctx=Load()), slice=Constant(value=0), ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='results'), List(elts=[], ctx=Load())], keywords=[]), orelse=List(elts=[], ctx=Load()))",
+      "rendered": "runs[0].get('results', []) if runs else []"
+    },
+    {
+      "line_start": 233,
+      "line_end": 233,
+      "column": 35,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 234,
+      "line_end": 234,
+      "column": 40,
+      "kind": "Name",
+      "original_ast": "Name(id='pairs', ctx=Load())",
+      "rendered": "pairs"
+    },
+    {
+      "line_start": 236,
+      "line_end": 236,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='str', ctx=Load()), args=[BoolOp(op=Or(), values=[Attribute(value=Name(id='finding', ctx=Load()), attr='case_id', ctx=Load()), Attribute(value=Name(id='row', ctx=Load()), attr='tracking_id', ctx=Load()), Constant(value='')])], keywords=[])",
+      "rendered": "str(finding.case_id or row.tracking_id or '')"
+    },
+    {
+      "line_start": 237,
+      "line_end": 237,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_match_sarif', ctx=Load()), args=[Name(id='results', ctx=Load()), Name(id='finding', ctx=Load()), Name(id='case_id', ctx=Load())], keywords=[])",
+      "rendered": "_match_sarif(results, finding, case_id)"
+    },
+    {
+      "line_start": 238,
+      "line_end": 238,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='match', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "match is None"
+    },
+    {
+      "line_start": 240,
+      "line_end": 240,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='matched', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "matched += 1"
+    },
+    {
+      "line_start": 241,
+      "line_end": 241,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Name(id='case_id', ctx=Load()), Call(func=Name(id='result_identifies', ctx=Load()), args=[Name(id='match', ctx=Load()), Name(id='case_id', ctx=Load())], keywords=[])])",
+      "rendered": "case_id and result_identifies(match, case_id)"
+    },
+    {
+      "line_start": 242,
+      "line_end": 242,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='by_print', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "by_print += 1"
+    },
+    {
+      "line_start": 243,
+      "line_end": 243,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_validation_block', ctx=Load()), args=[Name(id='row', ctx=Load())], keywords=[keyword(arg='session_failed', value=Name(id='session_failed', ctx=Load()))])",
+      "rendered": "_validation_block(row, session_failed=session_failed)"
+    },
+    {
+      "line_start": 244,
+      "line_end": 245,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='record_result_block', ctx=Load()), args=[Name(id='match', ctx=Load()), Name(id='case_id', ctx=Load()), Name(id='block', ctx=Load())], keywords=[keyword(arg='key', value=Name(id='BLOCK_KEY', ctx=Load())), keyword(arg='alias_key', value=Name(id='ALIAS_BLOCK_KEY', ctx=Load()))]))",
+      "rendered": "not record_result_block(match, case_id, block, key=BLOCK_KEY, alias_key=ALIAS_BLOCK_KEY)"
+    },
+    {
+      "line_start": 246,
+      "line_end": 246,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='aliased', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "aliased += 1"
+    },
+    {
+      "line_start": 248,
+      "line_end": 250,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[BinOp(left=JoinedStr(values=[Constant(value='  [s11] SARIF augment: matched '), FormattedValue(value=Name(id='matched', ctx=Load()), conversion=-1), Constant(value='/'), FormattedValue(value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='pairs', ctx=Load())], keywords=[]), conversion=-1), Constant(value=' finding(s), '), FormattedValue(value=Name(id='by_print', ctx=Load()), conversion=-1), Constant(value=' by '), FormattedValue(value=Name(id='FINGERPRINT_KEY', ctx=Load()), conversion=-1)]), op=Add(), right=IfExp(test=Name(id='aliased', ctx=Load()), body=JoinedStr(values=[Constant(value=', '), FormattedValue(value=Name(id='aliased', ctx=Load()), conversion=-1), Constant(value=' recorded under '), FormattedValue(value=Name(id='ALIAS_BLOCK_KEY', ctx=Load()), conversion=-1)]), orelse=Constant(value='')))], keywords=[])",
+      "rendered": "console.write(source_template_248_18 + (source_template_250_21 if aliased else ''))"
+    },
+    {
+      "line_start": 251,
+      "line_end": 251,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='path', ctx=Load()), attr='write_text', ctx=Load()), args=[BinOp(left=Call(func=Attribute(value=Name(id='json', ctx=Load()), attr='dumps', ctx=Load()), args=[Name(id='document', ctx=Load())], keywords=[keyword(arg='indent', value=Constant(value=2))]), op=Add(), right=Constant(value='\\n'))], keywords=[keyword(arg='encoding', value=Constant(value='utf-8'))])",
+      "rendered": "path.write_text(json.dumps(document, indent=2) + source_literal_251_53, encoding='utf-8')"
+    },
+    {
+      "line_start": 258,
+      "line_end": 262,
+      "column": 29,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='\\\\'), Constant(value='`'), Constant(value='*'), Constant(value='_'), Constant(value='['), Constant(value=']'), Constant(value='|'), Constant(value='#'), Constant(value='<'), Constant(value='>'), Constant(value='&')], values=[Constant(value='\\\\\\\\'), Constant(value='\\\\`'), Constant(value='\\\\*'), Constant(value='\\\\_'), Constant(value='\\\\['), Constant(value='\\\\]'), Constant(value='\\\\|'), Constant(value='\\\\#'), Constant(value='&lt;'), Constant(value='&gt;'), Constant(value='&amp;')])",
+      "rendered": "{'\\\\': '\\\\\\\\', '`': '\\\\`', '*': '\\\\*', '_': '\\\\_', '[': '\\\\[', ']': '\\\\]', '|': '\\\\|', '#': '\\\\#', '<': '&lt;', '>': '&gt;', '&': '&amp;'}"
+    },
+    {
+      "line_start": 267,
+      "line_end": 267,
+      "column": 7,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=BinOp(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='text', ctx=Load())], keywords=[]), op=Sub(), right=Call(func=Name(id='len', ctx=Load()), args=[Call(func=Attribute(value=Name(id='text', ctx=Load()), attr='rstrip', ctx=Load()), args=[Constant(value='\\\\')], keywords=[])], keywords=[])), op=Mod(), right=Constant(value=2))",
+      "rendered": "(len(text) - len(text.rstrip('\\\\'))) % 2"
+    },
+    {
+      "line_start": 268,
+      "line_end": 268,
+      "column": 15,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Name(id='text', ctx=Load()), slice=Slice(upper=UnaryOp(op=USub(), operand=Constant(value=1))), ctx=Load())",
+      "rendered": "text[:-1]"
+    },
+    {
+      "line_start": 269,
+      "line_end": 269,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='text', ctx=Load())",
+      "rendered": "text"
+    },
+    {
+      "line_start": 274,
+      "line_end": 274,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='text', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "text is None"
+    },
+    {
+      "line_start": 275,
+      "line_end": 275,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value='')",
+      "rendered": "''"
+    },
+    {
+      "line_start": 276,
+      "line_end": 276,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_MD_LINEBREAK_RX', ctx=Load()), attr='sub', ctx=Load()), args=[Constant(value=' '), Call(func=Name(id='str', ctx=Load()), args=[Name(id='text', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "_MD_LINEBREAK_RX.sub(' ', str(text))"
+    },
+    {
+      "line_start": 277,
+      "line_end": 277,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_MD_INVISIBLE_RX', ctx=Load()), attr='sub', ctx=Load()), args=[Constant(value=''), Name(id='cleaned', ctx=Load())], keywords=[])",
+      "rendered": "_MD_INVISIBLE_RX.sub('', cleaned)"
+    },
+    {
+      "line_start": 278,
+      "line_end": 278,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Constant(value=''), attr='join', ctx=Load()), args=[GeneratorExp(elt=Call(func=Attribute(value=Name(id='_MD_ESCAPE', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='char', ctx=Load()), Name(id='char', ctx=Load())], keywords=[]), generators=[comprehension(target=Name(id='char', ctx=Store()), iter=Name(id='cleaned', ctx=Load()), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "''.join((_MD_ESCAPE.get(char, char) for char in cleaned))"
+    },
+    {
+      "line_start": 279,
+      "line_end": 279,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_trim_dangling_escape', ctx=Load()), args=[Subscript(value=Name(id='cleaned', ctx=Load()), slice=Slice(upper=Name(id='limit', ctx=Load())), ctx=Load())], keywords=[])",
+      "rendered": "_trim_dangling_escape(cleaned[:limit])"
+    },
+    {
+      "line_start": 283,
+      "line_end": 283,
+      "column": 22,
+      "kind": "Constant",
+      "original_ast": "Constant(value='weighted_score')",
+      "rendered": "'weighted_score'"
+    },
+    {
+      "line_start": 288,
+      "line_end": 288,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_md_escape', ctx=Load()), args=[Name(id='text', ctx=Load())], keywords=[keyword(arg='limit', value=Constant(value=200))])",
+      "rendered": "_md_escape(text, limit=200)"
+    },
+    {
+      "line_start": 293,
+      "line_end": 293,
+      "column": 22,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 294,
+      "line_end": 294,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='gates', ctx=Load()), attr='items', ctx=Load()), args=[], keywords=[])",
+      "rendered": "gates.items()"
+    },
+    {
+      "line_start": 295,
+      "line_end": 295,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='entry', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(entry, dict)"
+    },
+    {
+      "line_start": 296,
+      "line_end": 296,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='entry', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='status'), Constant(value='')], keywords=[])",
+      "rendered": "entry.get('status', '')"
+    },
+    {
+      "line_start": 297,
+      "line_end": 297,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='entry', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='weight'), Constant(value='')], keywords=[])",
+      "rendered": "entry.get('weight', '')"
+    },
+    {
+      "line_start": 298,
+      "line_end": 298,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='entry', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='_WEIGHTED_SCORE_KEY', ctx=Load()), Constant(value='')], keywords=[])",
+      "rendered": "entry.get(_WEIGHTED_SCORE_KEY, '')"
+    },
+    {
+      "line_start": 299,
+      "line_end": 299,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Constant(value=' | '), attr='join', ctx=Load()), args=[GeneratorExp(elt=Call(func=Name(id='_md_cell', ctx=Load()), args=[Name(id='field', ctx=Load())], keywords=[]), generators=[comprehension(target=Name(id='field', ctx=Store()), iter=Tuple(elts=[Name(id='name', ctx=Load()), Name(id='status', ctx=Load()), Name(id='weight', ctx=Load()), Name(id='weighted', ctx=Load())], ctx=Load()), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "' | '.join((_md_cell(field) for field in (name, status, weight, weighted)))"
+    },
+    {
+      "line_start": 300,
+      "line_end": 300,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='rows', ctx=Load()), attr='append', ctx=Load()), args=[JoinedStr(values=[Constant(value='  | '), FormattedValue(value=Name(id='cells', ctx=Load()), conversion=-1), Constant(value=' |')])], keywords=[])",
+      "rendered": "rows.append(source_template_300_24)"
+    },
+    {
+      "line_start": 302,
+      "line_end": 302,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='rows', ctx=Load()), attr='append', ctx=Load()), args=[JoinedStr(values=[Constant(value='  | '), FormattedValue(value=Call(func=Name(id='_md_cell', ctx=Load()), args=[Name(id='name', ctx=Load())], keywords=[]), conversion=-1), Constant(value=' | '), FormattedValue(value=Call(func=Name(id='_md_cell', ctx=Load()), args=[Name(id='entry', ctx=Load())], keywords=[]), conversion=-1), Constant(value=' | | |')])], keywords=[])",
+      "rendered": "rows.append(source_template_302_24)"
+    },
+    {
+      "line_start": 303,
+      "line_end": 303,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='rows', ctx=Load())",
+      "rendered": "rows"
+    },
+    {
+      "line_start": 308,
+      "line_end": 313,
+      "column": 12,
+      "kind": "List",
+      "original_ast": "List(elts=[Constant(value='### Validation'), JoinedStr(values=[Constant(value='- **Status:** '), FormattedValue(value=Call(func=Name(id='_status_word', ctx=Load()), args=[Name(id='result', ctx=Load())], keywords=[keyword(arg='session_failed', value=Name(id='session_failed', ctx=Load()))]), conversion=-1)]), JoinedStr(values=[Constant(value='- **Weighted score:** '), FormattedValue(value=Attribute(value=Name(id='result', ctx=Load()), attr='fix_confidence', ctx=Load()), conversion=-1), Constant(value='  (merge readiness: '), FormattedValue(value=BoolOp(op=Or(), values=[Attribute(value=Name(id='result', ctx=Load()), attr='pr_merge_readiness', ctx=Load()), Constant(value='n/a')]), conversion=-1), Constant(value=')')])], ctx=Load())",
+      "rendered": "['### Validation', source_template_310_8, source_template_311_8]"
+    },
+    {
+      "line_start": 314,
+      "line_end": 314,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=BoolOp(op=Or(), values=[Attribute(value=Name(id='result', ctx=Load()), attr='justification', ctx=Load()), Attribute(value=Name(id='result', ctx=Load()), attr='reason_for_decision', ctx=Load()), Constant(value='')]), attr='strip', ctx=Load()), args=[], keywords=[])",
+      "rendered": "(result.justification or result.reason_for_decision or '').strip()"
+    },
+    {
+      "line_start": 315,
+      "line_end": 315,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[UnaryOp(op=Not(), operand=Name(id='summary', ctx=Load())), Name(id='session_failed', ctx=Load())])",
+      "rendered": "not summary and session_failed"
+    },
+    {
+      "line_start": 316,
+      "line_end": 316,
+      "column": 18,
+      "kind": "Constant",
+      "original_ast": "Constant(value='validation session failed; no verdict was reached')",
+      "rendered": "'validation session failed; no verdict was reached'"
+    },
+    {
+      "line_start": 317,
+      "line_end": 317,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='summary', ctx=Load())",
+      "rendered": "summary"
+    },
+    {
+      "line_start": 318,
+      "line_end": 318,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='lines', ctx=Load()), attr='append', ctx=Load()), args=[JoinedStr(values=[Constant(value='- **Summary:** '), FormattedValue(value=Call(func=Name(id='_md_escape', ctx=Load()), args=[Name(id='summary', ctx=Load())], keywords=[]), conversion=-1)])], keywords=[])",
+      "rendered": "lines.append(source_template_318_21)"
+    },
+    {
+      "line_start": 319,
+      "line_end": 319,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_parse_gates', ctx=Load()), args=[Attribute(value=Name(id='result', ctx=Load()), attr='gate_results_json', ctx=Load())], keywords=[])",
+      "rendered": "_parse_gates(result.gate_results_json)"
+    },
+    {
+      "line_start": 320,
+      "line_end": 320,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_gate_rows', ctx=Load()), args=[Name(id='gates', ctx=Load())], keywords=[])",
+      "rendered": "_gate_rows(gates)"
+    },
+    {
+      "line_start": 321,
+      "line_end": 321,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='rows', ctx=Load())",
+      "rendered": "rows"
+    },
+    {
+      "line_start": 322,
+      "line_end": 323,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='lines', ctx=Store()), op=Add(), value=List(elts=[Constant(value='- **Gate scores:**'), Constant(value=''), Constant(value='  | gate | status | weight | weighted |'), Constant(value='  |---|---|---|---|'), Starred(value=Name(id='rows', ctx=Load()), ctx=Load())], ctx=Load()))",
+      "rendered": "lines += ['- **Gate scores:**', '', '  | gate | status | weight | weighted |', '  |---|---|---|---|', *rows]"
+    },
+    {
+      "line_start": 324,
+      "line_end": 324,
+      "column": 11,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Attribute(value=Constant(value='\\n'), attr='join', ctx=Load()), args=[Name(id='lines', ctx=Load())], keywords=[]), op=Add(), right=Constant(value='\\n'))",
+      "rendered": "source_literal_324_11.join(lines) + source_literal_324_30"
+    },
+    {
+      "line_start": 329,
+      "line_end": 329,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=BoolOp(op=Or(), values=[Attribute(value=Attribute(value=Name(id='pair', ctx=Load()), attr='finding', ctx=Load()), attr='title', ctx=Load()), Attribute(value=Attribute(value=Name(id='pair', ctx=Load()), attr='row', ctx=Load()), attr='finding_title', ctx=Load()), Constant(value='')]), attr='strip', ctx=Load()), args=[], keywords=[]), attr='lower', ctx=Load()), args=[], keywords=[])",
+      "rendered": "(pair.finding.title or pair.row.finding_title or '').strip().lower()"
+    },
+    {
+      "line_start": 334,
+      "line_end": 334,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='pairs', ctx=Load())], keywords=[]), ops=[Eq()], comparators=[Constant(value=1)]), body=Subscript(value=Name(id='pairs', ctx=Load()), slice=Constant(value=0), ctx=Load()), orelse=Constant(value=None))",
+      "rendered": "pairs[0] if len(pairs) == 1 else None"
+    },
+    {
+      "line_start": 339,
+      "line_end": 339,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Name(id='title', ctx=Load()), attr='strip', ctx=Load()), args=[], keywords=[]), attr='lower', ctx=Load()), args=[], keywords=[])",
+      "rendered": "title.strip().lower()"
+    },
+    {
+      "line_start": 340,
+      "line_end": 340,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='norm', ctx=Load()))",
+      "rendered": "not norm"
+    },
+    {
+      "line_start": 341,
+      "line_end": 341,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 342,
+      "line_end": 342,
+      "column": 12,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='pair', ctx=Load()), generators=[comprehension(target=Name(id='pair', ctx=Store()), iter=Name(id='pairs', ctx=Load()), ifs=[Compare(left=Call(func=Name(id='_ftitle', ctx=Load()), args=[Name(id='pair', ctx=Load())], keywords=[]), ops=[Eq()], comparators=[Name(id='norm', ctx=Load())])], is_async=0)])",
+      "rendered": "[pair for pair in pairs if _ftitle(pair) == norm]"
+    },
+    {
+      "line_start": 343,
+      "line_end": 343,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='exact', ctx=Load())",
+      "rendered": "exact"
+    },
+    {
+      "line_start": 344,
+      "line_end": 344,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_only', ctx=Load()), args=[Name(id='exact', ctx=Load())], keywords=[])",
+      "rendered": "_only(exact)"
+    },
+    {
+      "line_start": 345,
+      "line_end": 348,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_only', ctx=Load()), args=[ListComp(elt=Name(id='pair', ctx=Load()), generators=[comprehension(target=Name(id='pair', ctx=Store()), iter=Name(id='pairs', ctx=Load()), ifs=[BoolOp(op=And(), values=[NamedExpr(target=Name(id='pair_title', ctx=Store()), value=Call(func=Name(id='_ftitle', ctx=Load()), args=[Name(id='pair', ctx=Load())], keywords=[])), BoolOp(op=Or(), values=[Compare(left=Name(id='pair_title', ctx=Load()), ops=[In()], comparators=[Name(id='norm', ctx=Load())]), Compare(left=Name(id='norm', ctx=Load()), ops=[In()], comparators=[Name(id='pair_title', ctx=Load())])])])], is_async=0)])], keywords=[])",
+      "rendered": "_only([pair for pair in pairs if (pair_title := _ftitle(pair)) and (pair_title in norm or norm in pair_title)])"
+    },
+    {
+      "line_start": 353,
+      "line_end": 353,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='path', ctx=Load()), attr='read_text', ctx=Load()), args=[], keywords=[keyword(arg='encoding', value=Constant(value='utf-8'))])",
+      "rendered": "path.read_text(encoding='utf-8')"
+    },
+    {
+      "line_start": 354,
+      "line_end": 354,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='list', ctx=Load()), args=[Call(func=Attribute(value=Name(id='_FINDING_RE', ctx=Load()), attr='finditer', ctx=Load()), args=[Name(id='text', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "list(_FINDING_RE.finditer(text))"
+    },
+    {
+      "line_start": 355,
+      "line_end": 355,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='matches', ctx=Load()))",
+      "rendered": "not matches"
+    },
+    {
+      "line_start": 357,
+      "line_end": 357,
+      "column": 13,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=ListComp(elt=Call(func=Attribute(value=Name(id='heading_match', ctx=Load()), attr='start', ctx=Load()), args=[], keywords=[]), generators=[comprehension(target=Name(id='heading_match', ctx=Store()), iter=Name(id='matches', ctx=Load()), ifs=[], is_async=0)]), op=Add(), right=List(elts=[Call(func=Name(id='len', ctx=Load()), args=[Name(id='text', ctx=Load())], keywords=[])], ctx=Load()))",
+      "rendered": "[heading_match.start() for heading_match in matches] + [len(text)]"
+    },
+    {
+      "line_start": 358,
+      "line_end": 358,
+      "column": 14,
+      "kind": "List",
+      "original_ast": "List(elts=[Subscript(value=Name(id='text', ctx=Load()), slice=Slice(upper=Subscript(value=Name(id='bounds', ctx=Load()), slice=Constant(value=0), ctx=Load())), ctx=Load())], ctx=Load())",
+      "rendered": "[text[:bounds[0]]]"
+    },
+    {
+      "line_start": 359,
+      "line_end": 359,
+      "column": 32,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='enumerate', ctx=Load()), args=[Name(id='matches', ctx=Load())], keywords=[])",
+      "rendered": "enumerate(matches)"
+    },
+    {
+      "line_start": 360,
+      "line_end": 360,
+      "column": 21,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Subscript(value=Name(id='bounds', ctx=Load()), slice=Name(id='index', ctx=Load()), ctx=Load()), Subscript(value=Name(id='bounds', ctx=Load()), slice=BinOp(left=Name(id='index', ctx=Load()), op=Add(), right=Constant(value=1)), ctx=Load())], ctx=Load())",
+      "rendered": "(bounds[index], bounds[index + 1])"
+    },
+    {
+      "line_start": 361,
+      "line_end": 361,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_LEVEL2_HEADING_RE', ctx=Load()), attr='search', ctx=Load()), args=[Name(id='text', ctx=Load()), Call(func=Attribute(value=Name(id='heading_match', ctx=Load()), attr='end', ctx=Load()), args=[], keywords=[]), Name(id='end', ctx=Load())], keywords=[])",
+      "rendered": "_LEVEL2_HEADING_RE.search(text, heading_match.end(), end)"
+    },
+    {
+      "line_start": 362,
+      "line_end": 362,
+      "column": 18,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='cut', ctx=Load()), body=Call(func=Attribute(value=Name(id='cut', ctx=Load()), attr='start', ctx=Load()), args=[], keywords=[]), orelse=Name(id='end', ctx=Load()))",
+      "rendered": "cut.start() if cut else end"
+    },
+    {
+      "line_start": 363,
+      "line_end": 363,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_best_md_match', ctx=Load()), args=[Call(func=Attribute(value=Name(id='heading_match', ctx=Load()), attr='group', ctx=Load()), args=[Constant(value=1)], keywords=[]), Name(id='pairs', ctx=Load())], keywords=[])",
+      "rendered": "_best_md_match(heading_match.group(1), pairs)"
+    },
+    {
+      "line_start": 364,
+      "line_end": 364,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='rebuilt', ctx=Load()), attr='append', ctx=Load()), args=[Call(func=Name(id='_augment_segment', ctx=Load()), args=[Subscript(value=Name(id='text', ctx=Load()), slice=Slice(lower=Name(id='start', ctx=Load()), upper=Name(id='seg_end', ctx=Load())), ctx=Load()), Name(id='pair', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "rebuilt.append(_augment_segment(text[start:seg_end], pair))"
+    },
+    {
+      "line_start": 365,
+      "line_end": 365,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='rebuilt', ctx=Load()), attr='append', ctx=Load()), args=[Subscript(value=Name(id='text', ctx=Load()), slice=Slice(lower=Name(id='seg_end', ctx=Load()), upper=Name(id='end', ctx=Load())), ctx=Load())], keywords=[])",
+      "rendered": "rebuilt.append(text[seg_end:end])"
+    },
+    {
+      "line_start": 366,
+      "line_end": 366,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='path', ctx=Load()), attr='write_text', ctx=Load()), args=[Call(func=Attribute(value=Constant(value=''), attr='join', ctx=Load()), args=[Name(id='rebuilt', ctx=Load())], keywords=[])], keywords=[keyword(arg='encoding', value=Constant(value='utf-8'))])",
+      "rendered": "path.write_text(''.join(rebuilt), encoding='utf-8')"
+    },
+    {
+      "line_start": 371,
+      "line_end": 371,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='pair', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "pair is None"
+    },
+    {
+      "line_start": 372,
+      "line_end": 372,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='segment', ctx=Load())",
+      "rendered": "segment"
+    },
+    {
+      "line_start": 373,
+      "line_end": 373,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_EXISTING_VALIDATION_RE', ctx=Load()), attr='sub', ctx=Load()), args=[Constant(value=''), Name(id='segment', ctx=Load())], keywords=[])",
+      "rendered": "_EXISTING_VALIDATION_RE.sub('', segment)"
+    },
+    {
+      "line_start": 374,
+      "line_end": 374,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_md_validation_section', ctx=Load()), args=[Attribute(value=Name(id='pair', ctx=Load()), attr='row', ctx=Load())], keywords=[keyword(arg='session_failed', value=Attribute(value=Name(id='pair', ctx=Load()), attr='session_failed', ctx=Load()))])",
+      "rendered": "_md_validation_section(pair.row, session_failed=pair.session_failed)"
+    },
+    {
+      "line_start": 375,
+      "line_end": 375,
+      "column": 11,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=BinOp(left=BinOp(left=Call(func=Attribute(value=Name(id='stripped', ctx=Load()), attr='rstrip', ctx=Load()), args=[], keywords=[]), op=Add(), right=Constant(value='\\n\\n')), op=Add(), right=Name(id='section', ctx=Load())), op=Add(), right=Constant(value='\\n'))",
+      "rendered": "stripped.rstrip() + source_literal_375_31 + section + source_literal_375_50"
+    }
+  ],
+  "calls": [
+    {
+      "line": 51,
+      "end_line": 51,
+      "callee": "logs.get_logger",
+      "enclosing": "module initialization",
+      "expression": "logs.get_logger(__name__)"
+    },
+    {
+      "line": 54,
+      "end_line": 54,
+      "callee": "re.compile",
+      "enclosing": "module initialization",
+      "expression": "re.compile(r\"(?m)^### \\d+\\. \\[[^\\]]*\\]\\s*(.+?)\\s*$\")"
+    },
+    {
+      "line": 56,
+      "end_line": 56,
+      "callee": "re.compile",
+      "enclosing": "module initialization",
+      "expression": "re.compile(r\"(?s)\\n+### Validation\\n.*\\Z\")"
+    },
+    {
+      "line": 58,
+      "end_line": 58,
+      "callee": "re.compile",
+      "enclosing": "module initialization",
+      "expression": "re.compile(r\"(?m)^## \")"
+    },
+    {
+      "line": 80,
+      "end_line": 80,
+      "callee": "_locate_combined_report",
+      "enclosing": "_augment",
+      "expression": "_locate_combined_report(repo, report_md)"
+    },
+    {
+      "line": 86,
+      "end_line": 86,
+      "callee": "_augment_sarif",
+      "enclosing": "_augment",
+      "expression": "_augment_sarif(sarif_dst, pairs)"
+    },
+    {
+      "line": 87,
+      "end_line": 87,
+      "callee": "_augment_md",
+      "enclosing": "_augment",
+      "expression": "_augment_md(md_dst, pairs)"
+    },
+    {
+      "line": 88,
+      "end_line": 88,
+      "callee": "log.info",
+      "enclosing": "_augment",
+      "expression": "log.info(\"validation results written to combined report under %s\", sarif_dst.parent)"
+    },
+    {
+      "line": 99,
+      "end_line": 99,
+      "callee": "sorted",
+      "enclosing": "_locate_combined_report",
+      "expression": "sorted((repo / REMEDIATION_DIRNAME).glob(SCAN_REPORT_GLOB))"
+    },
+    {
+      "line": 103,
+      "end_line": 103,
+      "callee": "sarif.with_suffix",
+      "enclosing": "_locate_combined_report",
+      "expression": "sarif.with_suffix(\".md\")"
+    },
+    {
+      "line": 144,
+      "end_line": 144,
+      "callee": "(result.reason_for_decision or result.justification or '').strip",
+      "enclosing": "_validation_block",
+      "expression": "(result.reason_for_decision or result.justification or \"\").strip()"
+    },
+    {
+      "line": 161,
+      "end_line": 161,
+      "callee": "path_text.replace",
+      "enclosing": "_norm_path",
+      "expression": "path_text.replace(\"\\\\\", \"/\")"
+    },
+    {
+      "line": 181,
+      "end_line": 181,
+      "callee": "SarifLocation",
+      "enclosing": "_match_by_loc",
+      "expression": "SarifLocation(_norm_path(file), line)"
+    },
+    {
+      "line": 190,
+      "end_line": 190,
+      "callee": "cast",
+      "enclosing": "_message_text",
+      "expression": "cast(SarifResult, result.get(\"message\") or {})"
+    },
+    {
+      "line": 191,
+      "end_line": 191,
+      "callee": "str",
+      "enclosing": "_message_text",
+      "expression": "str(message.get(\"text\", \"\"))"
+    },
+    {
+      "line": 214,
+      "end_line": 214,
+      "callee": "_match_by_fingerprint",
+      "enclosing": "_match_sarif",
+      "expression": "_match_by_fingerprint(results, case_id)"
+    },
+    {
+      "line": 224,
+      "end_line": 224,
+      "callee": "(finding.title or '').strip",
+      "enclosing": "_match_sarif",
+      "expression": "(finding.title or \"\").strip()"
+    },
+    {
+      "line": 230,
+      "end_line": 230,
+      "callee": "json.loads",
+      "enclosing": "_augment_sarif",
+      "expression": "json.loads(path.read_text(encoding=\"utf-8\"))"
+    },
+    {
+      "line": 248,
+      "end_line": 250,
+      "callee": "console.write",
+      "enclosing": "_augment_sarif",
+      "expression": "console.write(f\"  [s11] SARIF augment: matched {matched}/{len(pairs)} finding(s), \"\n                  f\"{by_print} by {FINGERPRINT_KEY}\"\n                  + (f\", {aliased} recorded under {ALIAS_BLOCK_KEY}\" if aliased else \"\"))"
+    },
+    {
+      "line": 251,
+      "end_line": 251,
+      "callee": "path.write_text",
+      "enclosing": "_augment_sarif",
+      "expression": "path.write_text(json.dumps(document, indent=2) + \"\\n\", encoding=\"utf-8\")"
+    },
+    {
+      "line": 276,
+      "end_line": 276,
+      "callee": "_MD_LINEBREAK_RX.sub",
+      "enclosing": "_md_escape",
+      "expression": "_MD_LINEBREAK_RX.sub(\" \", str(text))"
+    },
+    {
+      "line": 277,
+      "end_line": 277,
+      "callee": "_MD_INVISIBLE_RX.sub",
+      "enclosing": "_md_escape",
+      "expression": "_MD_INVISIBLE_RX.sub(\"\", cleaned)"
+    },
+    {
+      "line": 278,
+      "end_line": 278,
+      "callee": "''.join",
+      "enclosing": "_md_escape",
+      "expression": "\"\".join(_MD_ESCAPE.get(char, char) for char in cleaned)"
+    },
+    {
+      "line": 279,
+      "end_line": 279,
+      "callee": "_trim_dangling_escape",
+      "enclosing": "_md_escape",
+      "expression": "_trim_dangling_escape(cleaned[:limit])"
+    },
+    {
+      "line": 288,
+      "end_line": 288,
+      "callee": "_md_escape",
+      "enclosing": "_md_cell",
+      "expression": "_md_escape(text, limit=200)"
+    },
+    {
+      "line": 294,
+      "end_line": 294,
+      "callee": "gates.items",
+      "enclosing": "_gate_rows",
+      "expression": "gates.items()"
+    },
+    {
+      "line": 314,
+      "end_line": 314,
+      "callee": "(result.justification or result.reason_for_decision or '').strip",
+      "enclosing": "_md_validation_section",
+      "expression": "(result.justification or result.reason_for_decision or \"\").strip()"
+    },
+    {
+      "line": 319,
+      "end_line": 319,
+      "callee": "_parse_gates",
+      "enclosing": "_md_validation_section",
+      "expression": "_parse_gates(result.gate_results_json)"
+    },
+    {
+      "line": 320,
+      "end_line": 320,
+      "callee": "_gate_rows",
+      "enclosing": "_md_validation_section",
+      "expression": "_gate_rows(gates)"
+    },
+    {
+      "line": 329,
+      "end_line": 329,
+      "callee": "(pair.finding.title or pair.row.finding_title or '').strip().lower",
+      "enclosing": "_ftitle",
+      "expression": "(pair.finding.title or pair.row.finding_title or \"\").strip().lower()"
+    },
+    {
+      "line": 339,
+      "end_line": 339,
+      "callee": "title.strip().lower",
+      "enclosing": "_best_md_match",
+      "expression": "title.strip().lower()"
+    },
+    {
+      "line": 345,
+      "end_line": 348,
+      "callee": "_only",
+      "enclosing": "_best_md_match",
+      "expression": "_only([\n        pair for pair in pairs\n        if (pair_title := _ftitle(pair)) and (pair_title in norm or norm in pair_title)\n    ])"
+    },
+    {
+      "line": 353,
+      "end_line": 353,
+      "callee": "path.read_text",
+      "enclosing": "_augment_md",
+      "expression": "path.read_text(encoding=\"utf-8\")"
+    },
+    {
+      "line": 354,
+      "end_line": 354,
+      "callee": "list",
+      "enclosing": "_augment_md",
+      "expression": "list(_FINDING_RE.finditer(text))"
+    },
+    {
+      "line": 359,
+      "end_line": 359,
+      "callee": "enumerate",
+      "enclosing": "_augment_md",
+      "expression": "enumerate(matches)"
+    },
+    {
+      "line": 366,
+      "end_line": 366,
+      "callee": "path.write_text",
+      "enclosing": "_augment_md",
+      "expression": "path.write_text(\"\".join(rebuilt), encoding=\"utf-8\")"
+    },
+    {
+      "line": 373,
+      "end_line": 373,
+      "callee": "_EXISTING_VALIDATION_RE.sub",
+      "enclosing": "_augment_segment",
+      "expression": "_EXISTING_VALIDATION_RE.sub(\"\", segment)"
+    },
+    {
+      "line": 374,
+      "end_line": 374,
+      "callee": "_md_validation_section",
+      "enclosing": "_augment_segment",
+      "expression": "_md_validation_section(pair.row, session_failed=pair.session_failed)"
+    },
+    {
+      "line": 70,
+      "end_line": 70,
+      "callee": "_augment",
+      "enclosing": "augment_reports",
+      "expression": "_augment(repo, pairs, report_md)"
+    },
+    {
+      "line": 82,
+      "end_line": 83,
+      "callee": "log.warning",
+      "enclosing": "_augment",
+      "expression": "log.warning(\"no combined report under %s/%s — skipping report augmentation\",\n                    repo, REMEDIATION_DIRNAME)"
+    },
+    {
+      "line": 97,
+      "end_line": 97,
+      "callee": "md.with_suffix",
+      "enclosing": "_locate_combined_report",
+      "expression": "md.with_suffix(\".sarif\")"
+    },
+    {
+      "line": 99,
+      "end_line": 99,
+      "callee": "(repo / REMEDIATION_DIRNAME).glob",
+      "enclosing": "_locate_combined_report",
+      "expression": "(repo / REMEDIATION_DIRNAME).glob(SCAN_REPORT_GLOB)"
+    },
+    {
+      "line": 104,
+      "end_line": 104,
+      "callee": "md.exists",
+      "enclosing": "_locate_combined_report",
+      "expression": "md.exists()"
+    },
+    {
+      "line": 104,
+      "end_line": 104,
+      "callee": "CombinedReportPaths",
+      "enclosing": "_locate_combined_report",
+      "expression": "CombinedReportPaths(sarif, md)"
+    },
+    {
+      "line": 127,
+      "end_line": 127,
+      "callee": "_status_label",
+      "enclosing": "_status_word",
+      "expression": "_status_label(result, session_failed=session_failed)"
+    },
+    {
+      "line": 135,
+      "end_line": 135,
+      "callee": "json.loads",
+      "enclosing": "_parse_gates",
+      "expression": "json.loads(raw_json)"
+    },
+    {
+      "line": 138,
+      "end_line": 138,
+      "callee": "isinstance",
+      "enclosing": "_parse_gates",
+      "expression": "isinstance(parsed, dict)"
+    },
+    {
+      "line": 148,
+      "end_line": 148,
+      "callee": "_status_label",
+      "enclosing": "_validation_block",
+      "expression": "_status_label(result, session_failed=session_failed)"
+    },
+    {
+      "line": 152,
+      "end_line": 152,
+      "callee": "_parse_gates",
+      "enclosing": "_validation_block",
+      "expression": "_parse_gates(result.gate_results_json)"
+    },
+    {
+      "line": 167,
+      "end_line": 167,
+      "callee": "cast",
+      "enclosing": "_result_loc",
+      "expression": "cast(list[object], sarif_result[\"locations\"])"
+    },
+    {
+      "line": 168,
+      "end_line": 168,
+      "callee": "cast",
+      "enclosing": "_result_loc",
+      "expression": "cast(SarifResult, locations[0])"
+    },
+    {
+      "line": 169,
+      "end_line": 169,
+      "callee": "cast",
+      "enclosing": "_result_loc",
+      "expression": "cast(SarifResult, first_location[\"physicalLocation\"])"
+    },
+    {
+      "line": 170,
+      "end_line": 170,
+      "callee": "cast",
+      "enclosing": "_result_loc",
+      "expression": "cast(SarifResult, physical[\"artifactLocation\"])"
+    },
+    {
+      "line": 171,
+      "end_line": 171,
+      "callee": "cast",
+      "enclosing": "_result_loc",
+      "expression": "cast(SarifResult, physical[\"region\"])"
+    },
+    {
+      "line": 172,
+      "end_line": 172,
+      "callee": "_norm_path",
+      "enclosing": "_result_loc",
+      "expression": "_norm_path(str(artifact[\"uri\"]))"
+    },
+    {
+      "line": 173,
+      "end_line": 173,
+      "callee": "int",
+      "enclosing": "_result_loc",
+      "expression": "int(cast(int, region[\"startLine\"]))"
+    },
+    {
+      "line": 174,
+      "end_line": 174,
+      "callee": "SarifLocation",
+      "enclosing": "_result_loc",
+      "expression": "SarifLocation(uri, start_line)"
+    },
+    {
+      "line": 181,
+      "end_line": 181,
+      "callee": "_norm_path",
+      "enclosing": "_match_by_loc",
+      "expression": "_norm_path(file)"
+    },
+    {
+      "line": 191,
+      "end_line": 191,
+      "callee": "message.get",
+      "enclosing": "_message_text",
+      "expression": "message.get(\"text\", \"\")"
+    },
+    {
+      "line": 205,
+      "end_line": 205,
+      "callee": "result_identifies",
+      "enclosing": "_match_by_fingerprint",
+      "expression": "result_identifies(result, case_id)"
+    },
+    {
+      "line": 220,
+      "end_line": 220,
+      "callee": "_match_by_loc",
+      "enclosing": "_match_sarif",
+      "expression": "_match_by_loc(candidates, finding.file, finding.line_start)"
+    },
+    {
+      "line": 225,
+      "end_line": 225,
+      "callee": "_match_by_title",
+      "enclosing": "_match_sarif",
+      "expression": "_match_by_title(candidates, title)"
+    },
+    {
+      "line": 230,
+      "end_line": 230,
+      "callee": "path.read_text",
+      "enclosing": "_augment_sarif",
+      "expression": "path.read_text(encoding=\"utf-8\")"
+    },
+    {
+      "line": 231,
+      "end_line": 231,
+      "callee": "document.get",
+      "enclosing": "_augment_sarif",
+      "expression": "document.get(\"runs\")"
+    },
+    {
+      "line": 232,
+      "end_line": 232,
+      "callee": "runs[0].get",
+      "enclosing": "_augment_sarif",
+      "expression": "runs[0].get(\"results\", [])"
+    },
+    {
+      "line": 236,
+      "end_line": 236,
+      "callee": "str",
+      "enclosing": "_augment_sarif",
+      "expression": "str(finding.case_id or row.tracking_id or \"\")"
+    },
+    {
+      "line": 237,
+      "end_line": 237,
+      "callee": "_match_sarif",
+      "enclosing": "_augment_sarif",
+      "expression": "_match_sarif(results, finding, case_id)"
+    },
+    {
+      "line": 243,
+      "end_line": 243,
+      "callee": "_validation_block",
+      "enclosing": "_augment_sarif",
+      "expression": "_validation_block(row, session_failed=session_failed)"
+    },
+    {
+      "line": 276,
+      "end_line": 276,
+      "callee": "str",
+      "enclosing": "_md_escape",
+      "expression": "str(text)"
+    },
+    {
+      "line": 295,
+      "end_line": 295,
+      "callee": "isinstance",
+      "enclosing": "_gate_rows",
+      "expression": "isinstance(entry, dict)"
+    },
+    {
+      "line": 318,
+      "end_line": 318,
+      "callee": "lines.append",
+      "enclosing": "_md_validation_section",
+      "expression": "lines.append(f\"- **Summary:** {_md_escape(summary)}\")"
+    },
+    {
+      "line": 324,
+      "end_line": 324,
+      "callee": "'\\n'.join",
+      "enclosing": "_md_validation_section",
+      "expression": "\"\\n\".join(lines)"
+    },
+    {
+      "line": 344,
+      "end_line": 344,
+      "callee": "_only",
+      "enclosing": "_best_md_match",
+      "expression": "_only(exact)"
+    },
+    {
+      "line": 354,
+      "end_line": 354,
+      "callee": "_FINDING_RE.finditer",
+      "enclosing": "_augment_md",
+      "expression": "_FINDING_RE.finditer(text)"
+    },
+    {
+      "line": 361,
+      "end_line": 361,
+      "callee": "_LEVEL2_HEADING_RE.search",
+      "enclosing": "_augment_md",
+      "expression": "_LEVEL2_HEADING_RE.search(text, heading_match.end(), end)"
+    },
+    {
+      "line": 363,
+      "end_line": 363,
+      "callee": "_best_md_match",
+      "enclosing": "_augment_md",
+      "expression": "_best_md_match(heading_match.group(1), pairs)"
+    },
+    {
+      "line": 364,
+      "end_line": 364,
+      "callee": "rebuilt.append",
+      "enclosing": "_augment_md",
+      "expression": "rebuilt.append(_augment_segment(text[start:seg_end], pair))"
+    },
+    {
+      "line": 365,
+      "end_line": 365,
+      "callee": "rebuilt.append",
+      "enclosing": "_augment_md",
+      "expression": "rebuilt.append(text[seg_end:end])"
+    },
+    {
+      "line": 366,
+      "end_line": 366,
+      "callee": "''.join",
+      "enclosing": "_augment_md",
+      "expression": "\"\".join(rebuilt)"
+    },
+    {
+      "line": 72,
+      "end_line": 75,
+      "callee": "log.warning",
+      "enclosing": "augment_reports",
+      "expression": "log.warning(\n            \"report augmentation skipped (results not written to combined report): %s: %s\",\n            type(exc).__name__, exc,\n        )"
+    },
+    {
+      "line": 98,
+      "end_line": 98,
+      "callee": "CombinedReportPaths",
+      "enclosing": "_locate_combined_report",
+      "expression": "CombinedReportPaths(sarif, md)"
+    },
+    {
+      "line": 172,
+      "end_line": 172,
+      "callee": "str",
+      "enclosing": "_result_loc",
+      "expression": "str(artifact[\"uri\"])"
+    },
+    {
+      "line": 173,
+      "end_line": 173,
+      "callee": "cast",
+      "enclosing": "_result_loc",
+      "expression": "cast(int, region[\"startLine\"])"
+    },
+    {
+      "line": 183,
+      "end_line": 183,
+      "callee": "_result_loc",
+      "enclosing": "_match_by_loc",
+      "expression": "_result_loc(result)"
+    },
+    {
+      "line": 190,
+      "end_line": 190,
+      "callee": "result.get",
+      "enclosing": "_message_text",
+      "expression": "result.get(\"message\")"
+    },
+    {
+      "line": 196,
+      "end_line": 196,
+      "callee": "_message_text(result).startswith",
+      "enclosing": "_match_by_title",
+      "expression": "_message_text(result).startswith(title)"
+    },
+    {
+      "line": 197,
+      "end_line": 197,
+      "callee": "len",
+      "enclosing": "_match_by_title",
+      "expression": "len(hits)"
+    },
+    {
+      "line": 241,
+      "end_line": 241,
+      "callee": "result_identifies",
+      "enclosing": "_augment_sarif",
+      "expression": "result_identifies(match, case_id)"
+    },
+    {
+      "line": 244,
+      "end_line": 245,
+      "callee": "record_result_block",
+      "enclosing": "_augment_sarif",
+      "expression": "record_result_block(match, case_id, block,\n                                   key=BLOCK_KEY, alias_key=ALIAS_BLOCK_KEY)"
+    },
+    {
+      "line": 251,
+      "end_line": 251,
+      "callee": "json.dumps",
+      "enclosing": "_augment_sarif",
+      "expression": "json.dumps(document, indent=2)"
+    },
+    {
+      "line": 267,
+      "end_line": 267,
+      "callee": "len",
+      "enclosing": "_trim_dangling_escape",
+      "expression": "len(text)"
+    },
+    {
+      "line": 267,
+      "end_line": 267,
+      "callee": "len",
+      "enclosing": "_trim_dangling_escape",
+      "expression": "len(text.rstrip(\"\\\\\"))"
+    },
+    {
+      "line": 278,
+      "end_line": 278,
+      "callee": "_MD_ESCAPE.get",
+      "enclosing": "_md_escape",
+      "expression": "_MD_ESCAPE.get(char, char)"
+    },
+    {
+      "line": 296,
+      "end_line": 296,
+      "callee": "entry.get",
+      "enclosing": "_gate_rows",
+      "expression": "entry.get(\"status\", \"\")"
+    },
+    {
+      "line": 297,
+      "end_line": 297,
+      "callee": "entry.get",
+      "enclosing": "_gate_rows",
+      "expression": "entry.get(\"weight\", \"\")"
+    },
+    {
+      "line": 298,
+      "end_line": 298,
+      "callee": "entry.get",
+      "enclosing": "_gate_rows",
+      "expression": "entry.get(_WEIGHTED_SCORE_KEY, \"\")"
+    },
+    {
+      "line": 299,
+      "end_line": 299,
+      "callee": "' | '.join",
+      "enclosing": "_gate_rows",
+      "expression": "\" | \".join(_md_cell(field) for field in (name, status, weight, weighted))"
+    },
+    {
+      "line": 300,
+      "end_line": 300,
+      "callee": "rows.append",
+      "enclosing": "_gate_rows",
+      "expression": "rows.append(f\"  | {cells} |\")"
+    },
+    {
+      "line": 302,
+      "end_line": 302,
+      "callee": "rows.append",
+      "enclosing": "_gate_rows",
+      "expression": "rows.append(f\"  | {_md_cell(name)} | {_md_cell(entry)} | | |\")"
+    },
+    {
+      "line": 329,
+      "end_line": 329,
+      "callee": "(pair.finding.title or pair.row.finding_title or '').strip",
+      "enclosing": "_ftitle",
+      "expression": "(pair.finding.title or pair.row.finding_title or \"\").strip()"
+    },
+    {
+      "line": 334,
+      "end_line": 334,
+      "callee": "len",
+      "enclosing": "_only",
+      "expression": "len(pairs)"
+    },
+    {
+      "line": 339,
+      "end_line": 339,
+      "callee": "title.strip",
+      "enclosing": "_best_md_match",
+      "expression": "title.strip()"
+    },
+    {
+      "line": 357,
+      "end_line": 357,
+      "callee": "heading_match.start",
+      "enclosing": "_augment_md",
+      "expression": "heading_match.start()"
+    },
+    {
+      "line": 357,
+      "end_line": 357,
+      "callee": "len",
+      "enclosing": "_augment_md",
+      "expression": "len(text)"
+    },
+    {
+      "line": 361,
+      "end_line": 361,
+      "callee": "heading_match.end",
+      "enclosing": "_augment_md",
+      "expression": "heading_match.end()"
+    },
+    {
+      "line": 362,
+      "end_line": 362,
+      "callee": "cut.start",
+      "enclosing": "_augment_md",
+      "expression": "cut.start()"
+    },
+    {
+      "line": 363,
+      "end_line": 363,
+      "callee": "heading_match.group",
+      "enclosing": "_augment_md",
+      "expression": "heading_match.group(1)"
+    },
+    {
+      "line": 364,
+      "end_line": 364,
+      "callee": "_augment_segment",
+      "enclosing": "_augment_md",
+      "expression": "_augment_segment(text[start:seg_end], pair)"
+    },
+    {
+      "line": 96,
+      "end_line": 96,
+      "callee": "Path(report_md).with_suffix",
+      "enclosing": "_locate_combined_report",
+      "expression": "Path(report_md).with_suffix(\".md\")"
+    },
+    {
+      "line": 98,
+      "end_line": 98,
+      "callee": "md.exists",
+      "enclosing": "_locate_combined_report",
+      "expression": "md.exists()"
+    },
+    {
+      "line": 98,
+      "end_line": 98,
+      "callee": "sarif.exists",
+      "enclosing": "_locate_combined_report",
+      "expression": "sarif.exists()"
+    },
+    {
+      "line": 219,
+      "end_line": 219,
+      "callee": "result_identifies",
+      "enclosing": "_match_sarif",
+      "expression": "result_identifies(r, case_id)"
+    },
+    {
+      "line": 267,
+      "end_line": 267,
+      "callee": "text.rstrip",
+      "enclosing": "_trim_dangling_escape",
+      "expression": "text.rstrip(\"\\\\\")"
+    },
+    {
+      "line": 310,
+      "end_line": 310,
+      "callee": "_status_word",
+      "enclosing": "_md_validation_section",
+      "expression": "_status_word(result, session_failed=session_failed)"
+    },
+    {
+      "line": 342,
+      "end_line": 342,
+      "callee": "_ftitle",
+      "enclosing": "_best_md_match",
+      "expression": "_ftitle(pair)"
+    },
+    {
+      "line": 375,
+      "end_line": 375,
+      "callee": "stripped.rstrip",
+      "enclosing": "_augment_segment",
+      "expression": "stripped.rstrip()"
+    },
+    {
+      "line": 74,
+      "end_line": 74,
+      "callee": "type",
+      "enclosing": "augment_reports",
+      "expression": "type(exc)"
+    },
+    {
+      "line": 196,
+      "end_line": 196,
+      "callee": "_message_text",
+      "enclosing": "_match_by_title",
+      "expression": "_message_text(result)"
+    },
+    {
+      "line": 218,
+      "end_line": 218,
+      "callee": "result_fingerprint",
+      "enclosing": "_match_sarif",
+      "expression": "result_fingerprint(r)"
+    },
+    {
+      "line": 248,
+      "end_line": 248,
+      "callee": "len",
+      "enclosing": "_augment_sarif",
+      "expression": "len(pairs)"
+    },
+    {
+      "line": 299,
+      "end_line": 299,
+      "callee": "_md_cell",
+      "enclosing": "_gate_rows",
+      "expression": "_md_cell(field)"
+    },
+    {
+      "line": 318,
+      "end_line": 318,
+      "callee": "_md_escape",
+      "enclosing": "_md_validation_section",
+      "expression": "_md_escape(summary)"
+    },
+    {
+      "line": 96,
+      "end_line": 96,
+      "callee": "Path",
+      "enclosing": "_locate_combined_report",
+      "expression": "Path(report_md)"
+    },
+    {
+      "line": 302,
+      "end_line": 302,
+      "callee": "_md_cell",
+      "enclosing": "_gate_rows",
+      "expression": "_md_cell(name)"
+    },
+    {
+      "line": 302,
+      "end_line": 302,
+      "callee": "_md_cell",
+      "enclosing": "_gate_rows",
+      "expression": "_md_cell(entry)"
+    },
+    {
+      "line": 347,
+      "end_line": 347,
+      "callee": "_ftitle",
+      "enclosing": "_best_md_match",
+      "expression": "_ftitle(pair)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 16,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 18,
+      "source_expression": "import json",
+      "targets": [
+        "json"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "import re",
+      "targets": [
+        "re"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "from collections.abc import Mapping",
+      "targets": [
+        "collections.abc",
+        "collections.abc.Mapping"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "from pathlib import Path",
+      "targets": [
+        "pathlib",
+        "pathlib.Path"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "from typing import TYPE_CHECKING, cast",
+      "targets": [
+        "typing",
+        "typing.TYPE_CHECKING",
+        "typing.cast"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 25,
+      "source_expression": "from vvaharness.models import _MD_INVISIBLE_RX, _MD_LINEBREAK_RX",
+      "targets": [
+        "vvaharness.models",
+        "vvaharness.models._MD_INVISIBLE_RX",
+        "vvaharness.models._MD_LINEBREAK_RX"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 28,
+      "source_expression": "from vvaharness.pipeline.stages.s9.typed_sarif import FINGERPRINT_KEY, record_result_block, result_fingerprint, result_identifies",
+      "targets": [
+        "vvaharness.pipeline.stages.s9.typed_sarif",
+        "vvaharness.pipeline.stages.s9.typed_sarif.FINGERPRINT_KEY",
+        "vvaharness.pipeline.stages.s9.typed_sarif.record_result_block",
+        "vvaharness.pipeline.stages.s9.typed_sarif.result_fingerprint",
+        "vvaharness.pipeline.stages.s9.typed_sarif.result_identifies"
+      ],
+      "local_source_paths": [
+        "vvaharness/pipeline/stages/s9/typed_sarif.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 34,
+      "source_expression": "from vvaharness.util import console, logs",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.console",
+        "vvaharness.util.logs"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/console.py",
+        "vvaharness/util/logs.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 35,
+      "source_expression": "from vvaharness.validation.constants.artifacts import REMEDIATION_DIRNAME, SCAN_REPORT_GLOB",
+      "targets": [
+        "vvaharness.validation.constants.artifacts",
+        "vvaharness.validation.constants.artifacts.REMEDIATION_DIRNAME",
+        "vvaharness.validation.constants.artifacts.SCAN_REPORT_GLOB"
+      ],
+      "local_source_paths": [
+        "vvaharness/validation/constants/artifacts.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 39,
+      "source_expression": "from vvaharness.validation.models.results import SarifLocation",
+      "targets": [
+        "vvaharness.validation.models.results",
+        "vvaharness.validation.models.results.SarifLocation"
+      ],
+      "local_source_paths": [
+        "vvaharness/validation/models/results.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 40,
+      "source_expression": "from vvaharness.validation.report.models import CombinedReportPaths, SarifResult, SarifValidationBlock, ValidatedFinding",
+      "targets": [
+        "vvaharness.validation.report.models",
+        "vvaharness.validation.report.models.CombinedReportPaths",
+        "vvaharness.validation.report.models.SarifResult",
+        "vvaharness.validation.report.models.SarifValidationBlock",
+        "vvaharness.validation.report.models.ValidatedFinding"
+      ],
+      "local_source_paths": [
+        "vvaharness/validation/report/models.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 48,
+      "source_expression": "from vvaharness.models import Finding",
+      "targets": [
+        "vvaharness.models",
+        "vvaharness.models.Finding"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 49,
+      "source_expression": "from vvaharness.validation.models import ValidationResult",
+      "targets": [
+        "vvaharness.validation.models",
+        "vvaharness.validation.models.ValidationResult"
+      ],
+      "local_source_paths": [
+        "vvaharness/validation/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

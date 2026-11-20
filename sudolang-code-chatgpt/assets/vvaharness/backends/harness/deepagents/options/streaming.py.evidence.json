@@ -1,0 +1,1438 @@
+{
+  "source": "vvaharness/backends/harness/deepagents/options/streaming.py",
+  "sha256": "2285a52dd5871f083c49dce08b0d05cba4468627e0e20a5d72b3d70ea6cb1a69",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Streaming (multi-turn) graph compilation and its public entry point.\"\"\"\n\nfrom __future__ import annotations\n\nimport os\nimport threading\nfrom typing import TYPE_CHECKING\n\nfrom langgraph.graph.state import CompiledStateGraph\n\nfrom vvaharness.backends.harness.deepagents.force_verdict_only import ForceVerdictOnly\nfrom vvaharness.backends.harness.deepagents.limits import RECURSION_HEADROOM\nfrom vvaharness.backends.harness.deepagents.models import (\n    ALL_NATIVE_TOOLS,\n    SUBAGENT_DISPATCH_TOOL,\n    CompiledGraph,\n    SubagentSpec,\n)\nfrom vvaharness.backends.harness.deepagents.options.filesystem import (\n    _filesystem_permissions,\n    _session_backend,\n    _skill_sources,\n)\nfrom vvaharness.backends.harness.deepagents.options.graph_builder import _create_agent\nfrom vvaharness.backends.harness.deepagents.options.response_format import _response_format\nfrom vvaharness.backends.harness.deepagents.options.subagents import (\n    _build_session_tools,\n    _tool_policy,\n    get_subagent_specs,\n)\nfrom vvaharness.backends.harness.deepagents.tools import session_tool_names\nfrom vvaharness.backends.harness.models import READ_TOOLS, StreamingOptions\n\nif TYPE_CHECKING:\n    from langchain_core.tools import BaseTool\n\n\ndef build_subagents(options: StreamingOptions) -> list[SubagentSpec]:\n    \"\"\"Return native DeepAgents subagent specs for the streaming parent.\"\"\"\n    return get_subagent_specs(options)\n\n\ndef _middleware_tool_names(options: StreamingOptions) -> frozenset[str]:\n    \"\"\"Tool names contributed by the caller's middleware (langchain's `AgentMiddleware.tools`).\"\"\"\n    names: set[str] = set()\n    for mw in options.parent_middleware:\n        names.update(t.name for t in getattr(mw, \"tools\", ()) or ())\n    return frozenset(names)\n\n\ndef _permitted_tool_calls(\n    options: StreamingOptions, session_tools: list[BaseTool]\n) -> frozenset[str] | None:\n    \"\"\"Executor-permitted tool names: the caller's set, its session tools, its middleware's tools.\"\"\"\n    if options.permitted_tool_calls is None:\n        return None\n    permitted = (options.permitted_tool_calls | session_tool_names(session_tools)\n                 | _middleware_tool_names(options))\n    if options.agents:\n        permitted |= frozenset({SUBAGENT_DISPATCH_TOOL})\n    return permitted\n\n\ndef _extra_excluded_tools(options: StreamingOptions) -> frozenset[str] | None:\n    \"\"\"Advertisement counterpart of the executor gate: un-offer what it refuses.\"\"\"\n    # From the SAME permitted_tool_calls as PermitTools so the two cannot drift; advertising only\n    if options.permitted_tool_calls is None:\n        return None\n    excluded = ALL_NATIVE_TOOLS - options.permitted_tool_calls\n    if options.agents:\n        return excluded\n    return excluded | frozenset({SUBAGENT_DISPATCH_TOOL})\n\n\ndef _build_streaming_graph(options: StreamingOptions) -> CompiledStateGraph:\n    \"\"\"Compile the parent agent graph and its declarative subagents.\"\"\"\n    subagent_specs = build_subagents(options)\n    # The orchestrator only gets read tools; it dispatches subagents via the auto-added task() tool.\n    parent_tools = tuple(t for t in _tool_policy(options).allowed_tools if t in READ_TOOLS)\n    tools = _build_session_tools(options, parent_tools)\n    return _create_agent(\n        model_id=options.model,\n        env=options.env,\n        think_in_prompt=options.think_in_prompt,\n        system_prompt=options.system_prompt,\n        tools=tools,\n        name=options.graph_name,\n        skills=_skill_sources(options.skill_root, options.cwd),\n        permissions=_filesystem_permissions(options),\n        model_provider=options.model_provider,\n        redact_reads=bool(subagent_specs) or not options.allow_writes,\n        backend=_session_backend(options),\n        response_model=options.response_model,\n        response_format=_response_format(\n            options.response_model, options.model, options.model_provider,\n        ),\n        subagents=subagent_specs,\n        # None (S10/S11 and every non-opted-in caller) adds no exclusion and installs no gate.\n        extra_excluded_tools=_extra_excluded_tools(options),\n        permitted_tool_calls=_permitted_tool_calls(options, tools),\n        # None (the frozen S10/S11 defaults) keeps the model's own ceiling.\n        max_output_tokens=options.max_output_tokens,\n        output_cap=options.output_cap,\n        cache_markers=options.cache_markers,\n        # Agentic sessions re-read the marked tail every turn; keep it on.\n        cache_tail=True,\n        parent_middleware=(*options.parent_middleware,\n                           *((ForceVerdictOnly(),) if options.force_verdict_only else ())),\n        effort=options.effort,\n        use_responses_api=options.use_responses_api,\n    )\n\n\n#: session_id -> the compiled graph built for it, so a resume reaches the SAME MemorySaver.\n_SESSIONS: dict[str, CompiledGraph] = {}\n_SESSIONS_LOCK = threading.Lock()\n\n\ndef build_streaming_agent(options: StreamingOptions) -> CompiledGraph:\n    \"\"\"Return a compiled parent graph and its LangGraph invoke config.\"\"\"\n    graph = _build_streaming_graph(options)\n    # Generous headroom: LangGraph ticks the recursion limit per node, not per parallel batch.\n    compiled = CompiledGraph(\n        graph=graph,\n        config={\n            \"configurable\": {\"thread_id\": options.session_id or os.urandom(8).hex()},\n            \"recursion_limit\": (options.max_turns or 50) + RECURSION_HEADROOM,\n        },\n    )\n    if options.session_id:\n        # Held so resume_streaming can re-enter this graph: the conversation lives in its\n        # MemorySaver, keyed by thread_id, and dies with the graph object.\n        with _SESSIONS_LOCK:\n            _SESSIONS[options.session_id] = compiled\n    return compiled\n\n\ndef resumable(session_id: str) -> CompiledGraph | None:\n    \"\"\"The compiled graph still holding *session_id*'s conversation, or None once released.\"\"\"\n    with _SESSIONS_LOCK:\n        return _SESSIONS.get(session_id)\n\n\ndef release_session(session_id: str) -> None:\n    \"\"\"Drop *session_id*'s graph so its checkpointed conversation can be collected.\"\"\"\n    with _SESSIONS_LOCK:\n        _SESSIONS.pop(session_id, None)\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/backends/harness/deepagents/options/streaming.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "Streaming (multi-turn) graph compilation and its public entry point.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_53_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/streaming.py",
+      "line_start": 53,
+      "line_end": 53,
+      "value": "Return native DeepAgents subagent specs for the streaming parent.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_58_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/streaming.py",
+      "line_start": 58,
+      "line_end": 58,
+      "value": "Tool names contributed by the caller's middleware (langchain's `AgentMiddleware.tools`).",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_68_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/streaming.py",
+      "line_start": 68,
+      "line_end": 68,
+      "value": "Executor-permitted tool names: the caller's set, its session tools, its middleware's tools.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_79_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/streaming.py",
+      "line_start": 79,
+      "line_end": 79,
+      "value": "Advertisement counterpart of the executor gate: un-offer what it refuses.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_90_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/streaming.py",
+      "line_start": 90,
+      "line_end": 90,
+      "value": "Compile the parent agent graph and its declarative subagents.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_134_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/streaming.py",
+      "line_start": 134,
+      "line_end": 134,
+      "value": "Return a compiled parent graph and its LangGraph invoke config.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_153_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/streaming.py",
+      "line_start": 153,
+      "line_end": 153,
+      "value": "The compiled graph still holding *session_id*'s conversation, or None once released.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_159_4": {
+      "source": "vvaharness/backends/harness/deepagents/options/streaming.py",
+      "line_start": 159,
+      "line_end": 159,
+      "value": "Drop *session_id*'s graph so its checkpointed conversation can be collected.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "Streaming (multi-turn) graph compilation and its public entry point.",
+      "context": "literal"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 4,
+      "value": "Return native DeepAgents subagent specs for the streaming parent.",
+      "context": "literal"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 4,
+      "value": "Tool names contributed by the caller's middleware (langchain's `AgentMiddleware.tools`).",
+      "context": "literal"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 4,
+      "value": "Executor-permitted tool names: the caller's set, its session tools, its middleware's tools.",
+      "context": "literal"
+    },
+    {
+      "line_start": 79,
+      "line_end": 79,
+      "column": 4,
+      "value": "Advertisement counterpart of the executor gate: un-offer what it refuses.",
+      "context": "literal"
+    },
+    {
+      "line_start": 90,
+      "line_end": 90,
+      "column": 4,
+      "value": "Compile the parent agent graph and its declarative subagents.",
+      "context": "literal"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 4,
+      "value": "Return a compiled parent graph and its LangGraph invoke config.",
+      "context": "literal"
+    },
+    {
+      "line_start": 153,
+      "line_end": 153,
+      "column": 4,
+      "value": "The compiled graph still holding *session_id*'s conversation, or None once released.",
+      "context": "literal"
+    },
+    {
+      "line_start": 159,
+      "line_end": 159,
+      "column": 4,
+      "value": "Drop *session_id*'s graph so its checkpointed conversation can be collected.",
+      "context": "literal"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 12,
+      "value": "configurable",
+      "context": "literal"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 12,
+      "value": "recursion_limit",
+      "context": "literal"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 29,
+      "value": "thread_id",
+      "context": "literal"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 49,
+      "value": "tools",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 80,
+      "text": "# From the SAME permitted_tool_calls as PermitTools so the two cannot drift; advertising only"
+    },
+    {
+      "line": 92,
+      "text": "# The orchestrator only gets read tools; it dispatches subagents via the auto-added task() tool."
+    },
+    {
+      "line": 112,
+      "text": "# None (S10/S11 and every non-opted-in caller) adds no exclusion and installs no gate."
+    },
+    {
+      "line": 115,
+      "text": "# None (the frozen S10/S11 defaults) keeps the model's own ceiling."
+    },
+    {
+      "line": 119,
+      "text": "# Agentic sessions re-read the marked tail every turn; keep it on."
+    },
+    {
+      "line": 128,
+      "text": "#: session_id -> the compiled graph built for it, so a resume reaches the SAME MemorySaver."
+    },
+    {
+      "line": 136,
+      "text": "# Generous headroom: LangGraph ticks the recursion limit per node, not per parallel batch."
+    },
+    {
+      "line": 145,
+      "text": "# Held so resume_streaming can re-enter this graph: the conversation lives in its"
+    },
+    {
+      "line": 146,
+      "text": "# MemorySaver, keyed by thread_id, and dies with the graph object."
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 23,
+      "line_end": 23,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 26,
+      "line_end": 26,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 27,
+      "line_end": 32,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 33,
+      "line_end": 37,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 38,
+      "line_end": 38,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 39,
+      "line_end": 39,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 40,
+      "line_end": 44,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 45,
+      "line_end": 45,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 46,
+      "line_end": 46,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "If",
+      "line_start": 48,
+      "line_end": 49,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 7
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 49,
+      "line_end": 49,
+      "column": 4,
+      "owner": "module initialization",
+      "representation_line": 10
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 52,
+      "line_end": 54,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 12
+    },
+    {
+      "kind": "Expr",
+      "line_start": 53,
+      "line_end": 53,
+      "column": 4,
+      "owner": "build_subagents",
+      "representation_line": 18
+    },
+    {
+      "kind": "Return",
+      "line_start": 54,
+      "line_end": 54,
+      "column": 4,
+      "owner": "build_subagents",
+      "representation_line": 19
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 57,
+      "line_end": 62,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 23
+    },
+    {
+      "kind": "Expr",
+      "line_start": 58,
+      "line_end": 58,
+      "column": 4,
+      "owner": "_middleware_tool_names",
+      "representation_line": 29
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 59,
+      "line_end": 59,
+      "column": 4,
+      "owner": "_middleware_tool_names",
+      "representation_line": 29
+    },
+    {
+      "kind": "For",
+      "line_start": 60,
+      "line_end": 61,
+      "column": 4,
+      "owner": "_middleware_tool_names",
+      "representation_line": 30
+    },
+    {
+      "kind": "Expr",
+      "line_start": 61,
+      "line_end": 61,
+      "column": 8,
+      "owner": "_middleware_tool_names",
+      "representation_line": 33
+    },
+    {
+      "kind": "Return",
+      "line_start": 62,
+      "line_end": 62,
+      "column": 4,
+      "owner": "_middleware_tool_names",
+      "representation_line": 35
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 65,
+      "line_end": 75,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 39
+    },
+    {
+      "kind": "Expr",
+      "line_start": 68,
+      "line_end": 68,
+      "column": 4,
+      "owner": "_permitted_tool_calls",
+      "representation_line": 45
+    },
+    {
+      "kind": "If",
+      "line_start": 69,
+      "line_end": 70,
+      "column": 4,
+      "owner": "_permitted_tool_calls",
+      "representation_line": 46
+    },
+    {
+      "kind": "Return",
+      "line_start": 70,
+      "line_end": 70,
+      "column": 8,
+      "owner": "_permitted_tool_calls",
+      "representation_line": 48
+    },
+    {
+      "kind": "Assign",
+      "line_start": 71,
+      "line_end": 72,
+      "column": 4,
+      "owner": "_permitted_tool_calls",
+      "representation_line": 52
+    },
+    {
+      "kind": "If",
+      "line_start": 73,
+      "line_end": 74,
+      "column": 4,
+      "owner": "_permitted_tool_calls",
+      "representation_line": 53
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 74,
+      "line_end": 74,
+      "column": 8,
+      "owner": "_permitted_tool_calls",
+      "representation_line": 56
+    },
+    {
+      "kind": "Return",
+      "line_start": 75,
+      "line_end": 75,
+      "column": 4,
+      "owner": "_permitted_tool_calls",
+      "representation_line": 58
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 78,
+      "line_end": 86,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 62
+    },
+    {
+      "kind": "Expr",
+      "line_start": 79,
+      "line_end": 79,
+      "column": 4,
+      "owner": "_extra_excluded_tools",
+      "representation_line": 68
+    },
+    {
+      "kind": "If",
+      "line_start": 81,
+      "line_end": 82,
+      "column": 4,
+      "owner": "_extra_excluded_tools",
+      "representation_line": 69
+    },
+    {
+      "kind": "Return",
+      "line_start": 82,
+      "line_end": 82,
+      "column": 8,
+      "owner": "_extra_excluded_tools",
+      "representation_line": 71
+    },
+    {
+      "kind": "Assign",
+      "line_start": 83,
+      "line_end": 83,
+      "column": 4,
+      "owner": "_extra_excluded_tools",
+      "representation_line": 75
+    },
+    {
+      "kind": "If",
+      "line_start": 84,
+      "line_end": 85,
+      "column": 4,
+      "owner": "_extra_excluded_tools",
+      "representation_line": 76
+    },
+    {
+      "kind": "Return",
+      "line_start": 85,
+      "line_end": 85,
+      "column": 8,
+      "owner": "_extra_excluded_tools",
+      "representation_line": 78
+    },
+    {
+      "kind": "Return",
+      "line_start": 86,
+      "line_end": 86,
+      "column": 4,
+      "owner": "_extra_excluded_tools",
+      "representation_line": 81
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 89,
+      "line_end": 125,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 85
+    },
+    {
+      "kind": "Expr",
+      "line_start": 90,
+      "line_end": 90,
+      "column": 4,
+      "owner": "_build_streaming_graph",
+      "representation_line": 91
+    },
+    {
+      "kind": "Assign",
+      "line_start": 91,
+      "line_end": 91,
+      "column": 4,
+      "owner": "_build_streaming_graph",
+      "representation_line": 91
+    },
+    {
+      "kind": "Assign",
+      "line_start": 93,
+      "line_end": 93,
+      "column": 4,
+      "owner": "_build_streaming_graph",
+      "representation_line": 91
+    },
+    {
+      "kind": "Assign",
+      "line_start": 94,
+      "line_end": 94,
+      "column": 4,
+      "owner": "_build_streaming_graph",
+      "representation_line": 91
+    },
+    {
+      "kind": "Return",
+      "line_start": 95,
+      "line_end": 125,
+      "column": 4,
+      "owner": "_build_streaming_graph",
+      "representation_line": 92
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 129,
+      "line_end": 129,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 97
+    },
+    {
+      "kind": "Assign",
+      "line_start": 130,
+      "line_end": 130,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 97
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 133,
+      "line_end": 149,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 98
+    },
+    {
+      "kind": "Expr",
+      "line_start": 134,
+      "line_end": 134,
+      "column": 4,
+      "owner": "build_streaming_agent",
+      "representation_line": 104
+    },
+    {
+      "kind": "Assign",
+      "line_start": 135,
+      "line_end": 135,
+      "column": 4,
+      "owner": "build_streaming_agent",
+      "representation_line": 104
+    },
+    {
+      "kind": "Assign",
+      "line_start": 137,
+      "line_end": 143,
+      "column": 4,
+      "owner": "build_streaming_agent",
+      "representation_line": 104
+    },
+    {
+      "kind": "If",
+      "line_start": 144,
+      "line_end": 148,
+      "column": 4,
+      "owner": "build_streaming_agent",
+      "representation_line": 105
+    },
+    {
+      "kind": "With",
+      "line_start": 147,
+      "line_end": 148,
+      "column": 8,
+      "owner": "build_streaming_agent",
+      "representation_line": 107
+    },
+    {
+      "kind": "Assign",
+      "line_start": 148,
+      "line_end": 148,
+      "column": 12,
+      "owner": "build_streaming_agent",
+      "representation_line": 110
+    },
+    {
+      "kind": "Return",
+      "line_start": 149,
+      "line_end": 149,
+      "column": 4,
+      "owner": "build_streaming_agent",
+      "representation_line": 114
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 152,
+      "line_end": 155,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 118
+    },
+    {
+      "kind": "Expr",
+      "line_start": 153,
+      "line_end": 153,
+      "column": 4,
+      "owner": "resumable",
+      "representation_line": 124
+    },
+    {
+      "kind": "With",
+      "line_start": 154,
+      "line_end": 155,
+      "column": 4,
+      "owner": "resumable",
+      "representation_line": 125
+    },
+    {
+      "kind": "Return",
+      "line_start": 155,
+      "line_end": 155,
+      "column": 8,
+      "owner": "resumable",
+      "representation_line": 127
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 158,
+      "line_end": 161,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 133
+    },
+    {
+      "kind": "Expr",
+      "line_start": 159,
+      "line_end": 159,
+      "column": 4,
+      "owner": "release_session",
+      "representation_line": 139
+    },
+    {
+      "kind": "With",
+      "line_start": 160,
+      "line_end": 161,
+      "column": 4,
+      "owner": "release_session",
+      "representation_line": 140
+    },
+    {
+      "kind": "Expr",
+      "line_start": 161,
+      "line_end": 161,
+      "column": 8,
+      "owner": "release_session",
+      "representation_line": 143
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 3,
+      "kind": "Name",
+      "original_ast": "Name(id='TYPE_CHECKING', ctx=Load())",
+      "rendered": "TYPE_CHECKING"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='get_subagent_specs', ctx=Load()), args=[Name(id='options', ctx=Load())], keywords=[])",
+      "rendered": "get_subagent_specs(options)"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 14,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='options', ctx=Load()), attr='parent_middleware', ctx=Load())",
+      "rendered": "options.parent_middleware"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='names', ctx=Load()), attr='update', ctx=Load()), args=[GeneratorExp(elt=Attribute(value=Name(id='t', ctx=Load()), attr='name', ctx=Load()), generators=[comprehension(target=Name(id='t', ctx=Store()), iter=BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='mw', ctx=Load()), Constant(value='tools'), Tuple(elts=[], ctx=Load())], keywords=[]), Tuple(elts=[], ctx=Load())]), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "names.update((t.name for t in getattr(mw, 'tools', ()) or ()))"
+    },
+    {
+      "line_start": 62,
+      "line_end": 62,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='frozenset', ctx=Load()), args=[Name(id='names', ctx=Load())], keywords=[])",
+      "rendered": "frozenset(names)"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='options', ctx=Load()), attr='permitted_tool_calls', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "options.permitted_tool_calls is None"
+    },
+    {
+      "line_start": 70,
+      "line_end": 70,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 71,
+      "line_end": 72,
+      "column": 17,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=BinOp(left=Attribute(value=Name(id='options', ctx=Load()), attr='permitted_tool_calls', ctx=Load()), op=BitOr(), right=Call(func=Name(id='session_tool_names', ctx=Load()), args=[Name(id='session_tools', ctx=Load())], keywords=[])), op=BitOr(), right=Call(func=Name(id='_middleware_tool_names', ctx=Load()), args=[Name(id='options', ctx=Load())], keywords=[]))",
+      "rendered": "options.permitted_tool_calls | session_tool_names(session_tools) | _middleware_tool_names(options)"
+    },
+    {
+      "line_start": 73,
+      "line_end": 73,
+      "column": 7,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='options', ctx=Load()), attr='agents', ctx=Load())",
+      "rendered": "options.agents"
+    },
+    {
+      "line_start": 74,
+      "line_end": 74,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='permitted', ctx=Store()), op=BitOr(), value=Call(func=Name(id='frozenset', ctx=Load()), args=[Set(elts=[Name(id='SUBAGENT_DISPATCH_TOOL', ctx=Load())])], keywords=[]))",
+      "rendered": "permitted |= frozenset({SUBAGENT_DISPATCH_TOOL})"
+    },
+    {
+      "line_start": 75,
+      "line_end": 75,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='permitted', ctx=Load())",
+      "rendered": "permitted"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='options', ctx=Load()), attr='permitted_tool_calls', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "options.permitted_tool_calls is None"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 83,
+      "line_end": 83,
+      "column": 15,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Name(id='ALL_NATIVE_TOOLS', ctx=Load()), op=Sub(), right=Attribute(value=Name(id='options', ctx=Load()), attr='permitted_tool_calls', ctx=Load()))",
+      "rendered": "ALL_NATIVE_TOOLS - options.permitted_tool_calls"
+    },
+    {
+      "line_start": 84,
+      "line_end": 84,
+      "column": 7,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='options', ctx=Load()), attr='agents', ctx=Load())",
+      "rendered": "options.agents"
+    },
+    {
+      "line_start": 85,
+      "line_end": 85,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='excluded', ctx=Load())",
+      "rendered": "excluded"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 11,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Name(id='excluded', ctx=Load()), op=BitOr(), right=Call(func=Name(id='frozenset', ctx=Load()), args=[Set(elts=[Name(id='SUBAGENT_DISPATCH_TOOL', ctx=Load())])], keywords=[]))",
+      "rendered": "excluded | frozenset({SUBAGENT_DISPATCH_TOOL})"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='build_subagents', ctx=Load()), args=[Name(id='options', ctx=Load())], keywords=[])",
+      "rendered": "build_subagents(options)"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='tuple', ctx=Load()), args=[GeneratorExp(elt=Name(id='t', ctx=Load()), generators=[comprehension(target=Name(id='t', ctx=Store()), iter=Attribute(value=Call(func=Name(id='_tool_policy', ctx=Load()), args=[Name(id='options', ctx=Load())], keywords=[]), attr='allowed_tools', ctx=Load()), ifs=[Compare(left=Name(id='t', ctx=Load()), ops=[In()], comparators=[Name(id='READ_TOOLS', ctx=Load())])], is_async=0)])], keywords=[])",
+      "rendered": "tuple((t for t in _tool_policy(options).allowed_tools if t in READ_TOOLS))"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_build_session_tools', ctx=Load()), args=[Name(id='options', ctx=Load()), Name(id='parent_tools', ctx=Load())], keywords=[])",
+      "rendered": "_build_session_tools(options, parent_tools)"
+    },
+    {
+      "line_start": 95,
+      "line_end": 125,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_create_agent', ctx=Load()), args=[], keywords=[keyword(arg='model_id', value=Attribute(value=Name(id='options', ctx=Load()), attr='model', ctx=Load())), keyword(arg='env', value=Attribute(value=Name(id='options', ctx=Load()), attr='env', ctx=Load())), keyword(arg='think_in_prompt', value=Attribute(value=Name(id='options', ctx=Load()), attr='think_in_prompt', ctx=Load())), keyword(arg='system_prompt', value=Attribute(value=Name(id='options', ctx=Load()), attr='system_prompt', ctx=Load())), keyword(arg='tools', value=Name(id='tools', ctx=Load())), keyword(arg='name', value=Attribute(value=Name(id='options', ctx=Load()), attr='graph_name', ctx=Load())), keyword(arg='skills', value=Call(func=Name(id='_skill_sources', ctx=Load()), args=[Attribute(value=Name(id='options', ctx=Load()), attr='skill_root', ctx=Load()), Attribute(value=Name(id='options', ctx=Load()), attr='cwd', ctx=Load())], keywords=[])), keyword(arg='permissions', value=Call(func=Name(id='_filesystem_permissions', ctx=Load()), args=[Name(id='options', ctx=Load())], keywords=[])), keyword(arg='model_provider', value=Attribute(value=Name(id='options', ctx=Load()), attr='model_provider', ctx=Load())), keyword(arg='redact_reads', value=BoolOp(op=Or(), values=[Call(func=Name(id='bool', ctx=Load()), args=[Name(id='subagent_specs', ctx=Load())], keywords=[]), UnaryOp(op=Not(), operand=Attribute(value=Name(id='options', ctx=Load()), attr='allow_writes', ctx=Load()))])), keyword(arg='backend', value=Call(func=Name(id='_session_backend', ctx=Load()), args=[Name(id='options', ctx=Load())], keywords=[])), keyword(arg='response_model', value=Attribute(value=Name(id='options', ctx=Load()), attr='response_model', ctx=Load())), keyword(arg='response_format', value=Call(func=Name(id='_response_format', ctx=Load()), args=[Attribute(value=Name(id='options', ctx=Load()), attr='response_model', ctx=Load()), Attribute(value=Name(id='options', ctx=Load()), attr='model', ctx=Load()), Attribute(value=Name(id='options', ctx=Load()), attr='model_provider', ctx=Load())], keywords=[])), keyword(arg='subagents', value=Name(id='subagent_specs', ctx=Load())), keyword(arg='extra_excluded_tools', value=Call(func=Name(id='_extra_excluded_tools', ctx=Load()), args=[Name(id='options', ctx=Load())], keywords=[])), keyword(arg='permitted_tool_calls', value=Call(func=Name(id='_permitted_tool_calls', ctx=Load()), args=[Name(id='options', ctx=Load()), Name(id='tools', ctx=Load())], keywords=[])), keyword(arg='max_output_tokens', value=Attribute(value=Name(id='options', ctx=Load()), attr='max_output_tokens', ctx=Load())), keyword(arg='output_cap', value=Attribute(value=Name(id='options', ctx=Load()), attr='output_cap', ctx=Load())), keyword(arg='cache_markers', value=Attribute(value=Name(id='options', ctx=Load()), attr='cache_markers', ctx=Load())), keyword(arg='cache_tail', value=Constant(value=True)), keyword(arg='parent_middleware', value=Tuple(elts=[Starred(value=Attribute(value=Name(id='options', ctx=Load()), attr='parent_middleware', ctx=Load()), ctx=Load()), Starred(value=IfExp(test=Attribute(value=Name(id='options', ctx=Load()), attr='force_verdict_only', ctx=Load()), body=Tuple(elts=[Call(func=Name(id='ForceVerdictOnly', ctx=Load()), args=[], keywords=[])], ctx=Load()), orelse=Tuple(elts=[], ctx=Load())), ctx=Load())], ctx=Load())), keyword(arg='effort', value=Attribute(value=Name(id='options', ctx=Load()), attr='effort', ctx=Load())), keyword(arg='use_responses_api', value=Attribute(value=Name(id='options', ctx=Load()), attr='use_responses_api', ctx=Load()))])",
+      "rendered": "_create_agent(model_id=options.model, env=options.env, think_in_prompt=options.think_in_prompt, system_prompt=options.system_prompt, tools=tools, name=options.graph_name, skills=_skill_sources(options.skill_root, options.cwd), permissions=_filesystem_permissions(options), model_provider=options.model_provider, redact_reads=bool(subagent_specs) or not options.allow_writes, backend=_session_backend(options), response_model=options.response_model, response_format=_response_format(options.response_model, options.model, options.model_provider), subagents=subagent_specs, extra_excluded_tools=_extra_excluded_tools(options), permitted_tool_calls=_permitted_tool_calls(options, tools), max_output_tokens=options.max_output_tokens, output_cap=options.output_cap, cache_markers=options.cache_markers, cache_tail=True, parent_middleware=(*options.parent_middleware, *((ForceVerdictOnly(),) if options.force_verdict_only else ())), effort=options.effort, use_responses_api=options.use_responses_api)"
+    },
+    {
+      "line_start": 129,
+      "line_end": 129,
+      "column": 38,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='threading', ctx=Load()), attr='Lock', ctx=Load()), args=[], keywords=[])",
+      "rendered": "threading.Lock()"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_build_streaming_graph', ctx=Load()), args=[Name(id='options', ctx=Load())], keywords=[])",
+      "rendered": "_build_streaming_graph(options)"
+    },
+    {
+      "line_start": 137,
+      "line_end": 143,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='CompiledGraph', ctx=Load()), args=[], keywords=[keyword(arg='graph', value=Name(id='graph', ctx=Load())), keyword(arg='config', value=Dict(keys=[Constant(value='configurable'), Constant(value='recursion_limit')], values=[Dict(keys=[Constant(value='thread_id')], values=[BoolOp(op=Or(), values=[Attribute(value=Name(id='options', ctx=Load()), attr='session_id', ctx=Load()), Call(func=Attribute(value=Call(func=Attribute(value=Name(id='os', ctx=Load()), attr='urandom', ctx=Load()), args=[Constant(value=8)], keywords=[]), attr='hex', ctx=Load()), args=[], keywords=[])])]), BinOp(left=BoolOp(op=Or(), values=[Attribute(value=Name(id='options', ctx=Load()), attr='max_turns', ctx=Load()), Constant(value=50)]), op=Add(), right=Name(id='RECURSION_HEADROOM', ctx=Load()))]))])",
+      "rendered": "CompiledGraph(graph=graph, config={'configurable': {'thread_id': options.session_id or os.urandom(8).hex()}, 'recursion_limit': (options.max_turns or 50) + RECURSION_HEADROOM})"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 7,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='options', ctx=Load()), attr='session_id', ctx=Load())",
+      "rendered": "options.session_id"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 13,
+      "kind": "Name",
+      "original_ast": "Name(id='_SESSIONS_LOCK', ctx=Load())",
+      "rendered": "_SESSIONS_LOCK"
+    },
+    {
+      "line_start": 148,
+      "line_end": 148,
+      "column": 44,
+      "kind": "Name",
+      "original_ast": "Name(id='compiled', ctx=Load())",
+      "rendered": "compiled"
+    },
+    {
+      "line_start": 149,
+      "line_end": 149,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='compiled', ctx=Load())",
+      "rendered": "compiled"
+    },
+    {
+      "line_start": 154,
+      "line_end": 154,
+      "column": 9,
+      "kind": "Name",
+      "original_ast": "Name(id='_SESSIONS_LOCK', ctx=Load())",
+      "rendered": "_SESSIONS_LOCK"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_SESSIONS', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='session_id', ctx=Load())], keywords=[])",
+      "rendered": "_SESSIONS.get(session_id)"
+    },
+    {
+      "line_start": 160,
+      "line_end": 160,
+      "column": 9,
+      "kind": "Name",
+      "original_ast": "Name(id='_SESSIONS_LOCK', ctx=Load())",
+      "rendered": "_SESSIONS_LOCK"
+    },
+    {
+      "line_start": 161,
+      "line_end": 161,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_SESSIONS', ctx=Load()), attr='pop', ctx=Load()), args=[Name(id='session_id', ctx=Load()), Constant(value=None)], keywords=[])",
+      "rendered": "_SESSIONS.pop(session_id, None)"
+    }
+  ],
+  "calls": [
+    {
+      "line": 130,
+      "end_line": 130,
+      "callee": "threading.Lock",
+      "enclosing": "module initialization",
+      "expression": "threading.Lock()"
+    },
+    {
+      "line": 54,
+      "end_line": 54,
+      "callee": "get_subagent_specs",
+      "enclosing": "build_subagents",
+      "expression": "get_subagent_specs(options)"
+    },
+    {
+      "line": 59,
+      "end_line": 59,
+      "callee": "set",
+      "enclosing": "_middleware_tool_names",
+      "expression": "set()"
+    },
+    {
+      "line": 62,
+      "end_line": 62,
+      "callee": "frozenset",
+      "enclosing": "_middleware_tool_names",
+      "expression": "frozenset(names)"
+    },
+    {
+      "line": 91,
+      "end_line": 91,
+      "callee": "build_subagents",
+      "enclosing": "_build_streaming_graph",
+      "expression": "build_subagents(options)"
+    },
+    {
+      "line": 93,
+      "end_line": 93,
+      "callee": "tuple",
+      "enclosing": "_build_streaming_graph",
+      "expression": "tuple(t for t in _tool_policy(options).allowed_tools if t in READ_TOOLS)"
+    },
+    {
+      "line": 94,
+      "end_line": 94,
+      "callee": "_build_session_tools",
+      "enclosing": "_build_streaming_graph",
+      "expression": "_build_session_tools(options, parent_tools)"
+    },
+    {
+      "line": 95,
+      "end_line": 125,
+      "callee": "_create_agent",
+      "enclosing": "_build_streaming_graph",
+      "expression": "_create_agent(\n        model_id=options.model,\n        env=options.env,\n        think_in_prompt=options.think_in_prompt,\n        system_prompt=options.system_prompt,\n        tools=tools,\n        name=options.graph_name,\n        skills=_skill_sources(options.skill_root, options.cwd),\n        permissions=_filesystem_permissions(options),\n        model_provider=options.model_provider,\n        redact_reads=bool(subagent_specs) or not options.allow_writes,\n        backend=_session_backend(options),\n        response_model=options.response_model,\n        response_format=_response_format(\n            options.response_model, options.model, options.model_provider,\n        ),\n        subagents=subagent_specs,\n        # None (S10/S11 and every non-opted-in caller) adds no exclusion and installs no gate.\n        extra_excluded_tools=_extra_excluded_tools(options),\n        permitted_tool_calls=_permitted_tool_calls(options, tools),\n        # None (the frozen S10/S11 defaults) keeps the model's own ceiling.\n        max_output_tokens=options.max_output_tokens,\n        output_cap=options.output_cap,\n        cache_markers=options.cache_markers,\n        # Agentic sessions re-read the marked tail every turn; keep it on.\n        cache_tail=True,\n        parent_middleware=(*options.parent_middleware,\n                           *((ForceVerdictOnly(),) if options.force_verdict_only else ())),\n        effort=options.effort,\n        use_responses_api=options.use_responses_api,\n    )"
+    },
+    {
+      "line": 135,
+      "end_line": 135,
+      "callee": "_build_streaming_graph",
+      "enclosing": "build_streaming_agent",
+      "expression": "_build_streaming_graph(options)"
+    },
+    {
+      "line": 137,
+      "end_line": 143,
+      "callee": "CompiledGraph",
+      "enclosing": "build_streaming_agent",
+      "expression": "CompiledGraph(\n        graph=graph,\n        config={\n            \"configurable\": {\"thread_id\": options.session_id or os.urandom(8).hex()},\n            \"recursion_limit\": (options.max_turns or 50) + RECURSION_HEADROOM,\n        },\n    )"
+    },
+    {
+      "line": 61,
+      "end_line": 61,
+      "callee": "names.update",
+      "enclosing": "_middleware_tool_names",
+      "expression": "names.update(t.name for t in getattr(mw, \"tools\", ()) or ())"
+    },
+    {
+      "line": 72,
+      "end_line": 72,
+      "callee": "_middleware_tool_names",
+      "enclosing": "_permitted_tool_calls",
+      "expression": "_middleware_tool_names(options)"
+    },
+    {
+      "line": 74,
+      "end_line": 74,
+      "callee": "frozenset",
+      "enclosing": "_permitted_tool_calls",
+      "expression": "frozenset({SUBAGENT_DISPATCH_TOOL})"
+    },
+    {
+      "line": 86,
+      "end_line": 86,
+      "callee": "frozenset",
+      "enclosing": "_extra_excluded_tools",
+      "expression": "frozenset({SUBAGENT_DISPATCH_TOOL})"
+    },
+    {
+      "line": 155,
+      "end_line": 155,
+      "callee": "_SESSIONS.get",
+      "enclosing": "resumable",
+      "expression": "_SESSIONS.get(session_id)"
+    },
+    {
+      "line": 161,
+      "end_line": 161,
+      "callee": "_SESSIONS.pop",
+      "enclosing": "release_session",
+      "expression": "_SESSIONS.pop(session_id, None)"
+    },
+    {
+      "line": 71,
+      "end_line": 71,
+      "callee": "session_tool_names",
+      "enclosing": "_permitted_tool_calls",
+      "expression": "session_tool_names(session_tools)"
+    },
+    {
+      "line": 102,
+      "end_line": 102,
+      "callee": "_skill_sources",
+      "enclosing": "_build_streaming_graph",
+      "expression": "_skill_sources(options.skill_root, options.cwd)"
+    },
+    {
+      "line": 103,
+      "end_line": 103,
+      "callee": "_filesystem_permissions",
+      "enclosing": "_build_streaming_graph",
+      "expression": "_filesystem_permissions(options)"
+    },
+    {
+      "line": 106,
+      "end_line": 106,
+      "callee": "_session_backend",
+      "enclosing": "_build_streaming_graph",
+      "expression": "_session_backend(options)"
+    },
+    {
+      "line": 108,
+      "end_line": 110,
+      "callee": "_response_format",
+      "enclosing": "_build_streaming_graph",
+      "expression": "_response_format(\n            options.response_model, options.model, options.model_provider,\n        )"
+    },
+    {
+      "line": 113,
+      "end_line": 113,
+      "callee": "_extra_excluded_tools",
+      "enclosing": "_build_streaming_graph",
+      "expression": "_extra_excluded_tools(options)"
+    },
+    {
+      "line": 114,
+      "end_line": 114,
+      "callee": "_permitted_tool_calls",
+      "enclosing": "_build_streaming_graph",
+      "expression": "_permitted_tool_calls(options, tools)"
+    },
+    {
+      "line": 105,
+      "end_line": 105,
+      "callee": "bool",
+      "enclosing": "_build_streaming_graph",
+      "expression": "bool(subagent_specs)"
+    },
+    {
+      "line": 93,
+      "end_line": 93,
+      "callee": "_tool_policy",
+      "enclosing": "_build_streaming_graph",
+      "expression": "_tool_policy(options)"
+    },
+    {
+      "line": 61,
+      "end_line": 61,
+      "callee": "getattr",
+      "enclosing": "_middleware_tool_names",
+      "expression": "getattr(mw, \"tools\", ())"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "os.urandom(8).hex",
+      "enclosing": "build_streaming_agent",
+      "expression": "os.urandom(8).hex()"
+    },
+    {
+      "line": 122,
+      "end_line": 122,
+      "callee": "ForceVerdictOnly",
+      "enclosing": "_build_streaming_graph",
+      "expression": "ForceVerdictOnly()"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "os.urandom",
+      "enclosing": "build_streaming_agent",
+      "expression": "os.urandom(8)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 17,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "import os",
+      "targets": [
+        "os"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "import threading",
+      "targets": [
+        "threading"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "from typing import TYPE_CHECKING",
+      "targets": [
+        "typing",
+        "typing.TYPE_CHECKING"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 23,
+      "source_expression": "from langgraph.graph.state import CompiledStateGraph",
+      "targets": [
+        "langgraph.graph.state",
+        "langgraph.graph.state.CompiledStateGraph"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 25,
+      "source_expression": "from vvaharness.backends.harness.deepagents.force_verdict_only import ForceVerdictOnly",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.force_verdict_only",
+        "vvaharness.backends.harness.deepagents.force_verdict_only.ForceVerdictOnly"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/force_verdict_only.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 26,
+      "source_expression": "from vvaharness.backends.harness.deepagents.limits import RECURSION_HEADROOM",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.limits",
+        "vvaharness.backends.harness.deepagents.limits.RECURSION_HEADROOM"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/limits.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 27,
+      "source_expression": "from vvaharness.backends.harness.deepagents.models import ALL_NATIVE_TOOLS, SUBAGENT_DISPATCH_TOOL, CompiledGraph, SubagentSpec",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.models",
+        "vvaharness.backends.harness.deepagents.models.ALL_NATIVE_TOOLS",
+        "vvaharness.backends.harness.deepagents.models.SUBAGENT_DISPATCH_TOOL",
+        "vvaharness.backends.harness.deepagents.models.CompiledGraph",
+        "vvaharness.backends.harness.deepagents.models.SubagentSpec"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/models.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 33,
+      "source_expression": "from vvaharness.backends.harness.deepagents.options.filesystem import _filesystem_permissions, _session_backend, _skill_sources",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.options.filesystem",
+        "vvaharness.backends.harness.deepagents.options.filesystem._filesystem_permissions",
+        "vvaharness.backends.harness.deepagents.options.filesystem._session_backend",
+        "vvaharness.backends.harness.deepagents.options.filesystem._skill_sources"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/options/filesystem.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 38,
+      "source_expression": "from vvaharness.backends.harness.deepagents.options.graph_builder import _create_agent",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.options.graph_builder",
+        "vvaharness.backends.harness.deepagents.options.graph_builder._create_agent"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/options/graph_builder.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 39,
+      "source_expression": "from vvaharness.backends.harness.deepagents.options.response_format import _response_format",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.options.response_format",
+        "vvaharness.backends.harness.deepagents.options.response_format._response_format"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/options/response_format.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 40,
+      "source_expression": "from vvaharness.backends.harness.deepagents.options.subagents import _build_session_tools, _tool_policy, get_subagent_specs",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.options.subagents",
+        "vvaharness.backends.harness.deepagents.options.subagents._build_session_tools",
+        "vvaharness.backends.harness.deepagents.options.subagents._tool_policy",
+        "vvaharness.backends.harness.deepagents.options.subagents.get_subagent_specs"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/options/subagents.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 45,
+      "source_expression": "from vvaharness.backends.harness.deepagents.tools import session_tool_names",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.tools",
+        "vvaharness.backends.harness.deepagents.tools.session_tool_names"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/tools.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 46,
+      "source_expression": "from vvaharness.backends.harness.models import READ_TOOLS, StreamingOptions",
+      "targets": [
+        "vvaharness.backends.harness.models",
+        "vvaharness.backends.harness.models.READ_TOOLS",
+        "vvaharness.backends.harness.models.StreamingOptions"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/models.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 49,
+      "source_expression": "from langchain_core.tools import BaseTool",
+      "targets": [
+        "langchain_core.tools",
+        "langchain_core.tools.BaseTool"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    }
+  ]
+}

@@ -1,0 +1,185 @@
+# vvaharness/backends/harness/deepagents/options/model_building.py
+
+Resolves a model id to a chat model for the deepagents backend. Provider routing picks `ForcingChatAnthropic` (Anthropic route) or `ToolCallStateChatOpenAI` (every other route). It also sets the TLS client (CA bundle, mutual TLS, verification), the request timeout scaled by effort, retries, the output-token ceiling, thinking or reasoning-effort settings, the Responses-versus-Chat-Completions transport, and the in-prompt reasoning instruction. Built models are cached per process.
+
+Source: `vvaharness/backends/harness/deepagents/options/model_building.py` (lines 1-627)
+Executor: code
+Called from: `graph_builder.sudo` _create_agent and `subagents.sudo` get_subagent_specs (build_model_cached); `vvaharness/backends/llm/deepagents.py` (tls_carriers_for)
+
+// src: vvaharness/backends/harness/deepagents/options/model_building.py:592-627
+fn build_model_cached(model_id, env, provider?, effort?, use_responses_api?, think_in_prompt=false):executor=code {
+  resolved_transport = resolve_use_responses_api(model_id, provider, use_responses_api)
+  cache_effort = _openai_effort_kwargs(model_id, effort, think_in_prompt, bool(resolved_transport)).reasoning_effort
+  // keyed on the reasoning field actually sent, so a learned rejection produces a new model instead of returning the rejected one
+  key = [ModelKey.of(model_id, env, provider, cache_effort, resolved_transport), _tls_fingerprint(env), think_in_prompt, _loop_token()]
+  // _loop_token: a per-live-event-loop counter (null outside a loop), so Stage 10 and Stage 11, which run one asyncio loop per finding, never reuse a client bound to a closed loop
+  if (key in _model_cache) return _model_cache[key]
+  with _model_cache_lock {   // double-checked
+    if (key in _model_cache) return _model_cache[key]
+    _model_cache[key] = build_model(model_id, env, provider, effort, resolved_transport, think_in_prompt)
+    return _model_cache[key]
+  }
+}
+// preserved: on the Anthropic route the cache key still uses the OpenAI-shaped reasoning_effort derived from effort; the model itself uses thinking kwargs.
+
+// src: vvaharness/backends/harness/deepagents/options/model_building.py:459-521
+fn build_model(model_id, env, provider?, effort?, use_responses_api?, think_in_prompt=false):executor=code {
+  _warn_if_vendor_inferred(model_id, provider)   // once per id, when the id contains "/" and no provider is set
+  think_in_prompt = think_in_prompt && reasons_in_prompt(model_id, provider)
+  anthropic_route = provider_routing.routes_to_anthropic(model_id, provider)
+  // routes_to_anthropic (provider_routing.py:37-42): provider == "anthropic" when a provider is set; otherwise "claude" appears in the lowercased id
+  ssl_context = _ssl_context(env, allow_ambient_ca=!anthropic_route)
+  no_proxy = _config_no_proxy(env)
+  request_timeout = effort_scaled_seconds(MODEL_TIMEOUT_SECONDS, effort, kind=REQUEST)   // anchor 1800.0 seconds (limits.py:33)  // external to this batch: backends/llm/models.py
+
+  if (anthropic_route) {
+    token = anthropic_key(env)
+    chat = ForcingChatAnthropic(model_name=model_id, api_key=token, base_url=anthropic_base(env),
+      timeout=request_timeout,
+      max_retries=MODEL_MAX_RETRIES,                 // 2 (limits.py:39)
+      max_tokens_to_sample=MODEL_MAX_OUTPUT_TOKENS,  // 64000 (limits.py:36)
+      ..._anthropic_thinking_kwargs(effort, in_prompt=think_in_prompt))
+    if (ssl_context != null || is_anthropic_oauth_token(token)) {
+      with scoped_no_proxy_env(no_proxy): _inject_anthropic_clients(chat, ssl_context, token or "", timeout=request_timeout)
+    }
+    return chat
+  }
+
+  // OpenAI-compatible: always inject our own HTTP clients (the library's shared client cache is not event-loop safe)
+  http clients = openai.DefaultHttpxClient / DefaultAsyncHttpxClient(timeout=request_timeout, verify=ssl_context when set), built under scoped_no_proxy_env(no_proxy)
+  resolved_transport = bool(resolve_use_responses_api(model_id, provider, use_responses_api))
+  return ToolCallStateChatOpenAI(model=model_id, api_key=openai_key(env), base_url=openai_base(env),
+    timeout=request_timeout, max_retries=MODEL_MAX_RETRIES,   // 2
+    http_client, http_async_client, http_socket_options=() when the field exists,
+    ..._openai_effort_kwargs(model_id, effort, think_in_prompt, resolved_transport),
+    ..._transport_kwargs(resolved_transport))
+  // preserved: no max_tokens is set on the OpenAI-compatible arm (output uncapped unless CapOutputTokens applies)
+}
+
+// src: vvaharness/backends/harness/deepagents/options/model_building.py:398-408
+fn resolve_use_responses_api(model_id, provider, override?):executor=code {
+  if (routes_to_anthropic(model_id, provider)) return null
+  if (override != null) return override
+  if (_needs_chat_completions(model_id)) return false
+  return model_id not in _CHAT_COMPLETIONS_ONLY_MODELS   // same set object as TRANSPORT_MEMORY.chat_only; learned at runtime
+}
+
+// src: vvaharness/backends/harness/deepagents/options/model_building.py:302-311
+_RESPONSES_BROKEN_MODELS = ["kimi-k2.6", "kimi-k2.7-code", "glm-5.2"]
+fn _needs_chat_completions(model_id):executor=code {
+  return (part of model_id after the last "/", lowercased) in _RESPONSES_BROKEN_MODELS   // their Responses leg caps output at 4096 and drops the tool call
+}
+
+// src: vvaharness/backends/harness/deepagents/options/model_building.py:433-441
+fn _transport_kwargs(resolved):executor=code {
+  if (!resolved) return { use_responses_api: false }
+  return { use_responses_api: true, store: false, include: ["reasoning.encrypted_content"] }
+}
+
+// src: vvaharness/backends/harness/deepagents/options/model_building.py:444-456
+fn _openai_effort_kwargs(model_id, effort, think_in_prompt, resolved_transport):executor=code {
+  if (model_id in EFFORT_REJECTIONS.tools_off && !resolved_transport) return { reasoning_effort: REASONING_OFF }
+  transport = if (resolved_transport) TRANSPORT_RESPONSES else TRANSPORT_CHAT_COMPLETIONS
+  return if (think_in_prompt) _reasoning_off_kwargs(model_id) else _effort_kwargs(model_id, effort, transport)
+}
+
+// src: vvaharness/backends/harness/deepagents/options/model_building.py:319-331, 275-287
+fn _effort_kwargs(model_id, effort, transport):executor=code {
+  if (model_id in EFFORT_REJECTIONS.field) return {}   // the model rejected the field itself
+  mapped = effort_after_rejections(model_id, map effort low|medium|high|xhigh|max to the same literal, transport)   // steps down past tiers learned as rejected, per transport
+  return if (mapped == null) {} else { reasoning_effort: mapped }
+}
+
+// src: vvaharness/backends/harness/deepagents/options/model_building.py:336-350
+_REASONING_OFF_MODELS = ["kimi-k2.6", "kimi-k2.7-code", "glm-5.2"]
+fn _reasoning_off_kwargs(model_id):executor=code {
+  if (model_id not in _REASONING_OFF_MODELS || model_id in EFFORT_REJECTIONS.field) return {}
+  if ([model_id, REASONING_OFF] in EFFORT_REJECTIONS.tiers) return {}
+  return { reasoning_effort: REASONING_OFF }
+}
+
+// src: vvaharness/backends/harness/deepagents/options/model_building.py:385-395, 353-359
+fn _anthropic_thinking_kwargs(effort, in_prompt=false):executor=code {
+  mapped = effort mapped to low|medium|high|xhigh|max, or null when unparseable or absent
+  if (mapped == null) return if (in_prompt) { thinking: { type: "disabled" } } else {}
+  if (in_prompt) return { thinking: { type: "disabled" }, output_config: { effort: mapped } }
+  return { thinking: { type: "adaptive" }, output_config: { effort: mapped } }
+}
+
+// src: vvaharness/backends/harness/deepagents/options/model_building.py:373-382
+_NO_REASON_IN_PROMPT_RX = /claude-(?:sonnet-5-5|opus-5|fable-5)(?!\d)/i
+fn reasons_in_prompt(model_id, provider):executor=code {
+  if (!routes_to_anthropic(model_id, provider)) return true
+  return model_id does not match _NO_REASON_IN_PROMPT_RX   // these models cannot disable thinking and refuse REASON_IN_PROMPT
+}
+
+// prompt-src: vvaharness/backends/harness/deepagents/options/model_building.py:362-368
+REASON_IN_PROMPT {
+  // Appended to the system prompt by graph_builder._create_agent when think_in_prompt && reasons_in_prompt(model_id, provider); replaces native reasoning.
+  Constraints {
+    "REASONING: think it through in writing before you answer."
+    "Name each candidate, the control or framework default that would refute it, and discard what does not hold."
+    "Keep it compact -- no restating the input, no recap of your own steps."
+  }
+}
+
+// src: vvaharness/backends/harness/deepagents/options/model_building.py:212-228
+fn _ssl_context(env, allow_ambient_ca=true):executor=code {
+  verify = _resolve_verify(env, allow_ambient=allow_ambient_ca)
+  cert = _client_cert(env)
+  if (verify == null && cert == null) return null   // stock TLS
+  context = httpx2.create_ssl_context(verify=(verify or true), trust_env=true)
+  if (cert != null && !load_client_chain(context, cert) && verify == null) return null   // a bad client chain warns and falls back to stock when it was the only material
+  return context
+}
+
+// src: vvaharness/backends/harness/deepagents/options/model_building.py:148-158
+fn _resolve_verify(env, allow_ambient):executor=code {
+  verify = _ca_bundle(env, allow_ambient) or _config_verify(env)
+  if (verify == false) { warn_verify_disabled(endpoint); return false }
+  return if (verify is a String) verify else null
+}
+// src: vvaharness/backends/harness/deepagents/options/model_building.py:96-121
+fn _ca_bundle(env, allow_ambient):executor=code {
+  // allow_ambient (OpenAI route): SSL_CERT_FILE, REQUESTS_CA_BUNDLE, NODE_EXTRA_CA_CERTS from env, then the same from the process environment; Anthropic route: env SSL_CERT_FILE only
+  require configured CA file is a file => throw FileNotFoundError("DeepAgents CA bundle not found or not a file: $ca_file")
+  require configured CA directory is a directory => throw FileNotFoundError("DeepAgents CA directory not found or not a directory: $ca_dir")
+  return ca_file or ca_dir
+}
+// src: vvaharness/backends/harness/deepagents/options/model_building.py:124-133
+fn _config_verify(env):executor=code {
+  raw = env[TLS_VERIFY_VAR]
+  if (raw == null) return null
+  if (raw does not start with "vvaharness-config:") { warn AMBIENT_ENV_IGNORED; return null }   // only a config-stamped value can disable verification
+  return coerce_verify(raw without the stamp)
+}
+// src: vvaharness/backends/harness/deepagents/options/model_building.py:89-93, 136-145
+fn _config_no_proxy(env):executor=code { same stamp rule on NO_PROXY_VAR = "VVAHARNESS_NO_PROXY"; empty value gives null }
+
+// src: vvaharness/backends/harness/deepagents/options/model_building.py:231-272
+fn _inject_anthropic_clients(chat, ssl_context, token, timeout=MODEL_TIMEOUT_SECONDS):executor=code {
+  try {
+    params = chat client params; if (is_anthropic_oauth_token(token)) remove api_key   // OAuth replaces api_key; otherwise the explicit key is kept so a blank token fails closed
+    seed chat's sync and async anthropic clients with HTTP clients (timeout, verify=ssl_context when set)
+  }
+  catch error => {
+    undo any partial seed; close the sync HTTP client
+    throw RuntimeError("TLS client injection into ChatAnthropic failed ... Refusing to continue on SYSTEM TRUST ...")   // fails closed, never unpinned
+  }
+}
+
+// src: vvaharness/backends/harness/deepagents/options/model_building.py:180-209
+fn tls_carriers_for(model_id, provider, sdk_cfg, openai_cfg, cfg_dir?):executor=code {
+  // Detection seam only; builds the environment carriers build_model reads, from the sdk block (Anthropic route) or openai block
+  block = if (routes_to_anthropic(model_id, provider)) sdk_cfg else openai_cfg
+  if (block == null) return {}
+  carriers: ca_cert -> SSL_CERT_FILE_VAR; client_cert pair -> TLS_CLIENT_CERT_VAR, TLS_CLIENT_KEY_VAR (paths resolved against cfg_dir through _resolve_against, which refuses UNC paths)
+  if (verify_ssl coerces to something other than null or true) carriers[TLS_VERIFY_VAR] = "vvaharness-config:" + ("false" or resolved CA path)
+  if (block.no_proxy) carriers[NO_PROXY_VAR] = "vvaharness-config:" + block.no_proxy
+  return carriers
+}
+
+// src: vvaharness/backends/harness/deepagents/options/model_building.py:298-300
+_FORCED_TOOL_CHOICE_UNSUPPORTED_MODELS = deepagents.tool_choice_rejection.UNSUPPORTED_MODELS   // same set object; read by response_format._strategy_for, client.py and ForceVerdictOnly
+
+// abstracted: model_building.py:161-177 (_client_cert reads TLS_CLIENT_CERT_VAR / TLS_CLIENT_KEY_VAR from env then process environment and resolves the chain; _resolve_cert_path), 418-430 (_warn_if_vendor_inferred console text), 524-589 (_TLS_ENV_VARS fingerprint and _loop_token bookkeeping as described at build_model_cached). These do not change which model, route or limits are used beyond what is stated.

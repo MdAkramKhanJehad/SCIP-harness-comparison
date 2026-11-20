@@ -1,0 +1,1786 @@
+{
+  "source": "vvaharness/pipeline/stages/s8/window.py",
+  "sha256": "51f8750258a1cd701169b1a605c29b3fd1eed44862f9860fa325c094d4e699c4",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\n\"\"\"Limits the step 8 enrichment call to a deterministic rank prefix of findings plus a same-file pull-in.\"\"\"\nfrom __future__ import annotations\nfrom vvaharness.util import logs\n\nimport json\n\nfrom vvaharness.models import ContextPackage, Finding, Severity\nfrom vvaharness.models.vocab import SEV_RANK\nfrom vvaharness.pipeline.stages.s8.outcomes import (\n    ChainReport,\n    final_severity,\n    offensive_rank,\n)\nfrom vvaharness.pipeline.stages.s8.prompts import (\n    SYSTEM,\n    build_prompt,\n    facts_enabled,\n    finding_block,\n    hop_text_enabled,\n    repo_fact_blocks,\n)\nfrom vvaharness.util.config import knob\nfrom vvaharness.util.counters import COUNTERS\nfrom vvaharness.util.tokens import estimate_tokens\nfrom vvaharness.util.events import Event\n\nlog = logs.get_logger(__name__)\n\n# 100 tok/entry over-prices a typical entry against mid-JSON truncation; the reserve covers rest\n_OUT_RESERVE = 1500\n_TOKENS_PER_ENTRY = 100\n# Schema is outside build_prompt, so an under-estimate over-admits findings; +250 for provider wrap\n_SCHEMA_TOKENS = estimate_tokens(\n    json.dumps(ChainReport.model_json_schema())) + 250\n# The ceiling sits above the typical pull-in overshoot.\n_PULLIN_CEILING = 1.25\n\n_PULLIN_BANDS = (Severity.MEDIUM, Severity.LOW, Severity.INFO)\n\n\ndef _floor_order(findings: list[Finding]) -> list[int]:\n    \"\"\"Returns finding indices ordered by the floor pass's (severity band, OffensivePriority) key, without mutating findings.\"\"\"\n    # Windowing precedes enrichment, so the carried s4 severity is the fallback; INFO would discard\n    return sorted(\n        range(len(findings)),\n        key=lambda i: (SEV_RANK[final_severity(findings[i], findings[i].severity)],\n                       offensive_rank(findings[i])))\n\n\ndef half_window(findings: list[Finding], window: list[int]) -> list[int]:\n    \"\"\"The stronger half of *window*, by the floor pass's rank-prefix order; original indices,\n    sorted. Used for the one resend after an at-cap clip: a smaller input, not a dropped tier.\"\"\"\n    sub = [findings[i] for i in window]\n    order = _floor_order(sub)\n    half_n = max(1, len(order) // 2)\n    return sorted(window[k] for k in order[:half_n])\n\n\ndef select_window(findings: list[Finding], ctx: ContextPackage,\n                  cfg) -> list[int]:\n    \"\"\"Returns the original indices to send to the enrichment call, in original order: all of them unless the prompt or output budget forces a rank prefix.\"\"\"\n    n = len(findings)\n    budget = int(knob(cfg, \"step8.prompt_token_budget\", 100000) or 100000)\n    max_out = int(knob(cfg, \"step8.max_tokens\", 64000) or 64000)\n    k_out = max((max_out - _OUT_RESERVE) // _TOKENS_PER_ENTRY, 1)\n\n    # Resolved as build_prompt does, or the estimate prices a different prompt than session.py sends\n    facts_on = facts_enabled(cfg)\n    hop_text = hop_text_enabled(cfg)\n    block_costs = [\n        estimate_tokens(finding_block(f\"f{i}\", findings[i], ctx, facts_on,\n                                      hop_text))\n        for i in range(n)]\n    scaffold = build_prompt([], ctx, labels=[], cfg=cfg)\n    # Priced over all n on purpose: repo facts only shrink, so overshooting just sends less\n    repo_facts = repo_fact_blocks(findings, ctx, [f\"f{i}\" for i in range(n)],\n                                  facts_on)\n    fixed = (estimate_tokens(SYSTEM) + estimate_tokens(scaffold)\n             + estimate_tokens(repo_facts) + _SCHEMA_TOKENS)\n\n    if fixed + sum(block_costs) <= budget and n <= k_out:\n        return list(range(n))\n\n    order = _floor_order(findings)\n    included: list[int] = []\n    total = fixed\n    for i in order:\n        # Break, not skip: the window must stay a strict rank prefix so chains cite in-window ids\n        if len(included) >= k_out or total + block_costs[i] > budget:\n            break\n        included.append(i)\n        total += block_costs[i]\n\n    # One pass (no transitive closure); recovers same-file MEDIUM hops that chains often depend on\n    included_set = set(included)\n    seed_files = {findings[i].file for i in included}\n    pullins = 0\n    for i in order:\n        if i in included_set or len(included) >= k_out:\n            continue\n        f = findings[i]\n        if (final_severity(f, f.severity) in _PULLIN_BANDS\n                and f.file in seed_files\n                and total + block_costs[i] <= budget * _PULLIN_CEILING):\n            included.append(i)\n            included_set.add(i)\n            total += block_costs[i]\n            pullins += 1\n\n    excluded = n - len(included)\n    if not excluded:\n        # The model sees the full report, so this is no windowing event: no counters, no warning\n        return sorted(included)\n    COUNTERS.bump(\"s8_findings_windowed\", excluded)\n    if pullins:\n        COUNTERS.bump(\"s8_windowed_pullins\", pullins)\n\n    by_band: dict[str, list[int]] = {}\n    for i in range(n):\n        band = final_severity(findings[i], findings[i].severity).value\n        by_band.setdefault(band, [0, 0])[0 if i in included_set else 1] += 1\n    bands = \"  \".join(f\"{b}:{inc}/{inc + exc}\"\n                      for b, (inc, exc) in sorted(by_band.items()))\n    log.warning(Event.S8_ENRICHMENT_WINDOWED, sent=len(included), findings=n, pullins=pullins,\n                est_tokens=total, budget=budget, pullin_ceiling=_PULLIN_CEILING, k_out=k_out,\n                bands=bands)\n\n    return sorted(included)\n",
+  "literals": {
+    "source_literal_16_0": {
+      "source": "vvaharness/pipeline/stages/s8/window.py",
+      "line_start": 16,
+      "line_end": 16,
+      "value": "Limits the step 8 enrichment call to a deterministic rank prefix of findings plus a same-file pull-in.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_57_4": {
+      "source": "vvaharness/pipeline/stages/s8/window.py",
+      "line_start": 57,
+      "line_end": 57,
+      "value": "Returns finding indices ordered by the floor pass's (severity band, OffensivePriority) key, without mutating findings.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_66_4": {
+      "source": "vvaharness/pipeline/stages/s8/window.py",
+      "line_start": 66,
+      "line_end": 67,
+      "value": "The stronger half of *window*, by the floor pass's rank-prefix order; original indices,\n    sorted. Used for the one resend after an at-cap clip: a smaller input, not a dropped tier.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_76_4": {
+      "source": "vvaharness/pipeline/stages/s8/window.py",
+      "line_start": 76,
+      "line_end": 76,
+      "value": "Returns the original indices to send to the enrichment call, in original order: all of them unless the prompt or output budget forces a rank prefix.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_86_38": {
+      "source": "vvaharness/pipeline/stages/s8/window.py",
+      "line_start": 86,
+      "line_end": 86,
+      "source_expression": "f\"f{i}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_91_50": {
+      "source": "vvaharness/pipeline/stages/s8/window.py",
+      "line_start": 91,
+      "line_end": 91,
+      "source_expression": "f\"f{i}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_137_22": {
+      "source": "vvaharness/pipeline/stages/s8/window.py",
+      "line_start": 137,
+      "line_end": 137,
+      "source_expression": "f\"{b}:{inc}/{inc + exc}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "value": "Limits the step 8 enrichment call to a deterministic rank prefix of findings plus a same-file pull-in.",
+      "context": "literal"
+    },
+    {
+      "line_start": 57,
+      "line_end": 57,
+      "column": 4,
+      "value": "Returns finding indices ordered by the floor pass's (severity band, OffensivePriority) key, without mutating findings.",
+      "context": "literal"
+    },
+    {
+      "line_start": 66,
+      "line_end": 67,
+      "column": 4,
+      "value": "The stronger half of *window*, by the floor pass's rank-prefix order; original indices,\n    sorted. Used for the one resend after an at-cap clip: a smaller input, not a dropped tier.",
+      "context": "literal"
+    },
+    {
+      "line_start": 76,
+      "line_end": 76,
+      "column": 4,
+      "value": "Returns the original indices to send to the enrichment call, in original order: all of them unless the prompt or output budget forces a rank prefix.",
+      "context": "literal"
+    },
+    {
+      "line_start": 129,
+      "line_end": 129,
+      "column": 18,
+      "value": "s8_findings_windowed",
+      "context": "literal"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 22,
+      "value": "s8_windowed_pullins",
+      "context": "literal"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 12,
+      "value": "  ",
+      "context": "literal"
+    },
+    {
+      "line_start": 78,
+      "line_end": 78,
+      "column": 27,
+      "value": "step8.prompt_token_budget",
+      "context": "literal"
+    },
+    {
+      "line_start": 79,
+      "line_end": 79,
+      "column": 28,
+      "value": "step8.max_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 52,
+      "value": "f",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 27,
+      "value": ":",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 33,
+      "value": "/",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 40,
+      "value": "f",
+      "context": "f-string segment"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 44,
+      "text": "# 100 tok/entry over-prices a typical entry against mid-JSON truncation; the reserve covers rest"
+    },
+    {
+      "line": 47,
+      "text": "# Schema is outside build_prompt, so an under-estimate over-admits findings; +250 for provider wrap"
+    },
+    {
+      "line": 50,
+      "text": "# The ceiling sits above the typical pull-in overshoot."
+    },
+    {
+      "line": 58,
+      "text": "# Windowing precedes enrichment, so the carried s4 severity is the fallback; INFO would discard"
+    },
+    {
+      "line": 82,
+      "text": "# Resolved as build_prompt does, or the estimate prices a different prompt than session.py sends"
+    },
+    {
+      "line": 90,
+      "text": "# Priced over all n on purpose: repo facts only shrink, so overshooting just sends less"
+    },
+    {
+      "line": 103,
+      "text": "# Break, not skip: the window must stay a strict rank prefix so chains cite in-window ids"
+    },
+    {
+      "line": 109,
+      "text": "# One pass (no transitive closure); recovers same-file MEDIUM hops that chains often depend on"
+    },
+    {
+      "line": 127,
+      "text": "# The model sees the full report, so this is no windowing event: no counters, no warning"
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 18,
+      "line_end": 18,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 23,
+      "line_end": 23,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 28,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 29,
+      "line_end": 36,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 37,
+      "line_end": 37,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 38,
+      "line_end": 38,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 39,
+      "line_end": 39,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 40,
+      "line_end": 40,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 42,
+      "line_end": 42,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 45,
+      "line_end": 45,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 46,
+      "line_end": 46,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 48,
+      "line_end": 49,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "Assign",
+      "line_start": 51,
+      "line_end": 51,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "Assign",
+      "line_start": 53,
+      "line_end": 53,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 56,
+      "line_end": 62,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 9
+    },
+    {
+      "kind": "Expr",
+      "line_start": 57,
+      "line_end": 57,
+      "column": 4,
+      "owner": "_floor_order",
+      "representation_line": 15
+    },
+    {
+      "kind": "Return",
+      "line_start": 59,
+      "line_end": 62,
+      "column": 4,
+      "owner": "_floor_order",
+      "representation_line": 16
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 65,
+      "line_end": 71,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 20
+    },
+    {
+      "kind": "Expr",
+      "line_start": 66,
+      "line_end": 67,
+      "column": 4,
+      "owner": "half_window",
+      "representation_line": 26
+    },
+    {
+      "kind": "Assign",
+      "line_start": 68,
+      "line_end": 68,
+      "column": 4,
+      "owner": "half_window",
+      "representation_line": 26
+    },
+    {
+      "kind": "Assign",
+      "line_start": 69,
+      "line_end": 69,
+      "column": 4,
+      "owner": "half_window",
+      "representation_line": 26
+    },
+    {
+      "kind": "Assign",
+      "line_start": 70,
+      "line_end": 70,
+      "column": 4,
+      "owner": "half_window",
+      "representation_line": 26
+    },
+    {
+      "kind": "Return",
+      "line_start": 71,
+      "line_end": 71,
+      "column": 4,
+      "owner": "half_window",
+      "representation_line": 27
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 74,
+      "line_end": 143,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 31
+    },
+    {
+      "kind": "Expr",
+      "line_start": 76,
+      "line_end": 76,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 37
+    },
+    {
+      "kind": "Assign",
+      "line_start": 77,
+      "line_end": 77,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 37
+    },
+    {
+      "kind": "Assign",
+      "line_start": 78,
+      "line_end": 78,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 37
+    },
+    {
+      "kind": "Assign",
+      "line_start": 79,
+      "line_end": 79,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 37
+    },
+    {
+      "kind": "Assign",
+      "line_start": 80,
+      "line_end": 80,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 37
+    },
+    {
+      "kind": "Assign",
+      "line_start": 83,
+      "line_end": 83,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 39
+    },
+    {
+      "kind": "Assign",
+      "line_start": 84,
+      "line_end": 84,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 39
+    },
+    {
+      "kind": "Assign",
+      "line_start": 85,
+      "line_end": 88,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 39
+    },
+    {
+      "kind": "Assign",
+      "line_start": 89,
+      "line_end": 89,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 39
+    },
+    {
+      "kind": "Assign",
+      "line_start": 91,
+      "line_end": 92,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 39
+    },
+    {
+      "kind": "Assign",
+      "line_start": 93,
+      "line_end": 94,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 41
+    },
+    {
+      "kind": "If",
+      "line_start": 96,
+      "line_end": 97,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 42
+    },
+    {
+      "kind": "Return",
+      "line_start": 97,
+      "line_end": 97,
+      "column": 8,
+      "owner": "select_window",
+      "representation_line": 44
+    },
+    {
+      "kind": "Assign",
+      "line_start": 99,
+      "line_end": 99,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 48
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 100,
+      "line_end": 100,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 48
+    },
+    {
+      "kind": "Assign",
+      "line_start": 101,
+      "line_end": 101,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 48
+    },
+    {
+      "kind": "For",
+      "line_start": 102,
+      "line_end": 107,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 49
+    },
+    {
+      "kind": "If",
+      "line_start": 104,
+      "line_end": 105,
+      "column": 8,
+      "owner": "select_window",
+      "representation_line": 51
+    },
+    {
+      "kind": "Break",
+      "line_start": 105,
+      "line_end": 105,
+      "column": 12,
+      "owner": "select_window",
+      "representation_line": 53
+    },
+    {
+      "kind": "Expr",
+      "line_start": 106,
+      "line_end": 106,
+      "column": 8,
+      "owner": "select_window",
+      "representation_line": 57
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 107,
+      "line_end": 107,
+      "column": 8,
+      "owner": "select_window",
+      "representation_line": 57
+    },
+    {
+      "kind": "Assign",
+      "line_start": 110,
+      "line_end": 110,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 60
+    },
+    {
+      "kind": "Assign",
+      "line_start": 111,
+      "line_end": 111,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 60
+    },
+    {
+      "kind": "Assign",
+      "line_start": 112,
+      "line_end": 112,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 60
+    },
+    {
+      "kind": "For",
+      "line_start": 113,
+      "line_end": 123,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 61
+    },
+    {
+      "kind": "If",
+      "line_start": 114,
+      "line_end": 115,
+      "column": 8,
+      "owner": "select_window",
+      "representation_line": 63
+    },
+    {
+      "kind": "Continue",
+      "line_start": 115,
+      "line_end": 115,
+      "column": 12,
+      "owner": "select_window",
+      "representation_line": 65
+    },
+    {
+      "kind": "Assign",
+      "line_start": 116,
+      "line_end": 116,
+      "column": 8,
+      "owner": "select_window",
+      "representation_line": 69
+    },
+    {
+      "kind": "If",
+      "line_start": 117,
+      "line_end": 123,
+      "column": 8,
+      "owner": "select_window",
+      "representation_line": 70
+    },
+    {
+      "kind": "Expr",
+      "line_start": 120,
+      "line_end": 120,
+      "column": 12,
+      "owner": "select_window",
+      "representation_line": 73
+    },
+    {
+      "kind": "Expr",
+      "line_start": 121,
+      "line_end": 121,
+      "column": 12,
+      "owner": "select_window",
+      "representation_line": 73
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 122,
+      "line_end": 122,
+      "column": 12,
+      "owner": "select_window",
+      "representation_line": 73
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 123,
+      "line_end": 123,
+      "column": 12,
+      "owner": "select_window",
+      "representation_line": 73
+    },
+    {
+      "kind": "Assign",
+      "line_start": 125,
+      "line_end": 125,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 77
+    },
+    {
+      "kind": "If",
+      "line_start": 126,
+      "line_end": 128,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 78
+    },
+    {
+      "kind": "Return",
+      "line_start": 128,
+      "line_end": 128,
+      "column": 8,
+      "owner": "select_window",
+      "representation_line": 80
+    },
+    {
+      "kind": "Expr",
+      "line_start": 129,
+      "line_end": 129,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 84
+    },
+    {
+      "kind": "If",
+      "line_start": 130,
+      "line_end": 131,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 85
+    },
+    {
+      "kind": "Expr",
+      "line_start": 131,
+      "line_end": 131,
+      "column": 8,
+      "owner": "select_window",
+      "representation_line": 88
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 133,
+      "line_end": 133,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 91
+    },
+    {
+      "kind": "For",
+      "line_start": 134,
+      "line_end": 136,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 92
+    },
+    {
+      "kind": "Assign",
+      "line_start": 135,
+      "line_end": 135,
+      "column": 8,
+      "owner": "select_window",
+      "representation_line": 95
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 136,
+      "line_end": 136,
+      "column": 8,
+      "owner": "select_window",
+      "representation_line": 95
+    },
+    {
+      "kind": "Assign",
+      "line_start": 137,
+      "line_end": 138,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 98
+    },
+    {
+      "kind": "Expr",
+      "line_start": 139,
+      "line_end": 141,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 98
+    },
+    {
+      "kind": "Return",
+      "line_start": 143,
+      "line_end": 143,
+      "column": 4,
+      "owner": "select_window",
+      "representation_line": 99
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 6,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='logs', ctx=Load()), attr='get_logger', ctx=Load()), args=[Name(id='__name__', ctx=Load())], keywords=[])",
+      "rendered": "logs.get_logger(__name__)"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=1500)",
+      "rendered": "1500"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 20,
+      "kind": "Constant",
+      "original_ast": "Constant(value=100)",
+      "rendered": "100"
+    },
+    {
+      "line_start": 48,
+      "line_end": 49,
+      "column": 17,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Name(id='estimate_tokens', ctx=Load()), args=[Call(func=Attribute(value=Name(id='json', ctx=Load()), attr='dumps', ctx=Load()), args=[Call(func=Attribute(value=Name(id='ChainReport', ctx=Load()), attr='model_json_schema', ctx=Load()), args=[], keywords=[])], keywords=[])], keywords=[]), op=Add(), right=Constant(value=250))",
+      "rendered": "estimate_tokens(json.dumps(ChainReport.model_json_schema())) + 250"
+    },
+    {
+      "line_start": 51,
+      "line_end": 51,
+      "column": 18,
+      "kind": "Constant",
+      "original_ast": "Constant(value=1.25)",
+      "rendered": "1.25"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 16,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Attribute(value=Name(id='Severity', ctx=Load()), attr='MEDIUM', ctx=Load()), Attribute(value=Name(id='Severity', ctx=Load()), attr='LOW', ctx=Load()), Attribute(value=Name(id='Severity', ctx=Load()), attr='INFO', ctx=Load())], ctx=Load())",
+      "rendered": "(Severity.MEDIUM, Severity.LOW, Severity.INFO)"
+    },
+    {
+      "line_start": 59,
+      "line_end": 62,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[Call(func=Name(id='range', ctx=Load()), args=[Call(func=Name(id='len', ctx=Load()), args=[Name(id='findings', ctx=Load())], keywords=[])], keywords=[])], keywords=[keyword(arg='key', value=Lambda(args=arguments(posonlyargs=[], args=[arg(arg='i')], kwonlyargs=[], kw_defaults=[], defaults=[]), body=Tuple(elts=[Subscript(value=Name(id='SEV_RANK', ctx=Load()), slice=Call(func=Name(id='final_severity', ctx=Load()), args=[Subscript(value=Name(id='findings', ctx=Load()), slice=Name(id='i', ctx=Load()), ctx=Load()), Attribute(value=Subscript(value=Name(id='findings', ctx=Load()), slice=Name(id='i', ctx=Load()), ctx=Load()), attr='severity', ctx=Load())], keywords=[]), ctx=Load()), Call(func=Name(id='offensive_rank', ctx=Load()), args=[Subscript(value=Name(id='findings', ctx=Load()), slice=Name(id='i', ctx=Load()), ctx=Load())], keywords=[])], ctx=Load())))])",
+      "rendered": "sorted(range(len(findings)), key=lambda i: (SEV_RANK[final_severity(findings[i], findings[i].severity)], offensive_rank(findings[i])))"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 10,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Subscript(value=Name(id='findings', ctx=Load()), slice=Name(id='i', ctx=Load()), ctx=Load()), generators=[comprehension(target=Name(id='i', ctx=Store()), iter=Name(id='window', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "[findings[i] for i in window]"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_floor_order', ctx=Load()), args=[Name(id='sub', ctx=Load())], keywords=[])",
+      "rendered": "_floor_order(sub)"
+    },
+    {
+      "line_start": 70,
+      "line_end": 70,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='max', ctx=Load()), args=[Constant(value=1), BinOp(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='order', ctx=Load())], keywords=[]), op=FloorDiv(), right=Constant(value=2))], keywords=[])",
+      "rendered": "max(1, len(order) // 2)"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[GeneratorExp(elt=Subscript(value=Name(id='window', ctx=Load()), slice=Name(id='k', ctx=Load()), ctx=Load()), generators=[comprehension(target=Name(id='k', ctx=Store()), iter=Subscript(value=Name(id='order', ctx=Load()), slice=Slice(upper=Name(id='half_n', ctx=Load())), ctx=Load()), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "sorted((window[k] for k in order[:half_n]))"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='len', ctx=Load()), args=[Name(id='findings', ctx=Load())], keywords=[])",
+      "rendered": "len(findings)"
+    },
+    {
+      "line_start": 78,
+      "line_end": 78,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='int', ctx=Load()), args=[BoolOp(op=Or(), values=[Call(func=Name(id='knob', ctx=Load()), args=[Name(id='cfg', ctx=Load()), Constant(value='step8.prompt_token_budget'), Constant(value=100000)], keywords=[]), Constant(value=100000)])], keywords=[])",
+      "rendered": "int(knob(cfg, 'step8.prompt_token_budget', 100000) or 100000)"
+    },
+    {
+      "line_start": 79,
+      "line_end": 79,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='int', ctx=Load()), args=[BoolOp(op=Or(), values=[Call(func=Name(id='knob', ctx=Load()), args=[Name(id='cfg', ctx=Load()), Constant(value='step8.max_tokens'), Constant(value=64000)], keywords=[]), Constant(value=64000)])], keywords=[])",
+      "rendered": "int(knob(cfg, 'step8.max_tokens', 64000) or 64000)"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='max', ctx=Load()), args=[BinOp(left=BinOp(left=Name(id='max_out', ctx=Load()), op=Sub(), right=Name(id='_OUT_RESERVE', ctx=Load())), op=FloorDiv(), right=Name(id='_TOKENS_PER_ENTRY', ctx=Load())), Constant(value=1)], keywords=[])",
+      "rendered": "max((max_out - _OUT_RESERVE) // _TOKENS_PER_ENTRY, 1)"
+    },
+    {
+      "line_start": 83,
+      "line_end": 83,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='facts_enabled', ctx=Load()), args=[Name(id='cfg', ctx=Load())], keywords=[])",
+      "rendered": "facts_enabled(cfg)"
+    },
+    {
+      "line_start": 84,
+      "line_end": 84,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='hop_text_enabled', ctx=Load()), args=[Name(id='cfg', ctx=Load())], keywords=[])",
+      "rendered": "hop_text_enabled(cfg)"
+    },
+    {
+      "line_start": 85,
+      "line_end": 88,
+      "column": 18,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Call(func=Name(id='estimate_tokens', ctx=Load()), args=[Call(func=Name(id='finding_block', ctx=Load()), args=[JoinedStr(values=[Constant(value='f'), FormattedValue(value=Name(id='i', ctx=Load()), conversion=-1)]), Subscript(value=Name(id='findings', ctx=Load()), slice=Name(id='i', ctx=Load()), ctx=Load()), Name(id='ctx', ctx=Load()), Name(id='facts_on', ctx=Load()), Name(id='hop_text', ctx=Load())], keywords=[])], keywords=[]), generators=[comprehension(target=Name(id='i', ctx=Store()), iter=Call(func=Name(id='range', ctx=Load()), args=[Name(id='n', ctx=Load())], keywords=[]), ifs=[], is_async=0)])",
+      "rendered": "[estimate_tokens(finding_block(source_template_86_38, findings[i], ctx, facts_on, hop_text)) for i in range(n)]"
+    },
+    {
+      "line_start": 89,
+      "line_end": 89,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='build_prompt', ctx=Load()), args=[List(elts=[], ctx=Load()), Name(id='ctx', ctx=Load())], keywords=[keyword(arg='labels', value=List(elts=[], ctx=Load())), keyword(arg='cfg', value=Name(id='cfg', ctx=Load()))])",
+      "rendered": "build_prompt([], ctx, labels=[], cfg=cfg)"
+    },
+    {
+      "line_start": 91,
+      "line_end": 92,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='repo_fact_blocks', ctx=Load()), args=[Name(id='findings', ctx=Load()), Name(id='ctx', ctx=Load()), ListComp(elt=JoinedStr(values=[Constant(value='f'), FormattedValue(value=Name(id='i', ctx=Load()), conversion=-1)]), generators=[comprehension(target=Name(id='i', ctx=Store()), iter=Call(func=Name(id='range', ctx=Load()), args=[Name(id='n', ctx=Load())], keywords=[]), ifs=[], is_async=0)]), Name(id='facts_on', ctx=Load())], keywords=[])",
+      "rendered": "repo_fact_blocks(findings, ctx, [source_template_91_50 for i in range(n)], facts_on)"
+    },
+    {
+      "line_start": 93,
+      "line_end": 94,
+      "column": 13,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=BinOp(left=BinOp(left=Call(func=Name(id='estimate_tokens', ctx=Load()), args=[Name(id='SYSTEM', ctx=Load())], keywords=[]), op=Add(), right=Call(func=Name(id='estimate_tokens', ctx=Load()), args=[Name(id='scaffold', ctx=Load())], keywords=[])), op=Add(), right=Call(func=Name(id='estimate_tokens', ctx=Load()), args=[Name(id='repo_facts', ctx=Load())], keywords=[])), op=Add(), right=Name(id='_SCHEMA_TOKENS', ctx=Load()))",
+      "rendered": "estimate_tokens(SYSTEM) + estimate_tokens(scaffold) + estimate_tokens(repo_facts) + _SCHEMA_TOKENS"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=BinOp(left=Name(id='fixed', ctx=Load()), op=Add(), right=Call(func=Name(id='sum', ctx=Load()), args=[Name(id='block_costs', ctx=Load())], keywords=[])), ops=[LtE()], comparators=[Name(id='budget', ctx=Load())]), Compare(left=Name(id='n', ctx=Load()), ops=[LtE()], comparators=[Name(id='k_out', ctx=Load())])])",
+      "rendered": "fixed + sum(block_costs) <= budget and n <= k_out"
+    },
+    {
+      "line_start": 97,
+      "line_end": 97,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='list', ctx=Load()), args=[Call(func=Name(id='range', ctx=Load()), args=[Name(id='n', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "list(range(n))"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_floor_order', ctx=Load()), args=[Name(id='findings', ctx=Load())], keywords=[])",
+      "rendered": "_floor_order(findings)"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 26,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 12,
+      "kind": "Name",
+      "original_ast": "Name(id='fixed', ctx=Load())",
+      "rendered": "fixed"
+    },
+    {
+      "line_start": 102,
+      "line_end": 102,
+      "column": 13,
+      "kind": "Name",
+      "original_ast": "Name(id='order', ctx=Load())",
+      "rendered": "order"
+    },
+    {
+      "line_start": 104,
+      "line_end": 104,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='included', ctx=Load())], keywords=[]), ops=[GtE()], comparators=[Name(id='k_out', ctx=Load())]), Compare(left=BinOp(left=Name(id='total', ctx=Load()), op=Add(), right=Subscript(value=Name(id='block_costs', ctx=Load()), slice=Name(id='i', ctx=Load()), ctx=Load())), ops=[Gt()], comparators=[Name(id='budget', ctx=Load())])])",
+      "rendered": "len(included) >= k_out or total + block_costs[i] > budget"
+    },
+    {
+      "line_start": 106,
+      "line_end": 106,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='included', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='i', ctx=Load())], keywords=[])",
+      "rendered": "included.append(i)"
+    },
+    {
+      "line_start": 107,
+      "line_end": 107,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='total', ctx=Store()), op=Add(), value=Subscript(value=Name(id='block_costs', ctx=Load()), slice=Name(id='i', ctx=Load()), ctx=Load()))",
+      "rendered": "total += block_costs[i]"
+    },
+    {
+      "line_start": 110,
+      "line_end": 110,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[Name(id='included', ctx=Load())], keywords=[])",
+      "rendered": "set(included)"
+    },
+    {
+      "line_start": 111,
+      "line_end": 111,
+      "column": 17,
+      "kind": "SetComp",
+      "original_ast": "SetComp(elt=Attribute(value=Subscript(value=Name(id='findings', ctx=Load()), slice=Name(id='i', ctx=Load()), ctx=Load()), attr='file', ctx=Load()), generators=[comprehension(target=Name(id='i', ctx=Store()), iter=Name(id='included', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "{findings[i].file for i in included}"
+    },
+    {
+      "line_start": 112,
+      "line_end": 112,
+      "column": 14,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 113,
+      "line_end": 113,
+      "column": 13,
+      "kind": "Name",
+      "original_ast": "Name(id='order', ctx=Load())",
+      "rendered": "order"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Compare(left=Name(id='i', ctx=Load()), ops=[In()], comparators=[Name(id='included_set', ctx=Load())]), Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='included', ctx=Load())], keywords=[]), ops=[GtE()], comparators=[Name(id='k_out', ctx=Load())])])",
+      "rendered": "i in included_set or len(included) >= k_out"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 12,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Name(id='findings', ctx=Load()), slice=Name(id='i', ctx=Load()), ctx=Load())",
+      "rendered": "findings[i]"
+    },
+    {
+      "line_start": 117,
+      "line_end": 119,
+      "column": 12,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Call(func=Name(id='final_severity', ctx=Load()), args=[Name(id='f', ctx=Load()), Attribute(value=Name(id='f', ctx=Load()), attr='severity', ctx=Load())], keywords=[]), ops=[In()], comparators=[Name(id='_PULLIN_BANDS', ctx=Load())]), Compare(left=Attribute(value=Name(id='f', ctx=Load()), attr='file', ctx=Load()), ops=[In()], comparators=[Name(id='seed_files', ctx=Load())]), Compare(left=BinOp(left=Name(id='total', ctx=Load()), op=Add(), right=Subscript(value=Name(id='block_costs', ctx=Load()), slice=Name(id='i', ctx=Load()), ctx=Load())), ops=[LtE()], comparators=[BinOp(left=Name(id='budget', ctx=Load()), op=Mult(), right=Name(id='_PULLIN_CEILING', ctx=Load()))])])",
+      "rendered": "final_severity(f, f.severity) in _PULLIN_BANDS and f.file in seed_files and (total + block_costs[i] <= budget * _PULLIN_CEILING)"
+    },
+    {
+      "line_start": 120,
+      "line_end": 120,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='included', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='i', ctx=Load())], keywords=[])",
+      "rendered": "included.append(i)"
+    },
+    {
+      "line_start": 121,
+      "line_end": 121,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='included_set', ctx=Load()), attr='add', ctx=Load()), args=[Name(id='i', ctx=Load())], keywords=[])",
+      "rendered": "included_set.add(i)"
+    },
+    {
+      "line_start": 122,
+      "line_end": 122,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='total', ctx=Store()), op=Add(), value=Subscript(value=Name(id='block_costs', ctx=Load()), slice=Name(id='i', ctx=Load()), ctx=Load()))",
+      "rendered": "total += block_costs[i]"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='pullins', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "pullins += 1"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 15,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Name(id='n', ctx=Load()), op=Sub(), right=Call(func=Name(id='len', ctx=Load()), args=[Name(id='included', ctx=Load())], keywords=[]))",
+      "rendered": "n - len(included)"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='excluded', ctx=Load()))",
+      "rendered": "not excluded"
+    },
+    {
+      "line_start": 128,
+      "line_end": 128,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[Name(id='included', ctx=Load())], keywords=[])",
+      "rendered": "sorted(included)"
+    },
+    {
+      "line_start": 129,
+      "line_end": 129,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Constant(value='s8_findings_windowed'), Name(id='excluded', ctx=Load())], keywords=[])",
+      "rendered": "COUNTERS.bump('s8_findings_windowed', excluded)"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='pullins', ctx=Load())",
+      "rendered": "pullins"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Constant(value='s8_windowed_pullins'), Name(id='pullins', ctx=Load())], keywords=[])",
+      "rendered": "COUNTERS.bump('s8_windowed_pullins', pullins)"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 36,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='range', ctx=Load()), args=[Name(id='n', ctx=Load())], keywords=[])",
+      "rendered": "range(n)"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 15,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Call(func=Name(id='final_severity', ctx=Load()), args=[Subscript(value=Name(id='findings', ctx=Load()), slice=Name(id='i', ctx=Load()), ctx=Load()), Attribute(value=Subscript(value=Name(id='findings', ctx=Load()), slice=Name(id='i', ctx=Load()), ctx=Load()), attr='severity', ctx=Load())], keywords=[]), attr='value', ctx=Load())",
+      "rendered": "final_severity(findings[i], findings[i].severity).value"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Subscript(value=Call(func=Attribute(value=Name(id='by_band', ctx=Load()), attr='setdefault', ctx=Load()), args=[Name(id='band', ctx=Load()), List(elts=[Constant(value=0), Constant(value=0)], ctx=Load())], keywords=[]), slice=IfExp(test=Compare(left=Name(id='i', ctx=Load()), ops=[In()], comparators=[Name(id='included_set', ctx=Load())]), body=Constant(value=0), orelse=Constant(value=1)), ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "by_band.setdefault(band, [0, 0])[0 if i in included_set else 1] += 1"
+    },
+    {
+      "line_start": 137,
+      "line_end": 138,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Constant(value='  '), attr='join', ctx=Load()), args=[GeneratorExp(elt=JoinedStr(values=[FormattedValue(value=Name(id='b', ctx=Load()), conversion=-1), Constant(value=':'), FormattedValue(value=Name(id='inc', ctx=Load()), conversion=-1), Constant(value='/'), FormattedValue(value=BinOp(left=Name(id='inc', ctx=Load()), op=Add(), right=Name(id='exc', ctx=Load())), conversion=-1)]), generators=[comprehension(target=Tuple(elts=[Name(id='b', ctx=Store()), Tuple(elts=[Name(id='inc', ctx=Store()), Name(id='exc', ctx=Store())], ctx=Store())], ctx=Store()), iter=Call(func=Name(id='sorted', ctx=Load()), args=[Call(func=Attribute(value=Name(id='by_band', ctx=Load()), attr='items', ctx=Load()), args=[], keywords=[])], keywords=[]), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "'  '.join((source_template_137_22 for b, (inc, exc) in sorted(by_band.items())))"
+    },
+    {
+      "line_start": 139,
+      "line_end": 141,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Attribute(value=Name(id='Event', ctx=Load()), attr='S8_ENRICHMENT_WINDOWED', ctx=Load())], keywords=[keyword(arg='sent', value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='included', ctx=Load())], keywords=[])), keyword(arg='findings', value=Name(id='n', ctx=Load())), keyword(arg='pullins', value=Name(id='pullins', ctx=Load())), keyword(arg='est_tokens', value=Name(id='total', ctx=Load())), keyword(arg='budget', value=Name(id='budget', ctx=Load())), keyword(arg='pullin_ceiling', value=Name(id='_PULLIN_CEILING', ctx=Load())), keyword(arg='k_out', value=Name(id='k_out', ctx=Load())), keyword(arg='bands', value=Name(id='bands', ctx=Load()))])",
+      "rendered": "log.warning(Event.S8_ENRICHMENT_WINDOWED, sent=len(included), findings=n, pullins=pullins, est_tokens=total, budget=budget, pullin_ceiling=_PULLIN_CEILING, k_out=k_out, bands=bands)"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[Name(id='included', ctx=Load())], keywords=[])",
+      "rendered": "sorted(included)"
+    }
+  ],
+  "calls": [
+    {
+      "line": 42,
+      "end_line": 42,
+      "callee": "logs.get_logger",
+      "enclosing": "module initialization",
+      "expression": "logs.get_logger(__name__)"
+    },
+    {
+      "line": 48,
+      "end_line": 49,
+      "callee": "estimate_tokens",
+      "enclosing": "module initialization",
+      "expression": "estimate_tokens(\n    json.dumps(ChainReport.model_json_schema()))"
+    },
+    {
+      "line": 59,
+      "end_line": 62,
+      "callee": "sorted",
+      "enclosing": "_floor_order",
+      "expression": "sorted(\n        range(len(findings)),\n        key=lambda i: (SEV_RANK[final_severity(findings[i], findings[i].severity)],\n                       offensive_rank(findings[i])))"
+    },
+    {
+      "line": 69,
+      "end_line": 69,
+      "callee": "_floor_order",
+      "enclosing": "half_window",
+      "expression": "_floor_order(sub)"
+    },
+    {
+      "line": 70,
+      "end_line": 70,
+      "callee": "max",
+      "enclosing": "half_window",
+      "expression": "max(1, len(order) // 2)"
+    },
+    {
+      "line": 71,
+      "end_line": 71,
+      "callee": "sorted",
+      "enclosing": "half_window",
+      "expression": "sorted(window[k] for k in order[:half_n])"
+    },
+    {
+      "line": 77,
+      "end_line": 77,
+      "callee": "len",
+      "enclosing": "select_window",
+      "expression": "len(findings)"
+    },
+    {
+      "line": 78,
+      "end_line": 78,
+      "callee": "int",
+      "enclosing": "select_window",
+      "expression": "int(knob(cfg, \"step8.prompt_token_budget\", 100000) or 100000)"
+    },
+    {
+      "line": 79,
+      "end_line": 79,
+      "callee": "int",
+      "enclosing": "select_window",
+      "expression": "int(knob(cfg, \"step8.max_tokens\", 64000) or 64000)"
+    },
+    {
+      "line": 80,
+      "end_line": 80,
+      "callee": "max",
+      "enclosing": "select_window",
+      "expression": "max((max_out - _OUT_RESERVE) // _TOKENS_PER_ENTRY, 1)"
+    },
+    {
+      "line": 83,
+      "end_line": 83,
+      "callee": "facts_enabled",
+      "enclosing": "select_window",
+      "expression": "facts_enabled(cfg)"
+    },
+    {
+      "line": 84,
+      "end_line": 84,
+      "callee": "hop_text_enabled",
+      "enclosing": "select_window",
+      "expression": "hop_text_enabled(cfg)"
+    },
+    {
+      "line": 89,
+      "end_line": 89,
+      "callee": "build_prompt",
+      "enclosing": "select_window",
+      "expression": "build_prompt([], ctx, labels=[], cfg=cfg)"
+    },
+    {
+      "line": 91,
+      "end_line": 92,
+      "callee": "repo_fact_blocks",
+      "enclosing": "select_window",
+      "expression": "repo_fact_blocks(findings, ctx, [f\"f{i}\" for i in range(n)],\n                                  facts_on)"
+    },
+    {
+      "line": 99,
+      "end_line": 99,
+      "callee": "_floor_order",
+      "enclosing": "select_window",
+      "expression": "_floor_order(findings)"
+    },
+    {
+      "line": 110,
+      "end_line": 110,
+      "callee": "set",
+      "enclosing": "select_window",
+      "expression": "set(included)"
+    },
+    {
+      "line": 129,
+      "end_line": 129,
+      "callee": "COUNTERS.bump",
+      "enclosing": "select_window",
+      "expression": "COUNTERS.bump(\"s8_findings_windowed\", excluded)"
+    },
+    {
+      "line": 134,
+      "end_line": 134,
+      "callee": "range",
+      "enclosing": "select_window",
+      "expression": "range(n)"
+    },
+    {
+      "line": 137,
+      "end_line": 138,
+      "callee": "'  '.join",
+      "enclosing": "select_window",
+      "expression": "\"  \".join(f\"{b}:{inc}/{inc + exc}\"\n                      for b, (inc, exc) in sorted(by_band.items()))"
+    },
+    {
+      "line": 139,
+      "end_line": 141,
+      "callee": "log.warning",
+      "enclosing": "select_window",
+      "expression": "log.warning(Event.S8_ENRICHMENT_WINDOWED, sent=len(included), findings=n, pullins=pullins,\n                est_tokens=total, budget=budget, pullin_ceiling=_PULLIN_CEILING, k_out=k_out,\n                bands=bands)"
+    },
+    {
+      "line": 143,
+      "end_line": 143,
+      "callee": "sorted",
+      "enclosing": "select_window",
+      "expression": "sorted(included)"
+    },
+    {
+      "line": 49,
+      "end_line": 49,
+      "callee": "json.dumps",
+      "enclosing": "module initialization",
+      "expression": "json.dumps(ChainReport.model_json_schema())"
+    },
+    {
+      "line": 60,
+      "end_line": 60,
+      "callee": "range",
+      "enclosing": "_floor_order",
+      "expression": "range(len(findings))"
+    },
+    {
+      "line": 86,
+      "end_line": 87,
+      "callee": "estimate_tokens",
+      "enclosing": "select_window",
+      "expression": "estimate_tokens(finding_block(f\"f{i}\", findings[i], ctx, facts_on,\n                                      hop_text))"
+    },
+    {
+      "line": 97,
+      "end_line": 97,
+      "callee": "list",
+      "enclosing": "select_window",
+      "expression": "list(range(n))"
+    },
+    {
+      "line": 106,
+      "end_line": 106,
+      "callee": "included.append",
+      "enclosing": "select_window",
+      "expression": "included.append(i)"
+    },
+    {
+      "line": 125,
+      "end_line": 125,
+      "callee": "len",
+      "enclosing": "select_window",
+      "expression": "len(included)"
+    },
+    {
+      "line": 128,
+      "end_line": 128,
+      "callee": "sorted",
+      "enclosing": "select_window",
+      "expression": "sorted(included)"
+    },
+    {
+      "line": 131,
+      "end_line": 131,
+      "callee": "COUNTERS.bump",
+      "enclosing": "select_window",
+      "expression": "COUNTERS.bump(\"s8_windowed_pullins\", pullins)"
+    },
+    {
+      "line": 49,
+      "end_line": 49,
+      "callee": "ChainReport.model_json_schema",
+      "enclosing": "module initialization",
+      "expression": "ChainReport.model_json_schema()"
+    },
+    {
+      "line": 60,
+      "end_line": 60,
+      "callee": "len",
+      "enclosing": "_floor_order",
+      "expression": "len(findings)"
+    },
+    {
+      "line": 70,
+      "end_line": 70,
+      "callee": "len",
+      "enclosing": "half_window",
+      "expression": "len(order)"
+    },
+    {
+      "line": 78,
+      "end_line": 78,
+      "callee": "knob",
+      "enclosing": "select_window",
+      "expression": "knob(cfg, \"step8.prompt_token_budget\", 100000)"
+    },
+    {
+      "line": 79,
+      "end_line": 79,
+      "callee": "knob",
+      "enclosing": "select_window",
+      "expression": "knob(cfg, \"step8.max_tokens\", 64000)"
+    },
+    {
+      "line": 86,
+      "end_line": 87,
+      "callee": "finding_block",
+      "enclosing": "select_window",
+      "expression": "finding_block(f\"f{i}\", findings[i], ctx, facts_on,\n                                      hop_text)"
+    },
+    {
+      "line": 88,
+      "end_line": 88,
+      "callee": "range",
+      "enclosing": "select_window",
+      "expression": "range(n)"
+    },
+    {
+      "line": 94,
+      "end_line": 94,
+      "callee": "estimate_tokens",
+      "enclosing": "select_window",
+      "expression": "estimate_tokens(repo_facts)"
+    },
+    {
+      "line": 97,
+      "end_line": 97,
+      "callee": "range",
+      "enclosing": "select_window",
+      "expression": "range(n)"
+    },
+    {
+      "line": 120,
+      "end_line": 120,
+      "callee": "included.append",
+      "enclosing": "select_window",
+      "expression": "included.append(i)"
+    },
+    {
+      "line": 121,
+      "end_line": 121,
+      "callee": "included_set.add",
+      "enclosing": "select_window",
+      "expression": "included_set.add(i)"
+    },
+    {
+      "line": 135,
+      "end_line": 135,
+      "callee": "final_severity",
+      "enclosing": "select_window",
+      "expression": "final_severity(findings[i], findings[i].severity)"
+    },
+    {
+      "line": 136,
+      "end_line": 136,
+      "callee": "by_band.setdefault",
+      "enclosing": "select_window",
+      "expression": "by_band.setdefault(band, [0, 0])"
+    },
+    {
+      "line": 139,
+      "end_line": 139,
+      "callee": "len",
+      "enclosing": "select_window",
+      "expression": "len(included)"
+    },
+    {
+      "line": 91,
+      "end_line": 91,
+      "callee": "range",
+      "enclosing": "select_window",
+      "expression": "range(n)"
+    },
+    {
+      "line": 93,
+      "end_line": 93,
+      "callee": "estimate_tokens",
+      "enclosing": "select_window",
+      "expression": "estimate_tokens(SYSTEM)"
+    },
+    {
+      "line": 93,
+      "end_line": 93,
+      "callee": "estimate_tokens",
+      "enclosing": "select_window",
+      "expression": "estimate_tokens(scaffold)"
+    },
+    {
+      "line": 96,
+      "end_line": 96,
+      "callee": "sum",
+      "enclosing": "select_window",
+      "expression": "sum(block_costs)"
+    },
+    {
+      "line": 104,
+      "end_line": 104,
+      "callee": "len",
+      "enclosing": "select_window",
+      "expression": "len(included)"
+    },
+    {
+      "line": 114,
+      "end_line": 114,
+      "callee": "len",
+      "enclosing": "select_window",
+      "expression": "len(included)"
+    },
+    {
+      "line": 117,
+      "end_line": 117,
+      "callee": "final_severity",
+      "enclosing": "select_window",
+      "expression": "final_severity(f, f.severity)"
+    },
+    {
+      "line": 138,
+      "end_line": 138,
+      "callee": "sorted",
+      "enclosing": "select_window",
+      "expression": "sorted(by_band.items())"
+    },
+    {
+      "line": 62,
+      "end_line": 62,
+      "callee": "offensive_rank",
+      "enclosing": "_floor_order",
+      "expression": "offensive_rank(findings[i])"
+    },
+    {
+      "line": 138,
+      "end_line": 138,
+      "callee": "by_band.items",
+      "enclosing": "select_window",
+      "expression": "by_band.items()"
+    },
+    {
+      "line": 61,
+      "end_line": 61,
+      "callee": "final_severity",
+      "enclosing": "_floor_order",
+      "expression": "final_severity(findings[i], findings[i].severity)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 17,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 18,
+      "source_expression": "from vvaharness.util import logs",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.logs"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/logs.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 20,
+      "source_expression": "import json",
+      "targets": [
+        "json"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "from vvaharness.models import ContextPackage, Finding, Severity",
+      "targets": [
+        "vvaharness.models",
+        "vvaharness.models.ContextPackage",
+        "vvaharness.models.Finding",
+        "vvaharness.models.Severity"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 23,
+      "source_expression": "from vvaharness.models.vocab import SEV_RANK",
+      "targets": [
+        "vvaharness.models.vocab",
+        "vvaharness.models.vocab.SEV_RANK"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/vocab.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 24,
+      "source_expression": "from vvaharness.pipeline.stages.s8.outcomes import ChainReport, final_severity, offensive_rank",
+      "targets": [
+        "vvaharness.pipeline.stages.s8.outcomes",
+        "vvaharness.pipeline.stages.s8.outcomes.ChainReport",
+        "vvaharness.pipeline.stages.s8.outcomes.final_severity",
+        "vvaharness.pipeline.stages.s8.outcomes.offensive_rank"
+      ],
+      "local_source_paths": [
+        "vvaharness/pipeline/stages/s8/outcomes.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 29,
+      "source_expression": "from vvaharness.pipeline.stages.s8.prompts import SYSTEM, build_prompt, facts_enabled, finding_block, hop_text_enabled, repo_fact_blocks",
+      "targets": [
+        "vvaharness.pipeline.stages.s8.prompts",
+        "vvaharness.pipeline.stages.s8.prompts.SYSTEM",
+        "vvaharness.pipeline.stages.s8.prompts.build_prompt",
+        "vvaharness.pipeline.stages.s8.prompts.facts_enabled",
+        "vvaharness.pipeline.stages.s8.prompts.finding_block",
+        "vvaharness.pipeline.stages.s8.prompts.hop_text_enabled",
+        "vvaharness.pipeline.stages.s8.prompts.repo_fact_blocks"
+      ],
+      "local_source_paths": [
+        "vvaharness/pipeline/stages/s8/prompts.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 37,
+      "source_expression": "from vvaharness.util.config import knob",
+      "targets": [
+        "vvaharness.util.config",
+        "vvaharness.util.config.knob"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/config.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 38,
+      "source_expression": "from vvaharness.util.counters import COUNTERS",
+      "targets": [
+        "vvaharness.util.counters",
+        "vvaharness.util.counters.COUNTERS"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/counters.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 39,
+      "source_expression": "from vvaharness.util.tokens import estimate_tokens",
+      "targets": [
+        "vvaharness.util.tokens",
+        "vvaharness.util.tokens.estimate_tokens"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/tokens.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 40,
+      "source_expression": "from vvaharness.util.events import Event",
+      "targets": [
+        "vvaharness.util.events",
+        "vvaharness.util.events.Event"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/events.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

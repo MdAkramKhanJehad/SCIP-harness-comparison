@@ -1,0 +1,5168 @@
+{
+  "source": "vvaharness/validation/cli/_run.py",
+  "sha256": "9e48781d6b059a759d2f903c364e8d4e9aa43e635f064dc36a86f0cd93925751",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Core validation execution: run_validation() and _validate_one().\"\"\"\n\nfrom __future__ import annotations\n\nimport asyncio\nimport shutil\nimport uuid\nfrom dataclasses import dataclass\nfrom datetime import UTC, datetime\nfrom pathlib import Path\nfrom typing import NamedTuple\n\nfrom pydantic import ValidationError\n\nfrom vvaharness.models import HARNESS_REGISTRY, Provenance, ScoringPolicy, Verdict\nfrom vvaharness.orchestrator.artifacts import UnsafeArtifactDir\nfrom vvaharness.orchestrator.checkpoints import VALIDATE_PREFIX, step_key_for\nfrom vvaharness.report.redact import redact\nfrom vvaharness.util import console\nfrom vvaharness.util.tokens import TOKENS, Spend, reported_between\nfrom vvaharness.validation.cli._patterns import _UNSAFE\nfrom vvaharness.validation.config import Config\nfrom vvaharness.validation.constants.artifacts import (\n    CMD_PREVIEW_LEN,\n    LOGGING_DIRNAME,\n    ORCHESTRATOR_LOG_DIRNAME,\n    SESSION_LOG_FILENAME,\n    VALIDATABLE_STATES,\n    VALIDATE_ALIAS_S11,\n    VALIDATION_SESSION_LOG_PREFIX,\n)\nfrom vvaharness.validation.constants.scoring import FIX_POLICY\nfrom vvaharness.validation.execution.pipeline import execute_plan\nfrom vvaharness.validation.ingest.case_loader import (\n    LoadedCase,\n    all_case_ids,\n    discover_cases,\n    load_case,\n    select_cases,\n)\nfrom vvaharness.validation.ingest.errors import IngestError\nfrom vvaharness.validation.ingest.manifest_builder import build_manifest\nfrom vvaharness.validation.ingest.workspace import assert_remediation_applied, stage_workspace\nfrom vvaharness.validation.io.case_writeback import build_verdict, write_back_verdict\nfrom vvaharness.validation.io.result_collector import CollectedFinding\nfrom vvaharness.validation.models import RunMetadata, ValidationResult\nfrom vvaharness.validation.models.plans import FixValidationPlan\nfrom vvaharness.validation.report import augment_reports\nfrom vvaharness.validation.report.models import ValidatedFinding\n\n__all__ = [\"VALIDATION_ENGINE_ID\", \"Selection\", \"ValidationRunResult\", \"run_validation\"]\n\n#: Engine identity stamped on every verdict; mirrors plugin_runner.ENGINE_ID.\nVALIDATION_ENGINE_ID = \"vvaharness.validation\"\n\n\nclass SessionLogPaths(NamedTuple):\n    \"\"\"Where to read a session log from, and where its redacted copy will be written.\"\"\"\n\n    source: Path\n    destination: Path\n\n\nclass ValidatedCase(NamedTuple):\n    \"\"\"One case that was run to completion, with its verdict and render row.\"\"\"\n\n    loaded: LoadedCase\n    verdict: Verdict\n    row: ValidationResult\n    session_failed: bool\n\n\nclass ValidationRunResult(NamedTuple):\n    \"\"\"What one validation run produced: verdicts, exit code, and run metadata.\"\"\"\n\n    exit_code: int\n    verdicts: tuple[Verdict, ...]\n    metadata: RunMetadata\n\n\ndef _safe(case_id: str) -> str:\n    \"\"\"Return a filesystem-safe version of a case id (max 80 chars).\"\"\"\n    return _UNSAFE.sub(\"_\", case_id)[:CMD_PREVIEW_LEN]\n\n\ndef _engine_identity(config: Config) -> tuple[str, str]:\n    \"\"\"Resolve (model id, registry-qualified backend) for the validate role.\"\"\"\n    return str(config.agent.model), f\"{HARNESS_REGISTRY}:{config.agent.via}\"\n\n\ndef _step_key(case_id: str, *, model: str, backend: str) -> str:\n    \"\"\"Resume-checkpoint step for a case, keyed on the full case id to avoid collisions.\"\"\"\n    from vvaharness import __version__\n    return step_key_for(VALIDATE_PREFIX, engine_id=VALIDATION_ENGINE_ID,\n                        engine_version=__version__, case_id=case_id,\n                        model=model, backend=backend)\n\n\ndef _session_log_dest(workspace: Path, loaded: LoadedCase) -> SessionLogPaths | None:\n    \"\"\"Resolve the source and destination paths for the session log, or None if unavailable.\"\"\"\n    src = workspace / LOGGING_DIRNAME / ORCHESTRATOR_LOG_DIRNAME / SESSION_LOG_FILENAME\n    if not src.exists():\n        return None\n    fname = f\"{VALIDATION_SESSION_LOG_PREFIX}{_safe(loaded.case_id)}.jsonl\"\n    return SessionLogPaths(src, loaded.path.parent / fname)\n\n\ndef _persist_session_log(workspace: Path, loaded: LoadedCase) -> Path | None:\n    \"\"\"Persist the redacted session transcript next to the case file; best-effort.\"\"\"\n    resolved = _session_log_dest(workspace, loaded)\n    if resolved is None:\n        return None\n    src, dest = resolved\n    try:\n        dest.write_text(\n            redact(src.read_text(encoding=\"utf-8\", errors=\"replace\")), encoding=\"utf-8\"\n        )\n    except (OSError, ValueError):\n        dest.unlink(missing_ok=True)\n        return None\n    return dest\n\n\ndef _print_result(row: ValidationResult) -> None:\n    \"\"\"Print a one-line verdict summary for a completed validation.\"\"\"\n    print(f\"[{row.tracking_id}] verdict={row.reason_for_decision} score={row.fix_confidence}\")\n    if row.justification:\n        print(f\"    justification: {row.justification}\")\n\n\ndef _run_plan(loaded: LoadedCase, run: ValidationRun, workspace: Path) -> ValidatedCase:\n    \"\"\"Stage, validate and write back one case, returning its verdict and timed row.\"\"\"\n    started = datetime.now(UTC)\n    spend_before = TOKENS.spend()\n    session_id = uuid.uuid4().hex\n    latest = loaded.case.attempts[-1]\n    stage_workspace(run.repo, workspace, latest.remediation.diff)\n    plan = FixValidationPlan(\n        case_id=loaded.case_id,\n        session_id=session_id,\n        manifest=build_manifest(loaded.case, session_id=session_id),\n        workspace_dir=workspace,\n        output_dir=workspace,\n        provenance=run.provenance,\n        policy=run.policy,\n    )\n    outcome = asyncio.run(\n        execute_plan(\n            plan, run.config, post_results=False, meta=RunMetadata(total_findings=1)\n        )\n    )\n    collected: CollectedFinding = outcome.findings[0]\n    verdict = build_verdict(\n        loaded.case,\n        workspace,\n        provenance=_measured(run.provenance, started, spend_before),\n        policy=run.policy,\n        session_failed=outcome.session_failed,\n    )\n    _record(loaded, verdict, workspace)\n    return ValidatedCase(loaded, verdict, collected.row, outcome.session_failed)\n\n\ndef _measured(base: Provenance, started: datetime, spend_before: Spend) -> Provenance:\n    \"\"\"*base* with this case's session window and spend closed on (safe: cases run sequentially).\"\"\"\n    usd, turns = reported_between(spend_before, TOKENS.spend())\n    return base.model_copy(update={\"started\": started, \"ended\": datetime.now(UTC),\n                                   \"usd\": usd, \"turns\": turns})\n\n\ndef _record(loaded: LoadedCase, verdict: Verdict, workspace: Path) -> None:\n    \"\"\"Persist the session log and the verdict, reporting both on stderr.\"\"\"\n    record = _persist_session_log(workspace, loaded)\n    if record is not None:\n        console.write(f\"  [{VALIDATE_ALIAS_S11}] session log → {record}\")\n    judged = write_back_verdict(loaded.case, verdict, loaded.path)\n    if judged is not None:\n        console.write(\n            f\"  [{VALIDATE_ALIAS_S11}] case updated → {loaded.case_id}: \"\n            f\"state={judged.state.value}\"\n        )\n\n\ndef _validate_one(loaded: LoadedCase, run: ValidationRun) -> ValidatedCase | None:\n    \"\"\"Validate one case, or None when the pre-flight gate refuses it.\"\"\"\n    if not loaded.case.attempts:\n        console.write(f\"refusing {loaded.case_id}: no remediation attempt to validate\")\n        return None\n    workspace = run.workspace_root / _safe(loaded.case_id)\n    try:\n        assert_remediation_applied(run.repo, loaded.case.attempts[-1].remediation.files_touched)\n    except IngestError as exc:\n        console.write(f\"refusing {loaded.case_id}: {exc}\")\n        return None\n    try:\n        return _run_plan(loaded, run, workspace)\n    finally:\n        shutil.rmtree(workspace, ignore_errors=True)\n\n\ndef _resume_hit(run: ValidationRun, step: str) -> ValidationResult | None:\n    \"\"\"Return the cached render row for a prior run of *step*, or None to re-run.\"\"\"\n    from vvaharness.orchestrator.checkpoints import load_ckpt\n    return load_ckpt(run.workspace_root, run.run_id, step)\n\n\ndef _process_case(loaded: LoadedCase, run: ValidationRun) -> ValidatedCase | None:\n    \"\"\"Validate (or resume) one case; checkpoint a fresh row. None on gate failure.\"\"\"\n    model, backend = _engine_identity(run.config)\n    step = _step_key(loaded.case_id, model=model, backend=backend)\n    if run.resume:\n        cached = _resume_hit(run, step)\n        # Reuse only when the cached row matches THIS case; else re-validate.\n        if cached is not None and cached.tracking_id == loaded.case_id:\n            console.write(\n                f\"  [{VALIDATE_ALIAS_S11}] resume: {loaded.case_id} already validated\"\n            )\n            return _resumed(loaded, cached)\n    validated = _validate_one(loaded, run)\n    if validated is not None:\n        from vvaharness.orchestrator.checkpoints import save_ckpt\n        save_ckpt(run.workspace_root, run.run_id, step, validated.row)\n    return validated\n\n\ndef _resumed(loaded: LoadedCase, cached: ValidationResult) -> ValidatedCase:\n    \"\"\"Rebuild a ValidatedCase from a checkpointed row and the case's persisted verdict.\"\"\"\n    latest = loaded.case.attempts[-1] if loaded.case.attempts else None\n    verdict = latest.verdict if latest is not None else None\n    if verdict is None:\n        return ValidatedCase(loaded, _no_verdict(), cached, session_failed=True)\n    return ValidatedCase(loaded, verdict, cached, session_failed=False)\n\n\ndef _no_verdict() -> Verdict:\n    \"\"\"Verdict for a resume whose case file records none: unscored, engine-stamped but no model.\"\"\"\n    from vvaharness import __version__\n    from vvaharness.models import Decision\n    return Verdict(\n        decision=Decision.INCONCLUSIVE,\n        rationale=\"resumed from a checkpoint, but the case file records no verdict\",\n        score=None,\n        produced_by=Provenance(engine=VALIDATION_ENGINE_ID, engine_version=__version__),\n    )\n\n\ndef _run_cases(cases: list[LoadedCase], run: ValidationRun) -> tuple[int, list[ValidatedCase]]:\n    \"\"\"Run (or resume) validation per case; return the failure count and validated cases.\"\"\"\n    failures = 0\n    validated: list[ValidatedCase] = []\n    for loaded in cases:\n        result = _process_case(loaded, run)\n        if result is None:\n            failures += 1  # refused before validation; _validate_one already explained why\n            continue\n        if result.session_failed:\n            # A session/agent error — surface as FAILED, not a normal verdict.\n            console.write(f\"FAILED: {loaded.case_id} — {result.row.reason_for_decision}\")\n            failures += 1\n        else:\n            _print_result(result.row)\n        validated.append(result)\n    return failures, validated\n\n\n@dataclass(frozen=True)\nclass Selection:\n    \"\"\"What to validate: explicit case ids, or the validatable set capped top-N by CVSS.\"\"\"\n\n    case_ids: list[str] | None = None\n    max_findings: int | None = None\n    resume: bool = False\n\n\n@dataclass(frozen=True)\nclass ValidationRun:\n    \"\"\"Shared state of one validation run, threaded through the per-case loop.\"\"\"\n\n    repo: Path\n    workspace_root: Path\n    config: Config\n    run_id: str\n    provenance: Provenance\n    policy: ScoringPolicy\n    resume: bool = False\n\n\ndef _cleanup_workspace(workspace_root: Path) -> None:\n    \"\"\"Remove the ephemeral staging tree; surface a genuine failure (e.g. permissions) as a WARN.\"\"\"\n    try:\n        shutil.rmtree(workspace_root)\n    except FileNotFoundError:\n        pass\n    except OSError as exc:\n        console.write(\n            f\"  [{VALIDATE_ALIAS_S11}] WARN: could not remove workspace {workspace_root}: {exc}\"\n        )\n\n\ndef _any_owned(paths: list[Path], owned: set[tuple[str, Path]]) -> bool:\n    \"\"\"True if at least one of *paths* (``finding_case.json`` locations) matches *owned*.\"\"\"\n    for path in paths:\n        try:\n            case_id = load_case(path).case_id\n        except (OSError, ValueError, ValidationError):\n            continue\n        if (case_id, path.parent.resolve()) in owned:\n            return True\n    return False\n\n\ndef _empty_selection_rc(repo: Path, *, owned: set[tuple[str, Path]] | None = None) -> int:\n    \"\"\"Exit code when nothing was selected.\n\n    0 if all cases are closed already, 1 if none exist (or, with ``owned`` given, none\n    have an S10 record for this run in the state store).\n    \"\"\"\n    discovered = discover_cases(repo)\n    if not discovered:\n        valid = \" / \".join(sorted(state.value for state in VALIDATABLE_STATES))\n        console.write(\n            f\"validation cannot run: no findings in a validatable state ({valid}) under {repo}\"\n        )\n        return 1\n    if owned is not None and not _any_owned(discovered, owned):\n        console.write(\n            f\"validation cannot run: no case under {repo} has an S10 record in this \"\n            \"machine's state store (not written by this machine's remediation)\"\n        )\n        return 1\n    console.write(\n        f\"validation: nothing to validate — all findings under {repo} are already \"\n        \"in a terminal state\"\n    )\n    return 0\n\n\ndef _prune_orphans(repo: Path, run_id: str, *, model: str, backend: str) -> None:\n    \"\"\"Drop this repo's rows no case on disk claims (live set is every case, not ``--finding``).\"\"\"\n    from vvaharness.orchestrator.checkpoints import prune_stale_steps\n    case_ids = all_case_ids(repo)\n    if case_ids is None:\n        return\n    prune_stale_steps(run_id, VALIDATE_PREFIX,\n                      [_step_key(cid, model=model, backend=backend)\n                       for cid in case_ids])\n\n\ndef _provenance_for(config: Config) -> Provenance:\n    \"\"\"Stamp every verdict with what produced it; engine_version scopes the resume key.\"\"\"\n    from vvaharness import __version__\n    model, backend = _engine_identity(config)\n    return Provenance(\n        engine=VALIDATION_ENGINE_ID,\n        engine_version=__version__,\n        model=model,\n        backend=backend,\n    )\n\n\ndef run_validation(\n    *,\n    repo: Path,\n    selection: Selection,\n    workspace_root: Path,\n    config: Config,\n    report_md: Path | None = None,\n) -> ValidationRunResult:\n    \"\"\"Validate each validatable case in sequence; exit code is 0 when all succeeded.\"\"\"\n    meta = RunMetadata()\n    # SQLite resume layer (lazy import keeps the validation package standalone-runnable).\n    # Computed BEFORE select_cases so the owned-case provenance filter below can run: a\n    # case the repo carries is only trusted when THIS run_id's S10 wrote it (state store,\n    # outside the repo) — see vvaharness.remediation_agent.provenance.owned_cases.\n    from vvaharness.orchestrator.checkpoints import run_id_for\n    from vvaharness.orchestrator.store import register_run\n    from vvaharness.remediation_agent.provenance import owned_cases\n    run_id = run_id_for(repo)\n    register_run(run_id, repo_root=str(repo.resolve()))\n    owned = owned_cases(run_id)\n    try:\n        cases = select_cases(repo, selection.case_ids, selection.max_findings, owned=owned)\n    except (IngestError, UnsafeArtifactDir) as exc:\n        console.write(f\"ingest error: {exc}\")\n        meta.errors.append(str(exc))\n        return ValidationRunResult(1, (), meta)\n    if not cases:\n        return ValidationRunResult(_empty_selection_rc(repo, owned=owned), (), meta)\n    model, backend = _engine_identity(config)\n    _prune_orphans(repo, run_id, model=model, backend=backend)\n    run = ValidationRun(\n        repo=repo,\n        workspace_root=workspace_root,\n        config=config,\n        run_id=run_id,\n        provenance=_provenance_for(config),\n        policy=FIX_POLICY,\n        resume=selection.resume,\n    )\n    failures, validated = _run_cases(cases, run)\n    meta.total_findings = len(cases)\n    meta.findings_processed = len(validated)\n    meta.findings_failed = failures\n    # best-effort: write results into the combined report\n    augment_reports(\n        repo,\n        [ValidatedFinding(item.loaded.case.finding, item.row, item.session_failed)\n         for item in validated],\n        report_md,\n    )\n    # Remove the staging tree entirely; checkpoints live in SQLite, so this is safe for --resume.\n    _cleanup_workspace(workspace_root)\n    # A session failure outranks a verdict, so a broken run is never reported as clean\n    from vvaharness.orchestrator.case_rollup import rc_for_verdicts\n    verdicts = tuple(item.verdict for item in validated)\n    return ValidationRunResult(\n        exit_code=1 if failures else rc_for_verdicts(verdicts),\n        verdicts=verdicts,\n        metadata=meta,\n    )\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "Core validation execution: run_validation() and _validate_one().",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_72_4": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 72,
+      "line_end": 72,
+      "value": "Where to read a session log from, and where its redacted copy will be written.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_79_4": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 79,
+      "line_end": 79,
+      "value": "One case that was run to completion, with its verdict and render row.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_88_4": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 88,
+      "line_end": 88,
+      "value": "What one validation run produced: verdicts, exit code, and run metadata.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_96_4": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 96,
+      "line_end": 96,
+      "value": "Return a filesystem-safe version of a case id (max 80 chars).",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_101_4": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 101,
+      "line_end": 101,
+      "value": "Resolve (model id, registry-qualified backend) for the validate role.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_102_36": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 102,
+      "line_end": 102,
+      "source_expression": "f\"{HARNESS_REGISTRY}:{config.agent.via}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_106_4": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 106,
+      "line_end": 106,
+      "value": "Resume-checkpoint step for a case, keyed on the full case id to avoid collisions.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_114_4": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 114,
+      "line_end": 114,
+      "value": "Resolve the source and destination paths for the session log, or None if unavailable.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_118_12": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 118,
+      "line_end": 118,
+      "source_expression": "f\"{VALIDATION_SESSION_LOG_PREFIX}{_safe(loaded.case_id)}.jsonl\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_123_4": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 123,
+      "line_end": 123,
+      "value": "Persist the redacted session transcript next to the case file; best-effort.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_139_4": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 139,
+      "line_end": 139,
+      "value": "Print a one-line verdict summary for a completed validation.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_140_10": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 140,
+      "line_end": 140,
+      "source_expression": "f\"[{row.tracking_id}] verdict={row.reason_for_decision} score={row.fix_confidence}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_142_14": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 142,
+      "line_end": 142,
+      "source_expression": "f\"    justification: {row.justification}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_146_4": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 146,
+      "line_end": 146,
+      "value": "Stage, validate and write back one case, returning its verdict and timed row.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_179_4": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 179,
+      "line_end": 179,
+      "value": "*base* with this case's session window and spend closed on (safe: cases run sequentially).",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_186_4": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 186,
+      "line_end": 186,
+      "value": "Persist the session log and the verdict, reporting both on stderr.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_189_22": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 189,
+      "line_end": 189,
+      "source_expression": "f\"  [{VALIDATE_ALIAS_S11}] session log → {record}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_193_12": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 193,
+      "line_end": 194,
+      "source_expression": "f\"  [{VALIDATE_ALIAS_S11}] case updated → {loaded.case_id}: \"\n            f\"state={judged.state.value}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_199_4": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 199,
+      "line_end": 199,
+      "value": "Validate one case, or None when the pre-flight gate refuses it.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_201_22": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 201,
+      "line_end": 201,
+      "source_expression": "f\"refusing {loaded.case_id}: no remediation attempt to validate\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_207_22": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 207,
+      "line_end": 207,
+      "source_expression": "f\"refusing {loaded.case_id}: {exc}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_216_4": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 216,
+      "line_end": 216,
+      "value": "Return the cached render row for a prior run of *step*, or None to re-run.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_222_4": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 222,
+      "line_end": 222,
+      "value": "Validate (or resume) one case; checkpoint a fresh row. None on gate failure.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_230_16": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 230,
+      "line_end": 230,
+      "source_expression": "f\"  [{VALIDATE_ALIAS_S11}] resume: {loaded.case_id} already validated\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_241_4": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 241,
+      "line_end": 241,
+      "value": "Rebuild a ValidatedCase from a checkpointed row and the case's persisted verdict.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_250_4": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 250,
+      "line_end": 250,
+      "value": "Verdict for a resume whose case file records none: unscored, engine-stamped but no model.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_262_4": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 262,
+      "line_end": 262,
+      "value": "Run (or resume) validation per case; return the failure count and validated cases.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_272_26": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 272,
+      "line_end": 272,
+      "source_expression": "f\"FAILED: {loaded.case_id} — {result.row.reason_for_decision}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_282_4": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 282,
+      "line_end": 282,
+      "value": "What to validate: explicit case ids, or the validatable set capped top-N by CVSS.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_291_4": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 291,
+      "line_end": 291,
+      "value": "Shared state of one validation run, threaded through the per-case loop.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_303_4": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 303,
+      "line_end": 303,
+      "value": "Remove the ephemeral staging tree; surface a genuine failure (e.g. permissions) as a WARN.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_310_12": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 310,
+      "line_end": 310,
+      "source_expression": "f\"  [{VALIDATE_ALIAS_S11}] WARN: could not remove workspace {workspace_root}: {exc}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_315_4": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 315,
+      "line_end": 315,
+      "value": "True if at least one of *paths* (``finding_case.json`` locations) matches *owned*.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_327_4": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 327,
+      "line_end": 331,
+      "value": "Exit code when nothing was selected.\n\n    0 if all cases are closed already, 1 if none exist (or, with ``owned`` given, none\n    have an S10 record for this run in the state store).\n    ",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_336_12": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 336,
+      "line_end": 336,
+      "source_expression": "f\"validation cannot run: no findings in a validatable state ({valid}) under {repo}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_341_12": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 341,
+      "line_end": 342,
+      "source_expression": "f\"validation cannot run: no case under {repo} has an S10 record in this \"\n            \"machine's state store (not written by this machine's remediation)\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_346_8": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 346,
+      "line_end": 347,
+      "source_expression": "f\"validation: nothing to validate — all findings under {repo} are already \"\n        \"in a terminal state\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_353_4": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 353,
+      "line_end": 353,
+      "value": "Drop this repo's rows no case on disk claims (live set is every case, not ``--finding``).",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_364_4": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 364,
+      "line_end": 364,
+      "value": "Stamp every verdict with what produced it; engine_version scopes the resume key.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_383_4": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 383,
+      "line_end": 383,
+      "value": "Validate each validatable case in sequence; exit code is 0 when all succeeded.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_398_22": {
+      "source": "vvaharness/validation/cli/_run.py",
+      "line_start": 398,
+      "line_end": 398,
+      "source_expression": "f\"ingest error: {exc}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "Core validation execution: run_validation() and _validate_one().",
+      "context": "literal"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 23,
+      "value": "vvaharness.validation",
+      "context": "literal"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 11,
+      "value": "VALIDATION_ENGINE_ID",
+      "context": "literal"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 35,
+      "value": "Selection",
+      "context": "literal"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 48,
+      "value": "ValidationRunResult",
+      "context": "literal"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 71,
+      "value": "run_validation",
+      "context": "literal"
+    },
+    {
+      "line_start": 72,
+      "line_end": 72,
+      "column": 4,
+      "value": "Where to read a session log from, and where its redacted copy will be written.",
+      "context": "literal"
+    },
+    {
+      "line_start": 79,
+      "line_end": 79,
+      "column": 4,
+      "value": "One case that was run to completion, with its verdict and render row.",
+      "context": "literal"
+    },
+    {
+      "line_start": 88,
+      "line_end": 88,
+      "column": 4,
+      "value": "What one validation run produced: verdicts, exit code, and run metadata.",
+      "context": "literal"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 4,
+      "value": "Return a filesystem-safe version of a case id (max 80 chars).",
+      "context": "literal"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 4,
+      "value": "Resolve (model id, registry-qualified backend) for the validate role.",
+      "context": "literal"
+    },
+    {
+      "line_start": 106,
+      "line_end": 106,
+      "column": 4,
+      "value": "Resume-checkpoint step for a case, keyed on the full case id to avoid collisions.",
+      "context": "literal"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 4,
+      "value": "Resolve the source and destination paths for the session log, or None if unavailable.",
+      "context": "literal"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 4,
+      "value": "Persist the redacted session transcript next to the case file; best-effort.",
+      "context": "literal"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 4,
+      "value": "Print a one-line verdict summary for a completed validation.",
+      "context": "literal"
+    },
+    {
+      "line_start": 146,
+      "line_end": 146,
+      "column": 4,
+      "value": "Stage, validate and write back one case, returning its verdict and timed row.",
+      "context": "literal"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 4,
+      "value": "*base* with this case's session window and spend closed on (safe: cases run sequentially).",
+      "context": "literal"
+    },
+    {
+      "line_start": 186,
+      "line_end": 186,
+      "column": 4,
+      "value": "Persist the session log and the verdict, reporting both on stderr.",
+      "context": "literal"
+    },
+    {
+      "line_start": 199,
+      "line_end": 199,
+      "column": 4,
+      "value": "Validate one case, or None when the pre-flight gate refuses it.",
+      "context": "literal"
+    },
+    {
+      "line_start": 216,
+      "line_end": 216,
+      "column": 4,
+      "value": "Return the cached render row for a prior run of *step*, or None to re-run.",
+      "context": "literal"
+    },
+    {
+      "line_start": 222,
+      "line_end": 222,
+      "column": 4,
+      "value": "Validate (or resume) one case; checkpoint a fresh row. None on gate failure.",
+      "context": "literal"
+    },
+    {
+      "line_start": 241,
+      "line_end": 241,
+      "column": 4,
+      "value": "Rebuild a ValidatedCase from a checkpointed row and the case's persisted verdict.",
+      "context": "literal"
+    },
+    {
+      "line_start": 250,
+      "line_end": 250,
+      "column": 4,
+      "value": "Verdict for a resume whose case file records none: unscored, engine-stamped but no model.",
+      "context": "literal"
+    },
+    {
+      "line_start": 262,
+      "line_end": 262,
+      "column": 4,
+      "value": "Run (or resume) validation per case; return the failure count and validated cases.",
+      "context": "literal"
+    },
+    {
+      "line_start": 282,
+      "line_end": 282,
+      "column": 4,
+      "value": "What to validate: explicit case ids, or the validatable set capped top-N by CVSS.",
+      "context": "literal"
+    },
+    {
+      "line_start": 291,
+      "line_end": 291,
+      "column": 4,
+      "value": "Shared state of one validation run, threaded through the per-case loop.",
+      "context": "literal"
+    },
+    {
+      "line_start": 303,
+      "line_end": 303,
+      "column": 4,
+      "value": "Remove the ephemeral staging tree; surface a genuine failure (e.g. permissions) as a WARN.",
+      "context": "literal"
+    },
+    {
+      "line_start": 315,
+      "line_end": 315,
+      "column": 4,
+      "value": "True if at least one of *paths* (``finding_case.json`` locations) matches *owned*.",
+      "context": "literal"
+    },
+    {
+      "line_start": 327,
+      "line_end": 331,
+      "column": 4,
+      "value": "Exit code when nothing was selected.\n\n    0 if all cases are closed already, 1 if none exist (or, with ``owned`` given, none\n    have an S10 record for this run in the state store).\n    ",
+      "context": "literal"
+    },
+    {
+      "line_start": 353,
+      "line_end": 353,
+      "column": 4,
+      "value": "Drop this repo's rows no case on disk claims (live set is every case, not ``--finding``).",
+      "context": "literal"
+    },
+    {
+      "line_start": 364,
+      "line_end": 364,
+      "column": 4,
+      "value": "Stamp every verdict with what produced it; engine_version scopes the resume key.",
+      "context": "literal"
+    },
+    {
+      "line_start": 383,
+      "line_end": 383,
+      "column": 4,
+      "value": "Validate each validatable case in sequence; exit code is 0 when all succeeded.",
+      "context": "literal"
+    },
+    {
+      "line_start": 118,
+      "line_end": 118,
+      "column": 68,
+      "value": ".jsonl",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 97,
+      "line_end": 97,
+      "column": 23,
+      "value": "_",
+      "context": "literal"
+    },
+    {
+      "line_start": 102,
+      "line_end": 102,
+      "column": 56,
+      "value": ":",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 12,
+      "value": "[",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 30,
+      "value": "] verdict=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 65,
+      "value": " score=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 255,
+      "line_end": 255,
+      "column": 18,
+      "value": "resumed from a checkpoint, but the case file records no verdict",
+      "context": "literal"
+    },
+    {
+      "line_start": 346,
+      "line_end": 346,
+      "column": 10,
+      "value": "validation: nothing to validate — all findings under ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 346,
+      "line_end": 347,
+      "column": 71,
+      "value": " are already in a terminal state",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 80,
+      "value": "utf-8",
+      "context": "literal"
+    },
+    {
+      "line_start": 142,
+      "line_end": 142,
+      "column": 16,
+      "value": "    justification: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 35,
+      "value": "started",
+      "context": "literal"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 55,
+      "value": "ended",
+      "context": "literal"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 35,
+      "value": "usd",
+      "context": "literal"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 47,
+      "value": "turns",
+      "context": "literal"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 24,
+      "value": "  [",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 47,
+      "value": "] session log → ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 193,
+      "line_end": 193,
+      "column": 14,
+      "value": "  [",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 193,
+      "line_end": 193,
+      "column": 37,
+      "value": "] case updated → ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 193,
+      "line_end": 194,
+      "column": 72,
+      "value": ": state=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 201,
+      "line_end": 201,
+      "column": 24,
+      "value": "refusing ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 201,
+      "line_end": 201,
+      "column": 49,
+      "value": ": no remediation attempt to validate",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 334,
+      "line_end": 334,
+      "column": 16,
+      "value": " / ",
+      "context": "literal"
+    },
+    {
+      "line_start": 336,
+      "line_end": 336,
+      "column": 14,
+      "value": "validation cannot run: no findings in a validatable state (",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 336,
+      "line_end": 336,
+      "column": 80,
+      "value": ") under ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 341,
+      "line_end": 341,
+      "column": 14,
+      "value": "validation cannot run: no case under ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 341,
+      "line_end": 342,
+      "column": 57,
+      "value": " has an S10 record in this machine's state store (not written by this machine's remediation)",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 207,
+      "line_end": 207,
+      "column": 24,
+      "value": "refusing ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 207,
+      "line_end": 207,
+      "column": 49,
+      "value": ": ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 230,
+      "line_end": 230,
+      "column": 18,
+      "value": "  [",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 230,
+      "line_end": 230,
+      "column": 41,
+      "value": "] resume: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 230,
+      "line_end": 230,
+      "column": 67,
+      "value": " already validated",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 272,
+      "line_end": 272,
+      "column": 28,
+      "value": "FAILED: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 272,
+      "line_end": 272,
+      "column": 52,
+      "value": " — ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 310,
+      "line_end": 310,
+      "column": 14,
+      "value": "  [",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 310,
+      "line_end": 310,
+      "column": 37,
+      "value": "] WARN: could not remove workspace ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 310,
+      "line_end": 310,
+      "column": 88,
+      "value": ": ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 398,
+      "line_end": 398,
+      "column": 24,
+      "value": "ingest error: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 42,
+      "value": "utf-8",
+      "context": "literal"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 58,
+      "value": "replace",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 67,
+      "text": "#: Engine identity stamped on every verdict; mirrors plugin_runner.ENGINE_ID."
+    },
+    {
+      "line": 227,
+      "text": "# Reuse only when the cached row matches THIS case; else re-validate."
+    },
+    {
+      "line": 268,
+      "text": "# refused before validation; _validate_one already explained why"
+    },
+    {
+      "line": 271,
+      "text": "# A session/agent error — surface as FAILED, not a normal verdict."
+    },
+    {
+      "line": 385,
+      "text": "# SQLite resume layer (lazy import keeps the validation package standalone-runnable)."
+    },
+    {
+      "line": 386,
+      "text": "# Computed BEFORE select_cases so the owned-case provenance filter below can run: a"
+    },
+    {
+      "line": 387,
+      "text": "# case the repo carries is only trusted when THIS run_id's S10 wrote it (state store,"
+    },
+    {
+      "line": 388,
+      "text": "# outside the repo) — see vvaharness.remediation_agent.provenance.owned_cases."
+    },
+    {
+      "line": 418,
+      "text": "# best-effort: write results into the combined report"
+    },
+    {
+      "line": 425,
+      "text": "# Remove the staging tree entirely; checkpoints live in SQLite, so this is safe for --resume."
+    },
+    {
+      "line": 427,
+      "text": "# A session failure outranks a verdict, so a broken run is never reported as clean"
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 23,
+      "line_end": 23,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 27,
+      "line_end": 27,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 29,
+      "line_end": 29,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 30,
+      "line_end": 30,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 31,
+      "line_end": 31,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 32,
+      "line_end": 32,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 33,
+      "line_end": 33,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 34,
+      "line_end": 34,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 35,
+      "line_end": 35,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 36,
+      "line_end": 36,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 37,
+      "line_end": 45,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 46,
+      "line_end": 46,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 47,
+      "line_end": 47,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 10
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 48,
+      "line_end": 54,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 10
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 55,
+      "line_end": 55,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 10
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 56,
+      "line_end": 56,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 10
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 57,
+      "line_end": 57,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 10
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 58,
+      "line_end": 58,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 12
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 59,
+      "line_end": 59,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 12
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 60,
+      "line_end": 60,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 12
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 61,
+      "line_end": 61,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 12
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 62,
+      "line_end": 62,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 12
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 63,
+      "line_end": 63,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 14
+    },
+    {
+      "kind": "Assign",
+      "line_start": 65,
+      "line_end": 65,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 14
+    },
+    {
+      "kind": "Assign",
+      "line_start": 68,
+      "line_end": 68,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 14
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 71,
+      "line_end": 75,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 15
+    },
+    {
+      "kind": "Expr",
+      "line_start": 72,
+      "line_end": 72,
+      "column": 4,
+      "owner": "SessionLogPaths",
+      "representation_line": 20
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 74,
+      "line_end": 74,
+      "column": 4,
+      "owner": "SessionLogPaths",
+      "representation_line": 20
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 75,
+      "line_end": 75,
+      "column": 4,
+      "owner": "SessionLogPaths",
+      "representation_line": 20
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 78,
+      "line_end": 84,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 22
+    },
+    {
+      "kind": "Expr",
+      "line_start": 79,
+      "line_end": 79,
+      "column": 4,
+      "owner": "ValidatedCase",
+      "representation_line": 27
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 81,
+      "line_end": 81,
+      "column": 4,
+      "owner": "ValidatedCase",
+      "representation_line": 27
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 82,
+      "line_end": 82,
+      "column": 4,
+      "owner": "ValidatedCase",
+      "representation_line": 27
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 83,
+      "line_end": 83,
+      "column": 4,
+      "owner": "ValidatedCase",
+      "representation_line": 27
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 84,
+      "line_end": 84,
+      "column": 4,
+      "owner": "ValidatedCase",
+      "representation_line": 27
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 87,
+      "line_end": 92,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 29
+    },
+    {
+      "kind": "Expr",
+      "line_start": 88,
+      "line_end": 88,
+      "column": 4,
+      "owner": "ValidationRunResult",
+      "representation_line": 34
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 90,
+      "line_end": 90,
+      "column": 4,
+      "owner": "ValidationRunResult",
+      "representation_line": 34
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 91,
+      "line_end": 91,
+      "column": 4,
+      "owner": "ValidationRunResult",
+      "representation_line": 34
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 92,
+      "line_end": 92,
+      "column": 4,
+      "owner": "ValidationRunResult",
+      "representation_line": 34
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 95,
+      "line_end": 97,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 36
+    },
+    {
+      "kind": "Expr",
+      "line_start": 96,
+      "line_end": 96,
+      "column": 4,
+      "owner": "_safe",
+      "representation_line": 42
+    },
+    {
+      "kind": "Return",
+      "line_start": 97,
+      "line_end": 97,
+      "column": 4,
+      "owner": "_safe",
+      "representation_line": 43
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 100,
+      "line_end": 102,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 47
+    },
+    {
+      "kind": "Expr",
+      "line_start": 101,
+      "line_end": 101,
+      "column": 4,
+      "owner": "_engine_identity",
+      "representation_line": 53
+    },
+    {
+      "kind": "Return",
+      "line_start": 102,
+      "line_end": 102,
+      "column": 4,
+      "owner": "_engine_identity",
+      "representation_line": 54
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 105,
+      "line_end": 110,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 58
+    },
+    {
+      "kind": "Expr",
+      "line_start": 106,
+      "line_end": 106,
+      "column": 4,
+      "owner": "_step_key",
+      "representation_line": 64
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 107,
+      "line_end": 107,
+      "column": 4,
+      "owner": "_step_key",
+      "representation_line": 64
+    },
+    {
+      "kind": "Return",
+      "line_start": 108,
+      "line_end": 110,
+      "column": 4,
+      "owner": "_step_key",
+      "representation_line": 65
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 113,
+      "line_end": 119,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 69
+    },
+    {
+      "kind": "Expr",
+      "line_start": 114,
+      "line_end": 114,
+      "column": 4,
+      "owner": "_session_log_dest",
+      "representation_line": 75
+    },
+    {
+      "kind": "Assign",
+      "line_start": 115,
+      "line_end": 115,
+      "column": 4,
+      "owner": "_session_log_dest",
+      "representation_line": 75
+    },
+    {
+      "kind": "If",
+      "line_start": 116,
+      "line_end": 117,
+      "column": 4,
+      "owner": "_session_log_dest",
+      "representation_line": 76
+    },
+    {
+      "kind": "Return",
+      "line_start": 117,
+      "line_end": 117,
+      "column": 8,
+      "owner": "_session_log_dest",
+      "representation_line": 78
+    },
+    {
+      "kind": "Assign",
+      "line_start": 118,
+      "line_end": 118,
+      "column": 4,
+      "owner": "_session_log_dest",
+      "representation_line": 82
+    },
+    {
+      "kind": "Return",
+      "line_start": 119,
+      "line_end": 119,
+      "column": 4,
+      "owner": "_session_log_dest",
+      "representation_line": 83
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 122,
+      "line_end": 135,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 87
+    },
+    {
+      "kind": "Expr",
+      "line_start": 123,
+      "line_end": 123,
+      "column": 4,
+      "owner": "_persist_session_log",
+      "representation_line": 93
+    },
+    {
+      "kind": "Assign",
+      "line_start": 124,
+      "line_end": 124,
+      "column": 4,
+      "owner": "_persist_session_log",
+      "representation_line": 93
+    },
+    {
+      "kind": "If",
+      "line_start": 125,
+      "line_end": 126,
+      "column": 4,
+      "owner": "_persist_session_log",
+      "representation_line": 94
+    },
+    {
+      "kind": "Return",
+      "line_start": 126,
+      "line_end": 126,
+      "column": 8,
+      "owner": "_persist_session_log",
+      "representation_line": 96
+    },
+    {
+      "kind": "Assign",
+      "line_start": 127,
+      "line_end": 127,
+      "column": 4,
+      "owner": "_persist_session_log",
+      "representation_line": 100
+    },
+    {
+      "kind": "Try",
+      "line_start": 128,
+      "line_end": 134,
+      "column": 4,
+      "owner": "_persist_session_log",
+      "representation_line": 101
+    },
+    {
+      "kind": "Expr",
+      "line_start": 129,
+      "line_end": 131,
+      "column": 8,
+      "owner": "_persist_session_log",
+      "representation_line": 104
+    },
+    {
+      "kind": "Expr",
+      "line_start": 133,
+      "line_end": 133,
+      "column": 8,
+      "owner": "_persist_session_log",
+      "representation_line": 109
+    },
+    {
+      "kind": "Return",
+      "line_start": 134,
+      "line_end": 134,
+      "column": 8,
+      "owner": "_persist_session_log",
+      "representation_line": 110
+    },
+    {
+      "kind": "Return",
+      "line_start": 135,
+      "line_end": 135,
+      "column": 4,
+      "owner": "_persist_session_log",
+      "representation_line": 113
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 138,
+      "line_end": 142,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 117
+    },
+    {
+      "kind": "Expr",
+      "line_start": 139,
+      "line_end": 139,
+      "column": 4,
+      "owner": "_print_result",
+      "representation_line": 123
+    },
+    {
+      "kind": "Expr",
+      "line_start": 140,
+      "line_end": 140,
+      "column": 4,
+      "owner": "_print_result",
+      "representation_line": 123
+    },
+    {
+      "kind": "If",
+      "line_start": 141,
+      "line_end": 142,
+      "column": 4,
+      "owner": "_print_result",
+      "representation_line": 124
+    },
+    {
+      "kind": "Expr",
+      "line_start": 142,
+      "line_end": 142,
+      "column": 8,
+      "owner": "_print_result",
+      "representation_line": 127
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 145,
+      "line_end": 175,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 131
+    },
+    {
+      "kind": "Expr",
+      "line_start": 146,
+      "line_end": 146,
+      "column": 4,
+      "owner": "_run_plan",
+      "representation_line": 137
+    },
+    {
+      "kind": "Assign",
+      "line_start": 147,
+      "line_end": 147,
+      "column": 4,
+      "owner": "_run_plan",
+      "representation_line": 137
+    },
+    {
+      "kind": "Assign",
+      "line_start": 148,
+      "line_end": 148,
+      "column": 4,
+      "owner": "_run_plan",
+      "representation_line": 137
+    },
+    {
+      "kind": "Assign",
+      "line_start": 149,
+      "line_end": 149,
+      "column": 4,
+      "owner": "_run_plan",
+      "representation_line": 137
+    },
+    {
+      "kind": "Assign",
+      "line_start": 150,
+      "line_end": 150,
+      "column": 4,
+      "owner": "_run_plan",
+      "representation_line": 137
+    },
+    {
+      "kind": "Expr",
+      "line_start": 151,
+      "line_end": 151,
+      "column": 4,
+      "owner": "_run_plan",
+      "representation_line": 139
+    },
+    {
+      "kind": "Assign",
+      "line_start": 152,
+      "line_end": 160,
+      "column": 4,
+      "owner": "_run_plan",
+      "representation_line": 139
+    },
+    {
+      "kind": "Assign",
+      "line_start": 161,
+      "line_end": 165,
+      "column": 4,
+      "owner": "_run_plan",
+      "representation_line": 139
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 166,
+      "line_end": 166,
+      "column": 4,
+      "owner": "_run_plan",
+      "representation_line": 139
+    },
+    {
+      "kind": "Assign",
+      "line_start": 167,
+      "line_end": 173,
+      "column": 4,
+      "owner": "_run_plan",
+      "representation_line": 139
+    },
+    {
+      "kind": "Expr",
+      "line_start": 174,
+      "line_end": 174,
+      "column": 4,
+      "owner": "_run_plan",
+      "representation_line": 141
+    },
+    {
+      "kind": "Return",
+      "line_start": 175,
+      "line_end": 175,
+      "column": 4,
+      "owner": "_run_plan",
+      "representation_line": 142
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 178,
+      "line_end": 182,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 146
+    },
+    {
+      "kind": "Expr",
+      "line_start": 179,
+      "line_end": 179,
+      "column": 4,
+      "owner": "_measured",
+      "representation_line": 152
+    },
+    {
+      "kind": "Assign",
+      "line_start": 180,
+      "line_end": 180,
+      "column": 4,
+      "owner": "_measured",
+      "representation_line": 152
+    },
+    {
+      "kind": "Return",
+      "line_start": 181,
+      "line_end": 182,
+      "column": 4,
+      "owner": "_measured",
+      "representation_line": 153
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 185,
+      "line_end": 195,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 157
+    },
+    {
+      "kind": "Expr",
+      "line_start": 186,
+      "line_end": 186,
+      "column": 4,
+      "owner": "_record",
+      "representation_line": 163
+    },
+    {
+      "kind": "Assign",
+      "line_start": 187,
+      "line_end": 187,
+      "column": 4,
+      "owner": "_record",
+      "representation_line": 163
+    },
+    {
+      "kind": "If",
+      "line_start": 188,
+      "line_end": 189,
+      "column": 4,
+      "owner": "_record",
+      "representation_line": 164
+    },
+    {
+      "kind": "Expr",
+      "line_start": 189,
+      "line_end": 189,
+      "column": 8,
+      "owner": "_record",
+      "representation_line": 167
+    },
+    {
+      "kind": "Assign",
+      "line_start": 190,
+      "line_end": 190,
+      "column": 4,
+      "owner": "_record",
+      "representation_line": 170
+    },
+    {
+      "kind": "If",
+      "line_start": 191,
+      "line_end": 195,
+      "column": 4,
+      "owner": "_record",
+      "representation_line": 171
+    },
+    {
+      "kind": "Expr",
+      "line_start": 192,
+      "line_end": 195,
+      "column": 8,
+      "owner": "_record",
+      "representation_line": 174
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 198,
+      "line_end": 212,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 178
+    },
+    {
+      "kind": "Expr",
+      "line_start": 199,
+      "line_end": 199,
+      "column": 4,
+      "owner": "_validate_one",
+      "representation_line": 184
+    },
+    {
+      "kind": "If",
+      "line_start": 200,
+      "line_end": 202,
+      "column": 4,
+      "owner": "_validate_one",
+      "representation_line": 185
+    },
+    {
+      "kind": "Expr",
+      "line_start": 201,
+      "line_end": 201,
+      "column": 8,
+      "owner": "_validate_one",
+      "representation_line": 188
+    },
+    {
+      "kind": "Return",
+      "line_start": 202,
+      "line_end": 202,
+      "column": 8,
+      "owner": "_validate_one",
+      "representation_line": 189
+    },
+    {
+      "kind": "Assign",
+      "line_start": 203,
+      "line_end": 203,
+      "column": 4,
+      "owner": "_validate_one",
+      "representation_line": 193
+    },
+    {
+      "kind": "Try",
+      "line_start": 204,
+      "line_end": 208,
+      "column": 4,
+      "owner": "_validate_one",
+      "representation_line": 194
+    },
+    {
+      "kind": "Expr",
+      "line_start": 205,
+      "line_end": 205,
+      "column": 8,
+      "owner": "_validate_one",
+      "representation_line": 197
+    },
+    {
+      "kind": "Expr",
+      "line_start": 207,
+      "line_end": 207,
+      "column": 8,
+      "owner": "_validate_one",
+      "representation_line": 202
+    },
+    {
+      "kind": "Return",
+      "line_start": 208,
+      "line_end": 208,
+      "column": 8,
+      "owner": "_validate_one",
+      "representation_line": 203
+    },
+    {
+      "kind": "Try",
+      "line_start": 209,
+      "line_end": 212,
+      "column": 4,
+      "owner": "_validate_one",
+      "representation_line": 206
+    },
+    {
+      "kind": "Return",
+      "line_start": 210,
+      "line_end": 210,
+      "column": 8,
+      "owner": "_validate_one",
+      "representation_line": 208
+    },
+    {
+      "kind": "Expr",
+      "line_start": 212,
+      "line_end": 212,
+      "column": 8,
+      "owner": "_validate_one",
+      "representation_line": 213
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 215,
+      "line_end": 218,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 217
+    },
+    {
+      "kind": "Expr",
+      "line_start": 216,
+      "line_end": 216,
+      "column": 4,
+      "owner": "_resume_hit",
+      "representation_line": 223
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 217,
+      "line_end": 217,
+      "column": 4,
+      "owner": "_resume_hit",
+      "representation_line": 223
+    },
+    {
+      "kind": "Return",
+      "line_start": 218,
+      "line_end": 218,
+      "column": 4,
+      "owner": "_resume_hit",
+      "representation_line": 224
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 221,
+      "line_end": 237,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 228
+    },
+    {
+      "kind": "Expr",
+      "line_start": 222,
+      "line_end": 222,
+      "column": 4,
+      "owner": "_process_case",
+      "representation_line": 234
+    },
+    {
+      "kind": "Assign",
+      "line_start": 223,
+      "line_end": 223,
+      "column": 4,
+      "owner": "_process_case",
+      "representation_line": 234
+    },
+    {
+      "kind": "Assign",
+      "line_start": 224,
+      "line_end": 224,
+      "column": 4,
+      "owner": "_process_case",
+      "representation_line": 234
+    },
+    {
+      "kind": "If",
+      "line_start": 225,
+      "line_end": 232,
+      "column": 4,
+      "owner": "_process_case",
+      "representation_line": 235
+    },
+    {
+      "kind": "Assign",
+      "line_start": 226,
+      "line_end": 226,
+      "column": 8,
+      "owner": "_process_case",
+      "representation_line": 238
+    },
+    {
+      "kind": "If",
+      "line_start": 228,
+      "line_end": 232,
+      "column": 8,
+      "owner": "_process_case",
+      "representation_line": 239
+    },
+    {
+      "kind": "Expr",
+      "line_start": 229,
+      "line_end": 231,
+      "column": 12,
+      "owner": "_process_case",
+      "representation_line": 242
+    },
+    {
+      "kind": "Return",
+      "line_start": 232,
+      "line_end": 232,
+      "column": 12,
+      "owner": "_process_case",
+      "representation_line": 243
+    },
+    {
+      "kind": "Assign",
+      "line_start": 233,
+      "line_end": 233,
+      "column": 4,
+      "owner": "_process_case",
+      "representation_line": 248
+    },
+    {
+      "kind": "If",
+      "line_start": 234,
+      "line_end": 236,
+      "column": 4,
+      "owner": "_process_case",
+      "representation_line": 249
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 235,
+      "line_end": 235,
+      "column": 8,
+      "owner": "_process_case",
+      "representation_line": 252
+    },
+    {
+      "kind": "Expr",
+      "line_start": 236,
+      "line_end": 236,
+      "column": 8,
+      "owner": "_process_case",
+      "representation_line": 252
+    },
+    {
+      "kind": "Return",
+      "line_start": 237,
+      "line_end": 237,
+      "column": 4,
+      "owner": "_process_case",
+      "representation_line": 254
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 240,
+      "line_end": 246,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 258
+    },
+    {
+      "kind": "Expr",
+      "line_start": 241,
+      "line_end": 241,
+      "column": 4,
+      "owner": "_resumed",
+      "representation_line": 264
+    },
+    {
+      "kind": "Assign",
+      "line_start": 242,
+      "line_end": 242,
+      "column": 4,
+      "owner": "_resumed",
+      "representation_line": 264
+    },
+    {
+      "kind": "Assign",
+      "line_start": 243,
+      "line_end": 243,
+      "column": 4,
+      "owner": "_resumed",
+      "representation_line": 264
+    },
+    {
+      "kind": "If",
+      "line_start": 244,
+      "line_end": 245,
+      "column": 4,
+      "owner": "_resumed",
+      "representation_line": 265
+    },
+    {
+      "kind": "Return",
+      "line_start": 245,
+      "line_end": 245,
+      "column": 8,
+      "owner": "_resumed",
+      "representation_line": 267
+    },
+    {
+      "kind": "Return",
+      "line_start": 246,
+      "line_end": 246,
+      "column": 4,
+      "owner": "_resumed",
+      "representation_line": 270
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 249,
+      "line_end": 258,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 274
+    },
+    {
+      "kind": "Expr",
+      "line_start": 250,
+      "line_end": 250,
+      "column": 4,
+      "owner": "_no_verdict",
+      "representation_line": 280
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 251,
+      "line_end": 251,
+      "column": 4,
+      "owner": "_no_verdict",
+      "representation_line": 280
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 252,
+      "line_end": 252,
+      "column": 4,
+      "owner": "_no_verdict",
+      "representation_line": 280
+    },
+    {
+      "kind": "Return",
+      "line_start": 253,
+      "line_end": 258,
+      "column": 4,
+      "owner": "_no_verdict",
+      "representation_line": 281
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 261,
+      "line_end": 277,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 285
+    },
+    {
+      "kind": "Expr",
+      "line_start": 262,
+      "line_end": 262,
+      "column": 4,
+      "owner": "_run_cases",
+      "representation_line": 291
+    },
+    {
+      "kind": "Assign",
+      "line_start": 263,
+      "line_end": 263,
+      "column": 4,
+      "owner": "_run_cases",
+      "representation_line": 291
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 264,
+      "line_end": 264,
+      "column": 4,
+      "owner": "_run_cases",
+      "representation_line": 291
+    },
+    {
+      "kind": "For",
+      "line_start": 265,
+      "line_end": 276,
+      "column": 4,
+      "owner": "_run_cases",
+      "representation_line": 292
+    },
+    {
+      "kind": "Assign",
+      "line_start": 266,
+      "line_end": 266,
+      "column": 8,
+      "owner": "_run_cases",
+      "representation_line": 295
+    },
+    {
+      "kind": "If",
+      "line_start": 267,
+      "line_end": 269,
+      "column": 8,
+      "owner": "_run_cases",
+      "representation_line": 296
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 268,
+      "line_end": 268,
+      "column": 12,
+      "owner": "_run_cases",
+      "representation_line": 299
+    },
+    {
+      "kind": "Continue",
+      "line_start": 269,
+      "line_end": 269,
+      "column": 12,
+      "owner": "_run_cases",
+      "representation_line": 300
+    },
+    {
+      "kind": "If",
+      "line_start": 270,
+      "line_end": 275,
+      "column": 8,
+      "owner": "_run_cases",
+      "representation_line": 303
+    },
+    {
+      "kind": "Expr",
+      "line_start": 272,
+      "line_end": 272,
+      "column": 12,
+      "owner": "_run_cases",
+      "representation_line": 306
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 273,
+      "line_end": 273,
+      "column": 12,
+      "owner": "_run_cases",
+      "representation_line": 306
+    },
+    {
+      "kind": "Expr",
+      "line_start": 275,
+      "line_end": 275,
+      "column": 12,
+      "owner": "_run_cases",
+      "representation_line": 310
+    },
+    {
+      "kind": "Expr",
+      "line_start": 276,
+      "line_end": 276,
+      "column": 8,
+      "owner": "_run_cases",
+      "representation_line": 313
+    },
+    {
+      "kind": "Return",
+      "line_start": 277,
+      "line_end": 277,
+      "column": 4,
+      "owner": "_run_cases",
+      "representation_line": 315
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 281,
+      "line_end": 286,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 319
+    },
+    {
+      "kind": "Expr",
+      "line_start": 282,
+      "line_end": 282,
+      "column": 4,
+      "owner": "Selection",
+      "representation_line": 327
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 284,
+      "line_end": 284,
+      "column": 4,
+      "owner": "Selection",
+      "representation_line": 327
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 285,
+      "line_end": 285,
+      "column": 4,
+      "owner": "Selection",
+      "representation_line": 327
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 286,
+      "line_end": 286,
+      "column": 4,
+      "owner": "Selection",
+      "representation_line": 327
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 290,
+      "line_end": 299,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 330
+    },
+    {
+      "kind": "Expr",
+      "line_start": 291,
+      "line_end": 291,
+      "column": 4,
+      "owner": "ValidationRun",
+      "representation_line": 338
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 293,
+      "line_end": 293,
+      "column": 4,
+      "owner": "ValidationRun",
+      "representation_line": 338
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 294,
+      "line_end": 294,
+      "column": 4,
+      "owner": "ValidationRun",
+      "representation_line": 338
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 295,
+      "line_end": 295,
+      "column": 4,
+      "owner": "ValidationRun",
+      "representation_line": 338
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 296,
+      "line_end": 296,
+      "column": 4,
+      "owner": "ValidationRun",
+      "representation_line": 338
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 297,
+      "line_end": 297,
+      "column": 4,
+      "owner": "ValidationRun",
+      "representation_line": 340
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 298,
+      "line_end": 298,
+      "column": 4,
+      "owner": "ValidationRun",
+      "representation_line": 340
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 299,
+      "line_end": 299,
+      "column": 4,
+      "owner": "ValidationRun",
+      "representation_line": 340
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 302,
+      "line_end": 311,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 343
+    },
+    {
+      "kind": "Expr",
+      "line_start": 303,
+      "line_end": 303,
+      "column": 4,
+      "owner": "_cleanup_workspace",
+      "representation_line": 349
+    },
+    {
+      "kind": "Try",
+      "line_start": 304,
+      "line_end": 311,
+      "column": 4,
+      "owner": "_cleanup_workspace",
+      "representation_line": 350
+    },
+    {
+      "kind": "Expr",
+      "line_start": 305,
+      "line_end": 305,
+      "column": 8,
+      "owner": "_cleanup_workspace",
+      "representation_line": 353
+    },
+    {
+      "kind": "Pass",
+      "line_start": 307,
+      "line_end": 307,
+      "column": 8,
+      "owner": "_cleanup_workspace",
+      "representation_line": 358
+    },
+    {
+      "kind": "Expr",
+      "line_start": 309,
+      "line_end": 311,
+      "column": 8,
+      "owner": "_cleanup_workspace",
+      "representation_line": 363
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 314,
+      "line_end": 323,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 367
+    },
+    {
+      "kind": "Expr",
+      "line_start": 315,
+      "line_end": 315,
+      "column": 4,
+      "owner": "_any_owned",
+      "representation_line": 373
+    },
+    {
+      "kind": "For",
+      "line_start": 316,
+      "line_end": 322,
+      "column": 4,
+      "owner": "_any_owned",
+      "representation_line": 374
+    },
+    {
+      "kind": "Try",
+      "line_start": 317,
+      "line_end": 320,
+      "column": 8,
+      "owner": "_any_owned",
+      "representation_line": 376
+    },
+    {
+      "kind": "Assign",
+      "line_start": 318,
+      "line_end": 318,
+      "column": 12,
+      "owner": "_any_owned",
+      "representation_line": 379
+    },
+    {
+      "kind": "Continue",
+      "line_start": 320,
+      "line_end": 320,
+      "column": 12,
+      "owner": "_any_owned",
+      "representation_line": 383
+    },
+    {
+      "kind": "If",
+      "line_start": 321,
+      "line_end": 322,
+      "column": 8,
+      "owner": "_any_owned",
+      "representation_line": 386
+    },
+    {
+      "kind": "Return",
+      "line_start": 322,
+      "line_end": 322,
+      "column": 12,
+      "owner": "_any_owned",
+      "representation_line": 388
+    },
+    {
+      "kind": "Return",
+      "line_start": 323,
+      "line_end": 323,
+      "column": 4,
+      "owner": "_any_owned",
+      "representation_line": 392
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 326,
+      "line_end": 349,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 396
+    },
+    {
+      "kind": "Expr",
+      "line_start": 327,
+      "line_end": 331,
+      "column": 4,
+      "owner": "_empty_selection_rc",
+      "representation_line": 402
+    },
+    {
+      "kind": "Assign",
+      "line_start": 332,
+      "line_end": 332,
+      "column": 4,
+      "owner": "_empty_selection_rc",
+      "representation_line": 402
+    },
+    {
+      "kind": "If",
+      "line_start": 333,
+      "line_end": 338,
+      "column": 4,
+      "owner": "_empty_selection_rc",
+      "representation_line": 403
+    },
+    {
+      "kind": "Assign",
+      "line_start": 334,
+      "line_end": 334,
+      "column": 8,
+      "owner": "_empty_selection_rc",
+      "representation_line": 406
+    },
+    {
+      "kind": "Expr",
+      "line_start": 335,
+      "line_end": 337,
+      "column": 8,
+      "owner": "_empty_selection_rc",
+      "representation_line": 406
+    },
+    {
+      "kind": "Return",
+      "line_start": 338,
+      "line_end": 338,
+      "column": 8,
+      "owner": "_empty_selection_rc",
+      "representation_line": 407
+    },
+    {
+      "kind": "If",
+      "line_start": 339,
+      "line_end": 344,
+      "column": 4,
+      "owner": "_empty_selection_rc",
+      "representation_line": 410
+    },
+    {
+      "kind": "Expr",
+      "line_start": 340,
+      "line_end": 343,
+      "column": 8,
+      "owner": "_empty_selection_rc",
+      "representation_line": 413
+    },
+    {
+      "kind": "Return",
+      "line_start": 344,
+      "line_end": 344,
+      "column": 8,
+      "owner": "_empty_selection_rc",
+      "representation_line": 414
+    },
+    {
+      "kind": "Expr",
+      "line_start": 345,
+      "line_end": 348,
+      "column": 4,
+      "owner": "_empty_selection_rc",
+      "representation_line": 418
+    },
+    {
+      "kind": "Return",
+      "line_start": 349,
+      "line_end": 349,
+      "column": 4,
+      "owner": "_empty_selection_rc",
+      "representation_line": 419
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 352,
+      "line_end": 360,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 423
+    },
+    {
+      "kind": "Expr",
+      "line_start": 353,
+      "line_end": 353,
+      "column": 4,
+      "owner": "_prune_orphans",
+      "representation_line": 429
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 354,
+      "line_end": 354,
+      "column": 4,
+      "owner": "_prune_orphans",
+      "representation_line": 429
+    },
+    {
+      "kind": "Assign",
+      "line_start": 355,
+      "line_end": 355,
+      "column": 4,
+      "owner": "_prune_orphans",
+      "representation_line": 429
+    },
+    {
+      "kind": "If",
+      "line_start": 356,
+      "line_end": 357,
+      "column": 4,
+      "owner": "_prune_orphans",
+      "representation_line": 430
+    },
+    {
+      "kind": "Return",
+      "line_start": 357,
+      "line_end": 357,
+      "column": 8,
+      "owner": "_prune_orphans",
+      "representation_line": 432
+    },
+    {
+      "kind": "Expr",
+      "line_start": 358,
+      "line_end": 360,
+      "column": 4,
+      "owner": "_prune_orphans",
+      "representation_line": 436
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 363,
+      "line_end": 372,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 439
+    },
+    {
+      "kind": "Expr",
+      "line_start": 364,
+      "line_end": 364,
+      "column": 4,
+      "owner": "_provenance_for",
+      "representation_line": 445
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 365,
+      "line_end": 365,
+      "column": 4,
+      "owner": "_provenance_for",
+      "representation_line": 445
+    },
+    {
+      "kind": "Assign",
+      "line_start": 366,
+      "line_end": 366,
+      "column": 4,
+      "owner": "_provenance_for",
+      "representation_line": 445
+    },
+    {
+      "kind": "Return",
+      "line_start": 367,
+      "line_end": 372,
+      "column": 4,
+      "owner": "_provenance_for",
+      "representation_line": 446
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 375,
+      "line_end": 434,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 450
+    },
+    {
+      "kind": "Expr",
+      "line_start": 383,
+      "line_end": 383,
+      "column": 4,
+      "owner": "run_validation",
+      "representation_line": 456
+    },
+    {
+      "kind": "Assign",
+      "line_start": 384,
+      "line_end": 384,
+      "column": 4,
+      "owner": "run_validation",
+      "representation_line": 456
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 389,
+      "line_end": 389,
+      "column": 4,
+      "owner": "run_validation",
+      "representation_line": 456
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 390,
+      "line_end": 390,
+      "column": 4,
+      "owner": "run_validation",
+      "representation_line": 456
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 391,
+      "line_end": 391,
+      "column": 4,
+      "owner": "run_validation",
+      "representation_line": 456
+    },
+    {
+      "kind": "Assign",
+      "line_start": 392,
+      "line_end": 392,
+      "column": 4,
+      "owner": "run_validation",
+      "representation_line": 458
+    },
+    {
+      "kind": "Expr",
+      "line_start": 393,
+      "line_end": 393,
+      "column": 4,
+      "owner": "run_validation",
+      "representation_line": 458
+    },
+    {
+      "kind": "Assign",
+      "line_start": 394,
+      "line_end": 394,
+      "column": 4,
+      "owner": "run_validation",
+      "representation_line": 458
+    },
+    {
+      "kind": "Try",
+      "line_start": 395,
+      "line_end": 400,
+      "column": 4,
+      "owner": "run_validation",
+      "representation_line": 459
+    },
+    {
+      "kind": "Assign",
+      "line_start": 396,
+      "line_end": 396,
+      "column": 8,
+      "owner": "run_validation",
+      "representation_line": 462
+    },
+    {
+      "kind": "Expr",
+      "line_start": 398,
+      "line_end": 398,
+      "column": 8,
+      "owner": "run_validation",
+      "representation_line": 467
+    },
+    {
+      "kind": "Expr",
+      "line_start": 399,
+      "line_end": 399,
+      "column": 8,
+      "owner": "run_validation",
+      "representation_line": 467
+    },
+    {
+      "kind": "Return",
+      "line_start": 400,
+      "line_end": 400,
+      "column": 8,
+      "owner": "run_validation",
+      "representation_line": 468
+    },
+    {
+      "kind": "If",
+      "line_start": 401,
+      "line_end": 402,
+      "column": 4,
+      "owner": "run_validation",
+      "representation_line": 471
+    },
+    {
+      "kind": "Return",
+      "line_start": 402,
+      "line_end": 402,
+      "column": 8,
+      "owner": "run_validation",
+      "representation_line": 473
+    },
+    {
+      "kind": "Assign",
+      "line_start": 403,
+      "line_end": 403,
+      "column": 4,
+      "owner": "run_validation",
+      "representation_line": 477
+    },
+    {
+      "kind": "Expr",
+      "line_start": 404,
+      "line_end": 404,
+      "column": 4,
+      "owner": "run_validation",
+      "representation_line": 477
+    },
+    {
+      "kind": "Assign",
+      "line_start": 405,
+      "line_end": 413,
+      "column": 4,
+      "owner": "run_validation",
+      "representation_line": 477
+    },
+    {
+      "kind": "Assign",
+      "line_start": 414,
+      "line_end": 414,
+      "column": 4,
+      "owner": "run_validation",
+      "representation_line": 477
+    },
+    {
+      "kind": "Assign",
+      "line_start": 415,
+      "line_end": 415,
+      "column": 4,
+      "owner": "run_validation",
+      "representation_line": 477
+    },
+    {
+      "kind": "Assign",
+      "line_start": 416,
+      "line_end": 416,
+      "column": 4,
+      "owner": "run_validation",
+      "representation_line": 479
+    },
+    {
+      "kind": "Assign",
+      "line_start": 417,
+      "line_end": 417,
+      "column": 4,
+      "owner": "run_validation",
+      "representation_line": 479
+    },
+    {
+      "kind": "Expr",
+      "line_start": 419,
+      "line_end": 424,
+      "column": 4,
+      "owner": "run_validation",
+      "representation_line": 479
+    },
+    {
+      "kind": "Expr",
+      "line_start": 426,
+      "line_end": 426,
+      "column": 4,
+      "owner": "run_validation",
+      "representation_line": 479
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 428,
+      "line_end": 428,
+      "column": 4,
+      "owner": "run_validation",
+      "representation_line": 479
+    },
+    {
+      "kind": "Assign",
+      "line_start": 429,
+      "line_end": 429,
+      "column": 4,
+      "owner": "run_validation",
+      "representation_line": 481
+    },
+    {
+      "kind": "Return",
+      "line_start": 430,
+      "line_end": 434,
+      "column": 4,
+      "owner": "run_validation",
+      "representation_line": 482
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 10,
+      "kind": "List",
+      "original_ast": "List(elts=[Constant(value='VALIDATION_ENGINE_ID'), Constant(value='Selection'), Constant(value='ValidationRunResult'), Constant(value='run_validation')], ctx=Load())",
+      "rendered": "['VALIDATION_ENGINE_ID', 'Selection', 'ValidationRunResult', 'run_validation']"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 23,
+      "kind": "Constant",
+      "original_ast": "Constant(value='vvaharness.validation')",
+      "rendered": "'vvaharness.validation'"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 22,
+      "kind": "Name",
+      "original_ast": "Name(id='NamedTuple', ctx=Load())",
+      "rendered": "NamedTuple"
+    },
+    {
+      "line_start": 78,
+      "line_end": 78,
+      "column": 20,
+      "kind": "Name",
+      "original_ast": "Name(id='NamedTuple', ctx=Load())",
+      "rendered": "NamedTuple"
+    },
+    {
+      "line_start": 87,
+      "line_end": 87,
+      "column": 26,
+      "kind": "Name",
+      "original_ast": "Name(id='NamedTuple', ctx=Load())",
+      "rendered": "NamedTuple"
+    },
+    {
+      "line_start": 97,
+      "line_end": 97,
+      "column": 11,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Call(func=Attribute(value=Name(id='_UNSAFE', ctx=Load()), attr='sub', ctx=Load()), args=[Constant(value='_'), Name(id='case_id', ctx=Load())], keywords=[]), slice=Slice(upper=Name(id='CMD_PREVIEW_LEN', ctx=Load())), ctx=Load())",
+      "rendered": "_UNSAFE.sub('_', case_id)[:CMD_PREVIEW_LEN]"
+    },
+    {
+      "line_start": 102,
+      "line_end": 102,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Call(func=Name(id='str', ctx=Load()), args=[Attribute(value=Attribute(value=Name(id='config', ctx=Load()), attr='agent', ctx=Load()), attr='model', ctx=Load())], keywords=[]), JoinedStr(values=[FormattedValue(value=Name(id='HARNESS_REGISTRY', ctx=Load()), conversion=-1), Constant(value=':'), FormattedValue(value=Attribute(value=Attribute(value=Name(id='config', ctx=Load()), attr='agent', ctx=Load()), attr='via', ctx=Load()), conversion=-1)])], ctx=Load())",
+      "rendered": "(str(config.agent.model), source_template_102_36)"
+    },
+    {
+      "line_start": 108,
+      "line_end": 110,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='step_key_for', ctx=Load()), args=[Name(id='VALIDATE_PREFIX', ctx=Load())], keywords=[keyword(arg='engine_id', value=Name(id='VALIDATION_ENGINE_ID', ctx=Load())), keyword(arg='engine_version', value=Name(id='__version__', ctx=Load())), keyword(arg='case_id', value=Name(id='case_id', ctx=Load())), keyword(arg='model', value=Name(id='model', ctx=Load())), keyword(arg='backend', value=Name(id='backend', ctx=Load()))])",
+      "rendered": "step_key_for(VALIDATE_PREFIX, engine_id=VALIDATION_ENGINE_ID, engine_version=__version__, case_id=case_id, model=model, backend=backend)"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 10,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=BinOp(left=BinOp(left=Name(id='workspace', ctx=Load()), op=Div(), right=Name(id='LOGGING_DIRNAME', ctx=Load())), op=Div(), right=Name(id='ORCHESTRATOR_LOG_DIRNAME', ctx=Load())), op=Div(), right=Name(id='SESSION_LOG_FILENAME', ctx=Load()))",
+      "rendered": "workspace / LOGGING_DIRNAME / ORCHESTRATOR_LOG_DIRNAME / SESSION_LOG_FILENAME"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='src', ctx=Load()), attr='exists', ctx=Load()), args=[], keywords=[]))",
+      "rendered": "not src.exists()"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 118,
+      "line_end": 118,
+      "column": 12,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[FormattedValue(value=Name(id='VALIDATION_SESSION_LOG_PREFIX', ctx=Load()), conversion=-1), FormattedValue(value=Call(func=Name(id='_safe', ctx=Load()), args=[Attribute(value=Name(id='loaded', ctx=Load()), attr='case_id', ctx=Load())], keywords=[]), conversion=-1), Constant(value='.jsonl')])",
+      "rendered": "source_template_118_12"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='SessionLogPaths', ctx=Load()), args=[Name(id='src', ctx=Load()), BinOp(left=Attribute(value=Attribute(value=Name(id='loaded', ctx=Load()), attr='path', ctx=Load()), attr='parent', ctx=Load()), op=Div(), right=Name(id='fname', ctx=Load()))], keywords=[])",
+      "rendered": "SessionLogPaths(src, loaded.path.parent / fname)"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_session_log_dest', ctx=Load()), args=[Name(id='workspace', ctx=Load()), Name(id='loaded', ctx=Load())], keywords=[])",
+      "rendered": "_session_log_dest(workspace, loaded)"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='resolved', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "resolved is None"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 127,
+      "line_end": 127,
+      "column": 16,
+      "kind": "Name",
+      "original_ast": "Name(id='resolved', ctx=Load())",
+      "rendered": "resolved"
+    },
+    {
+      "line_start": 129,
+      "line_end": 131,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='dest', ctx=Load()), attr='write_text', ctx=Load()), args=[Call(func=Name(id='redact', ctx=Load()), args=[Call(func=Attribute(value=Name(id='src', ctx=Load()), attr='read_text', ctx=Load()), args=[], keywords=[keyword(arg='encoding', value=Constant(value='utf-8')), keyword(arg='errors', value=Constant(value='replace'))])], keywords=[])], keywords=[keyword(arg='encoding', value=Constant(value='utf-8'))])",
+      "rendered": "dest.write_text(redact(src.read_text(encoding='utf-8', errors='replace')), encoding='utf-8')"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='OSError', ctx=Load()), Name(id='ValueError', ctx=Load())], ctx=Load())",
+      "rendered": "(OSError, ValueError)"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='dest', ctx=Load()), attr='unlink', ctx=Load()), args=[], keywords=[keyword(arg='missing_ok', value=Constant(value=True))])",
+      "rendered": "dest.unlink(missing_ok=True)"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='dest', ctx=Load())",
+      "rendered": "dest"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='print', ctx=Load()), args=[JoinedStr(values=[Constant(value='['), FormattedValue(value=Attribute(value=Name(id='row', ctx=Load()), attr='tracking_id', ctx=Load()), conversion=-1), Constant(value='] verdict='), FormattedValue(value=Attribute(value=Name(id='row', ctx=Load()), attr='reason_for_decision', ctx=Load()), conversion=-1), Constant(value=' score='), FormattedValue(value=Attribute(value=Name(id='row', ctx=Load()), attr='fix_confidence', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "print(source_template_140_10)"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 7,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='row', ctx=Load()), attr='justification', ctx=Load())",
+      "rendered": "row.justification"
+    },
+    {
+      "line_start": 142,
+      "line_end": 142,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='print', ctx=Load()), args=[JoinedStr(values=[Constant(value='    justification: '), FormattedValue(value=Attribute(value=Name(id='row', ctx=Load()), attr='justification', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "print(source_template_142_14)"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='datetime', ctx=Load()), attr='now', ctx=Load()), args=[Name(id='UTC', ctx=Load())], keywords=[])",
+      "rendered": "datetime.now(UTC)"
+    },
+    {
+      "line_start": 148,
+      "line_end": 148,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='TOKENS', ctx=Load()), attr='spend', ctx=Load()), args=[], keywords=[])",
+      "rendered": "TOKENS.spend()"
+    },
+    {
+      "line_start": 149,
+      "line_end": 149,
+      "column": 17,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Call(func=Attribute(value=Name(id='uuid', ctx=Load()), attr='uuid4', ctx=Load()), args=[], keywords=[]), attr='hex', ctx=Load())",
+      "rendered": "uuid.uuid4().hex"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 13,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Attribute(value=Attribute(value=Name(id='loaded', ctx=Load()), attr='case', ctx=Load()), attr='attempts', ctx=Load()), slice=UnaryOp(op=USub(), operand=Constant(value=1)), ctx=Load())",
+      "rendered": "loaded.case.attempts[-1]"
+    },
+    {
+      "line_start": 151,
+      "line_end": 151,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='stage_workspace', ctx=Load()), args=[Attribute(value=Name(id='run', ctx=Load()), attr='repo', ctx=Load()), Name(id='workspace', ctx=Load()), Attribute(value=Attribute(value=Name(id='latest', ctx=Load()), attr='remediation', ctx=Load()), attr='diff', ctx=Load())], keywords=[])",
+      "rendered": "stage_workspace(run.repo, workspace, latest.remediation.diff)"
+    },
+    {
+      "line_start": 152,
+      "line_end": 160,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='FixValidationPlan', ctx=Load()), args=[], keywords=[keyword(arg='case_id', value=Attribute(value=Name(id='loaded', ctx=Load()), attr='case_id', ctx=Load())), keyword(arg='session_id', value=Name(id='session_id', ctx=Load())), keyword(arg='manifest', value=Call(func=Name(id='build_manifest', ctx=Load()), args=[Attribute(value=Name(id='loaded', ctx=Load()), attr='case', ctx=Load())], keywords=[keyword(arg='session_id', value=Name(id='session_id', ctx=Load()))])), keyword(arg='workspace_dir', value=Name(id='workspace', ctx=Load())), keyword(arg='output_dir', value=Name(id='workspace', ctx=Load())), keyword(arg='provenance', value=Attribute(value=Name(id='run', ctx=Load()), attr='provenance', ctx=Load())), keyword(arg='policy', value=Attribute(value=Name(id='run', ctx=Load()), attr='policy', ctx=Load()))])",
+      "rendered": "FixValidationPlan(case_id=loaded.case_id, session_id=session_id, manifest=build_manifest(loaded.case, session_id=session_id), workspace_dir=workspace, output_dir=workspace, provenance=run.provenance, policy=run.policy)"
+    },
+    {
+      "line_start": 161,
+      "line_end": 165,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='asyncio', ctx=Load()), attr='run', ctx=Load()), args=[Call(func=Name(id='execute_plan', ctx=Load()), args=[Name(id='plan', ctx=Load()), Attribute(value=Name(id='run', ctx=Load()), attr='config', ctx=Load())], keywords=[keyword(arg='post_results', value=Constant(value=False)), keyword(arg='meta', value=Call(func=Name(id='RunMetadata', ctx=Load()), args=[], keywords=[keyword(arg='total_findings', value=Constant(value=1))]))])], keywords=[])",
+      "rendered": "asyncio.run(execute_plan(plan, run.config, post_results=False, meta=RunMetadata(total_findings=1)))"
+    },
+    {
+      "line_start": 166,
+      "line_end": 166,
+      "column": 34,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Attribute(value=Name(id='outcome', ctx=Load()), attr='findings', ctx=Load()), slice=Constant(value=0), ctx=Load())",
+      "rendered": "outcome.findings[0]"
+    },
+    {
+      "line_start": 167,
+      "line_end": 173,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='build_verdict', ctx=Load()), args=[Attribute(value=Name(id='loaded', ctx=Load()), attr='case', ctx=Load()), Name(id='workspace', ctx=Load())], keywords=[keyword(arg='provenance', value=Call(func=Name(id='_measured', ctx=Load()), args=[Attribute(value=Name(id='run', ctx=Load()), attr='provenance', ctx=Load()), Name(id='started', ctx=Load()), Name(id='spend_before', ctx=Load())], keywords=[])), keyword(arg='policy', value=Attribute(value=Name(id='run', ctx=Load()), attr='policy', ctx=Load())), keyword(arg='session_failed', value=Attribute(value=Name(id='outcome', ctx=Load()), attr='session_failed', ctx=Load()))])",
+      "rendered": "build_verdict(loaded.case, workspace, provenance=_measured(run.provenance, started, spend_before), policy=run.policy, session_failed=outcome.session_failed)"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_record', ctx=Load()), args=[Name(id='loaded', ctx=Load()), Name(id='verdict', ctx=Load()), Name(id='workspace', ctx=Load())], keywords=[])",
+      "rendered": "_record(loaded, verdict, workspace)"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ValidatedCase', ctx=Load()), args=[Name(id='loaded', ctx=Load()), Name(id='verdict', ctx=Load()), Attribute(value=Name(id='collected', ctx=Load()), attr='row', ctx=Load()), Attribute(value=Name(id='outcome', ctx=Load()), attr='session_failed', ctx=Load())], keywords=[])",
+      "rendered": "ValidatedCase(loaded, verdict, collected.row, outcome.session_failed)"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='reported_between', ctx=Load()), args=[Name(id='spend_before', ctx=Load()), Call(func=Attribute(value=Name(id='TOKENS', ctx=Load()), attr='spend', ctx=Load()), args=[], keywords=[])], keywords=[])",
+      "rendered": "reported_between(spend_before, TOKENS.spend())"
+    },
+    {
+      "line_start": 181,
+      "line_end": 182,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='base', ctx=Load()), attr='model_copy', ctx=Load()), args=[], keywords=[keyword(arg='update', value=Dict(keys=[Constant(value='started'), Constant(value='ended'), Constant(value='usd'), Constant(value='turns')], values=[Name(id='started', ctx=Load()), Call(func=Attribute(value=Name(id='datetime', ctx=Load()), attr='now', ctx=Load()), args=[Name(id='UTC', ctx=Load())], keywords=[]), Name(id='usd', ctx=Load()), Name(id='turns', ctx=Load())]))])",
+      "rendered": "base.model_copy(update={'started': started, 'ended': datetime.now(UTC), 'usd': usd, 'turns': turns})"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_persist_session_log', ctx=Load()), args=[Name(id='workspace', ctx=Load()), Name(id='loaded', ctx=Load())], keywords=[])",
+      "rendered": "_persist_session_log(workspace, loaded)"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='record', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "record is not None"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='  ['), FormattedValue(value=Name(id='VALIDATE_ALIAS_S11', ctx=Load()), conversion=-1), Constant(value='] session log → '), FormattedValue(value=Name(id='record', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "console.write(source_template_189_22)"
+    },
+    {
+      "line_start": 190,
+      "line_end": 190,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='write_back_verdict', ctx=Load()), args=[Attribute(value=Name(id='loaded', ctx=Load()), attr='case', ctx=Load()), Name(id='verdict', ctx=Load()), Attribute(value=Name(id='loaded', ctx=Load()), attr='path', ctx=Load())], keywords=[])",
+      "rendered": "write_back_verdict(loaded.case, verdict, loaded.path)"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='judged', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "judged is not None"
+    },
+    {
+      "line_start": 192,
+      "line_end": 195,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='  ['), FormattedValue(value=Name(id='VALIDATE_ALIAS_S11', ctx=Load()), conversion=-1), Constant(value='] case updated → '), FormattedValue(value=Attribute(value=Name(id='loaded', ctx=Load()), attr='case_id', ctx=Load()), conversion=-1), Constant(value=': state='), FormattedValue(value=Attribute(value=Attribute(value=Name(id='judged', ctx=Load()), attr='state', ctx=Load()), attr='value', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "console.write(source_template_193_12)"
+    },
+    {
+      "line_start": 200,
+      "line_end": 200,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Attribute(value=Attribute(value=Name(id='loaded', ctx=Load()), attr='case', ctx=Load()), attr='attempts', ctx=Load()))",
+      "rendered": "not loaded.case.attempts"
+    },
+    {
+      "line_start": 201,
+      "line_end": 201,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='refusing '), FormattedValue(value=Attribute(value=Name(id='loaded', ctx=Load()), attr='case_id', ctx=Load()), conversion=-1), Constant(value=': no remediation attempt to validate')])], keywords=[])",
+      "rendered": "console.write(source_template_201_22)"
+    },
+    {
+      "line_start": 202,
+      "line_end": 202,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 203,
+      "line_end": 203,
+      "column": 16,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Attribute(value=Name(id='run', ctx=Load()), attr='workspace_root', ctx=Load()), op=Div(), right=Call(func=Name(id='_safe', ctx=Load()), args=[Attribute(value=Name(id='loaded', ctx=Load()), attr='case_id', ctx=Load())], keywords=[]))",
+      "rendered": "run.workspace_root / _safe(loaded.case_id)"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='assert_remediation_applied', ctx=Load()), args=[Attribute(value=Name(id='run', ctx=Load()), attr='repo', ctx=Load()), Attribute(value=Attribute(value=Subscript(value=Attribute(value=Attribute(value=Name(id='loaded', ctx=Load()), attr='case', ctx=Load()), attr='attempts', ctx=Load()), slice=UnaryOp(op=USub(), operand=Constant(value=1)), ctx=Load()), attr='remediation', ctx=Load()), attr='files_touched', ctx=Load())], keywords=[])",
+      "rendered": "assert_remediation_applied(run.repo, loaded.case.attempts[-1].remediation.files_touched)"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='IngestError', ctx=Load())",
+      "rendered": "IngestError"
+    },
+    {
+      "line_start": 207,
+      "line_end": 207,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='refusing '), FormattedValue(value=Attribute(value=Name(id='loaded', ctx=Load()), attr='case_id', ctx=Load()), conversion=-1), Constant(value=': '), FormattedValue(value=Name(id='exc', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "console.write(source_template_207_22)"
+    },
+    {
+      "line_start": 208,
+      "line_end": 208,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 210,
+      "line_end": 210,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_run_plan', ctx=Load()), args=[Name(id='loaded', ctx=Load()), Name(id='run', ctx=Load()), Name(id='workspace', ctx=Load())], keywords=[])",
+      "rendered": "_run_plan(loaded, run, workspace)"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='shutil', ctx=Load()), attr='rmtree', ctx=Load()), args=[Name(id='workspace', ctx=Load())], keywords=[keyword(arg='ignore_errors', value=Constant(value=True))])",
+      "rendered": "shutil.rmtree(workspace, ignore_errors=True)"
+    },
+    {
+      "line_start": 218,
+      "line_end": 218,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='load_ckpt', ctx=Load()), args=[Attribute(value=Name(id='run', ctx=Load()), attr='workspace_root', ctx=Load()), Attribute(value=Name(id='run', ctx=Load()), attr='run_id', ctx=Load()), Name(id='step', ctx=Load())], keywords=[])",
+      "rendered": "load_ckpt(run.workspace_root, run.run_id, step)"
+    },
+    {
+      "line_start": 223,
+      "line_end": 223,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_engine_identity', ctx=Load()), args=[Attribute(value=Name(id='run', ctx=Load()), attr='config', ctx=Load())], keywords=[])",
+      "rendered": "_engine_identity(run.config)"
+    },
+    {
+      "line_start": 224,
+      "line_end": 224,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_step_key', ctx=Load()), args=[Attribute(value=Name(id='loaded', ctx=Load()), attr='case_id', ctx=Load())], keywords=[keyword(arg='model', value=Name(id='model', ctx=Load())), keyword(arg='backend', value=Name(id='backend', ctx=Load()))])",
+      "rendered": "_step_key(loaded.case_id, model=model, backend=backend)"
+    },
+    {
+      "line_start": 225,
+      "line_end": 225,
+      "column": 7,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='run', ctx=Load()), attr='resume', ctx=Load())",
+      "rendered": "run.resume"
+    },
+    {
+      "line_start": 226,
+      "line_end": 226,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_resume_hit', ctx=Load()), args=[Name(id='run', ctx=Load()), Name(id='step', ctx=Load())], keywords=[])",
+      "rendered": "_resume_hit(run, step)"
+    },
+    {
+      "line_start": 228,
+      "line_end": 228,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='cached', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), Compare(left=Attribute(value=Name(id='cached', ctx=Load()), attr='tracking_id', ctx=Load()), ops=[Eq()], comparators=[Attribute(value=Name(id='loaded', ctx=Load()), attr='case_id', ctx=Load())])])",
+      "rendered": "cached is not None and cached.tracking_id == loaded.case_id"
+    },
+    {
+      "line_start": 229,
+      "line_end": 231,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='  ['), FormattedValue(value=Name(id='VALIDATE_ALIAS_S11', ctx=Load()), conversion=-1), Constant(value='] resume: '), FormattedValue(value=Attribute(value=Name(id='loaded', ctx=Load()), attr='case_id', ctx=Load()), conversion=-1), Constant(value=' already validated')])], keywords=[])",
+      "rendered": "console.write(source_template_230_16)"
+    },
+    {
+      "line_start": 232,
+      "line_end": 232,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_resumed', ctx=Load()), args=[Name(id='loaded', ctx=Load()), Name(id='cached', ctx=Load())], keywords=[])",
+      "rendered": "_resumed(loaded, cached)"
+    },
+    {
+      "line_start": 233,
+      "line_end": 233,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_validate_one', ctx=Load()), args=[Name(id='loaded', ctx=Load()), Name(id='run', ctx=Load())], keywords=[])",
+      "rendered": "_validate_one(loaded, run)"
+    },
+    {
+      "line_start": 234,
+      "line_end": 234,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='validated', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "validated is not None"
+    },
+    {
+      "line_start": 236,
+      "line_end": 236,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='save_ckpt', ctx=Load()), args=[Attribute(value=Name(id='run', ctx=Load()), attr='workspace_root', ctx=Load()), Attribute(value=Name(id='run', ctx=Load()), attr='run_id', ctx=Load()), Name(id='step', ctx=Load()), Attribute(value=Name(id='validated', ctx=Load()), attr='row', ctx=Load())], keywords=[])",
+      "rendered": "save_ckpt(run.workspace_root, run.run_id, step, validated.row)"
+    },
+    {
+      "line_start": 237,
+      "line_end": 237,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='validated', ctx=Load())",
+      "rendered": "validated"
+    },
+    {
+      "line_start": 242,
+      "line_end": 242,
+      "column": 13,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Attribute(value=Attribute(value=Name(id='loaded', ctx=Load()), attr='case', ctx=Load()), attr='attempts', ctx=Load()), body=Subscript(value=Attribute(value=Attribute(value=Name(id='loaded', ctx=Load()), attr='case', ctx=Load()), attr='attempts', ctx=Load()), slice=UnaryOp(op=USub(), operand=Constant(value=1)), ctx=Load()), orelse=Constant(value=None))",
+      "rendered": "loaded.case.attempts[-1] if loaded.case.attempts else None"
+    },
+    {
+      "line_start": 243,
+      "line_end": 243,
+      "column": 14,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=Name(id='latest', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), body=Attribute(value=Name(id='latest', ctx=Load()), attr='verdict', ctx=Load()), orelse=Constant(value=None))",
+      "rendered": "latest.verdict if latest is not None else None"
+    },
+    {
+      "line_start": 244,
+      "line_end": 244,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='verdict', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "verdict is None"
+    },
+    {
+      "line_start": 245,
+      "line_end": 245,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ValidatedCase', ctx=Load()), args=[Name(id='loaded', ctx=Load()), Call(func=Name(id='_no_verdict', ctx=Load()), args=[], keywords=[]), Name(id='cached', ctx=Load())], keywords=[keyword(arg='session_failed', value=Constant(value=True))])",
+      "rendered": "ValidatedCase(loaded, _no_verdict(), cached, session_failed=True)"
+    },
+    {
+      "line_start": 246,
+      "line_end": 246,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ValidatedCase', ctx=Load()), args=[Name(id='loaded', ctx=Load()), Name(id='verdict', ctx=Load()), Name(id='cached', ctx=Load())], keywords=[keyword(arg='session_failed', value=Constant(value=False))])",
+      "rendered": "ValidatedCase(loaded, verdict, cached, session_failed=False)"
+    },
+    {
+      "line_start": 253,
+      "line_end": 258,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='Verdict', ctx=Load()), args=[], keywords=[keyword(arg='decision', value=Attribute(value=Name(id='Decision', ctx=Load()), attr='INCONCLUSIVE', ctx=Load())), keyword(arg='rationale', value=Constant(value='resumed from a checkpoint, but the case file records no verdict')), keyword(arg='score', value=Constant(value=None)), keyword(arg='produced_by', value=Call(func=Name(id='Provenance', ctx=Load()), args=[], keywords=[keyword(arg='engine', value=Name(id='VALIDATION_ENGINE_ID', ctx=Load())), keyword(arg='engine_version', value=Name(id='__version__', ctx=Load()))]))])",
+      "rendered": "Verdict(decision=Decision.INCONCLUSIVE, rationale='resumed from a checkpoint, but the case file records no verdict', score=None, produced_by=Provenance(engine=VALIDATION_ENGINE_ID, engine_version=__version__))"
+    },
+    {
+      "line_start": 263,
+      "line_end": 263,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 264,
+      "line_end": 264,
+      "column": 37,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 265,
+      "line_end": 265,
+      "column": 18,
+      "kind": "Name",
+      "original_ast": "Name(id='cases', ctx=Load())",
+      "rendered": "cases"
+    },
+    {
+      "line_start": 266,
+      "line_end": 266,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_process_case', ctx=Load()), args=[Name(id='loaded', ctx=Load()), Name(id='run', ctx=Load())], keywords=[])",
+      "rendered": "_process_case(loaded, run)"
+    },
+    {
+      "line_start": 267,
+      "line_end": 267,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='result', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "result is None"
+    },
+    {
+      "line_start": 268,
+      "line_end": 268,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='failures', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "failures += 1"
+    },
+    {
+      "line_start": 270,
+      "line_end": 270,
+      "column": 11,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='result', ctx=Load()), attr='session_failed', ctx=Load())",
+      "rendered": "result.session_failed"
+    },
+    {
+      "line_start": 272,
+      "line_end": 272,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='FAILED: '), FormattedValue(value=Attribute(value=Name(id='loaded', ctx=Load()), attr='case_id', ctx=Load()), conversion=-1), Constant(value=' — '), FormattedValue(value=Attribute(value=Attribute(value=Name(id='result', ctx=Load()), attr='row', ctx=Load()), attr='reason_for_decision', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "console.write(source_template_272_26)"
+    },
+    {
+      "line_start": 273,
+      "line_end": 273,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='failures', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "failures += 1"
+    },
+    {
+      "line_start": 275,
+      "line_end": 275,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_print_result', ctx=Load()), args=[Attribute(value=Name(id='result', ctx=Load()), attr='row', ctx=Load())], keywords=[])",
+      "rendered": "_print_result(result.row)"
+    },
+    {
+      "line_start": 276,
+      "line_end": 276,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='validated', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='result', ctx=Load())], keywords=[])",
+      "rendered": "validated.append(result)"
+    },
+    {
+      "line_start": 277,
+      "line_end": 277,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='failures', ctx=Load()), Name(id='validated', ctx=Load())], ctx=Load())",
+      "rendered": "(failures, validated)"
+    },
+    {
+      "line_start": 280,
+      "line_end": 280,
+      "column": 1,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dataclass', ctx=Load()), args=[], keywords=[keyword(arg='frozen', value=Constant(value=True))])",
+      "rendered": "dataclass(frozen=True)"
+    },
+    {
+      "line_start": 284,
+      "line_end": 284,
+      "column": 33,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 285,
+      "line_end": 285,
+      "column": 31,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 286,
+      "line_end": 286,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 289,
+      "line_end": 289,
+      "column": 1,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dataclass', ctx=Load()), args=[], keywords=[keyword(arg='frozen', value=Constant(value=True))])",
+      "rendered": "dataclass(frozen=True)"
+    },
+    {
+      "line_start": 299,
+      "line_end": 299,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 305,
+      "line_end": 305,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='shutil', ctx=Load()), attr='rmtree', ctx=Load()), args=[Name(id='workspace_root', ctx=Load())], keywords=[])",
+      "rendered": "shutil.rmtree(workspace_root)"
+    },
+    {
+      "line_start": 306,
+      "line_end": 306,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='FileNotFoundError', ctx=Load())",
+      "rendered": "FileNotFoundError"
+    },
+    {
+      "line_start": 308,
+      "line_end": 308,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='OSError', ctx=Load())",
+      "rendered": "OSError"
+    },
+    {
+      "line_start": 309,
+      "line_end": 311,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='  ['), FormattedValue(value=Name(id='VALIDATE_ALIAS_S11', ctx=Load()), conversion=-1), Constant(value='] WARN: could not remove workspace '), FormattedValue(value=Name(id='workspace_root', ctx=Load()), conversion=-1), Constant(value=': '), FormattedValue(value=Name(id='exc', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "console.write(source_template_310_12)"
+    },
+    {
+      "line_start": 316,
+      "line_end": 316,
+      "column": 16,
+      "kind": "Name",
+      "original_ast": "Name(id='paths', ctx=Load())",
+      "rendered": "paths"
+    },
+    {
+      "line_start": 318,
+      "line_end": 318,
+      "column": 22,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Call(func=Name(id='load_case', ctx=Load()), args=[Name(id='path', ctx=Load())], keywords=[]), attr='case_id', ctx=Load())",
+      "rendered": "load_case(path).case_id"
+    },
+    {
+      "line_start": 319,
+      "line_end": 319,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='OSError', ctx=Load()), Name(id='ValueError', ctx=Load()), Name(id='ValidationError', ctx=Load())], ctx=Load())",
+      "rendered": "(OSError, ValueError, ValidationError)"
+    },
+    {
+      "line_start": 321,
+      "line_end": 321,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Tuple(elts=[Name(id='case_id', ctx=Load()), Call(func=Attribute(value=Attribute(value=Name(id='path', ctx=Load()), attr='parent', ctx=Load()), attr='resolve', ctx=Load()), args=[], keywords=[])], ctx=Load()), ops=[In()], comparators=[Name(id='owned', ctx=Load())])",
+      "rendered": "(case_id, path.parent.resolve()) in owned"
+    },
+    {
+      "line_start": 322,
+      "line_end": 322,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 323,
+      "line_end": 323,
+      "column": 11,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 332,
+      "line_end": 332,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='discover_cases', ctx=Load()), args=[Name(id='repo', ctx=Load())], keywords=[])",
+      "rendered": "discover_cases(repo)"
+    },
+    {
+      "line_start": 333,
+      "line_end": 333,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='discovered', ctx=Load()))",
+      "rendered": "not discovered"
+    },
+    {
+      "line_start": 334,
+      "line_end": 334,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Constant(value=' / '), attr='join', ctx=Load()), args=[Call(func=Name(id='sorted', ctx=Load()), args=[GeneratorExp(elt=Attribute(value=Name(id='state', ctx=Load()), attr='value', ctx=Load()), generators=[comprehension(target=Name(id='state', ctx=Store()), iter=Name(id='VALIDATABLE_STATES', ctx=Load()), ifs=[], is_async=0)])], keywords=[])], keywords=[])",
+      "rendered": "' / '.join(sorted((state.value for state in VALIDATABLE_STATES)))"
+    },
+    {
+      "line_start": 335,
+      "line_end": 337,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='validation cannot run: no findings in a validatable state ('), FormattedValue(value=Name(id='valid', ctx=Load()), conversion=-1), Constant(value=') under '), FormattedValue(value=Name(id='repo', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "console.write(source_template_336_12)"
+    },
+    {
+      "line_start": 338,
+      "line_end": 338,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=1)",
+      "rendered": "1"
+    },
+    {
+      "line_start": 339,
+      "line_end": 339,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='owned', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), UnaryOp(op=Not(), operand=Call(func=Name(id='_any_owned', ctx=Load()), args=[Name(id='discovered', ctx=Load()), Name(id='owned', ctx=Load())], keywords=[]))])",
+      "rendered": "owned is not None and (not _any_owned(discovered, owned))"
+    },
+    {
+      "line_start": 340,
+      "line_end": 343,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='validation cannot run: no case under '), FormattedValue(value=Name(id='repo', ctx=Load()), conversion=-1), Constant(value=\" has an S10 record in this machine's state store (not written by this machine's remediation)\")])], keywords=[])",
+      "rendered": "console.write(source_template_341_12)"
+    },
+    {
+      "line_start": 344,
+      "line_end": 344,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=1)",
+      "rendered": "1"
+    },
+    {
+      "line_start": 345,
+      "line_end": 348,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='validation: nothing to validate — all findings under '), FormattedValue(value=Name(id='repo', ctx=Load()), conversion=-1), Constant(value=' are already in a terminal state')])], keywords=[])",
+      "rendered": "console.write(source_template_346_8)"
+    },
+    {
+      "line_start": 349,
+      "line_end": 349,
+      "column": 11,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 355,
+      "line_end": 355,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='all_case_ids', ctx=Load()), args=[Name(id='repo', ctx=Load())], keywords=[])",
+      "rendered": "all_case_ids(repo)"
+    },
+    {
+      "line_start": 356,
+      "line_end": 356,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='case_ids', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "case_ids is None"
+    },
+    {
+      "line_start": 358,
+      "line_end": 360,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='prune_stale_steps', ctx=Load()), args=[Name(id='run_id', ctx=Load()), Name(id='VALIDATE_PREFIX', ctx=Load()), ListComp(elt=Call(func=Name(id='_step_key', ctx=Load()), args=[Name(id='cid', ctx=Load())], keywords=[keyword(arg='model', value=Name(id='model', ctx=Load())), keyword(arg='backend', value=Name(id='backend', ctx=Load()))]), generators=[comprehension(target=Name(id='cid', ctx=Store()), iter=Name(id='case_ids', ctx=Load()), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "prune_stale_steps(run_id, VALIDATE_PREFIX, [_step_key(cid, model=model, backend=backend) for cid in case_ids])"
+    },
+    {
+      "line_start": 366,
+      "line_end": 366,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_engine_identity', ctx=Load()), args=[Name(id='config', ctx=Load())], keywords=[])",
+      "rendered": "_engine_identity(config)"
+    },
+    {
+      "line_start": 367,
+      "line_end": 372,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='Provenance', ctx=Load()), args=[], keywords=[keyword(arg='engine', value=Name(id='VALIDATION_ENGINE_ID', ctx=Load())), keyword(arg='engine_version', value=Name(id='__version__', ctx=Load())), keyword(arg='model', value=Name(id='model', ctx=Load())), keyword(arg='backend', value=Name(id='backend', ctx=Load()))])",
+      "rendered": "Provenance(engine=VALIDATION_ENGINE_ID, engine_version=__version__, model=model, backend=backend)"
+    },
+    {
+      "line_start": 384,
+      "line_end": 384,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='RunMetadata', ctx=Load()), args=[], keywords=[])",
+      "rendered": "RunMetadata()"
+    },
+    {
+      "line_start": 392,
+      "line_end": 392,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='run_id_for', ctx=Load()), args=[Name(id='repo', ctx=Load())], keywords=[])",
+      "rendered": "run_id_for(repo)"
+    },
+    {
+      "line_start": 393,
+      "line_end": 393,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='register_run', ctx=Load()), args=[Name(id='run_id', ctx=Load())], keywords=[keyword(arg='repo_root', value=Call(func=Name(id='str', ctx=Load()), args=[Call(func=Attribute(value=Name(id='repo', ctx=Load()), attr='resolve', ctx=Load()), args=[], keywords=[])], keywords=[]))])",
+      "rendered": "register_run(run_id, repo_root=str(repo.resolve()))"
+    },
+    {
+      "line_start": 394,
+      "line_end": 394,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='owned_cases', ctx=Load()), args=[Name(id='run_id', ctx=Load())], keywords=[])",
+      "rendered": "owned_cases(run_id)"
+    },
+    {
+      "line_start": 396,
+      "line_end": 396,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='select_cases', ctx=Load()), args=[Name(id='repo', ctx=Load()), Attribute(value=Name(id='selection', ctx=Load()), attr='case_ids', ctx=Load()), Attribute(value=Name(id='selection', ctx=Load()), attr='max_findings', ctx=Load())], keywords=[keyword(arg='owned', value=Name(id='owned', ctx=Load()))])",
+      "rendered": "select_cases(repo, selection.case_ids, selection.max_findings, owned=owned)"
+    },
+    {
+      "line_start": 397,
+      "line_end": 397,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='IngestError', ctx=Load()), Name(id='UnsafeArtifactDir', ctx=Load())], ctx=Load())",
+      "rendered": "(IngestError, UnsafeArtifactDir)"
+    },
+    {
+      "line_start": 398,
+      "line_end": 398,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='ingest error: '), FormattedValue(value=Name(id='exc', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "console.write(source_template_398_22)"
+    },
+    {
+      "line_start": 399,
+      "line_end": 399,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='meta', ctx=Load()), attr='errors', ctx=Load()), attr='append', ctx=Load()), args=[Call(func=Name(id='str', ctx=Load()), args=[Name(id='exc', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "meta.errors.append(str(exc))"
+    },
+    {
+      "line_start": 400,
+      "line_end": 400,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ValidationRunResult', ctx=Load()), args=[Constant(value=1), Tuple(elts=[], ctx=Load()), Name(id='meta', ctx=Load())], keywords=[])",
+      "rendered": "ValidationRunResult(1, (), meta)"
+    },
+    {
+      "line_start": 401,
+      "line_end": 401,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='cases', ctx=Load()))",
+      "rendered": "not cases"
+    },
+    {
+      "line_start": 402,
+      "line_end": 402,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ValidationRunResult', ctx=Load()), args=[Call(func=Name(id='_empty_selection_rc', ctx=Load()), args=[Name(id='repo', ctx=Load())], keywords=[keyword(arg='owned', value=Name(id='owned', ctx=Load()))]), Tuple(elts=[], ctx=Load()), Name(id='meta', ctx=Load())], keywords=[])",
+      "rendered": "ValidationRunResult(_empty_selection_rc(repo, owned=owned), (), meta)"
+    },
+    {
+      "line_start": 403,
+      "line_end": 403,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_engine_identity', ctx=Load()), args=[Name(id='config', ctx=Load())], keywords=[])",
+      "rendered": "_engine_identity(config)"
+    },
+    {
+      "line_start": 404,
+      "line_end": 404,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_prune_orphans', ctx=Load()), args=[Name(id='repo', ctx=Load()), Name(id='run_id', ctx=Load())], keywords=[keyword(arg='model', value=Name(id='model', ctx=Load())), keyword(arg='backend', value=Name(id='backend', ctx=Load()))])",
+      "rendered": "_prune_orphans(repo, run_id, model=model, backend=backend)"
+    },
+    {
+      "line_start": 405,
+      "line_end": 413,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ValidationRun', ctx=Load()), args=[], keywords=[keyword(arg='repo', value=Name(id='repo', ctx=Load())), keyword(arg='workspace_root', value=Name(id='workspace_root', ctx=Load())), keyword(arg='config', value=Name(id='config', ctx=Load())), keyword(arg='run_id', value=Name(id='run_id', ctx=Load())), keyword(arg='provenance', value=Call(func=Name(id='_provenance_for', ctx=Load()), args=[Name(id='config', ctx=Load())], keywords=[])), keyword(arg='policy', value=Name(id='FIX_POLICY', ctx=Load())), keyword(arg='resume', value=Attribute(value=Name(id='selection', ctx=Load()), attr='resume', ctx=Load()))])",
+      "rendered": "ValidationRun(repo=repo, workspace_root=workspace_root, config=config, run_id=run_id, provenance=_provenance_for(config), policy=FIX_POLICY, resume=selection.resume)"
+    },
+    {
+      "line_start": 414,
+      "line_end": 414,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_run_cases', ctx=Load()), args=[Name(id='cases', ctx=Load()), Name(id='run', ctx=Load())], keywords=[])",
+      "rendered": "_run_cases(cases, run)"
+    },
+    {
+      "line_start": 415,
+      "line_end": 415,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='len', ctx=Load()), args=[Name(id='cases', ctx=Load())], keywords=[])",
+      "rendered": "len(cases)"
+    },
+    {
+      "line_start": 416,
+      "line_end": 416,
+      "column": 30,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='len', ctx=Load()), args=[Name(id='validated', ctx=Load())], keywords=[])",
+      "rendered": "len(validated)"
+    },
+    {
+      "line_start": 417,
+      "line_end": 417,
+      "column": 27,
+      "kind": "Name",
+      "original_ast": "Name(id='failures', ctx=Load())",
+      "rendered": "failures"
+    },
+    {
+      "line_start": 419,
+      "line_end": 424,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='augment_reports', ctx=Load()), args=[Name(id='repo', ctx=Load()), ListComp(elt=Call(func=Name(id='ValidatedFinding', ctx=Load()), args=[Attribute(value=Attribute(value=Attribute(value=Name(id='item', ctx=Load()), attr='loaded', ctx=Load()), attr='case', ctx=Load()), attr='finding', ctx=Load()), Attribute(value=Name(id='item', ctx=Load()), attr='row', ctx=Load()), Attribute(value=Name(id='item', ctx=Load()), attr='session_failed', ctx=Load())], keywords=[]), generators=[comprehension(target=Name(id='item', ctx=Store()), iter=Name(id='validated', ctx=Load()), ifs=[], is_async=0)]), Name(id='report_md', ctx=Load())], keywords=[])",
+      "rendered": "augment_reports(repo, [ValidatedFinding(item.loaded.case.finding, item.row, item.session_failed) for item in validated], report_md)"
+    },
+    {
+      "line_start": 426,
+      "line_end": 426,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_cleanup_workspace', ctx=Load()), args=[Name(id='workspace_root', ctx=Load())], keywords=[])",
+      "rendered": "_cleanup_workspace(workspace_root)"
+    },
+    {
+      "line_start": 429,
+      "line_end": 429,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='tuple', ctx=Load()), args=[GeneratorExp(elt=Attribute(value=Name(id='item', ctx=Load()), attr='verdict', ctx=Load()), generators=[comprehension(target=Name(id='item', ctx=Store()), iter=Name(id='validated', ctx=Load()), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "tuple((item.verdict for item in validated))"
+    },
+    {
+      "line_start": 430,
+      "line_end": 434,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ValidationRunResult', ctx=Load()), args=[], keywords=[keyword(arg='exit_code', value=IfExp(test=Name(id='failures', ctx=Load()), body=Constant(value=1), orelse=Call(func=Name(id='rc_for_verdicts', ctx=Load()), args=[Name(id='verdicts', ctx=Load())], keywords=[]))), keyword(arg='verdicts', value=Name(id='verdicts', ctx=Load())), keyword(arg='metadata', value=Name(id='meta', ctx=Load()))])",
+      "rendered": "ValidationRunResult(exit_code=1 if failures else rc_for_verdicts(verdicts), verdicts=verdicts, metadata=meta)"
+    }
+  ],
+  "calls": [
+    {
+      "line": 280,
+      "end_line": 280,
+      "callee": "dataclass",
+      "enclosing": "Selection",
+      "expression": "dataclass(frozen=True)"
+    },
+    {
+      "line": 289,
+      "end_line": 289,
+      "callee": "dataclass",
+      "enclosing": "ValidationRun",
+      "expression": "dataclass(frozen=True)"
+    },
+    {
+      "line": 108,
+      "end_line": 110,
+      "callee": "step_key_for",
+      "enclosing": "_step_key",
+      "expression": "step_key_for(VALIDATE_PREFIX, engine_id=VALIDATION_ENGINE_ID,\n                        engine_version=__version__, case_id=case_id,\n                        model=model, backend=backend)"
+    },
+    {
+      "line": 119,
+      "end_line": 119,
+      "callee": "SessionLogPaths",
+      "enclosing": "_session_log_dest",
+      "expression": "SessionLogPaths(src, loaded.path.parent / fname)"
+    },
+    {
+      "line": 124,
+      "end_line": 124,
+      "callee": "_session_log_dest",
+      "enclosing": "_persist_session_log",
+      "expression": "_session_log_dest(workspace, loaded)"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "print",
+      "enclosing": "_print_result",
+      "expression": "print(f\"[{row.tracking_id}] verdict={row.reason_for_decision} score={row.fix_confidence}\")"
+    },
+    {
+      "line": 147,
+      "end_line": 147,
+      "callee": "datetime.now",
+      "enclosing": "_run_plan",
+      "expression": "datetime.now(UTC)"
+    },
+    {
+      "line": 148,
+      "end_line": 148,
+      "callee": "TOKENS.spend",
+      "enclosing": "_run_plan",
+      "expression": "TOKENS.spend()"
+    },
+    {
+      "line": 151,
+      "end_line": 151,
+      "callee": "stage_workspace",
+      "enclosing": "_run_plan",
+      "expression": "stage_workspace(run.repo, workspace, latest.remediation.diff)"
+    },
+    {
+      "line": 152,
+      "end_line": 160,
+      "callee": "FixValidationPlan",
+      "enclosing": "_run_plan",
+      "expression": "FixValidationPlan(\n        case_id=loaded.case_id,\n        session_id=session_id,\n        manifest=build_manifest(loaded.case, session_id=session_id),\n        workspace_dir=workspace,\n        output_dir=workspace,\n        provenance=run.provenance,\n        policy=run.policy,\n    )"
+    },
+    {
+      "line": 161,
+      "end_line": 165,
+      "callee": "asyncio.run",
+      "enclosing": "_run_plan",
+      "expression": "asyncio.run(\n        execute_plan(\n            plan, run.config, post_results=False, meta=RunMetadata(total_findings=1)\n        )\n    )"
+    },
+    {
+      "line": 167,
+      "end_line": 173,
+      "callee": "build_verdict",
+      "enclosing": "_run_plan",
+      "expression": "build_verdict(\n        loaded.case,\n        workspace,\n        provenance=_measured(run.provenance, started, spend_before),\n        policy=run.policy,\n        session_failed=outcome.session_failed,\n    )"
+    },
+    {
+      "line": 174,
+      "end_line": 174,
+      "callee": "_record",
+      "enclosing": "_run_plan",
+      "expression": "_record(loaded, verdict, workspace)"
+    },
+    {
+      "line": 175,
+      "end_line": 175,
+      "callee": "ValidatedCase",
+      "enclosing": "_run_plan",
+      "expression": "ValidatedCase(loaded, verdict, collected.row, outcome.session_failed)"
+    },
+    {
+      "line": 180,
+      "end_line": 180,
+      "callee": "reported_between",
+      "enclosing": "_measured",
+      "expression": "reported_between(spend_before, TOKENS.spend())"
+    },
+    {
+      "line": 181,
+      "end_line": 182,
+      "callee": "base.model_copy",
+      "enclosing": "_measured",
+      "expression": "base.model_copy(update={\"started\": started, \"ended\": datetime.now(UTC),\n                                   \"usd\": usd, \"turns\": turns})"
+    },
+    {
+      "line": 187,
+      "end_line": 187,
+      "callee": "_persist_session_log",
+      "enclosing": "_record",
+      "expression": "_persist_session_log(workspace, loaded)"
+    },
+    {
+      "line": 190,
+      "end_line": 190,
+      "callee": "write_back_verdict",
+      "enclosing": "_record",
+      "expression": "write_back_verdict(loaded.case, verdict, loaded.path)"
+    },
+    {
+      "line": 218,
+      "end_line": 218,
+      "callee": "load_ckpt",
+      "enclosing": "_resume_hit",
+      "expression": "load_ckpt(run.workspace_root, run.run_id, step)"
+    },
+    {
+      "line": 223,
+      "end_line": 223,
+      "callee": "_engine_identity",
+      "enclosing": "_process_case",
+      "expression": "_engine_identity(run.config)"
+    },
+    {
+      "line": 224,
+      "end_line": 224,
+      "callee": "_step_key",
+      "enclosing": "_process_case",
+      "expression": "_step_key(loaded.case_id, model=model, backend=backend)"
+    },
+    {
+      "line": 233,
+      "end_line": 233,
+      "callee": "_validate_one",
+      "enclosing": "_process_case",
+      "expression": "_validate_one(loaded, run)"
+    },
+    {
+      "line": 246,
+      "end_line": 246,
+      "callee": "ValidatedCase",
+      "enclosing": "_resumed",
+      "expression": "ValidatedCase(loaded, verdict, cached, session_failed=False)"
+    },
+    {
+      "line": 253,
+      "end_line": 258,
+      "callee": "Verdict",
+      "enclosing": "_no_verdict",
+      "expression": "Verdict(\n        decision=Decision.INCONCLUSIVE,\n        rationale=\"resumed from a checkpoint, but the case file records no verdict\",\n        score=None,\n        produced_by=Provenance(engine=VALIDATION_ENGINE_ID, engine_version=__version__),\n    )"
+    },
+    {
+      "line": 332,
+      "end_line": 332,
+      "callee": "discover_cases",
+      "enclosing": "_empty_selection_rc",
+      "expression": "discover_cases(repo)"
+    },
+    {
+      "line": 345,
+      "end_line": 348,
+      "callee": "console.write",
+      "enclosing": "_empty_selection_rc",
+      "expression": "console.write(\n        f\"validation: nothing to validate — all findings under {repo} are already \"\n        \"in a terminal state\"\n    )"
+    },
+    {
+      "line": 355,
+      "end_line": 355,
+      "callee": "all_case_ids",
+      "enclosing": "_prune_orphans",
+      "expression": "all_case_ids(repo)"
+    },
+    {
+      "line": 358,
+      "end_line": 360,
+      "callee": "prune_stale_steps",
+      "enclosing": "_prune_orphans",
+      "expression": "prune_stale_steps(run_id, VALIDATE_PREFIX,\n                      [_step_key(cid, model=model, backend=backend)\n                       for cid in case_ids])"
+    },
+    {
+      "line": 366,
+      "end_line": 366,
+      "callee": "_engine_identity",
+      "enclosing": "_provenance_for",
+      "expression": "_engine_identity(config)"
+    },
+    {
+      "line": 367,
+      "end_line": 372,
+      "callee": "Provenance",
+      "enclosing": "_provenance_for",
+      "expression": "Provenance(\n        engine=VALIDATION_ENGINE_ID,\n        engine_version=__version__,\n        model=model,\n        backend=backend,\n    )"
+    },
+    {
+      "line": 384,
+      "end_line": 384,
+      "callee": "RunMetadata",
+      "enclosing": "run_validation",
+      "expression": "RunMetadata()"
+    },
+    {
+      "line": 392,
+      "end_line": 392,
+      "callee": "run_id_for",
+      "enclosing": "run_validation",
+      "expression": "run_id_for(repo)"
+    },
+    {
+      "line": 393,
+      "end_line": 393,
+      "callee": "register_run",
+      "enclosing": "run_validation",
+      "expression": "register_run(run_id, repo_root=str(repo.resolve()))"
+    },
+    {
+      "line": 394,
+      "end_line": 394,
+      "callee": "owned_cases",
+      "enclosing": "run_validation",
+      "expression": "owned_cases(run_id)"
+    },
+    {
+      "line": 403,
+      "end_line": 403,
+      "callee": "_engine_identity",
+      "enclosing": "run_validation",
+      "expression": "_engine_identity(config)"
+    },
+    {
+      "line": 404,
+      "end_line": 404,
+      "callee": "_prune_orphans",
+      "enclosing": "run_validation",
+      "expression": "_prune_orphans(repo, run_id, model=model, backend=backend)"
+    },
+    {
+      "line": 405,
+      "end_line": 413,
+      "callee": "ValidationRun",
+      "enclosing": "run_validation",
+      "expression": "ValidationRun(\n        repo=repo,\n        workspace_root=workspace_root,\n        config=config,\n        run_id=run_id,\n        provenance=_provenance_for(config),\n        policy=FIX_POLICY,\n        resume=selection.resume,\n    )"
+    },
+    {
+      "line": 414,
+      "end_line": 414,
+      "callee": "_run_cases",
+      "enclosing": "run_validation",
+      "expression": "_run_cases(cases, run)"
+    },
+    {
+      "line": 415,
+      "end_line": 415,
+      "callee": "len",
+      "enclosing": "run_validation",
+      "expression": "len(cases)"
+    },
+    {
+      "line": 416,
+      "end_line": 416,
+      "callee": "len",
+      "enclosing": "run_validation",
+      "expression": "len(validated)"
+    },
+    {
+      "line": 419,
+      "end_line": 424,
+      "callee": "augment_reports",
+      "enclosing": "run_validation",
+      "expression": "augment_reports(\n        repo,\n        [ValidatedFinding(item.loaded.case.finding, item.row, item.session_failed)\n         for item in validated],\n        report_md,\n    )"
+    },
+    {
+      "line": 426,
+      "end_line": 426,
+      "callee": "_cleanup_workspace",
+      "enclosing": "run_validation",
+      "expression": "_cleanup_workspace(workspace_root)"
+    },
+    {
+      "line": 429,
+      "end_line": 429,
+      "callee": "tuple",
+      "enclosing": "run_validation",
+      "expression": "tuple(item.verdict for item in validated)"
+    },
+    {
+      "line": 430,
+      "end_line": 434,
+      "callee": "ValidationRunResult",
+      "enclosing": "run_validation",
+      "expression": "ValidationRunResult(\n        exit_code=1 if failures else rc_for_verdicts(verdicts),\n        verdicts=verdicts,\n        metadata=meta,\n    )"
+    },
+    {
+      "line": 97,
+      "end_line": 97,
+      "callee": "_UNSAFE.sub",
+      "enclosing": "_safe",
+      "expression": "_UNSAFE.sub(\"_\", case_id)"
+    },
+    {
+      "line": 102,
+      "end_line": 102,
+      "callee": "str",
+      "enclosing": "_engine_identity",
+      "expression": "str(config.agent.model)"
+    },
+    {
+      "line": 116,
+      "end_line": 116,
+      "callee": "src.exists",
+      "enclosing": "_session_log_dest",
+      "expression": "src.exists()"
+    },
+    {
+      "line": 129,
+      "end_line": 131,
+      "callee": "dest.write_text",
+      "enclosing": "_persist_session_log",
+      "expression": "dest.write_text(\n            redact(src.read_text(encoding=\"utf-8\", errors=\"replace\")), encoding=\"utf-8\"\n        )"
+    },
+    {
+      "line": 142,
+      "end_line": 142,
+      "callee": "print",
+      "enclosing": "_print_result",
+      "expression": "print(f\"    justification: {row.justification}\")"
+    },
+    {
+      "line": 149,
+      "end_line": 149,
+      "callee": "uuid.uuid4",
+      "enclosing": "_run_plan",
+      "expression": "uuid.uuid4()"
+    },
+    {
+      "line": 162,
+      "end_line": 164,
+      "callee": "execute_plan",
+      "enclosing": "_run_plan",
+      "expression": "execute_plan(\n            plan, run.config, post_results=False, meta=RunMetadata(total_findings=1)\n        )"
+    },
+    {
+      "line": 180,
+      "end_line": 180,
+      "callee": "TOKENS.spend",
+      "enclosing": "_measured",
+      "expression": "TOKENS.spend()"
+    },
+    {
+      "line": 189,
+      "end_line": 189,
+      "callee": "console.write",
+      "enclosing": "_record",
+      "expression": "console.write(f\"  [{VALIDATE_ALIAS_S11}] session log → {record}\")"
+    },
+    {
+      "line": 192,
+      "end_line": 195,
+      "callee": "console.write",
+      "enclosing": "_record",
+      "expression": "console.write(\n            f\"  [{VALIDATE_ALIAS_S11}] case updated → {loaded.case_id}: \"\n            f\"state={judged.state.value}\"\n        )"
+    },
+    {
+      "line": 201,
+      "end_line": 201,
+      "callee": "console.write",
+      "enclosing": "_validate_one",
+      "expression": "console.write(f\"refusing {loaded.case_id}: no remediation attempt to validate\")"
+    },
+    {
+      "line": 203,
+      "end_line": 203,
+      "callee": "_safe",
+      "enclosing": "_validate_one",
+      "expression": "_safe(loaded.case_id)"
+    },
+    {
+      "line": 205,
+      "end_line": 205,
+      "callee": "assert_remediation_applied",
+      "enclosing": "_validate_one",
+      "expression": "assert_remediation_applied(run.repo, loaded.case.attempts[-1].remediation.files_touched)"
+    },
+    {
+      "line": 210,
+      "end_line": 210,
+      "callee": "_run_plan",
+      "enclosing": "_validate_one",
+      "expression": "_run_plan(loaded, run, workspace)"
+    },
+    {
+      "line": 212,
+      "end_line": 212,
+      "callee": "shutil.rmtree",
+      "enclosing": "_validate_one",
+      "expression": "shutil.rmtree(workspace, ignore_errors=True)"
+    },
+    {
+      "line": 226,
+      "end_line": 226,
+      "callee": "_resume_hit",
+      "enclosing": "_process_case",
+      "expression": "_resume_hit(run, step)"
+    },
+    {
+      "line": 236,
+      "end_line": 236,
+      "callee": "save_ckpt",
+      "enclosing": "_process_case",
+      "expression": "save_ckpt(run.workspace_root, run.run_id, step, validated.row)"
+    },
+    {
+      "line": 245,
+      "end_line": 245,
+      "callee": "ValidatedCase",
+      "enclosing": "_resumed",
+      "expression": "ValidatedCase(loaded, _no_verdict(), cached, session_failed=True)"
+    },
+    {
+      "line": 266,
+      "end_line": 266,
+      "callee": "_process_case",
+      "enclosing": "_run_cases",
+      "expression": "_process_case(loaded, run)"
+    },
+    {
+      "line": 276,
+      "end_line": 276,
+      "callee": "validated.append",
+      "enclosing": "_run_cases",
+      "expression": "validated.append(result)"
+    },
+    {
+      "line": 305,
+      "end_line": 305,
+      "callee": "shutil.rmtree",
+      "enclosing": "_cleanup_workspace",
+      "expression": "shutil.rmtree(workspace_root)"
+    },
+    {
+      "line": 334,
+      "end_line": 334,
+      "callee": "' / '.join",
+      "enclosing": "_empty_selection_rc",
+      "expression": "\" / \".join(sorted(state.value for state in VALIDATABLE_STATES))"
+    },
+    {
+      "line": 335,
+      "end_line": 337,
+      "callee": "console.write",
+      "enclosing": "_empty_selection_rc",
+      "expression": "console.write(\n            f\"validation cannot run: no findings in a validatable state ({valid}) under {repo}\"\n        )"
+    },
+    {
+      "line": 340,
+      "end_line": 343,
+      "callee": "console.write",
+      "enclosing": "_empty_selection_rc",
+      "expression": "console.write(\n            f\"validation cannot run: no case under {repo} has an S10 record in this \"\n            \"machine's state store (not written by this machine's remediation)\"\n        )"
+    },
+    {
+      "line": 396,
+      "end_line": 396,
+      "callee": "select_cases",
+      "enclosing": "run_validation",
+      "expression": "select_cases(repo, selection.case_ids, selection.max_findings, owned=owned)"
+    },
+    {
+      "line": 402,
+      "end_line": 402,
+      "callee": "ValidationRunResult",
+      "enclosing": "run_validation",
+      "expression": "ValidationRunResult(_empty_selection_rc(repo, owned=owned), (), meta)"
+    },
+    {
+      "line": 118,
+      "end_line": 118,
+      "callee": "_safe",
+      "enclosing": "_session_log_dest",
+      "expression": "_safe(loaded.case_id)"
+    },
+    {
+      "line": 130,
+      "end_line": 130,
+      "callee": "redact",
+      "enclosing": "_persist_session_log",
+      "expression": "redact(src.read_text(encoding=\"utf-8\", errors=\"replace\"))"
+    },
+    {
+      "line": 133,
+      "end_line": 133,
+      "callee": "dest.unlink",
+      "enclosing": "_persist_session_log",
+      "expression": "dest.unlink(missing_ok=True)"
+    },
+    {
+      "line": 155,
+      "end_line": 155,
+      "callee": "build_manifest",
+      "enclosing": "_run_plan",
+      "expression": "build_manifest(loaded.case, session_id=session_id)"
+    },
+    {
+      "line": 170,
+      "end_line": 170,
+      "callee": "_measured",
+      "enclosing": "_run_plan",
+      "expression": "_measured(run.provenance, started, spend_before)"
+    },
+    {
+      "line": 207,
+      "end_line": 207,
+      "callee": "console.write",
+      "enclosing": "_validate_one",
+      "expression": "console.write(f\"refusing {loaded.case_id}: {exc}\")"
+    },
+    {
+      "line": 229,
+      "end_line": 231,
+      "callee": "console.write",
+      "enclosing": "_process_case",
+      "expression": "console.write(\n                f\"  [{VALIDATE_ALIAS_S11}] resume: {loaded.case_id} already validated\"\n            )"
+    },
+    {
+      "line": 232,
+      "end_line": 232,
+      "callee": "_resumed",
+      "enclosing": "_process_case",
+      "expression": "_resumed(loaded, cached)"
+    },
+    {
+      "line": 245,
+      "end_line": 245,
+      "callee": "_no_verdict",
+      "enclosing": "_resumed",
+      "expression": "_no_verdict()"
+    },
+    {
+      "line": 257,
+      "end_line": 257,
+      "callee": "Provenance",
+      "enclosing": "_no_verdict",
+      "expression": "Provenance(engine=VALIDATION_ENGINE_ID, engine_version=__version__)"
+    },
+    {
+      "line": 272,
+      "end_line": 272,
+      "callee": "console.write",
+      "enclosing": "_run_cases",
+      "expression": "console.write(f\"FAILED: {loaded.case_id} — {result.row.reason_for_decision}\")"
+    },
+    {
+      "line": 275,
+      "end_line": 275,
+      "callee": "_print_result",
+      "enclosing": "_run_cases",
+      "expression": "_print_result(result.row)"
+    },
+    {
+      "line": 309,
+      "end_line": 311,
+      "callee": "console.write",
+      "enclosing": "_cleanup_workspace",
+      "expression": "console.write(\n            f\"  [{VALIDATE_ALIAS_S11}] WARN: could not remove workspace {workspace_root}: {exc}\"\n        )"
+    },
+    {
+      "line": 334,
+      "end_line": 334,
+      "callee": "sorted",
+      "enclosing": "_empty_selection_rc",
+      "expression": "sorted(state.value for state in VALIDATABLE_STATES)"
+    },
+    {
+      "line": 339,
+      "end_line": 339,
+      "callee": "_any_owned",
+      "enclosing": "_empty_selection_rc",
+      "expression": "_any_owned(discovered, owned)"
+    },
+    {
+      "line": 359,
+      "end_line": 359,
+      "callee": "_step_key",
+      "enclosing": "_prune_orphans",
+      "expression": "_step_key(cid, model=model, backend=backend)"
+    },
+    {
+      "line": 393,
+      "end_line": 393,
+      "callee": "str",
+      "enclosing": "run_validation",
+      "expression": "str(repo.resolve())"
+    },
+    {
+      "line": 398,
+      "end_line": 398,
+      "callee": "console.write",
+      "enclosing": "run_validation",
+      "expression": "console.write(f\"ingest error: {exc}\")"
+    },
+    {
+      "line": 399,
+      "end_line": 399,
+      "callee": "meta.errors.append",
+      "enclosing": "run_validation",
+      "expression": "meta.errors.append(str(exc))"
+    },
+    {
+      "line": 400,
+      "end_line": 400,
+      "callee": "ValidationRunResult",
+      "enclosing": "run_validation",
+      "expression": "ValidationRunResult(1, (), meta)"
+    },
+    {
+      "line": 402,
+      "end_line": 402,
+      "callee": "_empty_selection_rc",
+      "enclosing": "run_validation",
+      "expression": "_empty_selection_rc(repo, owned=owned)"
+    },
+    {
+      "line": 410,
+      "end_line": 410,
+      "callee": "_provenance_for",
+      "enclosing": "run_validation",
+      "expression": "_provenance_for(config)"
+    },
+    {
+      "line": 421,
+      "end_line": 421,
+      "callee": "ValidatedFinding",
+      "enclosing": "run_validation",
+      "expression": "ValidatedFinding(item.loaded.case.finding, item.row, item.session_failed)"
+    },
+    {
+      "line": 130,
+      "end_line": 130,
+      "callee": "src.read_text",
+      "enclosing": "_persist_session_log",
+      "expression": "src.read_text(encoding=\"utf-8\", errors=\"replace\")"
+    },
+    {
+      "line": 163,
+      "end_line": 163,
+      "callee": "RunMetadata",
+      "enclosing": "_run_plan",
+      "expression": "RunMetadata(total_findings=1)"
+    },
+    {
+      "line": 181,
+      "end_line": 181,
+      "callee": "datetime.now",
+      "enclosing": "_measured",
+      "expression": "datetime.now(UTC)"
+    },
+    {
+      "line": 318,
+      "end_line": 318,
+      "callee": "load_case",
+      "enclosing": "_any_owned",
+      "expression": "load_case(path)"
+    },
+    {
+      "line": 321,
+      "end_line": 321,
+      "callee": "path.parent.resolve",
+      "enclosing": "_any_owned",
+      "expression": "path.parent.resolve()"
+    },
+    {
+      "line": 393,
+      "end_line": 393,
+      "callee": "repo.resolve",
+      "enclosing": "run_validation",
+      "expression": "repo.resolve()"
+    },
+    {
+      "line": 399,
+      "end_line": 399,
+      "callee": "str",
+      "enclosing": "run_validation",
+      "expression": "str(exc)"
+    },
+    {
+      "line": 431,
+      "end_line": 431,
+      "callee": "rc_for_verdicts",
+      "enclosing": "run_validation",
+      "expression": "rc_for_verdicts(verdicts)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 17,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "import asyncio",
+      "targets": [
+        "asyncio"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "import shutil",
+      "targets": [
+        "shutil"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "import uuid",
+      "targets": [
+        "uuid"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "from dataclasses import dataclass",
+      "targets": [
+        "dataclasses",
+        "dataclasses.dataclass"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 23,
+      "source_expression": "from datetime import UTC, datetime",
+      "targets": [
+        "datetime",
+        "datetime.UTC",
+        "datetime.datetime"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 24,
+      "source_expression": "from pathlib import Path",
+      "targets": [
+        "pathlib",
+        "pathlib.Path"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 25,
+      "source_expression": "from typing import NamedTuple",
+      "targets": [
+        "typing",
+        "typing.NamedTuple"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 27,
+      "source_expression": "from pydantic import ValidationError",
+      "targets": [
+        "pydantic",
+        "pydantic.ValidationError"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 29,
+      "source_expression": "from vvaharness.models import HARNESS_REGISTRY, Provenance, ScoringPolicy, Verdict",
+      "targets": [
+        "vvaharness.models",
+        "vvaharness.models.HARNESS_REGISTRY",
+        "vvaharness.models.Provenance",
+        "vvaharness.models.ScoringPolicy",
+        "vvaharness.models.Verdict"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 30,
+      "source_expression": "from vvaharness.orchestrator.artifacts import UnsafeArtifactDir",
+      "targets": [
+        "vvaharness.orchestrator.artifacts",
+        "vvaharness.orchestrator.artifacts.UnsafeArtifactDir"
+      ],
+      "local_source_paths": [
+        "vvaharness/orchestrator/artifacts.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 31,
+      "source_expression": "from vvaharness.orchestrator.checkpoints import VALIDATE_PREFIX, step_key_for",
+      "targets": [
+        "vvaharness.orchestrator.checkpoints",
+        "vvaharness.orchestrator.checkpoints.VALIDATE_PREFIX",
+        "vvaharness.orchestrator.checkpoints.step_key_for"
+      ],
+      "local_source_paths": [
+        "vvaharness/orchestrator/checkpoints.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 32,
+      "source_expression": "from vvaharness.report.redact import redact",
+      "targets": [
+        "vvaharness.report.redact",
+        "vvaharness.report.redact.redact"
+      ],
+      "local_source_paths": [
+        "vvaharness/report/redact.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 33,
+      "source_expression": "from vvaharness.util import console",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.console"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/console.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 34,
+      "source_expression": "from vvaharness.util.tokens import TOKENS, Spend, reported_between",
+      "targets": [
+        "vvaharness.util.tokens",
+        "vvaharness.util.tokens.TOKENS",
+        "vvaharness.util.tokens.Spend",
+        "vvaharness.util.tokens.reported_between"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/tokens.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 35,
+      "source_expression": "from vvaharness.validation.cli._patterns import _UNSAFE",
+      "targets": [
+        "vvaharness.validation.cli._patterns",
+        "vvaharness.validation.cli._patterns._UNSAFE"
+      ],
+      "local_source_paths": [
+        "vvaharness/validation/cli/_patterns.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 36,
+      "source_expression": "from vvaharness.validation.config import Config",
+      "targets": [
+        "vvaharness.validation.config",
+        "vvaharness.validation.config.Config"
+      ],
+      "local_source_paths": [
+        "vvaharness/validation/config/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 37,
+      "source_expression": "from vvaharness.validation.constants.artifacts import CMD_PREVIEW_LEN, LOGGING_DIRNAME, ORCHESTRATOR_LOG_DIRNAME, SESSION_LOG_FILENAME, VALIDATABLE_STATES, VALIDATE_ALIAS_S11, VALIDATION_SESSION_LOG_PREFIX",
+      "targets": [
+        "vvaharness.validation.constants.artifacts",
+        "vvaharness.validation.constants.artifacts.CMD_PREVIEW_LEN",
+        "vvaharness.validation.constants.artifacts.LOGGING_DIRNAME",
+        "vvaharness.validation.constants.artifacts.ORCHESTRATOR_LOG_DIRNAME",
+        "vvaharness.validation.constants.artifacts.SESSION_LOG_FILENAME",
+        "vvaharness.validation.constants.artifacts.VALIDATABLE_STATES",
+        "vvaharness.validation.constants.artifacts.VALIDATE_ALIAS_S11",
+        "vvaharness.validation.constants.artifacts.VALIDATION_SESSION_LOG_PREFIX"
+      ],
+      "local_source_paths": [
+        "vvaharness/validation/constants/artifacts.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 46,
+      "source_expression": "from vvaharness.validation.constants.scoring import FIX_POLICY",
+      "targets": [
+        "vvaharness.validation.constants.scoring",
+        "vvaharness.validation.constants.scoring.FIX_POLICY"
+      ],
+      "local_source_paths": [
+        "vvaharness/validation/constants/scoring.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 47,
+      "source_expression": "from vvaharness.validation.execution.pipeline import execute_plan",
+      "targets": [
+        "vvaharness.validation.execution.pipeline",
+        "vvaharness.validation.execution.pipeline.execute_plan"
+      ],
+      "local_source_paths": [
+        "vvaharness/validation/execution/pipeline.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 48,
+      "source_expression": "from vvaharness.validation.ingest.case_loader import LoadedCase, all_case_ids, discover_cases, load_case, select_cases",
+      "targets": [
+        "vvaharness.validation.ingest.case_loader",
+        "vvaharness.validation.ingest.case_loader.LoadedCase",
+        "vvaharness.validation.ingest.case_loader.all_case_ids",
+        "vvaharness.validation.ingest.case_loader.discover_cases",
+        "vvaharness.validation.ingest.case_loader.load_case",
+        "vvaharness.validation.ingest.case_loader.select_cases"
+      ],
+      "local_source_paths": [
+        "vvaharness/validation/ingest/case_loader.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 55,
+      "source_expression": "from vvaharness.validation.ingest.errors import IngestError",
+      "targets": [
+        "vvaharness.validation.ingest.errors",
+        "vvaharness.validation.ingest.errors.IngestError"
+      ],
+      "local_source_paths": [
+        "vvaharness/validation/ingest/errors.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 56,
+      "source_expression": "from vvaharness.validation.ingest.manifest_builder import build_manifest",
+      "targets": [
+        "vvaharness.validation.ingest.manifest_builder",
+        "vvaharness.validation.ingest.manifest_builder.build_manifest"
+      ],
+      "local_source_paths": [
+        "vvaharness/validation/ingest/manifest_builder.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 57,
+      "source_expression": "from vvaharness.validation.ingest.workspace import assert_remediation_applied, stage_workspace",
+      "targets": [
+        "vvaharness.validation.ingest.workspace",
+        "vvaharness.validation.ingest.workspace.assert_remediation_applied",
+        "vvaharness.validation.ingest.workspace.stage_workspace"
+      ],
+      "local_source_paths": [
+        "vvaharness/validation/ingest/workspace.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 58,
+      "source_expression": "from vvaharness.validation.io.case_writeback import build_verdict, write_back_verdict",
+      "targets": [
+        "vvaharness.validation.io.case_writeback",
+        "vvaharness.validation.io.case_writeback.build_verdict",
+        "vvaharness.validation.io.case_writeback.write_back_verdict"
+      ],
+      "local_source_paths": [
+        "vvaharness/validation/io/case_writeback.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 59,
+      "source_expression": "from vvaharness.validation.io.result_collector import CollectedFinding",
+      "targets": [
+        "vvaharness.validation.io.result_collector",
+        "vvaharness.validation.io.result_collector.CollectedFinding"
+      ],
+      "local_source_paths": [
+        "vvaharness/validation/io/result_collector.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 60,
+      "source_expression": "from vvaharness.validation.models import RunMetadata, ValidationResult",
+      "targets": [
+        "vvaharness.validation.models",
+        "vvaharness.validation.models.RunMetadata",
+        "vvaharness.validation.models.ValidationResult"
+      ],
+      "local_source_paths": [
+        "vvaharness/validation/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 61,
+      "source_expression": "from vvaharness.validation.models.plans import FixValidationPlan",
+      "targets": [
+        "vvaharness.validation.models.plans",
+        "vvaharness.validation.models.plans.FixValidationPlan"
+      ],
+      "local_source_paths": [
+        "vvaharness/validation/models/plans.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 62,
+      "source_expression": "from vvaharness.validation.report import augment_reports",
+      "targets": [
+        "vvaharness.validation.report",
+        "vvaharness.validation.report.augment_reports"
+      ],
+      "local_source_paths": [
+        "vvaharness/validation/report/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 63,
+      "source_expression": "from vvaharness.validation.report.models import ValidatedFinding",
+      "targets": [
+        "vvaharness.validation.report.models",
+        "vvaharness.validation.report.models.ValidatedFinding"
+      ],
+      "local_source_paths": [
+        "vvaharness/validation/report/models.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 107,
+      "source_expression": "from vvaharness import __version__",
+      "targets": [
+        "vvaharness",
+        "vvaharness.__version__"
+      ],
+      "local_source_paths": [
+        "vvaharness/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 217,
+      "source_expression": "from vvaharness.orchestrator.checkpoints import load_ckpt",
+      "targets": [
+        "vvaharness.orchestrator.checkpoints",
+        "vvaharness.orchestrator.checkpoints.load_ckpt"
+      ],
+      "local_source_paths": [
+        "vvaharness/orchestrator/checkpoints.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 251,
+      "source_expression": "from vvaharness import __version__",
+      "targets": [
+        "vvaharness",
+        "vvaharness.__version__"
+      ],
+      "local_source_paths": [
+        "vvaharness/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 252,
+      "source_expression": "from vvaharness.models import Decision",
+      "targets": [
+        "vvaharness.models",
+        "vvaharness.models.Decision"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 354,
+      "source_expression": "from vvaharness.orchestrator.checkpoints import prune_stale_steps",
+      "targets": [
+        "vvaharness.orchestrator.checkpoints",
+        "vvaharness.orchestrator.checkpoints.prune_stale_steps"
+      ],
+      "local_source_paths": [
+        "vvaharness/orchestrator/checkpoints.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 365,
+      "source_expression": "from vvaharness import __version__",
+      "targets": [
+        "vvaharness",
+        "vvaharness.__version__"
+      ],
+      "local_source_paths": [
+        "vvaharness/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 389,
+      "source_expression": "from vvaharness.orchestrator.checkpoints import run_id_for",
+      "targets": [
+        "vvaharness.orchestrator.checkpoints",
+        "vvaharness.orchestrator.checkpoints.run_id_for"
+      ],
+      "local_source_paths": [
+        "vvaharness/orchestrator/checkpoints.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 390,
+      "source_expression": "from vvaharness.orchestrator.store import register_run",
+      "targets": [
+        "vvaharness.orchestrator.store",
+        "vvaharness.orchestrator.store.register_run"
+      ],
+      "local_source_paths": [
+        "vvaharness/orchestrator/store/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 391,
+      "source_expression": "from vvaharness.remediation_agent.provenance import owned_cases",
+      "targets": [
+        "vvaharness.remediation_agent.provenance",
+        "vvaharness.remediation_agent.provenance.owned_cases"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/provenance.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 428,
+      "source_expression": "from vvaharness.orchestrator.case_rollup import rc_for_verdicts",
+      "targets": [
+        "vvaharness.orchestrator.case_rollup",
+        "vvaharness.orchestrator.case_rollup.rc_for_verdicts"
+      ],
+      "local_source_paths": [
+        "vvaharness/orchestrator/case_rollup.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 235,
+      "source_expression": "from vvaharness.orchestrator.checkpoints import save_ckpt",
+      "targets": [
+        "vvaharness.orchestrator.checkpoints",
+        "vvaharness.orchestrator.checkpoints.save_ckpt"
+      ],
+      "local_source_paths": [
+        "vvaharness/orchestrator/checkpoints.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

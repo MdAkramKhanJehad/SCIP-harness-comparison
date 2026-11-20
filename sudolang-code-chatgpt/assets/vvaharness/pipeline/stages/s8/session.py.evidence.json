@@ -1,0 +1,1990 @@
+{
+  "source": "vvaharness/pipeline/stages/s8/session.py",
+  "sha256": "2bec7a23ef9f7c44897d86e7fac11d79518a444cc2cf24ddcefef6f7f3717643",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\n\"\"\"Step 8's one model call: the chaining pass, raising so run() can ship unranked.\"\"\"\nfrom __future__ import annotations\n\nimport re\n\nfrom vvaharness.backends.harness.deepagents.model_call_budget import ModelCallBudget\nfrom vvaharness.backends.harness.models import CallTimeoutError\nfrom vvaharness.backends.llm import deepagents as _deepagents\nfrom vvaharness.backends.llm.models import RESPONSE_MODEL_VIAS\nfrom vvaharness.backends.llm.registry import resolve\nfrom vvaharness.evidence import _cap_int\nfrom vvaharness.models import ContextPackage, Finding\nfrom vvaharness.pipeline.stages.replay import (\n    S8_REPLAY_INSTRUCTION,\n    RecordTranscript,\n    Transcript,\n    deadline_bound,\n    release_pinned_session,\n    replay_prompt,\n    run_with_deadline,\n    session_id_for,\n)\nfrom vvaharness.pipeline.stages.s8.outcomes import ChainReport\nfrom vvaharness.pipeline.stages.s8.prompts import SYSTEM, build_prompt, repair_prompt\nfrom vvaharness.util import console\nfrom vvaharness.util.config import knob\nfrom vvaharness.util.response_quality import dispatch_or_retry_unforced, stage_floors\nfrom vvaharness.util.tokens import estimate_tokens\n\n# VVAH-E003 floors sit under the shortest valid reply; all-discarded: run()'s check\nMIN_RESPONSE_CHARS = 90\nMIN_RESPONSE_TOKENS = 15\nTAG = \"s8 chain\"\n\n#: The replay restates a transcript; it needs the smallest reasoning budget, not the stage's.\n_REPLAY_EFFORT = \"low\"\n\n# A schema key followed by a value opener: the reply tried to answer, it is not prose or `{}`\n_REPAIRABLE_RX = re.compile(r'\\b(ranked_findings|chains)\"?\\s*(?::|=|\\bis\\b)\\s*[\\[{]')\n\n\ndef _call_budget(s8) -> ModelCallBudget | None:\n    \"\"\"s8's in-session cut: on the last permitted call every tool but ChainReport is withdrawn.\"\"\"\n    # Default 1. s8 reasons over a finding table it is handed whole -- it has nothing to look up, so\n    # a second turn can only re-read what is already in the prompt. The budget is what makes the\n    # agentic seam safe to use here: the session is resumable, and still cannot spend a second call.\n    limit = _cap_int(s8, \"max_model_calls\", 1)\n    if limit <= 0:\n        return None\n    return ModelCallBudget(limit=limit,\n                           outcome_tools=frozenset({ChainReport.__name__}),\n                           counter=\"s8_model_call_budget_final_turn\")\n\n\ndef _agentic_leg(user: str, ctx: ContextPackage, cfg, *, session_id: str,\n                 parent_middleware: tuple, drop_thinking: bool) -> str:\n    \"\"\"The agentic chaining call that the stage deadline wraps, pinned so it can be resumed.\"\"\"\n    s8 = getattr(cfg, \"step8\", None)\n    effort = knob(cfg, \"step8.effort\", None) or None\n    via = resolve(cfg.models.chain).via\n    return _deepagents.dispatch_agentic(\n        user,\n        model=cfg.models.chain,\n        cfg=cfg,\n        # cwd roots the deepagents route at the scanned repo; legacy vias ignore it.\n        cwd=ctx.repo_root,\n        system_prompt=SYSTEM,\n        # 2, not 1: turn 1 is the forced ChainReport call, turn 2 is the tool result it ends on.\n        max_turns=_cap_int(s8, \"max_turns\", 2),\n        timeout=deadline_bound(_cap_int(s8, \"timeout\", 3600), _cap_int(s8, \"deadline\", 0),\n                               None if drop_thinking else effort, via=via),\n        max_output_tokens=int(knob(cfg, \"step8.max_tokens\", 64000)),\n        response_model=ChainReport if via in RESPONSE_MODEL_VIAS else None,\n        # s8 is handed its finding table whole; it has nothing to look up, so no tool is allowed.\n        allowed_tools=(),\n        parent_middleware=parent_middleware,\n        tag=TAG,\n        effort=None if drop_thinking else effort,\n        session_id=session_id,\n    )\n\n\ndef _replay_max_tokens(cfg) -> int:\n    \"\"\"The output cap of every no-tool re-ask: replay and json-repair restate under one clock.\"\"\"\n    return _cap_int(getattr(cfg, \"step8\", None), \"replay_max_tokens\", 16000)\n\n\ndef _cold_call(prompt: str, ctx: ContextPackage, cfg, *, tag: str) -> str:\n    \"\"\"One no-tool chain re-ask (replay or json-repair), sized and clocked like the replay leg.\"\"\"\n    s8 = getattr(cfg, \"step8\", None)\n    # Floors are looked up by the exact tag, so the stage scope does not reach this one\n    with stage_floors(tag, min_chars=MIN_RESPONSE_CHARS, min_tokens=MIN_RESPONSE_TOKENS):\n        return _deepagents.dispatch_prompt(\n            prompt,\n            model=cfg.models.chain,\n            cfg=cfg,\n            cwd=ctx.repo_root,\n            system_prompt=SYSTEM,\n            max_tokens=_replay_max_tokens(cfg),\n            # replay_timeout, not the stage clock: the cli folds a None effort into an\n            # effort-scaled clock\n            timeout=_cap_int(s8, \"replay_timeout\", 300),\n            response_model=(ChainReport if resolve(cfg.models.chain).via in RESPONSE_MODEL_VIAS\n                            else None),\n            tag=tag,\n            effort=_REPLAY_EFFORT,\n        )\n\n\ndef _replay_leg(user: str, ctx: ContextPackage, cfg, transcript: Transcript) -> str:\n    \"\"\"Re-asks for the chain analysis with no tools, from the transcript the killed session reached.\"\"\"\n    return _cold_call(\n        replay_prompt(transcript, user, instruction=S8_REPLAY_INSTRUCTION, stage=\"s8\"),\n        ctx, cfg, tag=f\"{TAG} replay\")\n\n\ndef repairable(raw: object) -> bool:\n    \"\"\"True when an unparseable reply carries a schema key with a value, so a re-ask can restate it.\"\"\"\n    return isinstance(raw, str) and bool(_REPAIRABLE_RX.search(raw))\n\n\ndef repair_fits(raw: str, cfg) -> bool:\n    \"\"\"True when a restatement of *raw* fits the replay output cap the repair re-ask runs under.\"\"\"\n    # A repair re-emits the whole reply; past the replay cap it would clip or outrun\n    # replay_timeout, so it is skipped rather than given the stage cap\n    return estimate_tokens(raw) <= _replay_max_tokens(cfg)\n\n\ndef repair_call(raw: str, err: Exception, ctx: ContextPackage, cfg) -> str:\n    \"\"\"The one json-repair re-ask: restates *raw* as a ChainReport, raising on failure.\"\"\"\n    return _cold_call(repair_prompt(raw, err), ctx, cfg, tag=f\"{TAG} json-repair\")\n\n\ndef chain_call(findings: list[Finding], ctx: ContextPackage, cfg, *,\n               labels: list[str] | None = None, allow_resend: bool = True) -> str:\n    \"\"\"Returns the raw chaining reply, raising on failure; ``labels`` names each finding in the prompt so a windowed call's reply resolves against the full list. ``allow_resend=False`` vetoes the drop-tier resend, for a caller that is already sending a resend of its own (the half-window retry after an at-cap clip).\"\"\"\n    s8 = getattr(cfg, \"step8\", None)\n    effort = knob(cfg, \"step8.effort\", None) or None\n    user = build_prompt(findings, ctx, labels=labels, cfg=cfg)\n    deadline = _cap_int(s8, \"deadline\", 0)\n    replayed = False\n\n    def _dispatch(*, drop_thinking: bool) -> str:\n        nonlocal replayed\n        session_id = session_id_for(\"s8\", \"chain\")\n        transcript = Transcript()\n        middleware: tuple = (RecordTranscript(transcript),)\n        budget = _call_budget(s8)\n        if budget is not None:\n            middleware += (budget,)\n        try:\n            return run_with_deadline(\n                lambda: _agentic_leg(user, ctx, cfg, session_id=session_id,\n                                     parent_middleware=middleware,\n                                     drop_thinking=drop_thinking),\n                seconds=deadline, stage=TAG, effort=effort)\n        except CallTimeoutError:\n            # s8 is a ONE-CALL stage (`_call_budget` above): a kill mid-turn leaves no completed\n            # assistant turn to continue, so a resume here would be a second full chain analysis\n            # at stage effort under a shorter clock than the one that just expired -- a cold\n            # re-run, not a continuation. Go straight to the transcript re-ask instead.\n            console.write(f\"  [s8] deadline {deadline}s hit — replaying the chain analysis \"\n                          f\"from the transcript\")\n            replayed = True\n            return _replay_leg(user, ctx, cfg, transcript)\n        finally:\n            release_pinned_session(session_id)\n\n    with stage_floors(TAG, min_chars=MIN_RESPONSE_CHARS, min_tokens=MIN_RESPONSE_TOKENS):\n        # Only an effort can lose the forced tool_choice (memoised model or manual thinking) and\n        # shares the output budget; with none a retry just repeats\n        # A refused chain call loses only the enrichment: s8_chain.py ships the deterministic\n        # report regardless, so the resend buys nothing here (a category, where the route reports\n        # one, is diagnostic only and gates nothing).\n        # A reply that came from the deadline replay leg above is already a cold re-ask under the\n        # same deadline; a drop-tier resend of it would be a second, identical cold re-ask, so\n        # `replayed` vetoes it. `allow_resend=False` vetoes it the same way for the half-window caller.\n        return dispatch_or_retry_unforced(\n            _dispatch, \"chain\", stage=\"s8\",\n            effort=_deepagents.droppable_effort(cfg.models.chain, effort, agentic=True),\n            may_retry=lambda: allow_resend and effort is not None and not replayed,\n            resend_refusal=False)\n",
+  "literals": {
+    "source_literal_16_0": {
+      "source": "vvaharness/pipeline/stages/s8/session.py",
+      "line_start": 16,
+      "line_end": 16,
+      "value": "Step 8's one model call: the chaining pass, raising so run() can ship unranked.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_58_4": {
+      "source": "vvaharness/pipeline/stages/s8/session.py",
+      "line_start": 58,
+      "line_end": 58,
+      "value": "s8's in-session cut: on the last permitted call every tool but ChainReport is withdrawn.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_72_4": {
+      "source": "vvaharness/pipeline/stages/s8/session.py",
+      "line_start": 72,
+      "line_end": 72,
+      "value": "The agentic chaining call that the stage deadline wraps, pinned so it can be resumed.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_99_4": {
+      "source": "vvaharness/pipeline/stages/s8/session.py",
+      "line_start": 99,
+      "line_end": 99,
+      "value": "The output cap of every no-tool re-ask: replay and json-repair restate under one clock.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_104_4": {
+      "source": "vvaharness/pipeline/stages/s8/session.py",
+      "line_start": 104,
+      "line_end": 104,
+      "value": "One no-tool chain re-ask (replay or json-repair), sized and clocked like the replay leg.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_126_4": {
+      "source": "vvaharness/pipeline/stages/s8/session.py",
+      "line_start": 126,
+      "line_end": 126,
+      "value": "Re-asks for the chain analysis with no tools, from the transcript the killed session reached.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_129_22": {
+      "source": "vvaharness/pipeline/stages/s8/session.py",
+      "line_start": 129,
+      "line_end": 129,
+      "source_expression": "f\"{TAG} replay\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_133_4": {
+      "source": "vvaharness/pipeline/stages/s8/session.py",
+      "line_start": 133,
+      "line_end": 133,
+      "value": "True when an unparseable reply carries a schema key with a value, so a re-ask can restate it.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_138_4": {
+      "source": "vvaharness/pipeline/stages/s8/session.py",
+      "line_start": 138,
+      "line_end": 138,
+      "value": "True when a restatement of *raw* fits the replay output cap the repair re-ask runs under.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_145_4": {
+      "source": "vvaharness/pipeline/stages/s8/session.py",
+      "line_start": 145,
+      "line_end": 145,
+      "value": "The one json-repair re-ask: restates *raw* as a ChainReport, raising on failure.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_146_61": {
+      "source": "vvaharness/pipeline/stages/s8/session.py",
+      "line_start": 146,
+      "line_end": 146,
+      "source_expression": "f\"{TAG} json-repair\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_151_4": {
+      "source": "vvaharness/pipeline/stages/s8/session.py",
+      "line_start": 151,
+      "line_end": 151,
+      "value": "Returns the raw chaining reply, raising on failure; ``labels`` names each finding in the prompt so a windowed call's reply resolves against the full list. ``allow_resend=False`` vetoes the drop-tier resend, for a caller that is already sending a resend of its own (the half-window retry after an at-cap clip).",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_177_26": {
+      "source": "vvaharness/pipeline/stages/s8/session.py",
+      "line_start": 177,
+      "line_end": 178,
+      "source_expression": "f\"  [s8] deadline {deadline}s hit — replaying the chain analysis \"\n                          f\"from the transcript\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "value": "Step 8's one model call: the chaining pass, raising so run() can ship unranked.",
+      "context": "literal"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 6,
+      "value": "s8 chain",
+      "context": "literal"
+    },
+    {
+      "line_start": 51,
+      "line_end": 51,
+      "column": 17,
+      "value": "low",
+      "context": "literal"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 28,
+      "value": "\\b(ranked_findings|chains)\"?\\s*(?::|=|\\bis\\b)\\s*[\\[{]",
+      "context": "literal"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 4,
+      "value": "s8's in-session cut: on the last permitted call every tool but ChainReport is withdrawn.",
+      "context": "literal"
+    },
+    {
+      "line_start": 72,
+      "line_end": 72,
+      "column": 4,
+      "value": "The agentic chaining call that the stage deadline wraps, pinned so it can be resumed.",
+      "context": "literal"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 4,
+      "value": "The output cap of every no-tool re-ask: replay and json-repair restate under one clock.",
+      "context": "literal"
+    },
+    {
+      "line_start": 104,
+      "line_end": 104,
+      "column": 4,
+      "value": "One no-tool chain re-ask (replay or json-repair), sized and clocked like the replay leg.",
+      "context": "literal"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 4,
+      "value": "Re-asks for the chain analysis with no tools, from the transcript the killed session reached.",
+      "context": "literal"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 4,
+      "value": "True when an unparseable reply carries a schema key with a value, so a re-ask can restate it.",
+      "context": "literal"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 4,
+      "value": "True when a restatement of *raw* fits the replay output cap the repair re-ask runs under.",
+      "context": "literal"
+    },
+    {
+      "line_start": 145,
+      "line_end": 145,
+      "column": 4,
+      "value": "The one json-repair re-ask: restates *raw* as a ChainReport, raising on failure.",
+      "context": "literal"
+    },
+    {
+      "line_start": 151,
+      "line_end": 151,
+      "column": 4,
+      "value": "Returns the raw chaining reply, raising on failure; ``labels`` names each finding in the prompt so a windowed call's reply resolves against the full list. ``allow_resend=False`` vetoes the drop-tier resend, for a caller that is already sending a resend of its own (the half-window retry after an at-cap clip).",
+      "context": "literal"
+    },
+    {
+      "line_start": 62,
+      "line_end": 62,
+      "column": 25,
+      "value": "max_model_calls",
+      "context": "literal"
+    },
+    {
+      "line_start": 73,
+      "line_end": 73,
+      "column": 22,
+      "value": "step8",
+      "context": "literal"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 49,
+      "value": "replay_max_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 105,
+      "line_end": 105,
+      "column": 22,
+      "value": "step8",
+      "context": "literal"
+    },
+    {
+      "line_start": 152,
+      "line_end": 152,
+      "column": 22,
+      "value": "step8",
+      "context": "literal"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 28,
+      "value": "deadline",
+      "context": "literal"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 35,
+      "value": "s8_model_call_budget_final_turn",
+      "context": "literal"
+    },
+    {
+      "line_start": 74,
+      "line_end": 74,
+      "column": 23,
+      "value": "step8.effort",
+      "context": "literal"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 33,
+      "value": "step8",
+      "context": "literal"
+    },
+    {
+      "line_start": 153,
+      "line_end": 153,
+      "column": 23,
+      "value": "step8.effort",
+      "context": "literal"
+    },
+    {
+      "line_start": 160,
+      "line_end": 160,
+      "column": 36,
+      "value": "s8",
+      "context": "literal"
+    },
+    {
+      "line_start": 160,
+      "line_end": 160,
+      "column": 42,
+      "value": "chain",
+      "context": "literal"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 23,
+      "value": "chain",
+      "context": "literal"
+    },
+    {
+      "line_start": 84,
+      "line_end": 84,
+      "column": 31,
+      "value": "max_turns",
+      "context": "literal"
+    },
+    {
+      "line_start": 128,
+      "line_end": 128,
+      "column": 81,
+      "value": "s8",
+      "context": "literal"
+    },
+    {
+      "line_start": 129,
+      "line_end": 129,
+      "column": 29,
+      "value": " replay",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 146,
+      "line_end": 146,
+      "column": 68,
+      "value": " json-repair",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 38,
+      "value": "s8",
+      "context": "literal"
+    },
+    {
+      "line_start": 85,
+      "line_end": 85,
+      "column": 44,
+      "value": "timeout",
+      "context": "literal"
+    },
+    {
+      "line_start": 85,
+      "line_end": 85,
+      "column": 75,
+      "value": "deadline",
+      "context": "literal"
+    },
+    {
+      "line_start": 87,
+      "line_end": 87,
+      "column": 40,
+      "value": "step8.max_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 33,
+      "value": "replay_timeout",
+      "context": "literal"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 28,
+      "value": "  [s8] deadline ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 177,
+      "line_end": 178,
+      "column": 54,
+      "value": "s hit — replaying the chain analysis from the transcript",
+      "context": "f-string segment"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 45,
+      "text": "# VVAH-E003 floors sit under the shortest valid reply; all-discarded: run()'s check"
+    },
+    {
+      "line": 50,
+      "text": "#: The replay restates a transcript; it needs the smallest reasoning budget, not the stage's."
+    },
+    {
+      "line": 53,
+      "text": "# A schema key followed by a value opener: the reply tried to answer, it is not prose or `{}`"
+    },
+    {
+      "line": 59,
+      "text": "# Default 1. s8 reasons over a finding table it is handed whole -- it has nothing to look up, so"
+    },
+    {
+      "line": 60,
+      "text": "# a second turn can only re-read what is already in the prompt. The budget is what makes the"
+    },
+    {
+      "line": 61,
+      "text": "# agentic seam safe to use here: the session is resumable, and still cannot spend a second call."
+    },
+    {
+      "line": 80,
+      "text": "# cwd roots the deepagents route at the scanned repo; legacy vias ignore it."
+    },
+    {
+      "line": 83,
+      "text": "# 2, not 1: turn 1 is the forced ChainReport call, turn 2 is the tool result it ends on."
+    },
+    {
+      "line": 89,
+      "text": "# s8 is handed its finding table whole; it has nothing to look up, so no tool is allowed."
+    },
+    {
+      "line": 106,
+      "text": "# Floors are looked up by the exact tag, so the stage scope does not reach this one"
+    },
+    {
+      "line": 115,
+      "text": "# replay_timeout, not the stage clock: the cli folds a None effort into an"
+    },
+    {
+      "line": 116,
+      "text": "# effort-scaled clock"
+    },
+    {
+      "line": 139,
+      "text": "# A repair re-emits the whole reply; past the replay cap it would clip or outrun"
+    },
+    {
+      "line": 140,
+      "text": "# replay_timeout, so it is skipped rather than given the stage cap"
+    },
+    {
+      "line": 173,
+      "text": "# s8 is a ONE-CALL stage (`_call_budget` above): a kill mid-turn leaves no completed"
+    },
+    {
+      "line": 174,
+      "text": "# assistant turn to continue, so a resume here would be a second full chain analysis"
+    },
+    {
+      "line": 175,
+      "text": "# at stage effort under a shorter clock than the one that just expired -- a cold"
+    },
+    {
+      "line": 176,
+      "text": "# re-run, not a continuation. Go straight to the transcript re-ask instead."
+    },
+    {
+      "line": 185,
+      "text": "# Only an effort can lose the forced tool_choice (memoised model or manual thinking) and"
+    },
+    {
+      "line": 186,
+      "text": "# shares the output budget; with none a retry just repeats"
+    },
+    {
+      "line": 187,
+      "text": "# A refused chain call loses only the enrichment: s8_chain.py ships the deterministic"
+    },
+    {
+      "line": 188,
+      "text": "# report regardless, so the resend buys nothing here (a category, where the route reports"
+    },
+    {
+      "line": 189,
+      "text": "# one, is diagnostic only and gates nothing)."
+    },
+    {
+      "line": 190,
+      "text": "# A reply that came from the deadline replay leg above is already a cold re-ask under the"
+    },
+    {
+      "line": 191,
+      "text": "# same deadline; a drop-tier resend of it would be a second, identical cold re-ask, so"
+    },
+    {
+      "line": 192,
+      "text": "# `replayed` vetoes it. `allow_resend=False` vetoes it the same way for the half-window caller."
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 23,
+      "line_end": 23,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 26,
+      "line_end": 26,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 27,
+      "line_end": 27,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 28,
+      "line_end": 37,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 38,
+      "line_end": 38,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 39,
+      "line_end": 39,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 40,
+      "line_end": 40,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 41,
+      "line_end": 41,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 42,
+      "line_end": 42,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 43,
+      "line_end": 43,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "Assign",
+      "line_start": 46,
+      "line_end": 46,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "Assign",
+      "line_start": 47,
+      "line_end": 47,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "Assign",
+      "line_start": 48,
+      "line_end": 48,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "Assign",
+      "line_start": 51,
+      "line_end": 51,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 10
+    },
+    {
+      "kind": "Assign",
+      "line_start": 54,
+      "line_end": 54,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 10
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 57,
+      "line_end": 67,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 11
+    },
+    {
+      "kind": "Expr",
+      "line_start": 58,
+      "line_end": 58,
+      "column": 4,
+      "owner": "_call_budget",
+      "representation_line": 17
+    },
+    {
+      "kind": "Assign",
+      "line_start": 62,
+      "line_end": 62,
+      "column": 4,
+      "owner": "_call_budget",
+      "representation_line": 17
+    },
+    {
+      "kind": "If",
+      "line_start": 63,
+      "line_end": 64,
+      "column": 4,
+      "owner": "_call_budget",
+      "representation_line": 18
+    },
+    {
+      "kind": "Return",
+      "line_start": 64,
+      "line_end": 64,
+      "column": 8,
+      "owner": "_call_budget",
+      "representation_line": 20
+    },
+    {
+      "kind": "Return",
+      "line_start": 65,
+      "line_end": 67,
+      "column": 4,
+      "owner": "_call_budget",
+      "representation_line": 23
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 70,
+      "line_end": 95,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 27
+    },
+    {
+      "kind": "Expr",
+      "line_start": 72,
+      "line_end": 72,
+      "column": 4,
+      "owner": "_agentic_leg",
+      "representation_line": 33
+    },
+    {
+      "kind": "Assign",
+      "line_start": 73,
+      "line_end": 73,
+      "column": 4,
+      "owner": "_agentic_leg",
+      "representation_line": 33
+    },
+    {
+      "kind": "Assign",
+      "line_start": 74,
+      "line_end": 74,
+      "column": 4,
+      "owner": "_agentic_leg",
+      "representation_line": 33
+    },
+    {
+      "kind": "Assign",
+      "line_start": 75,
+      "line_end": 75,
+      "column": 4,
+      "owner": "_agentic_leg",
+      "representation_line": 33
+    },
+    {
+      "kind": "Return",
+      "line_start": 76,
+      "line_end": 95,
+      "column": 4,
+      "owner": "_agentic_leg",
+      "representation_line": 34
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 98,
+      "line_end": 100,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 38
+    },
+    {
+      "kind": "Expr",
+      "line_start": 99,
+      "line_end": 99,
+      "column": 4,
+      "owner": "_replay_max_tokens",
+      "representation_line": 44
+    },
+    {
+      "kind": "Return",
+      "line_start": 100,
+      "line_end": 100,
+      "column": 4,
+      "owner": "_replay_max_tokens",
+      "representation_line": 45
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 103,
+      "line_end": 122,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 49
+    },
+    {
+      "kind": "Expr",
+      "line_start": 104,
+      "line_end": 104,
+      "column": 4,
+      "owner": "_cold_call",
+      "representation_line": 55
+    },
+    {
+      "kind": "Assign",
+      "line_start": 105,
+      "line_end": 105,
+      "column": 4,
+      "owner": "_cold_call",
+      "representation_line": 55
+    },
+    {
+      "kind": "With",
+      "line_start": 107,
+      "line_end": 122,
+      "column": 4,
+      "owner": "_cold_call",
+      "representation_line": 56
+    },
+    {
+      "kind": "Return",
+      "line_start": 108,
+      "line_end": 122,
+      "column": 8,
+      "owner": "_cold_call",
+      "representation_line": 58
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 125,
+      "line_end": 129,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 64
+    },
+    {
+      "kind": "Expr",
+      "line_start": 126,
+      "line_end": 126,
+      "column": 4,
+      "owner": "_replay_leg",
+      "representation_line": 70
+    },
+    {
+      "kind": "Return",
+      "line_start": 127,
+      "line_end": 129,
+      "column": 4,
+      "owner": "_replay_leg",
+      "representation_line": 71
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 132,
+      "line_end": 134,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 75
+    },
+    {
+      "kind": "Expr",
+      "line_start": 133,
+      "line_end": 133,
+      "column": 4,
+      "owner": "repairable",
+      "representation_line": 81
+    },
+    {
+      "kind": "Return",
+      "line_start": 134,
+      "line_end": 134,
+      "column": 4,
+      "owner": "repairable",
+      "representation_line": 82
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 137,
+      "line_end": 141,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 86
+    },
+    {
+      "kind": "Expr",
+      "line_start": 138,
+      "line_end": 138,
+      "column": 4,
+      "owner": "repair_fits",
+      "representation_line": 92
+    },
+    {
+      "kind": "Return",
+      "line_start": 141,
+      "line_end": 141,
+      "column": 4,
+      "owner": "repair_fits",
+      "representation_line": 93
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 144,
+      "line_end": 146,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 97
+    },
+    {
+      "kind": "Expr",
+      "line_start": 145,
+      "line_end": 145,
+      "column": 4,
+      "owner": "repair_call",
+      "representation_line": 103
+    },
+    {
+      "kind": "Return",
+      "line_start": 146,
+      "line_end": 146,
+      "column": 4,
+      "owner": "repair_call",
+      "representation_line": 104
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 149,
+      "line_end": 197,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 108
+    },
+    {
+      "kind": "Expr",
+      "line_start": 151,
+      "line_end": 151,
+      "column": 4,
+      "owner": "chain_call",
+      "representation_line": 114
+    },
+    {
+      "kind": "Assign",
+      "line_start": 152,
+      "line_end": 152,
+      "column": 4,
+      "owner": "chain_call",
+      "representation_line": 114
+    },
+    {
+      "kind": "Assign",
+      "line_start": 153,
+      "line_end": 153,
+      "column": 4,
+      "owner": "chain_call",
+      "representation_line": 114
+    },
+    {
+      "kind": "Assign",
+      "line_start": 154,
+      "line_end": 154,
+      "column": 4,
+      "owner": "chain_call",
+      "representation_line": 114
+    },
+    {
+      "kind": "Assign",
+      "line_start": 155,
+      "line_end": 155,
+      "column": 4,
+      "owner": "chain_call",
+      "representation_line": 114
+    },
+    {
+      "kind": "Assign",
+      "line_start": 156,
+      "line_end": 156,
+      "column": 4,
+      "owner": "chain_call",
+      "representation_line": 116
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 158,
+      "line_end": 182,
+      "column": 4,
+      "owner": "chain_call",
+      "representation_line": 117
+    },
+    {
+      "kind": "Nonlocal",
+      "line_start": 159,
+      "line_end": 159,
+      "column": 8,
+      "owner": "chain_call._dispatch",
+      "representation_line": 123
+    },
+    {
+      "kind": "Assign",
+      "line_start": 160,
+      "line_end": 160,
+      "column": 8,
+      "owner": "chain_call._dispatch",
+      "representation_line": 123
+    },
+    {
+      "kind": "Assign",
+      "line_start": 161,
+      "line_end": 161,
+      "column": 8,
+      "owner": "chain_call._dispatch",
+      "representation_line": 123
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 162,
+      "line_end": 162,
+      "column": 8,
+      "owner": "chain_call._dispatch",
+      "representation_line": 123
+    },
+    {
+      "kind": "Assign",
+      "line_start": 163,
+      "line_end": 163,
+      "column": 8,
+      "owner": "chain_call._dispatch",
+      "representation_line": 123
+    },
+    {
+      "kind": "If",
+      "line_start": 164,
+      "line_end": 165,
+      "column": 8,
+      "owner": "chain_call._dispatch",
+      "representation_line": 124
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 165,
+      "line_end": 165,
+      "column": 12,
+      "owner": "chain_call._dispatch",
+      "representation_line": 127
+    },
+    {
+      "kind": "Try",
+      "line_start": 166,
+      "line_end": 182,
+      "column": 8,
+      "owner": "chain_call._dispatch",
+      "representation_line": 129
+    },
+    {
+      "kind": "Return",
+      "line_start": 167,
+      "line_end": 171,
+      "column": 12,
+      "owner": "chain_call._dispatch",
+      "representation_line": 131
+    },
+    {
+      "kind": "Expr",
+      "line_start": 177,
+      "line_end": 178,
+      "column": 12,
+      "owner": "chain_call._dispatch",
+      "representation_line": 137
+    },
+    {
+      "kind": "Assign",
+      "line_start": 179,
+      "line_end": 179,
+      "column": 12,
+      "owner": "chain_call._dispatch",
+      "representation_line": 137
+    },
+    {
+      "kind": "Return",
+      "line_start": 180,
+      "line_end": 180,
+      "column": 12,
+      "owner": "chain_call._dispatch",
+      "representation_line": 138
+    },
+    {
+      "kind": "Expr",
+      "line_start": 182,
+      "line_end": 182,
+      "column": 12,
+      "owner": "chain_call._dispatch",
+      "representation_line": 143
+    },
+    {
+      "kind": "With",
+      "line_start": 184,
+      "line_end": 197,
+      "column": 4,
+      "owner": "chain_call",
+      "representation_line": 147
+    },
+    {
+      "kind": "Return",
+      "line_start": 193,
+      "line_end": 197,
+      "column": 8,
+      "owner": "chain_call",
+      "representation_line": 149
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 21,
+      "kind": "Constant",
+      "original_ast": "Constant(value=90)",
+      "rendered": "90"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 22,
+      "kind": "Constant",
+      "original_ast": "Constant(value=15)",
+      "rendered": "15"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 6,
+      "kind": "Constant",
+      "original_ast": "Constant(value='s8 chain')",
+      "rendered": "'s8 chain'"
+    },
+    {
+      "line_start": 51,
+      "line_end": 51,
+      "column": 17,
+      "kind": "Constant",
+      "original_ast": "Constant(value='low')",
+      "rendered": "'low'"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='re', ctx=Load()), attr='compile', ctx=Load()), args=[Constant(value='\\\\b(ranked_findings|chains)\"?\\\\s*(?::|=|\\\\bis\\\\b)\\\\s*[\\\\[{]')], keywords=[])",
+      "rendered": "re.compile('\\\\b(ranked_findings|chains)\"?\\\\s*(?::|=|\\\\bis\\\\b)\\\\s*[\\\\[{]')"
+    },
+    {
+      "line_start": 62,
+      "line_end": 62,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s8', ctx=Load()), Constant(value='max_model_calls'), Constant(value=1)], keywords=[])",
+      "rendered": "_cap_int(s8, 'max_model_calls', 1)"
+    },
+    {
+      "line_start": 63,
+      "line_end": 63,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='limit', ctx=Load()), ops=[LtE()], comparators=[Constant(value=0)])",
+      "rendered": "limit <= 0"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 65,
+      "line_end": 67,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelCallBudget', ctx=Load()), args=[], keywords=[keyword(arg='limit', value=Name(id='limit', ctx=Load())), keyword(arg='outcome_tools', value=Call(func=Name(id='frozenset', ctx=Load()), args=[Set(elts=[Attribute(value=Name(id='ChainReport', ctx=Load()), attr='__name__', ctx=Load())])], keywords=[])), keyword(arg='counter', value=Constant(value='s8_model_call_budget_final_turn'))])",
+      "rendered": "ModelCallBudget(limit=limit, outcome_tools=frozenset({ChainReport.__name__}), counter='s8_model_call_budget_final_turn')"
+    },
+    {
+      "line_start": 73,
+      "line_end": 73,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='cfg', ctx=Load()), Constant(value='step8'), Constant(value=None)], keywords=[])",
+      "rendered": "getattr(cfg, 'step8', None)"
+    },
+    {
+      "line_start": 74,
+      "line_end": 74,
+      "column": 13,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Name(id='knob', ctx=Load()), args=[Name(id='cfg', ctx=Load()), Constant(value='step8.effort'), Constant(value=None)], keywords=[]), Constant(value=None)])",
+      "rendered": "knob(cfg, 'step8.effort', None) or None"
+    },
+    {
+      "line_start": 75,
+      "line_end": 75,
+      "column": 10,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Call(func=Name(id='resolve', ctx=Load()), args=[Attribute(value=Attribute(value=Name(id='cfg', ctx=Load()), attr='models', ctx=Load()), attr='chain', ctx=Load())], keywords=[]), attr='via', ctx=Load())",
+      "rendered": "resolve(cfg.models.chain).via"
+    },
+    {
+      "line_start": 76,
+      "line_end": 95,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_deepagents', ctx=Load()), attr='dispatch_agentic', ctx=Load()), args=[Name(id='user', ctx=Load())], keywords=[keyword(arg='model', value=Attribute(value=Attribute(value=Name(id='cfg', ctx=Load()), attr='models', ctx=Load()), attr='chain', ctx=Load())), keyword(arg='cfg', value=Name(id='cfg', ctx=Load())), keyword(arg='cwd', value=Attribute(value=Name(id='ctx', ctx=Load()), attr='repo_root', ctx=Load())), keyword(arg='system_prompt', value=Name(id='SYSTEM', ctx=Load())), keyword(arg='max_turns', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s8', ctx=Load()), Constant(value='max_turns'), Constant(value=2)], keywords=[])), keyword(arg='timeout', value=Call(func=Name(id='deadline_bound', ctx=Load()), args=[Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s8', ctx=Load()), Constant(value='timeout'), Constant(value=3600)], keywords=[]), Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s8', ctx=Load()), Constant(value='deadline'), Constant(value=0)], keywords=[]), IfExp(test=Name(id='drop_thinking', ctx=Load()), body=Constant(value=None), orelse=Name(id='effort', ctx=Load()))], keywords=[keyword(arg='via', value=Name(id='via', ctx=Load()))])), keyword(arg='max_output_tokens', value=Call(func=Name(id='int', ctx=Load()), args=[Call(func=Name(id='knob', ctx=Load()), args=[Name(id='cfg', ctx=Load()), Constant(value='step8.max_tokens'), Constant(value=64000)], keywords=[])], keywords=[])), keyword(arg='response_model', value=IfExp(test=Compare(left=Name(id='via', ctx=Load()), ops=[In()], comparators=[Name(id='RESPONSE_MODEL_VIAS', ctx=Load())]), body=Name(id='ChainReport', ctx=Load()), orelse=Constant(value=None))), keyword(arg='allowed_tools', value=Tuple(elts=[], ctx=Load())), keyword(arg='parent_middleware', value=Name(id='parent_middleware', ctx=Load())), keyword(arg='tag', value=Name(id='TAG', ctx=Load())), keyword(arg='effort', value=IfExp(test=Name(id='drop_thinking', ctx=Load()), body=Constant(value=None), orelse=Name(id='effort', ctx=Load()))), keyword(arg='session_id', value=Name(id='session_id', ctx=Load()))])",
+      "rendered": "_deepagents.dispatch_agentic(user, model=cfg.models.chain, cfg=cfg, cwd=ctx.repo_root, system_prompt=SYSTEM, max_turns=_cap_int(s8, 'max_turns', 2), timeout=deadline_bound(_cap_int(s8, 'timeout', 3600), _cap_int(s8, 'deadline', 0), None if drop_thinking else effort, via=via), max_output_tokens=int(knob(cfg, 'step8.max_tokens', 64000)), response_model=ChainReport if via in RESPONSE_MODEL_VIAS else None, allowed_tools=(), parent_middleware=parent_middleware, tag=TAG, effort=None if drop_thinking else effort, session_id=session_id)"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_cap_int', ctx=Load()), args=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='cfg', ctx=Load()), Constant(value='step8'), Constant(value=None)], keywords=[]), Constant(value='replay_max_tokens'), Constant(value=16000)], keywords=[])",
+      "rendered": "_cap_int(getattr(cfg, 'step8', None), 'replay_max_tokens', 16000)"
+    },
+    {
+      "line_start": 105,
+      "line_end": 105,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='cfg', ctx=Load()), Constant(value='step8'), Constant(value=None)], keywords=[])",
+      "rendered": "getattr(cfg, 'step8', None)"
+    },
+    {
+      "line_start": 107,
+      "line_end": 107,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='stage_floors', ctx=Load()), args=[Name(id='tag', ctx=Load())], keywords=[keyword(arg='min_chars', value=Name(id='MIN_RESPONSE_CHARS', ctx=Load())), keyword(arg='min_tokens', value=Name(id='MIN_RESPONSE_TOKENS', ctx=Load()))])",
+      "rendered": "stage_floors(tag, min_chars=MIN_RESPONSE_CHARS, min_tokens=MIN_RESPONSE_TOKENS)"
+    },
+    {
+      "line_start": 108,
+      "line_end": 122,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_deepagents', ctx=Load()), attr='dispatch_prompt', ctx=Load()), args=[Name(id='prompt', ctx=Load())], keywords=[keyword(arg='model', value=Attribute(value=Attribute(value=Name(id='cfg', ctx=Load()), attr='models', ctx=Load()), attr='chain', ctx=Load())), keyword(arg='cfg', value=Name(id='cfg', ctx=Load())), keyword(arg='cwd', value=Attribute(value=Name(id='ctx', ctx=Load()), attr='repo_root', ctx=Load())), keyword(arg='system_prompt', value=Name(id='SYSTEM', ctx=Load())), keyword(arg='max_tokens', value=Call(func=Name(id='_replay_max_tokens', ctx=Load()), args=[Name(id='cfg', ctx=Load())], keywords=[])), keyword(arg='timeout', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s8', ctx=Load()), Constant(value='replay_timeout'), Constant(value=300)], keywords=[])), keyword(arg='response_model', value=IfExp(test=Compare(left=Attribute(value=Call(func=Name(id='resolve', ctx=Load()), args=[Attribute(value=Attribute(value=Name(id='cfg', ctx=Load()), attr='models', ctx=Load()), attr='chain', ctx=Load())], keywords=[]), attr='via', ctx=Load()), ops=[In()], comparators=[Name(id='RESPONSE_MODEL_VIAS', ctx=Load())]), body=Name(id='ChainReport', ctx=Load()), orelse=Constant(value=None))), keyword(arg='tag', value=Name(id='tag', ctx=Load())), keyword(arg='effort', value=Name(id='_REPLAY_EFFORT', ctx=Load()))])",
+      "rendered": "_deepagents.dispatch_prompt(prompt, model=cfg.models.chain, cfg=cfg, cwd=ctx.repo_root, system_prompt=SYSTEM, max_tokens=_replay_max_tokens(cfg), timeout=_cap_int(s8, 'replay_timeout', 300), response_model=ChainReport if resolve(cfg.models.chain).via in RESPONSE_MODEL_VIAS else None, tag=tag, effort=_REPLAY_EFFORT)"
+    },
+    {
+      "line_start": 127,
+      "line_end": 129,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_cold_call', ctx=Load()), args=[Call(func=Name(id='replay_prompt', ctx=Load()), args=[Name(id='transcript', ctx=Load()), Name(id='user', ctx=Load())], keywords=[keyword(arg='instruction', value=Name(id='S8_REPLAY_INSTRUCTION', ctx=Load())), keyword(arg='stage', value=Constant(value='s8'))]), Name(id='ctx', ctx=Load()), Name(id='cfg', ctx=Load())], keywords=[keyword(arg='tag', value=JoinedStr(values=[FormattedValue(value=Name(id='TAG', ctx=Load()), conversion=-1), Constant(value=' replay')]))])",
+      "rendered": "_cold_call(replay_prompt(transcript, user, instruction=S8_REPLAY_INSTRUCTION, stage='s8'), ctx, cfg, tag=source_template_129_22)"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='raw', ctx=Load()), Name(id='str', ctx=Load())], keywords=[]), Call(func=Name(id='bool', ctx=Load()), args=[Call(func=Attribute(value=Name(id='_REPAIRABLE_RX', ctx=Load()), attr='search', ctx=Load()), args=[Name(id='raw', ctx=Load())], keywords=[])], keywords=[])])",
+      "rendered": "isinstance(raw, str) and bool(_REPAIRABLE_RX.search(raw))"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='estimate_tokens', ctx=Load()), args=[Name(id='raw', ctx=Load())], keywords=[]), ops=[LtE()], comparators=[Call(func=Name(id='_replay_max_tokens', ctx=Load()), args=[Name(id='cfg', ctx=Load())], keywords=[])])",
+      "rendered": "estimate_tokens(raw) <= _replay_max_tokens(cfg)"
+    },
+    {
+      "line_start": 146,
+      "line_end": 146,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_cold_call', ctx=Load()), args=[Call(func=Name(id='repair_prompt', ctx=Load()), args=[Name(id='raw', ctx=Load()), Name(id='err', ctx=Load())], keywords=[]), Name(id='ctx', ctx=Load()), Name(id='cfg', ctx=Load())], keywords=[keyword(arg='tag', value=JoinedStr(values=[FormattedValue(value=Name(id='TAG', ctx=Load()), conversion=-1), Constant(value=' json-repair')]))])",
+      "rendered": "_cold_call(repair_prompt(raw, err), ctx, cfg, tag=source_template_146_61)"
+    },
+    {
+      "line_start": 152,
+      "line_end": 152,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='cfg', ctx=Load()), Constant(value='step8'), Constant(value=None)], keywords=[])",
+      "rendered": "getattr(cfg, 'step8', None)"
+    },
+    {
+      "line_start": 153,
+      "line_end": 153,
+      "column": 13,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Name(id='knob', ctx=Load()), args=[Name(id='cfg', ctx=Load()), Constant(value='step8.effort'), Constant(value=None)], keywords=[]), Constant(value=None)])",
+      "rendered": "knob(cfg, 'step8.effort', None) or None"
+    },
+    {
+      "line_start": 154,
+      "line_end": 154,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='build_prompt', ctx=Load()), args=[Name(id='findings', ctx=Load()), Name(id='ctx', ctx=Load())], keywords=[keyword(arg='labels', value=Name(id='labels', ctx=Load())), keyword(arg='cfg', value=Name(id='cfg', ctx=Load()))])",
+      "rendered": "build_prompt(findings, ctx, labels=labels, cfg=cfg)"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s8', ctx=Load()), Constant(value='deadline'), Constant(value=0)], keywords=[])",
+      "rendered": "_cap_int(s8, 'deadline', 0)"
+    },
+    {
+      "line_start": 156,
+      "line_end": 156,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 160,
+      "line_end": 160,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='session_id_for', ctx=Load()), args=[Constant(value='s8'), Constant(value='chain')], keywords=[])",
+      "rendered": "session_id_for('s8', 'chain')"
+    },
+    {
+      "line_start": 161,
+      "line_end": 161,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='Transcript', ctx=Load()), args=[], keywords=[])",
+      "rendered": "Transcript()"
+    },
+    {
+      "line_start": 162,
+      "line_end": 162,
+      "column": 28,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Call(func=Name(id='RecordTranscript', ctx=Load()), args=[Name(id='transcript', ctx=Load())], keywords=[])], ctx=Load())",
+      "rendered": "(RecordTranscript(transcript),)"
+    },
+    {
+      "line_start": 163,
+      "line_end": 163,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_call_budget', ctx=Load()), args=[Name(id='s8', ctx=Load())], keywords=[])",
+      "rendered": "_call_budget(s8)"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='budget', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "budget is not None"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='middleware', ctx=Store()), op=Add(), value=Tuple(elts=[Name(id='budget', ctx=Load())], ctx=Load()))",
+      "rendered": "middleware += (budget,)"
+    },
+    {
+      "line_start": 167,
+      "line_end": 171,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='run_with_deadline', ctx=Load()), args=[Lambda(args=arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]), body=Call(func=Name(id='_agentic_leg', ctx=Load()), args=[Name(id='user', ctx=Load()), Name(id='ctx', ctx=Load()), Name(id='cfg', ctx=Load())], keywords=[keyword(arg='session_id', value=Name(id='session_id', ctx=Load())), keyword(arg='parent_middleware', value=Name(id='middleware', ctx=Load())), keyword(arg='drop_thinking', value=Name(id='drop_thinking', ctx=Load()))]))], keywords=[keyword(arg='seconds', value=Name(id='deadline', ctx=Load())), keyword(arg='stage', value=Name(id='TAG', ctx=Load())), keyword(arg='effort', value=Name(id='effort', ctx=Load()))])",
+      "rendered": "run_with_deadline(lambda: _agentic_leg(user, ctx, cfg, session_id=session_id, parent_middleware=middleware, drop_thinking=drop_thinking), seconds=deadline, stage=TAG, effort=effort)"
+    },
+    {
+      "line_start": 172,
+      "line_end": 172,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='CallTimeoutError', ctx=Load())",
+      "rendered": "CallTimeoutError"
+    },
+    {
+      "line_start": 177,
+      "line_end": 178,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='  [s8] deadline '), FormattedValue(value=Name(id='deadline', ctx=Load()), conversion=-1), Constant(value='s hit — replaying the chain analysis from the transcript')])], keywords=[])",
+      "rendered": "console.write(source_template_177_26)"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 23,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_replay_leg', ctx=Load()), args=[Name(id='user', ctx=Load()), Name(id='ctx', ctx=Load()), Name(id='cfg', ctx=Load()), Name(id='transcript', ctx=Load())], keywords=[])",
+      "rendered": "_replay_leg(user, ctx, cfg, transcript)"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='release_pinned_session', ctx=Load()), args=[Name(id='session_id', ctx=Load())], keywords=[])",
+      "rendered": "release_pinned_session(session_id)"
+    },
+    {
+      "line_start": 184,
+      "line_end": 184,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='stage_floors', ctx=Load()), args=[Name(id='TAG', ctx=Load())], keywords=[keyword(arg='min_chars', value=Name(id='MIN_RESPONSE_CHARS', ctx=Load())), keyword(arg='min_tokens', value=Name(id='MIN_RESPONSE_TOKENS', ctx=Load()))])",
+      "rendered": "stage_floors(TAG, min_chars=MIN_RESPONSE_CHARS, min_tokens=MIN_RESPONSE_TOKENS)"
+    },
+    {
+      "line_start": 193,
+      "line_end": 197,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dispatch_or_retry_unforced', ctx=Load()), args=[Name(id='_dispatch', ctx=Load()), Constant(value='chain')], keywords=[keyword(arg='stage', value=Constant(value='s8')), keyword(arg='effort', value=Call(func=Attribute(value=Name(id='_deepagents', ctx=Load()), attr='droppable_effort', ctx=Load()), args=[Attribute(value=Attribute(value=Name(id='cfg', ctx=Load()), attr='models', ctx=Load()), attr='chain', ctx=Load()), Name(id='effort', ctx=Load())], keywords=[keyword(arg='agentic', value=Constant(value=True))])), keyword(arg='may_retry', value=Lambda(args=arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]), body=BoolOp(op=And(), values=[Name(id='allow_resend', ctx=Load()), Compare(left=Name(id='effort', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), UnaryOp(op=Not(), operand=Name(id='replayed', ctx=Load()))]))), keyword(arg='resend_refusal', value=Constant(value=False))])",
+      "rendered": "dispatch_or_retry_unforced(_dispatch, 'chain', stage='s8', effort=_deepagents.droppable_effort(cfg.models.chain, effort, agentic=True), may_retry=lambda: allow_resend and effort is not None and (not replayed), resend_refusal=False)"
+    }
+  ],
+  "calls": [
+    {
+      "line": 54,
+      "end_line": 54,
+      "callee": "re.compile",
+      "enclosing": "module initialization",
+      "expression": "re.compile(r'\\b(ranked_findings|chains)\"?\\s*(?::|=|\\bis\\b)\\s*[\\[{]')"
+    },
+    {
+      "line": 62,
+      "end_line": 62,
+      "callee": "_cap_int",
+      "enclosing": "_call_budget",
+      "expression": "_cap_int(s8, \"max_model_calls\", 1)"
+    },
+    {
+      "line": 65,
+      "end_line": 67,
+      "callee": "ModelCallBudget",
+      "enclosing": "_call_budget",
+      "expression": "ModelCallBudget(limit=limit,\n                           outcome_tools=frozenset({ChainReport.__name__}),\n                           counter=\"s8_model_call_budget_final_turn\")"
+    },
+    {
+      "line": 73,
+      "end_line": 73,
+      "callee": "getattr",
+      "enclosing": "_agentic_leg",
+      "expression": "getattr(cfg, \"step8\", None)"
+    },
+    {
+      "line": 76,
+      "end_line": 95,
+      "callee": "_deepagents.dispatch_agentic",
+      "enclosing": "_agentic_leg",
+      "expression": "_deepagents.dispatch_agentic(\n        user,\n        model=cfg.models.chain,\n        cfg=cfg,\n        # cwd roots the deepagents route at the scanned repo; legacy vias ignore it.\n        cwd=ctx.repo_root,\n        system_prompt=SYSTEM,\n        # 2, not 1: turn 1 is the forced ChainReport call, turn 2 is the tool result it ends on.\n        max_turns=_cap_int(s8, \"max_turns\", 2),\n        timeout=deadline_bound(_cap_int(s8, \"timeout\", 3600), _cap_int(s8, \"deadline\", 0),\n                               None if drop_thinking else effort, via=via),\n        max_output_tokens=int(knob(cfg, \"step8.max_tokens\", 64000)),\n        response_model=ChainReport if via in RESPONSE_MODEL_VIAS else None,\n        # s8 is handed its finding table whole; it has nothing to look up, so no tool is allowed.\n        allowed_tools=(),\n        parent_middleware=parent_middleware,\n        tag=TAG,\n        effort=None if drop_thinking else effort,\n        session_id=session_id,\n    )"
+    },
+    {
+      "line": 100,
+      "end_line": 100,
+      "callee": "_cap_int",
+      "enclosing": "_replay_max_tokens",
+      "expression": "_cap_int(getattr(cfg, \"step8\", None), \"replay_max_tokens\", 16000)"
+    },
+    {
+      "line": 105,
+      "end_line": 105,
+      "callee": "getattr",
+      "enclosing": "_cold_call",
+      "expression": "getattr(cfg, \"step8\", None)"
+    },
+    {
+      "line": 127,
+      "end_line": 129,
+      "callee": "_cold_call",
+      "enclosing": "_replay_leg",
+      "expression": "_cold_call(\n        replay_prompt(transcript, user, instruction=S8_REPLAY_INSTRUCTION, stage=\"s8\"),\n        ctx, cfg, tag=f\"{TAG} replay\")"
+    },
+    {
+      "line": 146,
+      "end_line": 146,
+      "callee": "_cold_call",
+      "enclosing": "repair_call",
+      "expression": "_cold_call(repair_prompt(raw, err), ctx, cfg, tag=f\"{TAG} json-repair\")"
+    },
+    {
+      "line": 152,
+      "end_line": 152,
+      "callee": "getattr",
+      "enclosing": "chain_call",
+      "expression": "getattr(cfg, \"step8\", None)"
+    },
+    {
+      "line": 154,
+      "end_line": 154,
+      "callee": "build_prompt",
+      "enclosing": "chain_call",
+      "expression": "build_prompt(findings, ctx, labels=labels, cfg=cfg)"
+    },
+    {
+      "line": 155,
+      "end_line": 155,
+      "callee": "_cap_int",
+      "enclosing": "chain_call",
+      "expression": "_cap_int(s8, \"deadline\", 0)"
+    },
+    {
+      "line": 74,
+      "end_line": 74,
+      "callee": "knob",
+      "enclosing": "_agentic_leg",
+      "expression": "knob(cfg, \"step8.effort\", None)"
+    },
+    {
+      "line": 75,
+      "end_line": 75,
+      "callee": "resolve",
+      "enclosing": "_agentic_leg",
+      "expression": "resolve(cfg.models.chain)"
+    },
+    {
+      "line": 100,
+      "end_line": 100,
+      "callee": "getattr",
+      "enclosing": "_replay_max_tokens",
+      "expression": "getattr(cfg, \"step8\", None)"
+    },
+    {
+      "line": 107,
+      "end_line": 107,
+      "callee": "stage_floors",
+      "enclosing": "_cold_call",
+      "expression": "stage_floors(tag, min_chars=MIN_RESPONSE_CHARS, min_tokens=MIN_RESPONSE_TOKENS)"
+    },
+    {
+      "line": 108,
+      "end_line": 122,
+      "callee": "_deepagents.dispatch_prompt",
+      "enclosing": "_cold_call",
+      "expression": "_deepagents.dispatch_prompt(\n            prompt,\n            model=cfg.models.chain,\n            cfg=cfg,\n            cwd=ctx.repo_root,\n            system_prompt=SYSTEM,\n            max_tokens=_replay_max_tokens(cfg),\n            # replay_timeout, not the stage clock: the cli folds a None effort into an\n            # effort-scaled clock\n            timeout=_cap_int(s8, \"replay_timeout\", 300),\n            response_model=(ChainReport if resolve(cfg.models.chain).via in RESPONSE_MODEL_VIAS\n                            else None),\n            tag=tag,\n            effort=_REPLAY_EFFORT,\n        )"
+    },
+    {
+      "line": 128,
+      "end_line": 128,
+      "callee": "replay_prompt",
+      "enclosing": "_replay_leg",
+      "expression": "replay_prompt(transcript, user, instruction=S8_REPLAY_INSTRUCTION, stage=\"s8\")"
+    },
+    {
+      "line": 134,
+      "end_line": 134,
+      "callee": "isinstance",
+      "enclosing": "repairable",
+      "expression": "isinstance(raw, str)"
+    },
+    {
+      "line": 134,
+      "end_line": 134,
+      "callee": "bool",
+      "enclosing": "repairable",
+      "expression": "bool(_REPAIRABLE_RX.search(raw))"
+    },
+    {
+      "line": 141,
+      "end_line": 141,
+      "callee": "estimate_tokens",
+      "enclosing": "repair_fits",
+      "expression": "estimate_tokens(raw)"
+    },
+    {
+      "line": 141,
+      "end_line": 141,
+      "callee": "_replay_max_tokens",
+      "enclosing": "repair_fits",
+      "expression": "_replay_max_tokens(cfg)"
+    },
+    {
+      "line": 146,
+      "end_line": 146,
+      "callee": "repair_prompt",
+      "enclosing": "repair_call",
+      "expression": "repair_prompt(raw, err)"
+    },
+    {
+      "line": 153,
+      "end_line": 153,
+      "callee": "knob",
+      "enclosing": "chain_call",
+      "expression": "knob(cfg, \"step8.effort\", None)"
+    },
+    {
+      "line": 160,
+      "end_line": 160,
+      "callee": "session_id_for",
+      "enclosing": "chain_call._dispatch",
+      "expression": "session_id_for(\"s8\", \"chain\")"
+    },
+    {
+      "line": 161,
+      "end_line": 161,
+      "callee": "Transcript",
+      "enclosing": "chain_call._dispatch",
+      "expression": "Transcript()"
+    },
+    {
+      "line": 163,
+      "end_line": 163,
+      "callee": "_call_budget",
+      "enclosing": "chain_call._dispatch",
+      "expression": "_call_budget(s8)"
+    },
+    {
+      "line": 184,
+      "end_line": 184,
+      "callee": "stage_floors",
+      "enclosing": "chain_call",
+      "expression": "stage_floors(TAG, min_chars=MIN_RESPONSE_CHARS, min_tokens=MIN_RESPONSE_TOKENS)"
+    },
+    {
+      "line": 193,
+      "end_line": 197,
+      "callee": "dispatch_or_retry_unforced",
+      "enclosing": "chain_call",
+      "expression": "dispatch_or_retry_unforced(\n            _dispatch, \"chain\", stage=\"s8\",\n            effort=_deepagents.droppable_effort(cfg.models.chain, effort, agentic=True),\n            may_retry=lambda: allow_resend and effort is not None and not replayed,\n            resend_refusal=False)"
+    },
+    {
+      "line": 66,
+      "end_line": 66,
+      "callee": "frozenset",
+      "enclosing": "_call_budget",
+      "expression": "frozenset({ChainReport.__name__})"
+    },
+    {
+      "line": 84,
+      "end_line": 84,
+      "callee": "_cap_int",
+      "enclosing": "_agentic_leg",
+      "expression": "_cap_int(s8, \"max_turns\", 2)"
+    },
+    {
+      "line": 85,
+      "end_line": 86,
+      "callee": "deadline_bound",
+      "enclosing": "_agentic_leg",
+      "expression": "deadline_bound(_cap_int(s8, \"timeout\", 3600), _cap_int(s8, \"deadline\", 0),\n                               None if drop_thinking else effort, via=via)"
+    },
+    {
+      "line": 87,
+      "end_line": 87,
+      "callee": "int",
+      "enclosing": "_agentic_leg",
+      "expression": "int(knob(cfg, \"step8.max_tokens\", 64000))"
+    },
+    {
+      "line": 134,
+      "end_line": 134,
+      "callee": "_REPAIRABLE_RX.search",
+      "enclosing": "repairable",
+      "expression": "_REPAIRABLE_RX.search(raw)"
+    },
+    {
+      "line": 162,
+      "end_line": 162,
+      "callee": "RecordTranscript",
+      "enclosing": "chain_call._dispatch",
+      "expression": "RecordTranscript(transcript)"
+    },
+    {
+      "line": 167,
+      "end_line": 171,
+      "callee": "run_with_deadline",
+      "enclosing": "chain_call._dispatch",
+      "expression": "run_with_deadline(\n                lambda: _agentic_leg(user, ctx, cfg, session_id=session_id,\n                                     parent_middleware=middleware,\n                                     drop_thinking=drop_thinking),\n                seconds=deadline, stage=TAG, effort=effort)"
+    },
+    {
+      "line": 182,
+      "end_line": 182,
+      "callee": "release_pinned_session",
+      "enclosing": "chain_call._dispatch",
+      "expression": "release_pinned_session(session_id)"
+    },
+    {
+      "line": 85,
+      "end_line": 85,
+      "callee": "_cap_int",
+      "enclosing": "_agentic_leg",
+      "expression": "_cap_int(s8, \"timeout\", 3600)"
+    },
+    {
+      "line": 85,
+      "end_line": 85,
+      "callee": "_cap_int",
+      "enclosing": "_agentic_leg",
+      "expression": "_cap_int(s8, \"deadline\", 0)"
+    },
+    {
+      "line": 87,
+      "end_line": 87,
+      "callee": "knob",
+      "enclosing": "_agentic_leg",
+      "expression": "knob(cfg, \"step8.max_tokens\", 64000)"
+    },
+    {
+      "line": 114,
+      "end_line": 114,
+      "callee": "_replay_max_tokens",
+      "enclosing": "_cold_call",
+      "expression": "_replay_max_tokens(cfg)"
+    },
+    {
+      "line": 117,
+      "end_line": 117,
+      "callee": "_cap_int",
+      "enclosing": "_cold_call",
+      "expression": "_cap_int(s8, \"replay_timeout\", 300)"
+    },
+    {
+      "line": 177,
+      "end_line": 178,
+      "callee": "console.write",
+      "enclosing": "chain_call._dispatch",
+      "expression": "console.write(f\"  [s8] deadline {deadline}s hit — replaying the chain analysis \"\n                          f\"from the transcript\")"
+    },
+    {
+      "line": 180,
+      "end_line": 180,
+      "callee": "_replay_leg",
+      "enclosing": "chain_call._dispatch",
+      "expression": "_replay_leg(user, ctx, cfg, transcript)"
+    },
+    {
+      "line": 195,
+      "end_line": 195,
+      "callee": "_deepagents.droppable_effort",
+      "enclosing": "chain_call",
+      "expression": "_deepagents.droppable_effort(cfg.models.chain, effort, agentic=True)"
+    },
+    {
+      "line": 168,
+      "end_line": 170,
+      "callee": "_agentic_leg",
+      "enclosing": "chain_call._dispatch",
+      "expression": "_agentic_leg(user, ctx, cfg, session_id=session_id,\n                                     parent_middleware=middleware,\n                                     drop_thinking=drop_thinking)"
+    },
+    {
+      "line": 118,
+      "end_line": 118,
+      "callee": "resolve",
+      "enclosing": "_cold_call",
+      "expression": "resolve(cfg.models.chain)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 17,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "import re",
+      "targets": [
+        "re"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "from vvaharness.backends.harness.deepagents.model_call_budget import ModelCallBudget",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.model_call_budget",
+        "vvaharness.backends.harness.deepagents.model_call_budget.ModelCallBudget"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/model_call_budget.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 22,
+      "source_expression": "from vvaharness.backends.harness.models import CallTimeoutError",
+      "targets": [
+        "vvaharness.backends.harness.models",
+        "vvaharness.backends.harness.models.CallTimeoutError"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/models.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 23,
+      "source_expression": "from vvaharness.backends.llm import deepagents as _deepagents",
+      "targets": [
+        "vvaharness.backends.llm",
+        "vvaharness.backends.llm.deepagents"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/llm/__init__.py",
+        "vvaharness/backends/llm/deepagents.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 24,
+      "source_expression": "from vvaharness.backends.llm.models import RESPONSE_MODEL_VIAS",
+      "targets": [
+        "vvaharness.backends.llm.models",
+        "vvaharness.backends.llm.models.RESPONSE_MODEL_VIAS"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/llm/models.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 25,
+      "source_expression": "from vvaharness.backends.llm.registry import resolve",
+      "targets": [
+        "vvaharness.backends.llm.registry",
+        "vvaharness.backends.llm.registry.resolve"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/llm/registry.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 26,
+      "source_expression": "from vvaharness.evidence import _cap_int",
+      "targets": [
+        "vvaharness.evidence",
+        "vvaharness.evidence._cap_int"
+      ],
+      "local_source_paths": [
+        "vvaharness/evidence/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 27,
+      "source_expression": "from vvaharness.models import ContextPackage, Finding",
+      "targets": [
+        "vvaharness.models",
+        "vvaharness.models.ContextPackage",
+        "vvaharness.models.Finding"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 28,
+      "source_expression": "from vvaharness.pipeline.stages.replay import S8_REPLAY_INSTRUCTION, RecordTranscript, Transcript, deadline_bound, release_pinned_session, replay_prompt, run_with_deadline, session_id_for",
+      "targets": [
+        "vvaharness.pipeline.stages.replay",
+        "vvaharness.pipeline.stages.replay.S8_REPLAY_INSTRUCTION",
+        "vvaharness.pipeline.stages.replay.RecordTranscript",
+        "vvaharness.pipeline.stages.replay.Transcript",
+        "vvaharness.pipeline.stages.replay.deadline_bound",
+        "vvaharness.pipeline.stages.replay.release_pinned_session",
+        "vvaharness.pipeline.stages.replay.replay_prompt",
+        "vvaharness.pipeline.stages.replay.run_with_deadline",
+        "vvaharness.pipeline.stages.replay.session_id_for"
+      ],
+      "local_source_paths": [
+        "vvaharness/pipeline/stages/replay.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 38,
+      "source_expression": "from vvaharness.pipeline.stages.s8.outcomes import ChainReport",
+      "targets": [
+        "vvaharness.pipeline.stages.s8.outcomes",
+        "vvaharness.pipeline.stages.s8.outcomes.ChainReport"
+      ],
+      "local_source_paths": [
+        "vvaharness/pipeline/stages/s8/outcomes.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 39,
+      "source_expression": "from vvaharness.pipeline.stages.s8.prompts import SYSTEM, build_prompt, repair_prompt",
+      "targets": [
+        "vvaharness.pipeline.stages.s8.prompts",
+        "vvaharness.pipeline.stages.s8.prompts.SYSTEM",
+        "vvaharness.pipeline.stages.s8.prompts.build_prompt",
+        "vvaharness.pipeline.stages.s8.prompts.repair_prompt"
+      ],
+      "local_source_paths": [
+        "vvaharness/pipeline/stages/s8/prompts.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 40,
+      "source_expression": "from vvaharness.util import console",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.console"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/console.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 41,
+      "source_expression": "from vvaharness.util.config import knob",
+      "targets": [
+        "vvaharness.util.config",
+        "vvaharness.util.config.knob"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/config.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 42,
+      "source_expression": "from vvaharness.util.response_quality import dispatch_or_retry_unforced, stage_floors",
+      "targets": [
+        "vvaharness.util.response_quality",
+        "vvaharness.util.response_quality.dispatch_or_retry_unforced",
+        "vvaharness.util.response_quality.stage_floors"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/response_quality.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 43,
+      "source_expression": "from vvaharness.util.tokens import estimate_tokens",
+      "targets": [
+        "vvaharness.util.tokens",
+        "vvaharness.util.tokens.estimate_tokens"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/tokens.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

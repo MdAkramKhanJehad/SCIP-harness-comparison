@@ -1,0 +1,2216 @@
+{
+  "source": "vvaharness/validation/scoring/_engine.py",
+  "sha256": "167ee7696b9608943a8f85c74f4e4dee6feb79c081e7ac454449e2efd7bff528",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Config-driven scoring engine; speaks Decision, fails closed to INCONCLUSIVE on any gap.\"\"\"\n\nfrom __future__ import annotations\n\nfrom collections.abc import Mapping\nfrom typing import Final\n\nfrom vvaharness.models import Decision, EvidenceAnchor, GateStatus\nfrom vvaharness.validation.constants.scoring import SCORE_FLOOR, SCORE_PRECISION\nfrom vvaharness.validation.enums.synthesis import SynthesisConfidence\nfrom vvaharness.validation.models.scoring import (\n    RawCriterion,\n    RawExtra,\n    ScoreResult,\n    ScoringConfig,\n)\n\n__all__ = [\"parse_raw_criterion\", \"score\"]\n\n#: Prefix on a fail-closed rationale. Host-facing diagnostic text, not prompt vocabulary.\nINCONCLUSIVE_PREFIX: Final = \"INCONCLUSIVE\"\n\n\ndef _str_from(entry: Mapping[str, object], field_key: str, default: str = \"\") -> str:\n    \"\"\"Return a string field from an agent-emitted dict, or *default* when absent/mistyped.\"\"\"\n    value = entry.get(field_key, default)\n    return value if isinstance(value, str) else default\n\n\ndef _int_or_none(value: object) -> int | None:\n    \"\"\"Narrow a line number to int, rejecting bool (a JSON ``true`` is not line 1).\"\"\"\n    if isinstance(value, bool):\n        return None\n    return value if isinstance(value, int) else None\n\n\ndef _parse_evidence(entry: Mapping[str, object]) -> EvidenceAnchor:\n    \"\"\"Narrow one agent-emitted evidence dict onto the shared anchor contract.\"\"\"\n    return EvidenceAnchor(\n        file=_str_from(entry, \"file\"),\n        line=_int_or_none(entry.get(\"line\")),\n        snippet=_str_from(entry, \"snippet\"),\n    )\n\n\ndef parse_raw_criterion(entry: Mapping[str, object], name_field: str) -> RawCriterion:\n    \"\"\"Narrow one agent-emitted dict into a typed RawCriterion.\"\"\"\n    evidence_raw = entry.get(\"evidence\", [])\n    evidence: tuple[EvidenceAnchor, ...] = ()\n    if isinstance(evidence_raw, list):\n        evidence = tuple(\n            _parse_evidence(evidence_entry)\n            for evidence_entry in evidence_raw\n            if isinstance(evidence_entry, Mapping)\n        )\n    return RawCriterion(\n        name=_str_from(entry, name_field),\n        # Canonicalise status here so a bad/case-variant value never reaches the multiplier.\n        status=GateStatus(_str_from(entry, \"status\")).value,\n        confidence=_str_from(entry, \"confidence\"),\n        summary=_str_from(entry, \"summary\"),\n        details=_str_from(entry, \"details\"),\n        evidence=evidence,\n    )\n\n\ndef _inconclusive(reason: str) -> ScoreResult:\n    \"\"\"Build the fail-closed result, so every refusal path reads identically.\"\"\"\n    return ScoreResult(\n        raw_score=0.0,\n        decision=Decision.INCONCLUSIVE,\n        justification=f\"{INCONCLUSIVE_PREFIX}: {reason}\",\n    )\n\n\ndef _shape_error(config: ScoringConfig, criteria: list[RawCriterion]) -> ScoreResult | None:\n    \"\"\"Return an INCONCLUSIVE result when the criteria set is malformed, else None.\"\"\"\n    names: list[str] = [criterion.name for criterion in criteria]\n    provided: set[str] = set(names)\n    if provided != config.expected_criteria:\n        missing = sorted(config.expected_criteria - provided)\n        return _inconclusive(f\"Missing criterion evaluations: {', '.join(missing)}.\")\n    if len(names) != len(provided):\n        duplicates: list[str] = sorted({name for name in names if names.count(name) > 1})\n        return _inconclusive(f\"Duplicate criterion evaluations: {', '.join(duplicates)}.\")\n    return None\n\n\ndef _renormalized_score(\n    config: ScoringConfig, criteria: list[RawCriterion]\n) -> ScoreResult | float:\n    \"\"\"Weighted score over evaluated (non-skip) gates, or INCONCLUSIVE when none was evaluated.\"\"\"\n    earned = 0.0\n    active_weight = 0.0\n    for criterion in criteria:\n        if criterion.status == GateStatus.SKIP.value:\n            continue\n        active_weight += config.weights[criterion.name]\n        earned += config.weights[criterion.name] * config.status_multiplier.get(\n            criterion.status, SCORE_FLOOR\n        )\n    if active_weight <= 0.0:\n        return _inconclusive(\"no gates were evaluated.\")\n    # clamp: a weights misconfig must never push the score above 1.0.\n    return round(min(earned / active_weight, 1.0), SCORE_PRECISION)\n\n\n_UNEVALUATED: Final = frozenset({GateStatus.SKIP.value, GateStatus.INVALID.value})\n# evaluated but not clean: a critical gate in either state caps the decision below the top one\n_CRITICAL_NOT_CLEAN: Final = frozenset({GateStatus.PARTIAL.value, GateStatus.FAIL.value})\n\n\ndef _critical_gate_error(\n    config: ScoringConfig, criteria: list[RawCriterion]\n) -> ScoreResult | None:\n    \"\"\"INCONCLUSIVE when a critical gate is unevaluated (skip) or invalid -- never waivable.\"\"\"\n    for criterion in criteria:\n        if criterion.name in config.critical_criteria and criterion.status in _UNEVALUATED:\n            return _inconclusive(\n                f\"critical gate '{criterion.name}' was not evaluated \"\n                f\"(status '{criterion.status}').\"\n            )\n    return None\n\n\ndef _consensus_error(criteria: list[RawCriterion]) -> ScoreResult | None:\n    \"\"\"Fail closed when the host panel could not reach consensus on any gate.\"\"\"\n    flagged = sorted(\n        criterion.name\n        for criterion in criteria\n        if criterion.confidence == SynthesisConfidence.FLAGGED.value\n    )\n    if not flagged:\n        return None\n    return _inconclusive(\n        f\"Insufficient persona consensus for gate(s): {', '.join(flagged)}.\"\n    )\n\n\ndef _cap_critical_fail(\n    config: ScoringConfig, criteria: list[RawCriterion], decision: Decision\n) -> Decision:\n    \"\"\"Cap below the top decision when a critical gate isn't clean, so it can't be out-weighted.\"\"\"\n    if not config.verdicts or decision is not config.verdicts[0].decision:\n        return decision\n    not_clean = any(\n        criterion.name in config.critical_criteria and criterion.status in _CRITICAL_NOT_CLEAN\n        for criterion in criteria\n    )\n    return config.verdicts[1].decision if (not_clean and len(config.verdicts) > 1) else decision\n\n\ndef _precheck(config: ScoringConfig, criteria: list[RawCriterion]) -> ScoreResult | None:\n    \"\"\"Fail-closed gates before scoring: malformed criteria set, or an unevaluated critical gate.\"\"\"\n    return (\n        _shape_error(config, criteria)\n        or _consensus_error(criteria)\n        or _critical_gate_error(config, criteria)\n    )\n\n\ndef _apply_verdicts(config: ScoringConfig, raw_score: float) -> Decision:\n    \"\"\"Band a score onto a decision; a score under every threshold is INCONCLUSIVE.\"\"\"\n    for rule in config.verdicts:\n        if raw_score >= rule.min_score:\n            return rule.decision\n    return Decision.INCONCLUSIVE\n\n\ndef score(\n    config: ScoringConfig,\n    criteria: list[RawCriterion],\n    extra: RawExtra | None = None,\n) -> ScoreResult:\n    \"\"\"Score a list of parsed criteria against a scoring config.\"\"\"\n    precheck_error: ScoreResult | None = _precheck(config, criteria)\n    if precheck_error is not None:\n        return precheck_error\n    scored: ScoreResult | float = _renormalized_score(config, criteria)\n    if isinstance(scored, ScoreResult):\n        return scored\n    decision = _cap_critical_fail(config, criteria, _apply_verdicts(config, scored))\n    partial = ScoreResult(raw_score=scored, decision=decision, justification=\"\")\n    return ScoreResult(\n        raw_score=scored,\n        decision=decision,\n        justification=config.justify(partial, criteria, extra or {}),\n    )\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/validation/scoring/_engine.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "Config-driven scoring engine; speaks Decision, fails closed to INCONCLUSIVE on any gap.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_39_4": {
+      "source": "vvaharness/validation/scoring/_engine.py",
+      "line_start": 39,
+      "line_end": 39,
+      "value": "Return a string field from an agent-emitted dict, or *default* when absent/mistyped.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_45_4": {
+      "source": "vvaharness/validation/scoring/_engine.py",
+      "line_start": 45,
+      "line_end": 45,
+      "value": "Narrow a line number to int, rejecting bool (a JSON ``true`` is not line 1).",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_52_4": {
+      "source": "vvaharness/validation/scoring/_engine.py",
+      "line_start": 52,
+      "line_end": 52,
+      "value": "Narrow one agent-emitted evidence dict onto the shared anchor contract.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_61_4": {
+      "source": "vvaharness/validation/scoring/_engine.py",
+      "line_start": 61,
+      "line_end": 61,
+      "value": "Narrow one agent-emitted dict into a typed RawCriterion.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_82_4": {
+      "source": "vvaharness/validation/scoring/_engine.py",
+      "line_start": 82,
+      "line_end": 82,
+      "value": "Build the fail-closed result, so every refusal path reads identically.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_86_22": {
+      "source": "vvaharness/validation/scoring/_engine.py",
+      "line_start": 86,
+      "line_end": 86,
+      "source_expression": "f\"{INCONCLUSIVE_PREFIX}: {reason}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_91_4": {
+      "source": "vvaharness/validation/scoring/_engine.py",
+      "line_start": 91,
+      "line_end": 91,
+      "value": "Return an INCONCLUSIVE result when the criteria set is malformed, else None.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_96_29": {
+      "source": "vvaharness/validation/scoring/_engine.py",
+      "line_start": 96,
+      "line_end": 96,
+      "source_expression": "f\"Missing criterion evaluations: {', '.join(missing)}.\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_99_29": {
+      "source": "vvaharness/validation/scoring/_engine.py",
+      "line_start": 99,
+      "line_end": 99,
+      "source_expression": "f\"Duplicate criterion evaluations: {', '.join(duplicates)}.\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_106_4": {
+      "source": "vvaharness/validation/scoring/_engine.py",
+      "line_start": 106,
+      "line_end": 106,
+      "value": "Weighted score over evaluated (non-skip) gates, or INCONCLUSIVE when none was evaluated.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_130_4": {
+      "source": "vvaharness/validation/scoring/_engine.py",
+      "line_start": 130,
+      "line_end": 130,
+      "value": "INCONCLUSIVE when a critical gate is unevaluated (skip) or invalid -- never waivable.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_134_16": {
+      "source": "vvaharness/validation/scoring/_engine.py",
+      "line_start": 134,
+      "line_end": 135,
+      "source_expression": "f\"critical gate '{criterion.name}' was not evaluated \"\n                f\"(status '{criterion.status}').\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_141_4": {
+      "source": "vvaharness/validation/scoring/_engine.py",
+      "line_start": 141,
+      "line_end": 141,
+      "value": "Fail closed when the host panel could not reach consensus on any gate.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_150_8": {
+      "source": "vvaharness/validation/scoring/_engine.py",
+      "line_start": 150,
+      "line_end": 150,
+      "source_expression": "f\"Insufficient persona consensus for gate(s): {', '.join(flagged)}.\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_157_4": {
+      "source": "vvaharness/validation/scoring/_engine.py",
+      "line_start": 157,
+      "line_end": 157,
+      "value": "Cap below the top decision when a critical gate isn't clean, so it can't be out-weighted.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_168_4": {
+      "source": "vvaharness/validation/scoring/_engine.py",
+      "line_start": 168,
+      "line_end": 168,
+      "value": "Fail-closed gates before scoring: malformed criteria set, or an unevaluated critical gate.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_177_4": {
+      "source": "vvaharness/validation/scoring/_engine.py",
+      "line_start": 177,
+      "line_end": 177,
+      "value": "Band a score onto a decision; a score under every threshold is INCONCLUSIVE.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_189_4": {
+      "source": "vvaharness/validation/scoring/_engine.py",
+      "line_start": 189,
+      "line_end": 189,
+      "value": "Score a list of parsed criteria against a scoring config.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "Config-driven scoring engine; speaks Decision, fails closed to INCONCLUSIVE on any gap.",
+      "context": "literal"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 29,
+      "value": "INCONCLUSIVE",
+      "context": "literal"
+    },
+    {
+      "line_start": 32,
+      "line_end": 32,
+      "column": 11,
+      "value": "parse_raw_criterion",
+      "context": "literal"
+    },
+    {
+      "line_start": 32,
+      "line_end": 32,
+      "column": 34,
+      "value": "score",
+      "context": "literal"
+    },
+    {
+      "line_start": 38,
+      "line_end": 38,
+      "column": 74,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 39,
+      "line_end": 39,
+      "column": 4,
+      "value": "Return a string field from an agent-emitted dict, or *default* when absent/mistyped.",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 4,
+      "value": "Narrow a line number to int, rejecting bool (a JSON ``true`` is not line 1).",
+      "context": "literal"
+    },
+    {
+      "line_start": 52,
+      "line_end": 52,
+      "column": 4,
+      "value": "Narrow one agent-emitted evidence dict onto the shared anchor contract.",
+      "context": "literal"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 4,
+      "value": "Narrow one agent-emitted dict into a typed RawCriterion.",
+      "context": "literal"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 4,
+      "value": "Build the fail-closed result, so every refusal path reads identically.",
+      "context": "literal"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 4,
+      "value": "Return an INCONCLUSIVE result when the criteria set is malformed, else None.",
+      "context": "literal"
+    },
+    {
+      "line_start": 106,
+      "line_end": 106,
+      "column": 4,
+      "value": "Weighted score over evaluated (non-skip) gates, or INCONCLUSIVE when none was evaluated.",
+      "context": "literal"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 4,
+      "value": "INCONCLUSIVE when a critical gate is unevaluated (skip) or invalid -- never waivable.",
+      "context": "literal"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 4,
+      "value": "Fail closed when the host panel could not reach consensus on any gate.",
+      "context": "literal"
+    },
+    {
+      "line_start": 157,
+      "line_end": 157,
+      "column": 4,
+      "value": "Cap below the top decision when a critical gate isn't clean, so it can't be out-weighted.",
+      "context": "literal"
+    },
+    {
+      "line_start": 168,
+      "line_end": 168,
+      "column": 4,
+      "value": "Fail-closed gates before scoring: malformed criteria set, or an unevaluated critical gate.",
+      "context": "literal"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 4,
+      "value": "Band a score onto a decision; a score under every threshold is INCONCLUSIVE.",
+      "context": "literal"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 4,
+      "value": "Score a list of parsed criteria against a scoring config.",
+      "context": "literal"
+    },
+    {
+      "line_start": 62,
+      "line_end": 62,
+      "column": 29,
+      "value": "evidence",
+      "context": "literal"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 29,
+      "value": "no gates were evaluated.",
+      "context": "literal"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 10,
+      "value": "Insufficient persona consensus for gate(s): ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 74,
+      "value": ".",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 197,
+      "line_end": 197,
+      "column": 77,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 30,
+      "value": "file",
+      "context": "literal"
+    },
+    {
+      "line_start": 56,
+      "line_end": 56,
+      "column": 33,
+      "value": "snippet",
+      "context": "literal"
+    },
+    {
+      "line_start": 74,
+      "line_end": 74,
+      "column": 36,
+      "value": "confidence",
+      "context": "literal"
+    },
+    {
+      "line_start": 75,
+      "line_end": 75,
+      "column": 33,
+      "value": "summary",
+      "context": "literal"
+    },
+    {
+      "line_start": 76,
+      "line_end": 76,
+      "column": 33,
+      "value": "details",
+      "context": "literal"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 45,
+      "value": ": ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 31,
+      "value": "Missing criterion evaluations: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 82,
+      "value": ".",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 31,
+      "value": "Duplicate criterion evaluations: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 87,
+      "value": ".",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 36,
+      "value": "line",
+      "context": "literal"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 18,
+      "value": "critical gate '",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 134,
+      "line_end": 135,
+      "column": 49,
+      "value": "' was not evaluated (status '",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 45,
+      "value": "').",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 73,
+      "line_end": 73,
+      "column": 43,
+      "value": "status",
+      "context": "literal"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 55,
+      "value": ", ",
+      "context": "literal"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 63,
+      "value": ", ",
+      "context": "literal"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 65,
+      "value": ", ",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 34,
+      "text": "#: Prefix on a fail-closed rationale. Host-facing diagnostic text, not prompt vocabulary."
+    },
+    {
+      "line": 72,
+      "text": "# Canonicalise status here so a bad/case-variant value never reaches the multiplier."
+    },
+    {
+      "line": 118,
+      "text": "# clamp: a weights misconfig must never push the score above 1.0."
+    },
+    {
+      "line": 123,
+      "text": "# evaluated but not clean: a critical gate in either state caps the decision below the top one"
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 23,
+      "line_end": 23,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 30,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "Assign",
+      "line_start": 32,
+      "line_end": 32,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 35,
+      "line_end": 35,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 38,
+      "line_end": 41,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 5
+    },
+    {
+      "kind": "Expr",
+      "line_start": 39,
+      "line_end": 39,
+      "column": 4,
+      "owner": "_str_from",
+      "representation_line": 11
+    },
+    {
+      "kind": "Assign",
+      "line_start": 40,
+      "line_end": 40,
+      "column": 4,
+      "owner": "_str_from",
+      "representation_line": 11
+    },
+    {
+      "kind": "Return",
+      "line_start": 41,
+      "line_end": 41,
+      "column": 4,
+      "owner": "_str_from",
+      "representation_line": 12
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 44,
+      "line_end": 48,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 16
+    },
+    {
+      "kind": "Expr",
+      "line_start": 45,
+      "line_end": 45,
+      "column": 4,
+      "owner": "_int_or_none",
+      "representation_line": 22
+    },
+    {
+      "kind": "If",
+      "line_start": 46,
+      "line_end": 47,
+      "column": 4,
+      "owner": "_int_or_none",
+      "representation_line": 23
+    },
+    {
+      "kind": "Return",
+      "line_start": 47,
+      "line_end": 47,
+      "column": 8,
+      "owner": "_int_or_none",
+      "representation_line": 25
+    },
+    {
+      "kind": "Return",
+      "line_start": 48,
+      "line_end": 48,
+      "column": 4,
+      "owner": "_int_or_none",
+      "representation_line": 28
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 51,
+      "line_end": 57,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 32
+    },
+    {
+      "kind": "Expr",
+      "line_start": 52,
+      "line_end": 52,
+      "column": 4,
+      "owner": "_parse_evidence",
+      "representation_line": 38
+    },
+    {
+      "kind": "Return",
+      "line_start": 53,
+      "line_end": 57,
+      "column": 4,
+      "owner": "_parse_evidence",
+      "representation_line": 39
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 60,
+      "line_end": 78,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 43
+    },
+    {
+      "kind": "Expr",
+      "line_start": 61,
+      "line_end": 61,
+      "column": 4,
+      "owner": "parse_raw_criterion",
+      "representation_line": 49
+    },
+    {
+      "kind": "Assign",
+      "line_start": 62,
+      "line_end": 62,
+      "column": 4,
+      "owner": "parse_raw_criterion",
+      "representation_line": 49
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 63,
+      "line_end": 63,
+      "column": 4,
+      "owner": "parse_raw_criterion",
+      "representation_line": 49
+    },
+    {
+      "kind": "If",
+      "line_start": 64,
+      "line_end": 69,
+      "column": 4,
+      "owner": "parse_raw_criterion",
+      "representation_line": 50
+    },
+    {
+      "kind": "Assign",
+      "line_start": 65,
+      "line_end": 69,
+      "column": 8,
+      "owner": "parse_raw_criterion",
+      "representation_line": 53
+    },
+    {
+      "kind": "Return",
+      "line_start": 70,
+      "line_end": 78,
+      "column": 4,
+      "owner": "parse_raw_criterion",
+      "representation_line": 55
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 81,
+      "line_end": 87,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 59
+    },
+    {
+      "kind": "Expr",
+      "line_start": 82,
+      "line_end": 82,
+      "column": 4,
+      "owner": "_inconclusive",
+      "representation_line": 65
+    },
+    {
+      "kind": "Return",
+      "line_start": 83,
+      "line_end": 87,
+      "column": 4,
+      "owner": "_inconclusive",
+      "representation_line": 66
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 90,
+      "line_end": 100,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 70
+    },
+    {
+      "kind": "Expr",
+      "line_start": 91,
+      "line_end": 91,
+      "column": 4,
+      "owner": "_shape_error",
+      "representation_line": 76
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 92,
+      "line_end": 92,
+      "column": 4,
+      "owner": "_shape_error",
+      "representation_line": 76
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 93,
+      "line_end": 93,
+      "column": 4,
+      "owner": "_shape_error",
+      "representation_line": 76
+    },
+    {
+      "kind": "If",
+      "line_start": 94,
+      "line_end": 96,
+      "column": 4,
+      "owner": "_shape_error",
+      "representation_line": 77
+    },
+    {
+      "kind": "Assign",
+      "line_start": 95,
+      "line_end": 95,
+      "column": 8,
+      "owner": "_shape_error",
+      "representation_line": 80
+    },
+    {
+      "kind": "Return",
+      "line_start": 96,
+      "line_end": 96,
+      "column": 8,
+      "owner": "_shape_error",
+      "representation_line": 81
+    },
+    {
+      "kind": "If",
+      "line_start": 97,
+      "line_end": 99,
+      "column": 4,
+      "owner": "_shape_error",
+      "representation_line": 84
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 98,
+      "line_end": 98,
+      "column": 8,
+      "owner": "_shape_error",
+      "representation_line": 87
+    },
+    {
+      "kind": "Return",
+      "line_start": 99,
+      "line_end": 99,
+      "column": 8,
+      "owner": "_shape_error",
+      "representation_line": 88
+    },
+    {
+      "kind": "Return",
+      "line_start": 100,
+      "line_end": 100,
+      "column": 4,
+      "owner": "_shape_error",
+      "representation_line": 91
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 103,
+      "line_end": 119,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 95
+    },
+    {
+      "kind": "Expr",
+      "line_start": 106,
+      "line_end": 106,
+      "column": 4,
+      "owner": "_renormalized_score",
+      "representation_line": 101
+    },
+    {
+      "kind": "Assign",
+      "line_start": 107,
+      "line_end": 107,
+      "column": 4,
+      "owner": "_renormalized_score",
+      "representation_line": 101
+    },
+    {
+      "kind": "Assign",
+      "line_start": 108,
+      "line_end": 108,
+      "column": 4,
+      "owner": "_renormalized_score",
+      "representation_line": 101
+    },
+    {
+      "kind": "For",
+      "line_start": 109,
+      "line_end": 115,
+      "column": 4,
+      "owner": "_renormalized_score",
+      "representation_line": 102
+    },
+    {
+      "kind": "If",
+      "line_start": 110,
+      "line_end": 111,
+      "column": 8,
+      "owner": "_renormalized_score",
+      "representation_line": 104
+    },
+    {
+      "kind": "Continue",
+      "line_start": 111,
+      "line_end": 111,
+      "column": 12,
+      "owner": "_renormalized_score",
+      "representation_line": 106
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 112,
+      "line_end": 112,
+      "column": 8,
+      "owner": "_renormalized_score",
+      "representation_line": 110
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 113,
+      "line_end": 115,
+      "column": 8,
+      "owner": "_renormalized_score",
+      "representation_line": 110
+    },
+    {
+      "kind": "If",
+      "line_start": 116,
+      "line_end": 117,
+      "column": 4,
+      "owner": "_renormalized_score",
+      "representation_line": 112
+    },
+    {
+      "kind": "Return",
+      "line_start": 117,
+      "line_end": 117,
+      "column": 8,
+      "owner": "_renormalized_score",
+      "representation_line": 114
+    },
+    {
+      "kind": "Return",
+      "line_start": 119,
+      "line_end": 119,
+      "column": 4,
+      "owner": "_renormalized_score",
+      "representation_line": 117
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 122,
+      "line_end": 122,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 122
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 124,
+      "line_end": 124,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 122
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 127,
+      "line_end": 137,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 123
+    },
+    {
+      "kind": "Expr",
+      "line_start": 130,
+      "line_end": 130,
+      "column": 4,
+      "owner": "_critical_gate_error",
+      "representation_line": 129
+    },
+    {
+      "kind": "For",
+      "line_start": 131,
+      "line_end": 136,
+      "column": 4,
+      "owner": "_critical_gate_error",
+      "representation_line": 130
+    },
+    {
+      "kind": "If",
+      "line_start": 132,
+      "line_end": 136,
+      "column": 8,
+      "owner": "_critical_gate_error",
+      "representation_line": 132
+    },
+    {
+      "kind": "Return",
+      "line_start": 133,
+      "line_end": 136,
+      "column": 12,
+      "owner": "_critical_gate_error",
+      "representation_line": 134
+    },
+    {
+      "kind": "Return",
+      "line_start": 137,
+      "line_end": 137,
+      "column": 4,
+      "owner": "_critical_gate_error",
+      "representation_line": 138
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 140,
+      "line_end": 151,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 142
+    },
+    {
+      "kind": "Expr",
+      "line_start": 141,
+      "line_end": 141,
+      "column": 4,
+      "owner": "_consensus_error",
+      "representation_line": 148
+    },
+    {
+      "kind": "Assign",
+      "line_start": 142,
+      "line_end": 146,
+      "column": 4,
+      "owner": "_consensus_error",
+      "representation_line": 148
+    },
+    {
+      "kind": "If",
+      "line_start": 147,
+      "line_end": 148,
+      "column": 4,
+      "owner": "_consensus_error",
+      "representation_line": 149
+    },
+    {
+      "kind": "Return",
+      "line_start": 148,
+      "line_end": 148,
+      "column": 8,
+      "owner": "_consensus_error",
+      "representation_line": 151
+    },
+    {
+      "kind": "Return",
+      "line_start": 149,
+      "line_end": 151,
+      "column": 4,
+      "owner": "_consensus_error",
+      "representation_line": 154
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 154,
+      "line_end": 164,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 158
+    },
+    {
+      "kind": "Expr",
+      "line_start": 157,
+      "line_end": 157,
+      "column": 4,
+      "owner": "_cap_critical_fail",
+      "representation_line": 164
+    },
+    {
+      "kind": "If",
+      "line_start": 158,
+      "line_end": 159,
+      "column": 4,
+      "owner": "_cap_critical_fail",
+      "representation_line": 165
+    },
+    {
+      "kind": "Return",
+      "line_start": 159,
+      "line_end": 159,
+      "column": 8,
+      "owner": "_cap_critical_fail",
+      "representation_line": 167
+    },
+    {
+      "kind": "Assign",
+      "line_start": 160,
+      "line_end": 163,
+      "column": 4,
+      "owner": "_cap_critical_fail",
+      "representation_line": 171
+    },
+    {
+      "kind": "Return",
+      "line_start": 164,
+      "line_end": 164,
+      "column": 4,
+      "owner": "_cap_critical_fail",
+      "representation_line": 172
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 167,
+      "line_end": 173,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 176
+    },
+    {
+      "kind": "Expr",
+      "line_start": 168,
+      "line_end": 168,
+      "column": 4,
+      "owner": "_precheck",
+      "representation_line": 182
+    },
+    {
+      "kind": "Return",
+      "line_start": 169,
+      "line_end": 173,
+      "column": 4,
+      "owner": "_precheck",
+      "representation_line": 183
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 176,
+      "line_end": 181,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 187
+    },
+    {
+      "kind": "Expr",
+      "line_start": 177,
+      "line_end": 177,
+      "column": 4,
+      "owner": "_apply_verdicts",
+      "representation_line": 193
+    },
+    {
+      "kind": "For",
+      "line_start": 178,
+      "line_end": 180,
+      "column": 4,
+      "owner": "_apply_verdicts",
+      "representation_line": 194
+    },
+    {
+      "kind": "If",
+      "line_start": 179,
+      "line_end": 180,
+      "column": 8,
+      "owner": "_apply_verdicts",
+      "representation_line": 196
+    },
+    {
+      "kind": "Return",
+      "line_start": 180,
+      "line_end": 180,
+      "column": 12,
+      "owner": "_apply_verdicts",
+      "representation_line": 198
+    },
+    {
+      "kind": "Return",
+      "line_start": 181,
+      "line_end": 181,
+      "column": 4,
+      "owner": "_apply_verdicts",
+      "representation_line": 202
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 184,
+      "line_end": 202,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 206
+    },
+    {
+      "kind": "Expr",
+      "line_start": 189,
+      "line_end": 189,
+      "column": 4,
+      "owner": "score",
+      "representation_line": 212
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 190,
+      "line_end": 190,
+      "column": 4,
+      "owner": "score",
+      "representation_line": 212
+    },
+    {
+      "kind": "If",
+      "line_start": 191,
+      "line_end": 192,
+      "column": 4,
+      "owner": "score",
+      "representation_line": 213
+    },
+    {
+      "kind": "Return",
+      "line_start": 192,
+      "line_end": 192,
+      "column": 8,
+      "owner": "score",
+      "representation_line": 215
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 193,
+      "line_end": 193,
+      "column": 4,
+      "owner": "score",
+      "representation_line": 219
+    },
+    {
+      "kind": "If",
+      "line_start": 194,
+      "line_end": 195,
+      "column": 4,
+      "owner": "score",
+      "representation_line": 220
+    },
+    {
+      "kind": "Return",
+      "line_start": 195,
+      "line_end": 195,
+      "column": 8,
+      "owner": "score",
+      "representation_line": 222
+    },
+    {
+      "kind": "Assign",
+      "line_start": 196,
+      "line_end": 196,
+      "column": 4,
+      "owner": "score",
+      "representation_line": 226
+    },
+    {
+      "kind": "Assign",
+      "line_start": 197,
+      "line_end": 197,
+      "column": 4,
+      "owner": "score",
+      "representation_line": 226
+    },
+    {
+      "kind": "Return",
+      "line_start": 198,
+      "line_end": 202,
+      "column": 4,
+      "owner": "score",
+      "representation_line": 227
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 32,
+      "line_end": 32,
+      "column": 10,
+      "kind": "List",
+      "original_ast": "List(elts=[Constant(value='parse_raw_criterion'), Constant(value='score')], ctx=Load())",
+      "rendered": "['parse_raw_criterion', 'score']"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 29,
+      "kind": "Constant",
+      "original_ast": "Constant(value='INCONCLUSIVE')",
+      "rendered": "'INCONCLUSIVE'"
+    },
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='entry', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='field_key', ctx=Load()), Name(id='default', ctx=Load())], keywords=[])",
+      "rendered": "entry.get(field_key, default)"
+    },
+    {
+      "line_start": 41,
+      "line_end": 41,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='value', ctx=Load()), Name(id='str', ctx=Load())], keywords=[]), body=Name(id='value', ctx=Load()), orelse=Name(id='default', ctx=Load()))",
+      "rendered": "value if isinstance(value, str) else default"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='value', ctx=Load()), Name(id='bool', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(value, bool)"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='value', ctx=Load()), Name(id='int', ctx=Load())], keywords=[]), body=Name(id='value', ctx=Load()), orelse=Constant(value=None))",
+      "rendered": "value if isinstance(value, int) else None"
+    },
+    {
+      "line_start": 53,
+      "line_end": 57,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='EvidenceAnchor', ctx=Load()), args=[], keywords=[keyword(arg='file', value=Call(func=Name(id='_str_from', ctx=Load()), args=[Name(id='entry', ctx=Load()), Constant(value='file')], keywords=[])), keyword(arg='line', value=Call(func=Name(id='_int_or_none', ctx=Load()), args=[Call(func=Attribute(value=Name(id='entry', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='line')], keywords=[])], keywords=[])), keyword(arg='snippet', value=Call(func=Name(id='_str_from', ctx=Load()), args=[Name(id='entry', ctx=Load()), Constant(value='snippet')], keywords=[]))])",
+      "rendered": "EvidenceAnchor(file=_str_from(entry, 'file'), line=_int_or_none(entry.get('line')), snippet=_str_from(entry, 'snippet'))"
+    },
+    {
+      "line_start": 62,
+      "line_end": 62,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='entry', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='evidence'), List(elts=[], ctx=Load())], keywords=[])",
+      "rendered": "entry.get('evidence', [])"
+    },
+    {
+      "line_start": 63,
+      "line_end": 63,
+      "column": 43,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[], ctx=Load())",
+      "rendered": "()"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='evidence_raw', ctx=Load()), Name(id='list', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(evidence_raw, list)"
+    },
+    {
+      "line_start": 65,
+      "line_end": 69,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='tuple', ctx=Load()), args=[GeneratorExp(elt=Call(func=Name(id='_parse_evidence', ctx=Load()), args=[Name(id='evidence_entry', ctx=Load())], keywords=[]), generators=[comprehension(target=Name(id='evidence_entry', ctx=Store()), iter=Name(id='evidence_raw', ctx=Load()), ifs=[Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='evidence_entry', ctx=Load()), Name(id='Mapping', ctx=Load())], keywords=[])], is_async=0)])], keywords=[])",
+      "rendered": "tuple((_parse_evidence(evidence_entry) for evidence_entry in evidence_raw if isinstance(evidence_entry, Mapping)))"
+    },
+    {
+      "line_start": 70,
+      "line_end": 78,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='RawCriterion', ctx=Load()), args=[], keywords=[keyword(arg='name', value=Call(func=Name(id='_str_from', ctx=Load()), args=[Name(id='entry', ctx=Load()), Name(id='name_field', ctx=Load())], keywords=[])), keyword(arg='status', value=Attribute(value=Call(func=Name(id='GateStatus', ctx=Load()), args=[Call(func=Name(id='_str_from', ctx=Load()), args=[Name(id='entry', ctx=Load()), Constant(value='status')], keywords=[])], keywords=[]), attr='value', ctx=Load())), keyword(arg='confidence', value=Call(func=Name(id='_str_from', ctx=Load()), args=[Name(id='entry', ctx=Load()), Constant(value='confidence')], keywords=[])), keyword(arg='summary', value=Call(func=Name(id='_str_from', ctx=Load()), args=[Name(id='entry', ctx=Load()), Constant(value='summary')], keywords=[])), keyword(arg='details', value=Call(func=Name(id='_str_from', ctx=Load()), args=[Name(id='entry', ctx=Load()), Constant(value='details')], keywords=[])), keyword(arg='evidence', value=Name(id='evidence', ctx=Load()))])",
+      "rendered": "RawCriterion(name=_str_from(entry, name_field), status=GateStatus(_str_from(entry, 'status')).value, confidence=_str_from(entry, 'confidence'), summary=_str_from(entry, 'summary'), details=_str_from(entry, 'details'), evidence=evidence)"
+    },
+    {
+      "line_start": 83,
+      "line_end": 87,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ScoreResult', ctx=Load()), args=[], keywords=[keyword(arg='raw_score', value=Constant(value=0.0)), keyword(arg='decision', value=Attribute(value=Name(id='Decision', ctx=Load()), attr='INCONCLUSIVE', ctx=Load())), keyword(arg='justification', value=JoinedStr(values=[FormattedValue(value=Name(id='INCONCLUSIVE_PREFIX', ctx=Load()), conversion=-1), Constant(value=': '), FormattedValue(value=Name(id='reason', ctx=Load()), conversion=-1)]))])",
+      "rendered": "ScoreResult(raw_score=0.0, decision=Decision.INCONCLUSIVE, justification=source_template_86_22)"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 23,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Attribute(value=Name(id='criterion', ctx=Load()), attr='name', ctx=Load()), generators=[comprehension(target=Name(id='criterion', ctx=Store()), iter=Name(id='criteria', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "[criterion.name for criterion in criteria]"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 25,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[Name(id='names', ctx=Load())], keywords=[])",
+      "rendered": "set(names)"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='provided', ctx=Load()), ops=[NotEq()], comparators=[Attribute(value=Name(id='config', ctx=Load()), attr='expected_criteria', ctx=Load())])",
+      "rendered": "provided != config.expected_criteria"
+    },
+    {
+      "line_start": 95,
+      "line_end": 95,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[BinOp(left=Attribute(value=Name(id='config', ctx=Load()), attr='expected_criteria', ctx=Load()), op=Sub(), right=Name(id='provided', ctx=Load()))], keywords=[])",
+      "rendered": "sorted(config.expected_criteria - provided)"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_inconclusive', ctx=Load()), args=[JoinedStr(values=[Constant(value='Missing criterion evaluations: '), FormattedValue(value=Call(func=Attribute(value=Constant(value=', '), attr='join', ctx=Load()), args=[Name(id='missing', ctx=Load())], keywords=[]), conversion=-1), Constant(value='.')])], keywords=[])",
+      "rendered": "_inconclusive(source_template_96_29)"
+    },
+    {
+      "line_start": 97,
+      "line_end": 97,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='names', ctx=Load())], keywords=[]), ops=[NotEq()], comparators=[Call(func=Name(id='len', ctx=Load()), args=[Name(id='provided', ctx=Load())], keywords=[])])",
+      "rendered": "len(names) != len(provided)"
+    },
+    {
+      "line_start": 98,
+      "line_end": 98,
+      "column": 32,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[SetComp(elt=Name(id='name', ctx=Load()), generators=[comprehension(target=Name(id='name', ctx=Store()), iter=Name(id='names', ctx=Load()), ifs=[Compare(left=Call(func=Attribute(value=Name(id='names', ctx=Load()), attr='count', ctx=Load()), args=[Name(id='name', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Constant(value=1)])], is_async=0)])], keywords=[])",
+      "rendered": "sorted({name for name in names if names.count(name) > 1})"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_inconclusive', ctx=Load()), args=[JoinedStr(values=[Constant(value='Duplicate criterion evaluations: '), FormattedValue(value=Call(func=Attribute(value=Constant(value=', '), attr='join', ctx=Load()), args=[Name(id='duplicates', ctx=Load())], keywords=[]), conversion=-1), Constant(value='.')])], keywords=[])",
+      "rendered": "_inconclusive(source_template_99_29)"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 11,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 107,
+      "line_end": 107,
+      "column": 13,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0.0)",
+      "rendered": "0.0"
+    },
+    {
+      "line_start": 108,
+      "line_end": 108,
+      "column": 20,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0.0)",
+      "rendered": "0.0"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 21,
+      "kind": "Name",
+      "original_ast": "Name(id='criteria', ctx=Load())",
+      "rendered": "criteria"
+    },
+    {
+      "line_start": 110,
+      "line_end": 110,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='criterion', ctx=Load()), attr='status', ctx=Load()), ops=[Eq()], comparators=[Attribute(value=Attribute(value=Name(id='GateStatus', ctx=Load()), attr='SKIP', ctx=Load()), attr='value', ctx=Load())])",
+      "rendered": "criterion.status == GateStatus.SKIP.value"
+    },
+    {
+      "line_start": 112,
+      "line_end": 112,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='active_weight', ctx=Store()), op=Add(), value=Subscript(value=Attribute(value=Name(id='config', ctx=Load()), attr='weights', ctx=Load()), slice=Attribute(value=Name(id='criterion', ctx=Load()), attr='name', ctx=Load()), ctx=Load()))",
+      "rendered": "active_weight += config.weights[criterion.name]"
+    },
+    {
+      "line_start": 113,
+      "line_end": 115,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='earned', ctx=Store()), op=Add(), value=BinOp(left=Subscript(value=Attribute(value=Name(id='config', ctx=Load()), attr='weights', ctx=Load()), slice=Attribute(value=Name(id='criterion', ctx=Load()), attr='name', ctx=Load()), ctx=Load()), op=Mult(), right=Call(func=Attribute(value=Attribute(value=Name(id='config', ctx=Load()), attr='status_multiplier', ctx=Load()), attr='get', ctx=Load()), args=[Attribute(value=Name(id='criterion', ctx=Load()), attr='status', ctx=Load()), Name(id='SCORE_FLOOR', ctx=Load())], keywords=[])))",
+      "rendered": "earned += config.weights[criterion.name] * config.status_multiplier.get(criterion.status, SCORE_FLOOR)"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='active_weight', ctx=Load()), ops=[LtE()], comparators=[Constant(value=0.0)])",
+      "rendered": "active_weight <= 0.0"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_inconclusive', ctx=Load()), args=[Constant(value='no gates were evaluated.')], keywords=[])",
+      "rendered": "_inconclusive('no gates were evaluated.')"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='round', ctx=Load()), args=[Call(func=Name(id='min', ctx=Load()), args=[BinOp(left=Name(id='earned', ctx=Load()), op=Div(), right=Name(id='active_weight', ctx=Load())), Constant(value=1.0)], keywords=[]), Name(id='SCORE_PRECISION', ctx=Load())], keywords=[])",
+      "rendered": "round(min(earned / active_weight, 1.0), SCORE_PRECISION)"
+    },
+    {
+      "line_start": 122,
+      "line_end": 122,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='frozenset', ctx=Load()), args=[Set(elts=[Attribute(value=Attribute(value=Name(id='GateStatus', ctx=Load()), attr='SKIP', ctx=Load()), attr='value', ctx=Load()), Attribute(value=Attribute(value=Name(id='GateStatus', ctx=Load()), attr='INVALID', ctx=Load()), attr='value', ctx=Load())])], keywords=[])",
+      "rendered": "frozenset({GateStatus.SKIP.value, GateStatus.INVALID.value})"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 29,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='frozenset', ctx=Load()), args=[Set(elts=[Attribute(value=Attribute(value=Name(id='GateStatus', ctx=Load()), attr='PARTIAL', ctx=Load()), attr='value', ctx=Load()), Attribute(value=Attribute(value=Name(id='GateStatus', ctx=Load()), attr='FAIL', ctx=Load()), attr='value', ctx=Load())])], keywords=[])",
+      "rendered": "frozenset({GateStatus.PARTIAL.value, GateStatus.FAIL.value})"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 21,
+      "kind": "Name",
+      "original_ast": "Name(id='criteria', ctx=Load())",
+      "rendered": "criteria"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Attribute(value=Name(id='criterion', ctx=Load()), attr='name', ctx=Load()), ops=[In()], comparators=[Attribute(value=Name(id='config', ctx=Load()), attr='critical_criteria', ctx=Load())]), Compare(left=Attribute(value=Name(id='criterion', ctx=Load()), attr='status', ctx=Load()), ops=[In()], comparators=[Name(id='_UNEVALUATED', ctx=Load())])])",
+      "rendered": "criterion.name in config.critical_criteria and criterion.status in _UNEVALUATED"
+    },
+    {
+      "line_start": 133,
+      "line_end": 136,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_inconclusive', ctx=Load()), args=[JoinedStr(values=[Constant(value=\"critical gate '\"), FormattedValue(value=Attribute(value=Name(id='criterion', ctx=Load()), attr='name', ctx=Load()), conversion=-1), Constant(value=\"' was not evaluated (status '\"), FormattedValue(value=Attribute(value=Name(id='criterion', ctx=Load()), attr='status', ctx=Load()), conversion=-1), Constant(value=\"').\")])], keywords=[])",
+      "rendered": "_inconclusive(source_template_134_16)"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 11,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 142,
+      "line_end": 146,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[GeneratorExp(elt=Attribute(value=Name(id='criterion', ctx=Load()), attr='name', ctx=Load()), generators=[comprehension(target=Name(id='criterion', ctx=Store()), iter=Name(id='criteria', ctx=Load()), ifs=[Compare(left=Attribute(value=Name(id='criterion', ctx=Load()), attr='confidence', ctx=Load()), ops=[Eq()], comparators=[Attribute(value=Attribute(value=Name(id='SynthesisConfidence', ctx=Load()), attr='FLAGGED', ctx=Load()), attr='value', ctx=Load())])], is_async=0)])], keywords=[])",
+      "rendered": "sorted((criterion.name for criterion in criteria if criterion.confidence == SynthesisConfidence.FLAGGED.value))"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='flagged', ctx=Load()))",
+      "rendered": "not flagged"
+    },
+    {
+      "line_start": 148,
+      "line_end": 148,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 149,
+      "line_end": 151,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_inconclusive', ctx=Load()), args=[JoinedStr(values=[Constant(value='Insufficient persona consensus for gate(s): '), FormattedValue(value=Call(func=Attribute(value=Constant(value=', '), attr='join', ctx=Load()), args=[Name(id='flagged', ctx=Load())], keywords=[]), conversion=-1), Constant(value='.')])], keywords=[])",
+      "rendered": "_inconclusive(source_template_150_8)"
+    },
+    {
+      "line_start": 158,
+      "line_end": 158,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[UnaryOp(op=Not(), operand=Attribute(value=Name(id='config', ctx=Load()), attr='verdicts', ctx=Load())), Compare(left=Name(id='decision', ctx=Load()), ops=[IsNot()], comparators=[Attribute(value=Subscript(value=Attribute(value=Name(id='config', ctx=Load()), attr='verdicts', ctx=Load()), slice=Constant(value=0), ctx=Load()), attr='decision', ctx=Load())])])",
+      "rendered": "not config.verdicts or decision is not config.verdicts[0].decision"
+    },
+    {
+      "line_start": 159,
+      "line_end": 159,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='decision', ctx=Load())",
+      "rendered": "decision"
+    },
+    {
+      "line_start": 160,
+      "line_end": 163,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='any', ctx=Load()), args=[GeneratorExp(elt=BoolOp(op=And(), values=[Compare(left=Attribute(value=Name(id='criterion', ctx=Load()), attr='name', ctx=Load()), ops=[In()], comparators=[Attribute(value=Name(id='config', ctx=Load()), attr='critical_criteria', ctx=Load())]), Compare(left=Attribute(value=Name(id='criterion', ctx=Load()), attr='status', ctx=Load()), ops=[In()], comparators=[Name(id='_CRITICAL_NOT_CLEAN', ctx=Load())])]), generators=[comprehension(target=Name(id='criterion', ctx=Store()), iter=Name(id='criteria', ctx=Load()), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "any((criterion.name in config.critical_criteria and criterion.status in _CRITICAL_NOT_CLEAN for criterion in criteria))"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=BoolOp(op=And(), values=[Name(id='not_clean', ctx=Load()), Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='config', ctx=Load()), attr='verdicts', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Constant(value=1)])]), body=Attribute(value=Subscript(value=Attribute(value=Name(id='config', ctx=Load()), attr='verdicts', ctx=Load()), slice=Constant(value=1), ctx=Load()), attr='decision', ctx=Load()), orelse=Name(id='decision', ctx=Load()))",
+      "rendered": "config.verdicts[1].decision if not_clean and len(config.verdicts) > 1 else decision"
+    },
+    {
+      "line_start": 170,
+      "line_end": 172,
+      "column": 8,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Name(id='_shape_error', ctx=Load()), args=[Name(id='config', ctx=Load()), Name(id='criteria', ctx=Load())], keywords=[]), Call(func=Name(id='_consensus_error', ctx=Load()), args=[Name(id='criteria', ctx=Load())], keywords=[]), Call(func=Name(id='_critical_gate_error', ctx=Load()), args=[Name(id='config', ctx=Load()), Name(id='criteria', ctx=Load())], keywords=[])])",
+      "rendered": "_shape_error(config, criteria) or _consensus_error(criteria) or _critical_gate_error(config, criteria)"
+    },
+    {
+      "line_start": 178,
+      "line_end": 178,
+      "column": 16,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='config', ctx=Load()), attr='verdicts', ctx=Load())",
+      "rendered": "config.verdicts"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='raw_score', ctx=Load()), ops=[GtE()], comparators=[Attribute(value=Name(id='rule', ctx=Load()), attr='min_score', ctx=Load())])",
+      "rendered": "raw_score >= rule.min_score"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 19,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='rule', ctx=Load()), attr='decision', ctx=Load())",
+      "rendered": "rule.decision"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 11,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='Decision', ctx=Load()), attr='INCONCLUSIVE', ctx=Load())",
+      "rendered": "Decision.INCONCLUSIVE"
+    },
+    {
+      "line_start": 190,
+      "line_end": 190,
+      "column": 41,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_precheck', ctx=Load()), args=[Name(id='config', ctx=Load()), Name(id='criteria', ctx=Load())], keywords=[])",
+      "rendered": "_precheck(config, criteria)"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='precheck_error', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "precheck_error is not None"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='precheck_error', ctx=Load())",
+      "rendered": "precheck_error"
+    },
+    {
+      "line_start": 193,
+      "line_end": 193,
+      "column": 34,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_renormalized_score', ctx=Load()), args=[Name(id='config', ctx=Load()), Name(id='criteria', ctx=Load())], keywords=[])",
+      "rendered": "_renormalized_score(config, criteria)"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='scored', ctx=Load()), Name(id='ScoreResult', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(scored, ScoreResult)"
+    },
+    {
+      "line_start": 195,
+      "line_end": 195,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='scored', ctx=Load())",
+      "rendered": "scored"
+    },
+    {
+      "line_start": 196,
+      "line_end": 196,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_cap_critical_fail', ctx=Load()), args=[Name(id='config', ctx=Load()), Name(id='criteria', ctx=Load()), Call(func=Name(id='_apply_verdicts', ctx=Load()), args=[Name(id='config', ctx=Load()), Name(id='scored', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "_cap_critical_fail(config, criteria, _apply_verdicts(config, scored))"
+    },
+    {
+      "line_start": 197,
+      "line_end": 197,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ScoreResult', ctx=Load()), args=[], keywords=[keyword(arg='raw_score', value=Name(id='scored', ctx=Load())), keyword(arg='decision', value=Name(id='decision', ctx=Load())), keyword(arg='justification', value=Constant(value=''))])",
+      "rendered": "ScoreResult(raw_score=scored, decision=decision, justification='')"
+    },
+    {
+      "line_start": 198,
+      "line_end": 202,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ScoreResult', ctx=Load()), args=[], keywords=[keyword(arg='raw_score', value=Name(id='scored', ctx=Load())), keyword(arg='decision', value=Name(id='decision', ctx=Load())), keyword(arg='justification', value=Call(func=Attribute(value=Name(id='config', ctx=Load()), attr='justify', ctx=Load()), args=[Name(id='partial', ctx=Load()), Name(id='criteria', ctx=Load()), BoolOp(op=Or(), values=[Name(id='extra', ctx=Load()), Dict(keys=[], values=[])])], keywords=[]))])",
+      "rendered": "ScoreResult(raw_score=scored, decision=decision, justification=config.justify(partial, criteria, extra or {}))"
+    }
+  ],
+  "calls": [
+    {
+      "line": 122,
+      "end_line": 122,
+      "callee": "frozenset",
+      "enclosing": "module initialization",
+      "expression": "frozenset({GateStatus.SKIP.value, GateStatus.INVALID.value})"
+    },
+    {
+      "line": 124,
+      "end_line": 124,
+      "callee": "frozenset",
+      "enclosing": "module initialization",
+      "expression": "frozenset({GateStatus.PARTIAL.value, GateStatus.FAIL.value})"
+    },
+    {
+      "line": 40,
+      "end_line": 40,
+      "callee": "entry.get",
+      "enclosing": "_str_from",
+      "expression": "entry.get(field_key, default)"
+    },
+    {
+      "line": 46,
+      "end_line": 46,
+      "callee": "isinstance",
+      "enclosing": "_int_or_none",
+      "expression": "isinstance(value, bool)"
+    },
+    {
+      "line": 53,
+      "end_line": 57,
+      "callee": "EvidenceAnchor",
+      "enclosing": "_parse_evidence",
+      "expression": "EvidenceAnchor(\n        file=_str_from(entry, \"file\"),\n        line=_int_or_none(entry.get(\"line\")),\n        snippet=_str_from(entry, \"snippet\"),\n    )"
+    },
+    {
+      "line": 62,
+      "end_line": 62,
+      "callee": "entry.get",
+      "enclosing": "parse_raw_criterion",
+      "expression": "entry.get(\"evidence\", [])"
+    },
+    {
+      "line": 64,
+      "end_line": 64,
+      "callee": "isinstance",
+      "enclosing": "parse_raw_criterion",
+      "expression": "isinstance(evidence_raw, list)"
+    },
+    {
+      "line": 70,
+      "end_line": 78,
+      "callee": "RawCriterion",
+      "enclosing": "parse_raw_criterion",
+      "expression": "RawCriterion(\n        name=_str_from(entry, name_field),\n        # Canonicalise status here so a bad/case-variant value never reaches the multiplier.\n        status=GateStatus(_str_from(entry, \"status\")).value,\n        confidence=_str_from(entry, \"confidence\"),\n        summary=_str_from(entry, \"summary\"),\n        details=_str_from(entry, \"details\"),\n        evidence=evidence,\n    )"
+    },
+    {
+      "line": 83,
+      "end_line": 87,
+      "callee": "ScoreResult",
+      "enclosing": "_inconclusive",
+      "expression": "ScoreResult(\n        raw_score=0.0,\n        decision=Decision.INCONCLUSIVE,\n        justification=f\"{INCONCLUSIVE_PREFIX}: {reason}\",\n    )"
+    },
+    {
+      "line": 93,
+      "end_line": 93,
+      "callee": "set",
+      "enclosing": "_shape_error",
+      "expression": "set(names)"
+    },
+    {
+      "line": 119,
+      "end_line": 119,
+      "callee": "round",
+      "enclosing": "_renormalized_score",
+      "expression": "round(min(earned / active_weight, 1.0), SCORE_PRECISION)"
+    },
+    {
+      "line": 142,
+      "end_line": 146,
+      "callee": "sorted",
+      "enclosing": "_consensus_error",
+      "expression": "sorted(\n        criterion.name\n        for criterion in criteria\n        if criterion.confidence == SynthesisConfidence.FLAGGED.value\n    )"
+    },
+    {
+      "line": 149,
+      "end_line": 151,
+      "callee": "_inconclusive",
+      "enclosing": "_consensus_error",
+      "expression": "_inconclusive(\n        f\"Insufficient persona consensus for gate(s): {', '.join(flagged)}.\"\n    )"
+    },
+    {
+      "line": 160,
+      "end_line": 163,
+      "callee": "any",
+      "enclosing": "_cap_critical_fail",
+      "expression": "any(\n        criterion.name in config.critical_criteria and criterion.status in _CRITICAL_NOT_CLEAN\n        for criterion in criteria\n    )"
+    },
+    {
+      "line": 190,
+      "end_line": 190,
+      "callee": "_precheck",
+      "enclosing": "score",
+      "expression": "_precheck(config, criteria)"
+    },
+    {
+      "line": 193,
+      "end_line": 193,
+      "callee": "_renormalized_score",
+      "enclosing": "score",
+      "expression": "_renormalized_score(config, criteria)"
+    },
+    {
+      "line": 194,
+      "end_line": 194,
+      "callee": "isinstance",
+      "enclosing": "score",
+      "expression": "isinstance(scored, ScoreResult)"
+    },
+    {
+      "line": 196,
+      "end_line": 196,
+      "callee": "_cap_critical_fail",
+      "enclosing": "score",
+      "expression": "_cap_critical_fail(config, criteria, _apply_verdicts(config, scored))"
+    },
+    {
+      "line": 197,
+      "end_line": 197,
+      "callee": "ScoreResult",
+      "enclosing": "score",
+      "expression": "ScoreResult(raw_score=scored, decision=decision, justification=\"\")"
+    },
+    {
+      "line": 198,
+      "end_line": 202,
+      "callee": "ScoreResult",
+      "enclosing": "score",
+      "expression": "ScoreResult(\n        raw_score=scored,\n        decision=decision,\n        justification=config.justify(partial, criteria, extra or {}),\n    )"
+    },
+    {
+      "line": 41,
+      "end_line": 41,
+      "callee": "isinstance",
+      "enclosing": "_str_from",
+      "expression": "isinstance(value, str)"
+    },
+    {
+      "line": 48,
+      "end_line": 48,
+      "callee": "isinstance",
+      "enclosing": "_int_or_none",
+      "expression": "isinstance(value, int)"
+    },
+    {
+      "line": 65,
+      "end_line": 69,
+      "callee": "tuple",
+      "enclosing": "parse_raw_criterion",
+      "expression": "tuple(\n            _parse_evidence(evidence_entry)\n            for evidence_entry in evidence_raw\n            if isinstance(evidence_entry, Mapping)\n        )"
+    },
+    {
+      "line": 95,
+      "end_line": 95,
+      "callee": "sorted",
+      "enclosing": "_shape_error",
+      "expression": "sorted(config.expected_criteria - provided)"
+    },
+    {
+      "line": 96,
+      "end_line": 96,
+      "callee": "_inconclusive",
+      "enclosing": "_shape_error",
+      "expression": "_inconclusive(f\"Missing criterion evaluations: {', '.join(missing)}.\")"
+    },
+    {
+      "line": 97,
+      "end_line": 97,
+      "callee": "len",
+      "enclosing": "_shape_error",
+      "expression": "len(names)"
+    },
+    {
+      "line": 97,
+      "end_line": 97,
+      "callee": "len",
+      "enclosing": "_shape_error",
+      "expression": "len(provided)"
+    },
+    {
+      "line": 98,
+      "end_line": 98,
+      "callee": "sorted",
+      "enclosing": "_shape_error",
+      "expression": "sorted({name for name in names if names.count(name) > 1})"
+    },
+    {
+      "line": 99,
+      "end_line": 99,
+      "callee": "_inconclusive",
+      "enclosing": "_shape_error",
+      "expression": "_inconclusive(f\"Duplicate criterion evaluations: {', '.join(duplicates)}.\")"
+    },
+    {
+      "line": 117,
+      "end_line": 117,
+      "callee": "_inconclusive",
+      "enclosing": "_renormalized_score",
+      "expression": "_inconclusive(\"no gates were evaluated.\")"
+    },
+    {
+      "line": 119,
+      "end_line": 119,
+      "callee": "min",
+      "enclosing": "_renormalized_score",
+      "expression": "min(earned / active_weight, 1.0)"
+    },
+    {
+      "line": 170,
+      "end_line": 170,
+      "callee": "_shape_error",
+      "enclosing": "_precheck",
+      "expression": "_shape_error(config, criteria)"
+    },
+    {
+      "line": 171,
+      "end_line": 171,
+      "callee": "_consensus_error",
+      "enclosing": "_precheck",
+      "expression": "_consensus_error(criteria)"
+    },
+    {
+      "line": 172,
+      "end_line": 172,
+      "callee": "_critical_gate_error",
+      "enclosing": "_precheck",
+      "expression": "_critical_gate_error(config, criteria)"
+    },
+    {
+      "line": 196,
+      "end_line": 196,
+      "callee": "_apply_verdicts",
+      "enclosing": "score",
+      "expression": "_apply_verdicts(config, scored)"
+    },
+    {
+      "line": 54,
+      "end_line": 54,
+      "callee": "_str_from",
+      "enclosing": "_parse_evidence",
+      "expression": "_str_from(entry, \"file\")"
+    },
+    {
+      "line": 55,
+      "end_line": 55,
+      "callee": "_int_or_none",
+      "enclosing": "_parse_evidence",
+      "expression": "_int_or_none(entry.get(\"line\"))"
+    },
+    {
+      "line": 56,
+      "end_line": 56,
+      "callee": "_str_from",
+      "enclosing": "_parse_evidence",
+      "expression": "_str_from(entry, \"snippet\")"
+    },
+    {
+      "line": 71,
+      "end_line": 71,
+      "callee": "_str_from",
+      "enclosing": "parse_raw_criterion",
+      "expression": "_str_from(entry, name_field)"
+    },
+    {
+      "line": 74,
+      "end_line": 74,
+      "callee": "_str_from",
+      "enclosing": "parse_raw_criterion",
+      "expression": "_str_from(entry, \"confidence\")"
+    },
+    {
+      "line": 75,
+      "end_line": 75,
+      "callee": "_str_from",
+      "enclosing": "parse_raw_criterion",
+      "expression": "_str_from(entry, \"summary\")"
+    },
+    {
+      "line": 76,
+      "end_line": 76,
+      "callee": "_str_from",
+      "enclosing": "parse_raw_criterion",
+      "expression": "_str_from(entry, \"details\")"
+    },
+    {
+      "line": 113,
+      "end_line": 115,
+      "callee": "config.status_multiplier.get",
+      "enclosing": "_renormalized_score",
+      "expression": "config.status_multiplier.get(\n            criterion.status, SCORE_FLOOR\n        )"
+    },
+    {
+      "line": 133,
+      "end_line": 136,
+      "callee": "_inconclusive",
+      "enclosing": "_critical_gate_error",
+      "expression": "_inconclusive(\n                f\"critical gate '{criterion.name}' was not evaluated \"\n                f\"(status '{criterion.status}').\"\n            )"
+    },
+    {
+      "line": 201,
+      "end_line": 201,
+      "callee": "config.justify",
+      "enclosing": "score",
+      "expression": "config.justify(partial, criteria, extra or {})"
+    },
+    {
+      "line": 55,
+      "end_line": 55,
+      "callee": "entry.get",
+      "enclosing": "_parse_evidence",
+      "expression": "entry.get(\"line\")"
+    },
+    {
+      "line": 66,
+      "end_line": 66,
+      "callee": "_parse_evidence",
+      "enclosing": "parse_raw_criterion",
+      "expression": "_parse_evidence(evidence_entry)"
+    },
+    {
+      "line": 73,
+      "end_line": 73,
+      "callee": "GateStatus",
+      "enclosing": "parse_raw_criterion",
+      "expression": "GateStatus(_str_from(entry, \"status\"))"
+    },
+    {
+      "line": 150,
+      "end_line": 150,
+      "callee": "', '.join",
+      "enclosing": "_consensus_error",
+      "expression": "', '.join(flagged)"
+    },
+    {
+      "line": 164,
+      "end_line": 164,
+      "callee": "len",
+      "enclosing": "_cap_critical_fail",
+      "expression": "len(config.verdicts)"
+    },
+    {
+      "line": 68,
+      "end_line": 68,
+      "callee": "isinstance",
+      "enclosing": "parse_raw_criterion",
+      "expression": "isinstance(evidence_entry, Mapping)"
+    },
+    {
+      "line": 73,
+      "end_line": 73,
+      "callee": "_str_from",
+      "enclosing": "parse_raw_criterion",
+      "expression": "_str_from(entry, \"status\")"
+    },
+    {
+      "line": 96,
+      "end_line": 96,
+      "callee": "', '.join",
+      "enclosing": "_shape_error",
+      "expression": "', '.join(missing)"
+    },
+    {
+      "line": 99,
+      "end_line": 99,
+      "callee": "', '.join",
+      "enclosing": "_shape_error",
+      "expression": "', '.join(duplicates)"
+    },
+    {
+      "line": 98,
+      "end_line": 98,
+      "callee": "names.count",
+      "enclosing": "_shape_error",
+      "expression": "names.count(name)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 17,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "from collections.abc import Mapping",
+      "targets": [
+        "collections.abc",
+        "collections.abc.Mapping"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "from typing import Final",
+      "targets": [
+        "typing",
+        "typing.Final"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "from vvaharness.models import Decision, EvidenceAnchor, GateStatus",
+      "targets": [
+        "vvaharness.models",
+        "vvaharness.models.Decision",
+        "vvaharness.models.EvidenceAnchor",
+        "vvaharness.models.GateStatus"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 23,
+      "source_expression": "from vvaharness.validation.constants.scoring import SCORE_FLOOR, SCORE_PRECISION",
+      "targets": [
+        "vvaharness.validation.constants.scoring",
+        "vvaharness.validation.constants.scoring.SCORE_FLOOR",
+        "vvaharness.validation.constants.scoring.SCORE_PRECISION"
+      ],
+      "local_source_paths": [
+        "vvaharness/validation/constants/scoring.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 24,
+      "source_expression": "from vvaharness.validation.enums.synthesis import SynthesisConfidence",
+      "targets": [
+        "vvaharness.validation.enums.synthesis",
+        "vvaharness.validation.enums.synthesis.SynthesisConfidence"
+      ],
+      "local_source_paths": [
+        "vvaharness/validation/enums/synthesis.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 25,
+      "source_expression": "from vvaharness.validation.models.scoring import RawCriterion, RawExtra, ScoreResult, ScoringConfig",
+      "targets": [
+        "vvaharness.validation.models.scoring",
+        "vvaharness.validation.models.scoring.RawCriterion",
+        "vvaharness.validation.models.scoring.RawExtra",
+        "vvaharness.validation.models.scoring.ScoreResult",
+        "vvaharness.validation.models.scoring.ScoringConfig"
+      ],
+      "local_source_paths": [
+        "vvaharness/validation/models/scoring.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

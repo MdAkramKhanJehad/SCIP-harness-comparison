@@ -1,0 +1,2260 @@
+{
+  "source": "vendor/context_graph_sdk/src/context_graph_sdk/plugins/runner.py",
+  "sha256": "b6859d2c4b9594babbafe3da4f1a767a2cc978cca49cd6cb8fdf54e030dc9d19",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Transactional project-local trusted plugin runner.\"\"\"\n\nfrom __future__ import annotations\n\nimport time\nfrom collections.abc import Callable\nfrom dataclasses import dataclass\n\nfrom context_graph_sdk.errors import ModelValidationError, PluginError\nfrom context_graph_sdk.models import FrozenMap, GraphEdge, GraphMutation, GraphNode, GraphSnapshot\nfrom context_graph_sdk.pipeline import PluginContext, PluginDiagnostic, SourceReader\n\nfrom .base import PluginMetadata, PluginPhase\nfrom .context import BufferedPluginReporter, CancellationToken, PluginLogRecord\nfrom .registry import PluginRegistry\n\nDEFAULT_LOCAL_PLUGIN_TIMEOUT_SECONDS = 300.0\n\n\n@dataclass(frozen=True)\nclass LocalPluginLimits:\n    max_nodes_per_plugin: int = 10_000\n    max_edges_per_plugin: int = 20_000\n    max_removals_per_plugin: int = 20_000\n    max_total_work: int = 50_000\n\n    def __post_init__(self) -> None:\n        if (\n            min(\n                self.max_nodes_per_plugin,\n                self.max_edges_per_plugin,\n                self.max_removals_per_plugin,\n                self.max_total_work,\n            )\n            <= 0\n        ):\n            raise ModelValidationError(\"local plugin limits must be positive\")\n\n\n@dataclass(frozen=True)\nclass LocalPluginResult:\n    snapshot: GraphSnapshot\n    executed: tuple[PluginMetadata, ...]\n    logs: tuple[PluginLogRecord, ...]\n    diagnostics: tuple[PluginDiagnostic, ...]\n\n\nclass LocalPluginRunner:\n    def __init__(self, limits: LocalPluginLimits | None = None) -> None:\n        self._limits = limits or LocalPluginLimits()\n\n    def run(\n        self,\n        snapshot: GraphSnapshot,\n        registry: PluginRegistry,\n        *,\n        source_reader: SourceReader,\n        cancellation: CancellationToken,\n        deadline_monotonic: float,\n        configuration: FrozenMap,\n        derive: Callable[[GraphSnapshot], GraphSnapshot] | None = None,\n    ) -> LocalPluginResult:\n        current = snapshot\n        reporter = BufferedPluginReporter()\n        executed: list[PluginMetadata] = []\n        total_work = 0\n        context_label = (\n            f\"project={snapshot.project.project_id.value},snapshot={snapshot.snapshot_id.value}\"\n        )\n        for phase in (PluginPhase.PRE_DERIVATION, PluginPhase.POST_DERIVATION):\n            for plugin in registry.for_phase(phase):\n                metadata = plugin.metadata\n                self._check_lifecycle(metadata, cancellation, deadline_monotonic, context_label)\n                context = PluginContext(\n                    snapshot.project,\n                    current,\n                    source_reader,\n                    reporter,\n                    cancellation,\n                    configuration,\n                    deadline_monotonic,\n                )\n                try:\n                    mutation = _require_mutation(plugin.enrich(context))\n                    work = self._validate_bounds(mutation)\n                    if total_work + work > self._limits.max_total_work:\n                        raise ModelValidationError(\"aggregate local plugin work exceeds bound\")\n                    candidate = _apply_mutation(current, mutation)\n                    self._check_lifecycle(metadata, cancellation, deadline_monotonic, context_label)\n                except PluginError as exc:\n                    # Preserve runner-created lifecycle errors; recontextualize\n                    # plugin-created errors so registry metadata stays authoritative.\n                    if (\n                        exc.plugin_name == metadata.name\n                        and exc.phase == metadata.phase.value\n                        and exc.context == context_label\n                    ):\n                        raise\n                    raise PluginError(\n                        metadata.name,\n                        metadata.phase.value,\n                        str(exc),\n                        context=context_label,\n                    ) from exc\n                except Exception as exc:\n                    raise PluginError(\n                        metadata.name,\n                        metadata.phase.value,\n                        str(exc),\n                        context=context_label,\n                    ) from exc\n                current = candidate\n                total_work += work\n                executed.append(metadata)\n            if phase == PluginPhase.PRE_DERIVATION and derive is not None:\n                derived = derive(current)\n                if (\n                    derived.project != snapshot.project\n                    or derived.snapshot_id != snapshot.snapshot_id\n                ):\n                    raise ModelValidationError(\n                        \"derived graph changed the candidate project or snapshot identity\"\n                    )\n                current = derived\n        return LocalPluginResult(current, tuple(executed), reporter.logs, reporter.diagnostics)\n\n    def _validate_bounds(self, mutation: GraphMutation) -> int:\n        removals = len(mutation.removed_node_ids) + len(mutation.removed_edge_ids)\n        if len(mutation.nodes) > self._limits.max_nodes_per_plugin:\n            raise ModelValidationError(\"plugin node emission exceeds bound\")\n        if len(mutation.edges) > self._limits.max_edges_per_plugin:\n            raise ModelValidationError(\"plugin edge emission exceeds bound\")\n        if removals > self._limits.max_removals_per_plugin:\n            raise ModelValidationError(\"plugin removal emission exceeds bound\")\n        return len(mutation.nodes) + len(mutation.edges) + removals\n\n    @staticmethod\n    def _check_lifecycle(\n        metadata: PluginMetadata,\n        cancellation: CancellationToken,\n        deadline_monotonic: float,\n        context: str,\n    ) -> None:\n        if cancellation.is_cancelled:\n            raise PluginError(\n                metadata.name,\n                metadata.phase.value,\n                \"plugin execution cancelled\",\n                context=context,\n            )\n        if time.monotonic() >= deadline_monotonic:\n            raise PluginError(\n                metadata.name,\n                metadata.phase.value,\n                \"plugin execution deadline exceeded\",\n                context=context,\n            )\n\n\ndef _require_mutation(value: object) -> GraphMutation:\n    if not isinstance(value, GraphMutation):\n        raise ModelValidationError(\"plugin must return GraphMutation\")\n    return value\n\n\ndef _apply_mutation(snapshot: GraphSnapshot, mutation: GraphMutation) -> GraphSnapshot:\n    if mutation.project_id != snapshot.project.project_id:\n        raise ModelValidationError(\"plugin mutation targets another project\")\n    nodes: dict[str, GraphNode] = {node.id: node for node in snapshot.nodes}\n    edges: dict[str, GraphEdge] = {edge.id: edge for edge in snapshot.edges}\n    missing_nodes = set(mutation.removed_node_ids).difference(nodes)\n    removed_edge_ids = set(mutation.removed_edge_ids)\n    missing_edges = removed_edge_ids.difference(edges)\n    if missing_nodes or missing_edges:\n        raise ModelValidationError(\"plugin mutation removes unknown graph identities\")\n    remaining_edges = {\n        edge_id: edge for edge_id, edge in edges.items() if edge_id not in removed_edge_ids\n    }\n    remaining_endpoints = {\n        endpoint\n        for edge in remaining_edges.values()\n        for endpoint in (edge.source_id, edge.target_id)\n    }\n    for node_id in mutation.removed_node_ids:\n        if node_id in remaining_endpoints:\n            raise ModelValidationError(\n                \"plugin must explicitly remove edges incident to removed nodes\"\n            )\n        del nodes[node_id]\n    for edge_id in mutation.removed_edge_ids:\n        edges.pop(edge_id)\n    for node in mutation.nodes:\n        if node.id in nodes:\n            raise ModelValidationError(\"plugin adds an existing node identity\")\n        nodes[node.id] = node\n    for edge in mutation.edges:\n        if edge.id in edges:\n            raise ModelValidationError(\"plugin adds an existing edge identity\")\n        if edge.source_id not in nodes or edge.target_id not in nodes:\n            raise ModelValidationError(\"plugin edge endpoints must exist in the candidate graph\")\n        edges[edge.id] = edge\n    return GraphSnapshot(\n        snapshot.project,\n        snapshot.snapshot_id,\n        snapshot.analysis_version,\n        tuple(nodes.values()),\n        tuple(edges.values()),\n    )\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/plugins/runner.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "Transactional project-local trusted plugin runner.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_82_12": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/plugins/runner.py",
+      "line_start": 82,
+      "line_end": 82,
+      "source_expression": "f\"project={snapshot.project.project_id.value},snapshot={snapshot.snapshot_id.value}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "Transactional project-local trusted plugin runner.",
+      "context": "literal"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 14,
+      "value": "project=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 57,
+      "value": ",snapshot=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 176,
+      "line_end": 176,
+      "column": 35,
+      "value": "plugin must return GraphMutation",
+      "context": "literal"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 35,
+      "value": "plugin mutation targets another project",
+      "context": "literal"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 35,
+      "value": "plugin mutation removes unknown graph identities",
+      "context": "literal"
+    },
+    {
+      "line_start": 51,
+      "line_end": 51,
+      "column": 39,
+      "value": "local plugin limits must be positive",
+      "context": "literal"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 39,
+      "value": "plugin node emission exceeds bound",
+      "context": "literal"
+    },
+    {
+      "line_start": 146,
+      "line_end": 146,
+      "column": 39,
+      "value": "plugin edge emission exceeds bound",
+      "context": "literal"
+    },
+    {
+      "line_start": 148,
+      "line_end": 148,
+      "column": 39,
+      "value": "plugin removal emission exceeds bound",
+      "context": "literal"
+    },
+    {
+      "line_start": 162,
+      "line_end": 162,
+      "column": 16,
+      "value": "plugin execution cancelled",
+      "context": "literal"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 16,
+      "value": "plugin execution deadline exceeded",
+      "context": "literal"
+    },
+    {
+      "line_start": 201,
+      "line_end": 201,
+      "column": 16,
+      "value": "plugin must explicitly remove edges incident to removed nodes",
+      "context": "literal"
+    },
+    {
+      "line_start": 208,
+      "line_end": 208,
+      "column": 39,
+      "value": "plugin adds an existing node identity",
+      "context": "literal"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 39,
+      "value": "plugin adds an existing edge identity",
+      "context": "literal"
+    },
+    {
+      "line_start": 214,
+      "line_end": 214,
+      "column": 39,
+      "value": "plugin edge endpoints must exist in the candidate graph",
+      "context": "literal"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 24,
+      "value": "derived graph changed the candidate project or snapshot identity",
+      "context": "literal"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 51,
+      "value": "aggregate local plugin work exceeds bound",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 105,
+      "text": "# Preserve runner-created lifecycle errors; recontextualize"
+    },
+    {
+      "line": 106,
+      "text": "# plugin-created errors so registry metadata stays authoritative."
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 23,
+      "line_end": 23,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 27,
+      "line_end": 27,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 28,
+      "line_end": 28,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 29,
+      "line_end": 29,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 31,
+      "line_end": 31,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 35,
+      "line_end": 51,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 7
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 36,
+      "line_end": 36,
+      "column": 4,
+      "owner": "LocalPluginLimits",
+      "representation_line": 15
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 37,
+      "line_end": 37,
+      "column": 4,
+      "owner": "LocalPluginLimits",
+      "representation_line": 15
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 38,
+      "line_end": 38,
+      "column": 4,
+      "owner": "LocalPluginLimits",
+      "representation_line": 15
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 39,
+      "line_end": 39,
+      "column": 4,
+      "owner": "LocalPluginLimits",
+      "representation_line": 15
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 41,
+      "line_end": 51,
+      "column": 4,
+      "owner": "LocalPluginLimits",
+      "representation_line": 16
+    },
+    {
+      "kind": "If",
+      "line_start": 42,
+      "line_end": 51,
+      "column": 8,
+      "owner": "LocalPluginLimits.__post_init__",
+      "representation_line": 21
+    },
+    {
+      "kind": "Raise",
+      "line_start": 51,
+      "line_end": 51,
+      "column": 12,
+      "owner": "LocalPluginLimits.__post_init__",
+      "representation_line": 23
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 55,
+      "line_end": 59,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 30
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 56,
+      "line_end": 56,
+      "column": 4,
+      "owner": "LocalPluginResult",
+      "representation_line": 38
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 57,
+      "line_end": 57,
+      "column": 4,
+      "owner": "LocalPluginResult",
+      "representation_line": 38
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 58,
+      "line_end": 58,
+      "column": 4,
+      "owner": "LocalPluginResult",
+      "representation_line": 38
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 59,
+      "line_end": 59,
+      "column": 4,
+      "owner": "LocalPluginResult",
+      "representation_line": 38
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 62,
+      "line_end": 171,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 41
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 63,
+      "line_end": 64,
+      "column": 4,
+      "owner": "LocalPluginRunner",
+      "representation_line": 45
+    },
+    {
+      "kind": "Assign",
+      "line_start": 64,
+      "line_end": 64,
+      "column": 8,
+      "owner": "LocalPluginRunner.__init__",
+      "representation_line": 51
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 66,
+      "line_end": 139,
+      "column": 4,
+      "owner": "LocalPluginRunner",
+      "representation_line": 54
+    },
+    {
+      "kind": "Assign",
+      "line_start": 77,
+      "line_end": 77,
+      "column": 8,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 60
+    },
+    {
+      "kind": "Assign",
+      "line_start": 78,
+      "line_end": 78,
+      "column": 8,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 60
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 79,
+      "line_end": 79,
+      "column": 8,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 60
+    },
+    {
+      "kind": "Assign",
+      "line_start": 80,
+      "line_end": 80,
+      "column": 8,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 60
+    },
+    {
+      "kind": "Assign",
+      "line_start": 81,
+      "line_end": 83,
+      "column": 8,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 60
+    },
+    {
+      "kind": "For",
+      "line_start": 84,
+      "line_end": 138,
+      "column": 8,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 61
+    },
+    {
+      "kind": "For",
+      "line_start": 85,
+      "line_end": 128,
+      "column": 12,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 63
+    },
+    {
+      "kind": "Assign",
+      "line_start": 86,
+      "line_end": 86,
+      "column": 16,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 66
+    },
+    {
+      "kind": "Expr",
+      "line_start": 87,
+      "line_end": 87,
+      "column": 16,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 66
+    },
+    {
+      "kind": "Assign",
+      "line_start": 88,
+      "line_end": 96,
+      "column": 16,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 66
+    },
+    {
+      "kind": "Try",
+      "line_start": 97,
+      "line_end": 125,
+      "column": 16,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 67
+    },
+    {
+      "kind": "Assign",
+      "line_start": 98,
+      "line_end": 98,
+      "column": 20,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 70
+    },
+    {
+      "kind": "Assign",
+      "line_start": 99,
+      "line_end": 99,
+      "column": 20,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 70
+    },
+    {
+      "kind": "If",
+      "line_start": 100,
+      "line_end": 101,
+      "column": 20,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 71
+    },
+    {
+      "kind": "Raise",
+      "line_start": 101,
+      "line_end": 101,
+      "column": 24,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 73
+    },
+    {
+      "kind": "Assign",
+      "line_start": 102,
+      "line_end": 102,
+      "column": 20,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 77
+    },
+    {
+      "kind": "Expr",
+      "line_start": 103,
+      "line_end": 103,
+      "column": 20,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 77
+    },
+    {
+      "kind": "If",
+      "line_start": 107,
+      "line_end": 112,
+      "column": 20,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 81
+    },
+    {
+      "kind": "Raise",
+      "line_start": 112,
+      "line_end": 112,
+      "column": 24,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 83
+    },
+    {
+      "kind": "Raise",
+      "line_start": 113,
+      "line_end": 118,
+      "column": 20,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 86
+    },
+    {
+      "kind": "Raise",
+      "line_start": 120,
+      "line_end": 125,
+      "column": 20,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 91
+    },
+    {
+      "kind": "Assign",
+      "line_start": 126,
+      "line_end": 126,
+      "column": 16,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 95
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 127,
+      "line_end": 127,
+      "column": 16,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 95
+    },
+    {
+      "kind": "Expr",
+      "line_start": 128,
+      "line_end": 128,
+      "column": 16,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 95
+    },
+    {
+      "kind": "If",
+      "line_start": 129,
+      "line_end": 138,
+      "column": 12,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 97
+    },
+    {
+      "kind": "Assign",
+      "line_start": 130,
+      "line_end": 130,
+      "column": 16,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 100
+    },
+    {
+      "kind": "If",
+      "line_start": 131,
+      "line_end": 137,
+      "column": 16,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 101
+    },
+    {
+      "kind": "Raise",
+      "line_start": 135,
+      "line_end": 137,
+      "column": 20,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 103
+    },
+    {
+      "kind": "Assign",
+      "line_start": 138,
+      "line_end": 138,
+      "column": 16,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 107
+    },
+    {
+      "kind": "Return",
+      "line_start": 139,
+      "line_end": 139,
+      "column": 8,
+      "owner": "LocalPluginRunner.run",
+      "representation_line": 110
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 141,
+      "line_end": 149,
+      "column": 4,
+      "owner": "LocalPluginRunner",
+      "representation_line": 114
+    },
+    {
+      "kind": "Assign",
+      "line_start": 142,
+      "line_end": 142,
+      "column": 8,
+      "owner": "LocalPluginRunner._validate_bounds",
+      "representation_line": 120
+    },
+    {
+      "kind": "If",
+      "line_start": 143,
+      "line_end": 144,
+      "column": 8,
+      "owner": "LocalPluginRunner._validate_bounds",
+      "representation_line": 121
+    },
+    {
+      "kind": "Raise",
+      "line_start": 144,
+      "line_end": 144,
+      "column": 12,
+      "owner": "LocalPluginRunner._validate_bounds",
+      "representation_line": 123
+    },
+    {
+      "kind": "If",
+      "line_start": 145,
+      "line_end": 146,
+      "column": 8,
+      "owner": "LocalPluginRunner._validate_bounds",
+      "representation_line": 126
+    },
+    {
+      "kind": "Raise",
+      "line_start": 146,
+      "line_end": 146,
+      "column": 12,
+      "owner": "LocalPluginRunner._validate_bounds",
+      "representation_line": 128
+    },
+    {
+      "kind": "If",
+      "line_start": 147,
+      "line_end": 148,
+      "column": 8,
+      "owner": "LocalPluginRunner._validate_bounds",
+      "representation_line": 131
+    },
+    {
+      "kind": "Raise",
+      "line_start": 148,
+      "line_end": 148,
+      "column": 12,
+      "owner": "LocalPluginRunner._validate_bounds",
+      "representation_line": 133
+    },
+    {
+      "kind": "Return",
+      "line_start": 149,
+      "line_end": 149,
+      "column": 8,
+      "owner": "LocalPluginRunner._validate_bounds",
+      "representation_line": 136
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 152,
+      "line_end": 171,
+      "column": 4,
+      "owner": "LocalPluginRunner",
+      "representation_line": 140
+    },
+    {
+      "kind": "If",
+      "line_start": 158,
+      "line_end": 164,
+      "column": 8,
+      "owner": "LocalPluginRunner._check_lifecycle",
+      "representation_line": 148
+    },
+    {
+      "kind": "Raise",
+      "line_start": 159,
+      "line_end": 164,
+      "column": 12,
+      "owner": "LocalPluginRunner._check_lifecycle",
+      "representation_line": 150
+    },
+    {
+      "kind": "If",
+      "line_start": 165,
+      "line_end": 171,
+      "column": 8,
+      "owner": "LocalPluginRunner._check_lifecycle",
+      "representation_line": 153
+    },
+    {
+      "kind": "Raise",
+      "line_start": 166,
+      "line_end": 171,
+      "column": 12,
+      "owner": "LocalPluginRunner._check_lifecycle",
+      "representation_line": 155
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 174,
+      "line_end": 177,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 162
+    },
+    {
+      "kind": "If",
+      "line_start": 175,
+      "line_end": 176,
+      "column": 4,
+      "owner": "_require_mutation",
+      "representation_line": 167
+    },
+    {
+      "kind": "Raise",
+      "line_start": 176,
+      "line_end": 176,
+      "column": 8,
+      "owner": "_require_mutation",
+      "representation_line": 169
+    },
+    {
+      "kind": "Return",
+      "line_start": 177,
+      "line_end": 177,
+      "column": 4,
+      "owner": "_require_mutation",
+      "representation_line": 172
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 180,
+      "line_end": 222,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 176
+    },
+    {
+      "kind": "If",
+      "line_start": 181,
+      "line_end": 182,
+      "column": 4,
+      "owner": "_apply_mutation",
+      "representation_line": 181
+    },
+    {
+      "kind": "Raise",
+      "line_start": 182,
+      "line_end": 182,
+      "column": 8,
+      "owner": "_apply_mutation",
+      "representation_line": 183
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 183,
+      "line_end": 183,
+      "column": 4,
+      "owner": "_apply_mutation",
+      "representation_line": 187
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 184,
+      "line_end": 184,
+      "column": 4,
+      "owner": "_apply_mutation",
+      "representation_line": 187
+    },
+    {
+      "kind": "Assign",
+      "line_start": 185,
+      "line_end": 185,
+      "column": 4,
+      "owner": "_apply_mutation",
+      "representation_line": 187
+    },
+    {
+      "kind": "Assign",
+      "line_start": 186,
+      "line_end": 186,
+      "column": 4,
+      "owner": "_apply_mutation",
+      "representation_line": 187
+    },
+    {
+      "kind": "Assign",
+      "line_start": 187,
+      "line_end": 187,
+      "column": 4,
+      "owner": "_apply_mutation",
+      "representation_line": 187
+    },
+    {
+      "kind": "If",
+      "line_start": 188,
+      "line_end": 189,
+      "column": 4,
+      "owner": "_apply_mutation",
+      "representation_line": 188
+    },
+    {
+      "kind": "Raise",
+      "line_start": 189,
+      "line_end": 189,
+      "column": 8,
+      "owner": "_apply_mutation",
+      "representation_line": 190
+    },
+    {
+      "kind": "Assign",
+      "line_start": 190,
+      "line_end": 192,
+      "column": 4,
+      "owner": "_apply_mutation",
+      "representation_line": 194
+    },
+    {
+      "kind": "Assign",
+      "line_start": 193,
+      "line_end": 197,
+      "column": 4,
+      "owner": "_apply_mutation",
+      "representation_line": 194
+    },
+    {
+      "kind": "For",
+      "line_start": 198,
+      "line_end": 203,
+      "column": 4,
+      "owner": "_apply_mutation",
+      "representation_line": 195
+    },
+    {
+      "kind": "If",
+      "line_start": 199,
+      "line_end": 202,
+      "column": 8,
+      "owner": "_apply_mutation",
+      "representation_line": 197
+    },
+    {
+      "kind": "Raise",
+      "line_start": 200,
+      "line_end": 202,
+      "column": 12,
+      "owner": "_apply_mutation",
+      "representation_line": 199
+    },
+    {
+      "kind": "Delete",
+      "line_start": 203,
+      "line_end": 203,
+      "column": 8,
+      "owner": "_apply_mutation",
+      "representation_line": 203
+    },
+    {
+      "kind": "For",
+      "line_start": 204,
+      "line_end": 205,
+      "column": 4,
+      "owner": "_apply_mutation",
+      "representation_line": 205
+    },
+    {
+      "kind": "Expr",
+      "line_start": 205,
+      "line_end": 205,
+      "column": 8,
+      "owner": "_apply_mutation",
+      "representation_line": 208
+    },
+    {
+      "kind": "For",
+      "line_start": 206,
+      "line_end": 209,
+      "column": 4,
+      "owner": "_apply_mutation",
+      "representation_line": 210
+    },
+    {
+      "kind": "If",
+      "line_start": 207,
+      "line_end": 208,
+      "column": 8,
+      "owner": "_apply_mutation",
+      "representation_line": 212
+    },
+    {
+      "kind": "Raise",
+      "line_start": 208,
+      "line_end": 208,
+      "column": 12,
+      "owner": "_apply_mutation",
+      "representation_line": 214
+    },
+    {
+      "kind": "Assign",
+      "line_start": 209,
+      "line_end": 209,
+      "column": 8,
+      "owner": "_apply_mutation",
+      "representation_line": 218
+    },
+    {
+      "kind": "For",
+      "line_start": 210,
+      "line_end": 215,
+      "column": 4,
+      "owner": "_apply_mutation",
+      "representation_line": 220
+    },
+    {
+      "kind": "If",
+      "line_start": 211,
+      "line_end": 212,
+      "column": 8,
+      "owner": "_apply_mutation",
+      "representation_line": 222
+    },
+    {
+      "kind": "Raise",
+      "line_start": 212,
+      "line_end": 212,
+      "column": 12,
+      "owner": "_apply_mutation",
+      "representation_line": 224
+    },
+    {
+      "kind": "If",
+      "line_start": 213,
+      "line_end": 214,
+      "column": 8,
+      "owner": "_apply_mutation",
+      "representation_line": 227
+    },
+    {
+      "kind": "Raise",
+      "line_start": 214,
+      "line_end": 214,
+      "column": 12,
+      "owner": "_apply_mutation",
+      "representation_line": 229
+    },
+    {
+      "kind": "Assign",
+      "line_start": 215,
+      "line_end": 215,
+      "column": 8,
+      "owner": "_apply_mutation",
+      "representation_line": 233
+    },
+    {
+      "kind": "Return",
+      "line_start": 216,
+      "line_end": 222,
+      "column": 4,
+      "owner": "_apply_mutation",
+      "representation_line": 235
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 31,
+      "line_end": 31,
+      "column": 39,
+      "kind": "Constant",
+      "original_ast": "Constant(value=300.0)",
+      "rendered": "300.0"
+    },
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 1,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dataclass', ctx=Load()), args=[], keywords=[keyword(arg='frozen', value=Constant(value=True))])",
+      "rendered": "dataclass(frozen=True)"
+    },
+    {
+      "line_start": 36,
+      "line_end": 36,
+      "column": 32,
+      "kind": "Constant",
+      "original_ast": "Constant(value=10000)",
+      "rendered": "10000"
+    },
+    {
+      "line_start": 37,
+      "line_end": 37,
+      "column": 32,
+      "kind": "Constant",
+      "original_ast": "Constant(value=20000)",
+      "rendered": "20000"
+    },
+    {
+      "line_start": 38,
+      "line_end": 38,
+      "column": 35,
+      "kind": "Constant",
+      "original_ast": "Constant(value=20000)",
+      "rendered": "20000"
+    },
+    {
+      "line_start": 39,
+      "line_end": 39,
+      "column": 26,
+      "kind": "Constant",
+      "original_ast": "Constant(value=50000)",
+      "rendered": "50000"
+    },
+    {
+      "line_start": 43,
+      "line_end": 49,
+      "column": 12,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='min', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='max_nodes_per_plugin', ctx=Load()), Attribute(value=Name(id='self', ctx=Load()), attr='max_edges_per_plugin', ctx=Load()), Attribute(value=Name(id='self', ctx=Load()), attr='max_removals_per_plugin', ctx=Load()), Attribute(value=Name(id='self', ctx=Load()), attr='max_total_work', ctx=Load())], keywords=[]), ops=[LtE()], comparators=[Constant(value=0)])",
+      "rendered": "min(self.max_nodes_per_plugin, self.max_edges_per_plugin, self.max_removals_per_plugin, self.max_total_work) <= 0"
+    },
+    {
+      "line_start": 51,
+      "line_end": 51,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='local plugin limits must be positive')], keywords=[])",
+      "rendered": "ModelValidationError('local plugin limits must be positive')"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 1,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dataclass', ctx=Load()), args=[], keywords=[keyword(arg='frozen', value=Constant(value=True))])",
+      "rendered": "dataclass(frozen=True)"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 23,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Name(id='limits', ctx=Load()), Call(func=Name(id='LocalPluginLimits', ctx=Load()), args=[], keywords=[])])",
+      "rendered": "limits or LocalPluginLimits()"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 18,
+      "kind": "Name",
+      "original_ast": "Name(id='snapshot', ctx=Load())",
+      "rendered": "snapshot"
+    },
+    {
+      "line_start": 78,
+      "line_end": 78,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='BufferedPluginReporter', ctx=Load()), args=[], keywords=[])",
+      "rendered": "BufferedPluginReporter()"
+    },
+    {
+      "line_start": 79,
+      "line_end": 79,
+      "column": 41,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 21,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 12,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[Constant(value='project='), FormattedValue(value=Attribute(value=Attribute(value=Attribute(value=Name(id='snapshot', ctx=Load()), attr='project', ctx=Load()), attr='project_id', ctx=Load()), attr='value', ctx=Load()), conversion=-1), Constant(value=',snapshot='), FormattedValue(value=Attribute(value=Attribute(value=Name(id='snapshot', ctx=Load()), attr='snapshot_id', ctx=Load()), attr='value', ctx=Load()), conversion=-1)])",
+      "rendered": "source_template_82_12"
+    },
+    {
+      "line_start": 84,
+      "line_end": 84,
+      "column": 21,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Attribute(value=Name(id='PluginPhase', ctx=Load()), attr='PRE_DERIVATION', ctx=Load()), Attribute(value=Name(id='PluginPhase', ctx=Load()), attr='POST_DERIVATION', ctx=Load())], ctx=Load())",
+      "rendered": "(PluginPhase.PRE_DERIVATION, PluginPhase.POST_DERIVATION)"
+    },
+    {
+      "line_start": 85,
+      "line_end": 85,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='registry', ctx=Load()), attr='for_phase', ctx=Load()), args=[Name(id='phase', ctx=Load())], keywords=[])",
+      "rendered": "registry.for_phase(phase)"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 27,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='plugin', ctx=Load()), attr='metadata', ctx=Load())",
+      "rendered": "plugin.metadata"
+    },
+    {
+      "line_start": 87,
+      "line_end": 87,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_check_lifecycle', ctx=Load()), args=[Name(id='metadata', ctx=Load()), Name(id='cancellation', ctx=Load()), Name(id='deadline_monotonic', ctx=Load()), Name(id='context_label', ctx=Load())], keywords=[])",
+      "rendered": "self._check_lifecycle(metadata, cancellation, deadline_monotonic, context_label)"
+    },
+    {
+      "line_start": 88,
+      "line_end": 96,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='PluginContext', ctx=Load()), args=[Attribute(value=Name(id='snapshot', ctx=Load()), attr='project', ctx=Load()), Name(id='current', ctx=Load()), Name(id='source_reader', ctx=Load()), Name(id='reporter', ctx=Load()), Name(id='cancellation', ctx=Load()), Name(id='configuration', ctx=Load()), Name(id='deadline_monotonic', ctx=Load())], keywords=[])",
+      "rendered": "PluginContext(snapshot.project, current, source_reader, reporter, cancellation, configuration, deadline_monotonic)"
+    },
+    {
+      "line_start": 98,
+      "line_end": 98,
+      "column": 31,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_require_mutation', ctx=Load()), args=[Call(func=Attribute(value=Name(id='plugin', ctx=Load()), attr='enrich', ctx=Load()), args=[Name(id='context', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "_require_mutation(plugin.enrich(context))"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 27,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_validate_bounds', ctx=Load()), args=[Name(id='mutation', ctx=Load())], keywords=[])",
+      "rendered": "self._validate_bounds(mutation)"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 23,
+      "kind": "Compare",
+      "original_ast": "Compare(left=BinOp(left=Name(id='total_work', ctx=Load()), op=Add(), right=Name(id='work', ctx=Load())), ops=[Gt()], comparators=[Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_limits', ctx=Load()), attr='max_total_work', ctx=Load())])",
+      "rendered": "total_work + work > self._limits.max_total_work"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 30,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='aggregate local plugin work exceeds bound')], keywords=[])",
+      "rendered": "ModelValidationError('aggregate local plugin work exceeds bound')"
+    },
+    {
+      "line_start": 102,
+      "line_end": 102,
+      "column": 32,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_apply_mutation', ctx=Load()), args=[Name(id='current', ctx=Load()), Name(id='mutation', ctx=Load())], keywords=[])",
+      "rendered": "_apply_mutation(current, mutation)"
+    },
+    {
+      "line_start": 103,
+      "line_end": 103,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_check_lifecycle', ctx=Load()), args=[Name(id='metadata', ctx=Load()), Name(id='cancellation', ctx=Load()), Name(id='deadline_monotonic', ctx=Load()), Name(id='context_label', ctx=Load())], keywords=[])",
+      "rendered": "self._check_lifecycle(metadata, cancellation, deadline_monotonic, context_label)"
+    },
+    {
+      "line_start": 104,
+      "line_end": 104,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='PluginError', ctx=Load())",
+      "rendered": "PluginError"
+    },
+    {
+      "line_start": 108,
+      "line_end": 110,
+      "column": 24,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Attribute(value=Name(id='exc', ctx=Load()), attr='plugin_name', ctx=Load()), ops=[Eq()], comparators=[Attribute(value=Name(id='metadata', ctx=Load()), attr='name', ctx=Load())]), Compare(left=Attribute(value=Name(id='exc', ctx=Load()), attr='phase', ctx=Load()), ops=[Eq()], comparators=[Attribute(value=Attribute(value=Name(id='metadata', ctx=Load()), attr='phase', ctx=Load()), attr='value', ctx=Load())]), Compare(left=Attribute(value=Name(id='exc', ctx=Load()), attr='context', ctx=Load()), ops=[Eq()], comparators=[Name(id='context_label', ctx=Load())])])",
+      "rendered": "exc.plugin_name == metadata.name and exc.phase == metadata.phase.value and (exc.context == context_label)"
+    },
+    {
+      "line_start": 113,
+      "line_end": 118,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='PluginError', ctx=Load()), args=[Attribute(value=Name(id='metadata', ctx=Load()), attr='name', ctx=Load()), Attribute(value=Attribute(value=Name(id='metadata', ctx=Load()), attr='phase', ctx=Load()), attr='value', ctx=Load()), Call(func=Name(id='str', ctx=Load()), args=[Name(id='exc', ctx=Load())], keywords=[])], keywords=[keyword(arg='context', value=Name(id='context_label', ctx=Load()))])",
+      "rendered": "PluginError(metadata.name, metadata.phase.value, str(exc), context=context_label)"
+    },
+    {
+      "line_start": 118,
+      "line_end": 118,
+      "column": 27,
+      "kind": "Name",
+      "original_ast": "Name(id='exc', ctx=Load())",
+      "rendered": "exc"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 120,
+      "line_end": 125,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='PluginError', ctx=Load()), args=[Attribute(value=Name(id='metadata', ctx=Load()), attr='name', ctx=Load()), Attribute(value=Attribute(value=Name(id='metadata', ctx=Load()), attr='phase', ctx=Load()), attr='value', ctx=Load()), Call(func=Name(id='str', ctx=Load()), args=[Name(id='exc', ctx=Load())], keywords=[])], keywords=[keyword(arg='context', value=Name(id='context_label', ctx=Load()))])",
+      "rendered": "PluginError(metadata.name, metadata.phase.value, str(exc), context=context_label)"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 27,
+      "kind": "Name",
+      "original_ast": "Name(id='exc', ctx=Load())",
+      "rendered": "exc"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 26,
+      "kind": "Name",
+      "original_ast": "Name(id='candidate', ctx=Load())",
+      "rendered": "candidate"
+    },
+    {
+      "line_start": 127,
+      "line_end": 127,
+      "column": 16,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='total_work', ctx=Store()), op=Add(), value=Name(id='work', ctx=Load()))",
+      "rendered": "total_work += work"
+    },
+    {
+      "line_start": 128,
+      "line_end": 128,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='executed', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='metadata', ctx=Load())], keywords=[])",
+      "rendered": "executed.append(metadata)"
+    },
+    {
+      "line_start": 129,
+      "line_end": 129,
+      "column": 15,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='phase', ctx=Load()), ops=[Eq()], comparators=[Attribute(value=Name(id='PluginPhase', ctx=Load()), attr='PRE_DERIVATION', ctx=Load())]), Compare(left=Name(id='derive', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])])",
+      "rendered": "phase == PluginPhase.PRE_DERIVATION and derive is not None"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='derive', ctx=Load()), args=[Name(id='current', ctx=Load())], keywords=[])",
+      "rendered": "derive(current)"
+    },
+    {
+      "line_start": 132,
+      "line_end": 133,
+      "column": 20,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Compare(left=Attribute(value=Name(id='derived', ctx=Load()), attr='project', ctx=Load()), ops=[NotEq()], comparators=[Attribute(value=Name(id='snapshot', ctx=Load()), attr='project', ctx=Load())]), Compare(left=Attribute(value=Name(id='derived', ctx=Load()), attr='snapshot_id', ctx=Load()), ops=[NotEq()], comparators=[Attribute(value=Name(id='snapshot', ctx=Load()), attr='snapshot_id', ctx=Load())])])",
+      "rendered": "derived.project != snapshot.project or derived.snapshot_id != snapshot.snapshot_id"
+    },
+    {
+      "line_start": 135,
+      "line_end": 137,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='derived graph changed the candidate project or snapshot identity')], keywords=[])",
+      "rendered": "ModelValidationError('derived graph changed the candidate project or snapshot identity')"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 26,
+      "kind": "Name",
+      "original_ast": "Name(id='derived', ctx=Load())",
+      "rendered": "derived"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='LocalPluginResult', ctx=Load()), args=[Name(id='current', ctx=Load()), Call(func=Name(id='tuple', ctx=Load()), args=[Name(id='executed', ctx=Load())], keywords=[]), Attribute(value=Name(id='reporter', ctx=Load()), attr='logs', ctx=Load()), Attribute(value=Name(id='reporter', ctx=Load()), attr='diagnostics', ctx=Load())], keywords=[])",
+      "rendered": "LocalPluginResult(current, tuple(executed), reporter.logs, reporter.diagnostics)"
+    },
+    {
+      "line_start": 142,
+      "line_end": 142,
+      "column": 19,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='mutation', ctx=Load()), attr='removed_node_ids', ctx=Load())], keywords=[]), op=Add(), right=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='mutation', ctx=Load()), attr='removed_edge_ids', ctx=Load())], keywords=[]))",
+      "rendered": "len(mutation.removed_node_ids) + len(mutation.removed_edge_ids)"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='mutation', ctx=Load()), attr='nodes', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_limits', ctx=Load()), attr='max_nodes_per_plugin', ctx=Load())])",
+      "rendered": "len(mutation.nodes) > self._limits.max_nodes_per_plugin"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='plugin node emission exceeds bound')], keywords=[])",
+      "rendered": "ModelValidationError('plugin node emission exceeds bound')"
+    },
+    {
+      "line_start": 145,
+      "line_end": 145,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='mutation', ctx=Load()), attr='edges', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_limits', ctx=Load()), attr='max_edges_per_plugin', ctx=Load())])",
+      "rendered": "len(mutation.edges) > self._limits.max_edges_per_plugin"
+    },
+    {
+      "line_start": 146,
+      "line_end": 146,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='plugin edge emission exceeds bound')], keywords=[])",
+      "rendered": "ModelValidationError('plugin edge emission exceeds bound')"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='removals', ctx=Load()), ops=[Gt()], comparators=[Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_limits', ctx=Load()), attr='max_removals_per_plugin', ctx=Load())])",
+      "rendered": "removals > self._limits.max_removals_per_plugin"
+    },
+    {
+      "line_start": 148,
+      "line_end": 148,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='plugin removal emission exceeds bound')], keywords=[])",
+      "rendered": "ModelValidationError('plugin removal emission exceeds bound')"
+    },
+    {
+      "line_start": 149,
+      "line_end": 149,
+      "column": 15,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=BinOp(left=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='mutation', ctx=Load()), attr='nodes', ctx=Load())], keywords=[]), op=Add(), right=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='mutation', ctx=Load()), attr='edges', ctx=Load())], keywords=[])), op=Add(), right=Name(id='removals', ctx=Load()))",
+      "rendered": "len(mutation.nodes) + len(mutation.edges) + removals"
+    },
+    {
+      "line_start": 151,
+      "line_end": 151,
+      "column": 5,
+      "kind": "Name",
+      "original_ast": "Name(id='staticmethod', ctx=Load())",
+      "rendered": "staticmethod"
+    },
+    {
+      "line_start": 158,
+      "line_end": 158,
+      "column": 11,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='cancellation', ctx=Load()), attr='is_cancelled', ctx=Load())",
+      "rendered": "cancellation.is_cancelled"
+    },
+    {
+      "line_start": 159,
+      "line_end": 164,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='PluginError', ctx=Load()), args=[Attribute(value=Name(id='metadata', ctx=Load()), attr='name', ctx=Load()), Attribute(value=Attribute(value=Name(id='metadata', ctx=Load()), attr='phase', ctx=Load()), attr='value', ctx=Load()), Constant(value='plugin execution cancelled')], keywords=[keyword(arg='context', value=Name(id='context', ctx=Load()))])",
+      "rendered": "PluginError(metadata.name, metadata.phase.value, 'plugin execution cancelled', context=context)"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Attribute(value=Name(id='time', ctx=Load()), attr='monotonic', ctx=Load()), args=[], keywords=[]), ops=[GtE()], comparators=[Name(id='deadline_monotonic', ctx=Load())])",
+      "rendered": "time.monotonic() >= deadline_monotonic"
+    },
+    {
+      "line_start": 166,
+      "line_end": 171,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='PluginError', ctx=Load()), args=[Attribute(value=Name(id='metadata', ctx=Load()), attr='name', ctx=Load()), Attribute(value=Attribute(value=Name(id='metadata', ctx=Load()), attr='phase', ctx=Load()), attr='value', ctx=Load()), Constant(value='plugin execution deadline exceeded')], keywords=[keyword(arg='context', value=Name(id='context', ctx=Load()))])",
+      "rendered": "PluginError(metadata.name, metadata.phase.value, 'plugin execution deadline exceeded', context=context)"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='value', ctx=Load()), Name(id='GraphMutation', ctx=Load())], keywords=[]))",
+      "rendered": "not isinstance(value, GraphMutation)"
+    },
+    {
+      "line_start": 176,
+      "line_end": 176,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='plugin must return GraphMutation')], keywords=[])",
+      "rendered": "ModelValidationError('plugin must return GraphMutation')"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='value', ctx=Load())",
+      "rendered": "value"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='mutation', ctx=Load()), attr='project_id', ctx=Load()), ops=[NotEq()], comparators=[Attribute(value=Attribute(value=Name(id='snapshot', ctx=Load()), attr='project', ctx=Load()), attr='project_id', ctx=Load())])",
+      "rendered": "mutation.project_id != snapshot.project.project_id"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='plugin mutation targets another project')], keywords=[])",
+      "rendered": "ModelValidationError('plugin mutation targets another project')"
+    },
+    {
+      "line_start": 183,
+      "line_end": 183,
+      "column": 34,
+      "kind": "DictComp",
+      "original_ast": "DictComp(key=Attribute(value=Name(id='node', ctx=Load()), attr='id', ctx=Load()), value=Name(id='node', ctx=Load()), generators=[comprehension(target=Name(id='node', ctx=Store()), iter=Attribute(value=Name(id='snapshot', ctx=Load()), attr='nodes', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "{node.id: node for node in snapshot.nodes}"
+    },
+    {
+      "line_start": 184,
+      "line_end": 184,
+      "column": 34,
+      "kind": "DictComp",
+      "original_ast": "DictComp(key=Attribute(value=Name(id='edge', ctx=Load()), attr='id', ctx=Load()), value=Name(id='edge', ctx=Load()), generators=[comprehension(target=Name(id='edge', ctx=Store()), iter=Attribute(value=Name(id='snapshot', ctx=Load()), attr='edges', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "{edge.id: edge for edge in snapshot.edges}"
+    },
+    {
+      "line_start": 185,
+      "line_end": 185,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Name(id='set', ctx=Load()), args=[Attribute(value=Name(id='mutation', ctx=Load()), attr='removed_node_ids', ctx=Load())], keywords=[]), attr='difference', ctx=Load()), args=[Name(id='nodes', ctx=Load())], keywords=[])",
+      "rendered": "set(mutation.removed_node_ids).difference(nodes)"
+    },
+    {
+      "line_start": 186,
+      "line_end": 186,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[Attribute(value=Name(id='mutation', ctx=Load()), attr='removed_edge_ids', ctx=Load())], keywords=[])",
+      "rendered": "set(mutation.removed_edge_ids)"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='removed_edge_ids', ctx=Load()), attr='difference', ctx=Load()), args=[Name(id='edges', ctx=Load())], keywords=[])",
+      "rendered": "removed_edge_ids.difference(edges)"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Name(id='missing_nodes', ctx=Load()), Name(id='missing_edges', ctx=Load())])",
+      "rendered": "missing_nodes or missing_edges"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='plugin mutation removes unknown graph identities')], keywords=[])",
+      "rendered": "ModelValidationError('plugin mutation removes unknown graph identities')"
+    },
+    {
+      "line_start": 190,
+      "line_end": 192,
+      "column": 22,
+      "kind": "DictComp",
+      "original_ast": "DictComp(key=Name(id='edge_id', ctx=Load()), value=Name(id='edge', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='edge_id', ctx=Store()), Name(id='edge', ctx=Store())], ctx=Store()), iter=Call(func=Attribute(value=Name(id='edges', ctx=Load()), attr='items', ctx=Load()), args=[], keywords=[]), ifs=[Compare(left=Name(id='edge_id', ctx=Load()), ops=[NotIn()], comparators=[Name(id='removed_edge_ids', ctx=Load())])], is_async=0)])",
+      "rendered": "{edge_id: edge for edge_id, edge in edges.items() if edge_id not in removed_edge_ids}"
+    },
+    {
+      "line_start": 193,
+      "line_end": 197,
+      "column": 26,
+      "kind": "SetComp",
+      "original_ast": "SetComp(elt=Name(id='endpoint', ctx=Load()), generators=[comprehension(target=Name(id='edge', ctx=Store()), iter=Call(func=Attribute(value=Name(id='remaining_edges', ctx=Load()), attr='values', ctx=Load()), args=[], keywords=[]), ifs=[], is_async=0), comprehension(target=Name(id='endpoint', ctx=Store()), iter=Tuple(elts=[Attribute(value=Name(id='edge', ctx=Load()), attr='source_id', ctx=Load()), Attribute(value=Name(id='edge', ctx=Load()), attr='target_id', ctx=Load())], ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "{endpoint for edge in remaining_edges.values() for endpoint in (edge.source_id, edge.target_id)}"
+    },
+    {
+      "line_start": 198,
+      "line_end": 198,
+      "column": 19,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='mutation', ctx=Load()), attr='removed_node_ids', ctx=Load())",
+      "rendered": "mutation.removed_node_ids"
+    },
+    {
+      "line_start": 199,
+      "line_end": 199,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='node_id', ctx=Load()), ops=[In()], comparators=[Name(id='remaining_endpoints', ctx=Load())])",
+      "rendered": "node_id in remaining_endpoints"
+    },
+    {
+      "line_start": 200,
+      "line_end": 202,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='plugin must explicitly remove edges incident to removed nodes')], keywords=[])",
+      "rendered": "ModelValidationError('plugin must explicitly remove edges incident to removed nodes')"
+    },
+    {
+      "line_start": 204,
+      "line_end": 204,
+      "column": 19,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='mutation', ctx=Load()), attr='removed_edge_ids', ctx=Load())",
+      "rendered": "mutation.removed_edge_ids"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='edges', ctx=Load()), attr='pop', ctx=Load()), args=[Name(id='edge_id', ctx=Load())], keywords=[])",
+      "rendered": "edges.pop(edge_id)"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 16,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='mutation', ctx=Load()), attr='nodes', ctx=Load())",
+      "rendered": "mutation.nodes"
+    },
+    {
+      "line_start": 207,
+      "line_end": 207,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='node', ctx=Load()), attr='id', ctx=Load()), ops=[In()], comparators=[Name(id='nodes', ctx=Load())])",
+      "rendered": "node.id in nodes"
+    },
+    {
+      "line_start": 208,
+      "line_end": 208,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='plugin adds an existing node identity')], keywords=[])",
+      "rendered": "ModelValidationError('plugin adds an existing node identity')"
+    },
+    {
+      "line_start": 209,
+      "line_end": 209,
+      "column": 25,
+      "kind": "Name",
+      "original_ast": "Name(id='node', ctx=Load())",
+      "rendered": "node"
+    },
+    {
+      "line_start": 210,
+      "line_end": 210,
+      "column": 16,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='mutation', ctx=Load()), attr='edges', ctx=Load())",
+      "rendered": "mutation.edges"
+    },
+    {
+      "line_start": 211,
+      "line_end": 211,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='edge', ctx=Load()), attr='id', ctx=Load()), ops=[In()], comparators=[Name(id='edges', ctx=Load())])",
+      "rendered": "edge.id in edges"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='plugin adds an existing edge identity')], keywords=[])",
+      "rendered": "ModelValidationError('plugin adds an existing edge identity')"
+    },
+    {
+      "line_start": 213,
+      "line_end": 213,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Compare(left=Attribute(value=Name(id='edge', ctx=Load()), attr='source_id', ctx=Load()), ops=[NotIn()], comparators=[Name(id='nodes', ctx=Load())]), Compare(left=Attribute(value=Name(id='edge', ctx=Load()), attr='target_id', ctx=Load()), ops=[NotIn()], comparators=[Name(id='nodes', ctx=Load())])])",
+      "rendered": "edge.source_id not in nodes or edge.target_id not in nodes"
+    },
+    {
+      "line_start": 214,
+      "line_end": 214,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='plugin edge endpoints must exist in the candidate graph')], keywords=[])",
+      "rendered": "ModelValidationError('plugin edge endpoints must exist in the candidate graph')"
+    },
+    {
+      "line_start": 215,
+      "line_end": 215,
+      "column": 25,
+      "kind": "Name",
+      "original_ast": "Name(id='edge', ctx=Load())",
+      "rendered": "edge"
+    },
+    {
+      "line_start": 216,
+      "line_end": 222,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='GraphSnapshot', ctx=Load()), args=[Attribute(value=Name(id='snapshot', ctx=Load()), attr='project', ctx=Load()), Attribute(value=Name(id='snapshot', ctx=Load()), attr='snapshot_id', ctx=Load()), Attribute(value=Name(id='snapshot', ctx=Load()), attr='analysis_version', ctx=Load()), Call(func=Name(id='tuple', ctx=Load()), args=[Call(func=Attribute(value=Name(id='nodes', ctx=Load()), attr='values', ctx=Load()), args=[], keywords=[])], keywords=[]), Call(func=Name(id='tuple', ctx=Load()), args=[Call(func=Attribute(value=Name(id='edges', ctx=Load()), attr='values', ctx=Load()), args=[], keywords=[])], keywords=[])], keywords=[])",
+      "rendered": "GraphSnapshot(snapshot.project, snapshot.snapshot_id, snapshot.analysis_version, tuple(nodes.values()), tuple(edges.values()))"
+    }
+  ],
+  "calls": [
+    {
+      "line": 34,
+      "end_line": 34,
+      "callee": "dataclass",
+      "enclosing": "LocalPluginLimits",
+      "expression": "dataclass(frozen=True)"
+    },
+    {
+      "line": 54,
+      "end_line": 54,
+      "callee": "dataclass",
+      "enclosing": "LocalPluginResult",
+      "expression": "dataclass(frozen=True)"
+    },
+    {
+      "line": 185,
+      "end_line": 185,
+      "callee": "set(mutation.removed_node_ids).difference",
+      "enclosing": "_apply_mutation",
+      "expression": "set(mutation.removed_node_ids).difference(nodes)"
+    },
+    {
+      "line": 186,
+      "end_line": 186,
+      "callee": "set",
+      "enclosing": "_apply_mutation",
+      "expression": "set(mutation.removed_edge_ids)"
+    },
+    {
+      "line": 187,
+      "end_line": 187,
+      "callee": "removed_edge_ids.difference",
+      "enclosing": "_apply_mutation",
+      "expression": "removed_edge_ids.difference(edges)"
+    },
+    {
+      "line": 216,
+      "end_line": 222,
+      "callee": "GraphSnapshot",
+      "enclosing": "_apply_mutation",
+      "expression": "GraphSnapshot(\n        snapshot.project,\n        snapshot.snapshot_id,\n        snapshot.analysis_version,\n        tuple(nodes.values()),\n        tuple(edges.values()),\n    )"
+    },
+    {
+      "line": 78,
+      "end_line": 78,
+      "callee": "BufferedPluginReporter",
+      "enclosing": "LocalPluginRunner.run",
+      "expression": "BufferedPluginReporter()"
+    },
+    {
+      "line": 139,
+      "end_line": 139,
+      "callee": "LocalPluginResult",
+      "enclosing": "LocalPluginRunner.run",
+      "expression": "LocalPluginResult(current, tuple(executed), reporter.logs, reporter.diagnostics)"
+    },
+    {
+      "line": 175,
+      "end_line": 175,
+      "callee": "isinstance",
+      "enclosing": "_require_mutation",
+      "expression": "isinstance(value, GraphMutation)"
+    },
+    {
+      "line": 176,
+      "end_line": 176,
+      "callee": "ModelValidationError",
+      "enclosing": "_require_mutation",
+      "expression": "ModelValidationError(\"plugin must return GraphMutation\")"
+    },
+    {
+      "line": 182,
+      "end_line": 182,
+      "callee": "ModelValidationError",
+      "enclosing": "_apply_mutation",
+      "expression": "ModelValidationError(\"plugin mutation targets another project\")"
+    },
+    {
+      "line": 189,
+      "end_line": 189,
+      "callee": "ModelValidationError",
+      "enclosing": "_apply_mutation",
+      "expression": "ModelValidationError(\"plugin mutation removes unknown graph identities\")"
+    },
+    {
+      "line": 205,
+      "end_line": 205,
+      "callee": "edges.pop",
+      "enclosing": "_apply_mutation",
+      "expression": "edges.pop(edge_id)"
+    },
+    {
+      "line": 220,
+      "end_line": 220,
+      "callee": "tuple",
+      "enclosing": "_apply_mutation",
+      "expression": "tuple(nodes.values())"
+    },
+    {
+      "line": 221,
+      "end_line": 221,
+      "callee": "tuple",
+      "enclosing": "_apply_mutation",
+      "expression": "tuple(edges.values())"
+    },
+    {
+      "line": 43,
+      "end_line": 48,
+      "callee": "min",
+      "enclosing": "LocalPluginLimits.__post_init__",
+      "expression": "min(\n                self.max_nodes_per_plugin,\n                self.max_edges_per_plugin,\n                self.max_removals_per_plugin,\n                self.max_total_work,\n            )"
+    },
+    {
+      "line": 51,
+      "end_line": 51,
+      "callee": "ModelValidationError",
+      "enclosing": "LocalPluginLimits.__post_init__",
+      "expression": "ModelValidationError(\"local plugin limits must be positive\")"
+    },
+    {
+      "line": 64,
+      "end_line": 64,
+      "callee": "LocalPluginLimits",
+      "enclosing": "LocalPluginRunner.__init__",
+      "expression": "LocalPluginLimits()"
+    },
+    {
+      "line": 85,
+      "end_line": 85,
+      "callee": "registry.for_phase",
+      "enclosing": "LocalPluginRunner.run",
+      "expression": "registry.for_phase(phase)"
+    },
+    {
+      "line": 139,
+      "end_line": 139,
+      "callee": "tuple",
+      "enclosing": "LocalPluginRunner.run",
+      "expression": "tuple(executed)"
+    },
+    {
+      "line": 142,
+      "end_line": 142,
+      "callee": "len",
+      "enclosing": "LocalPluginRunner._validate_bounds",
+      "expression": "len(mutation.removed_node_ids)"
+    },
+    {
+      "line": 142,
+      "end_line": 142,
+      "callee": "len",
+      "enclosing": "LocalPluginRunner._validate_bounds",
+      "expression": "len(mutation.removed_edge_ids)"
+    },
+    {
+      "line": 143,
+      "end_line": 143,
+      "callee": "len",
+      "enclosing": "LocalPluginRunner._validate_bounds",
+      "expression": "len(mutation.nodes)"
+    },
+    {
+      "line": 144,
+      "end_line": 144,
+      "callee": "ModelValidationError",
+      "enclosing": "LocalPluginRunner._validate_bounds",
+      "expression": "ModelValidationError(\"plugin node emission exceeds bound\")"
+    },
+    {
+      "line": 145,
+      "end_line": 145,
+      "callee": "len",
+      "enclosing": "LocalPluginRunner._validate_bounds",
+      "expression": "len(mutation.edges)"
+    },
+    {
+      "line": 146,
+      "end_line": 146,
+      "callee": "ModelValidationError",
+      "enclosing": "LocalPluginRunner._validate_bounds",
+      "expression": "ModelValidationError(\"plugin edge emission exceeds bound\")"
+    },
+    {
+      "line": 148,
+      "end_line": 148,
+      "callee": "ModelValidationError",
+      "enclosing": "LocalPluginRunner._validate_bounds",
+      "expression": "ModelValidationError(\"plugin removal emission exceeds bound\")"
+    },
+    {
+      "line": 159,
+      "end_line": 164,
+      "callee": "PluginError",
+      "enclosing": "LocalPluginRunner._check_lifecycle",
+      "expression": "PluginError(\n                metadata.name,\n                metadata.phase.value,\n                \"plugin execution cancelled\",\n                context=context,\n            )"
+    },
+    {
+      "line": 165,
+      "end_line": 165,
+      "callee": "time.monotonic",
+      "enclosing": "LocalPluginRunner._check_lifecycle",
+      "expression": "time.monotonic()"
+    },
+    {
+      "line": 166,
+      "end_line": 171,
+      "callee": "PluginError",
+      "enclosing": "LocalPluginRunner._check_lifecycle",
+      "expression": "PluginError(\n                metadata.name,\n                metadata.phase.value,\n                \"plugin execution deadline exceeded\",\n                context=context,\n            )"
+    },
+    {
+      "line": 185,
+      "end_line": 185,
+      "callee": "set",
+      "enclosing": "_apply_mutation",
+      "expression": "set(mutation.removed_node_ids)"
+    },
+    {
+      "line": 191,
+      "end_line": 191,
+      "callee": "edges.items",
+      "enclosing": "_apply_mutation",
+      "expression": "edges.items()"
+    },
+    {
+      "line": 195,
+      "end_line": 195,
+      "callee": "remaining_edges.values",
+      "enclosing": "_apply_mutation",
+      "expression": "remaining_edges.values()"
+    },
+    {
+      "line": 200,
+      "end_line": 202,
+      "callee": "ModelValidationError",
+      "enclosing": "_apply_mutation",
+      "expression": "ModelValidationError(\n                \"plugin must explicitly remove edges incident to removed nodes\"\n            )"
+    },
+    {
+      "line": 208,
+      "end_line": 208,
+      "callee": "ModelValidationError",
+      "enclosing": "_apply_mutation",
+      "expression": "ModelValidationError(\"plugin adds an existing node identity\")"
+    },
+    {
+      "line": 212,
+      "end_line": 212,
+      "callee": "ModelValidationError",
+      "enclosing": "_apply_mutation",
+      "expression": "ModelValidationError(\"plugin adds an existing edge identity\")"
+    },
+    {
+      "line": 214,
+      "end_line": 214,
+      "callee": "ModelValidationError",
+      "enclosing": "_apply_mutation",
+      "expression": "ModelValidationError(\"plugin edge endpoints must exist in the candidate graph\")"
+    },
+    {
+      "line": 220,
+      "end_line": 220,
+      "callee": "nodes.values",
+      "enclosing": "_apply_mutation",
+      "expression": "nodes.values()"
+    },
+    {
+      "line": 221,
+      "end_line": 221,
+      "callee": "edges.values",
+      "enclosing": "_apply_mutation",
+      "expression": "edges.values()"
+    },
+    {
+      "line": 87,
+      "end_line": 87,
+      "callee": "self._check_lifecycle",
+      "enclosing": "LocalPluginRunner.run",
+      "expression": "self._check_lifecycle(metadata, cancellation, deadline_monotonic, context_label)"
+    },
+    {
+      "line": 88,
+      "end_line": 96,
+      "callee": "PluginContext",
+      "enclosing": "LocalPluginRunner.run",
+      "expression": "PluginContext(\n                    snapshot.project,\n                    current,\n                    source_reader,\n                    reporter,\n                    cancellation,\n                    configuration,\n                    deadline_monotonic,\n                )"
+    },
+    {
+      "line": 128,
+      "end_line": 128,
+      "callee": "executed.append",
+      "enclosing": "LocalPluginRunner.run",
+      "expression": "executed.append(metadata)"
+    },
+    {
+      "line": 130,
+      "end_line": 130,
+      "callee": "derive",
+      "enclosing": "LocalPluginRunner.run",
+      "expression": "derive(current)"
+    },
+    {
+      "line": 149,
+      "end_line": 149,
+      "callee": "len",
+      "enclosing": "LocalPluginRunner._validate_bounds",
+      "expression": "len(mutation.nodes)"
+    },
+    {
+      "line": 149,
+      "end_line": 149,
+      "callee": "len",
+      "enclosing": "LocalPluginRunner._validate_bounds",
+      "expression": "len(mutation.edges)"
+    },
+    {
+      "line": 98,
+      "end_line": 98,
+      "callee": "_require_mutation",
+      "enclosing": "LocalPluginRunner.run",
+      "expression": "_require_mutation(plugin.enrich(context))"
+    },
+    {
+      "line": 99,
+      "end_line": 99,
+      "callee": "self._validate_bounds",
+      "enclosing": "LocalPluginRunner.run",
+      "expression": "self._validate_bounds(mutation)"
+    },
+    {
+      "line": 102,
+      "end_line": 102,
+      "callee": "_apply_mutation",
+      "enclosing": "LocalPluginRunner.run",
+      "expression": "_apply_mutation(current, mutation)"
+    },
+    {
+      "line": 103,
+      "end_line": 103,
+      "callee": "self._check_lifecycle",
+      "enclosing": "LocalPluginRunner.run",
+      "expression": "self._check_lifecycle(metadata, cancellation, deadline_monotonic, context_label)"
+    },
+    {
+      "line": 135,
+      "end_line": 137,
+      "callee": "ModelValidationError",
+      "enclosing": "LocalPluginRunner.run",
+      "expression": "ModelValidationError(\n                        \"derived graph changed the candidate project or snapshot identity\"\n                    )"
+    },
+    {
+      "line": 98,
+      "end_line": 98,
+      "callee": "plugin.enrich",
+      "enclosing": "LocalPluginRunner.run",
+      "expression": "plugin.enrich(context)"
+    },
+    {
+      "line": 101,
+      "end_line": 101,
+      "callee": "ModelValidationError",
+      "enclosing": "LocalPluginRunner.run",
+      "expression": "ModelValidationError(\"aggregate local plugin work exceeds bound\")"
+    },
+    {
+      "line": 113,
+      "end_line": 118,
+      "callee": "PluginError",
+      "enclosing": "LocalPluginRunner.run",
+      "expression": "PluginError(\n                        metadata.name,\n                        metadata.phase.value,\n                        str(exc),\n                        context=context_label,\n                    )"
+    },
+    {
+      "line": 120,
+      "end_line": 125,
+      "callee": "PluginError",
+      "enclosing": "LocalPluginRunner.run",
+      "expression": "PluginError(\n                        metadata.name,\n                        metadata.phase.value,\n                        str(exc),\n                        context=context_label,\n                    )"
+    },
+    {
+      "line": 116,
+      "end_line": 116,
+      "callee": "str",
+      "enclosing": "LocalPluginRunner.run",
+      "expression": "str(exc)"
+    },
+    {
+      "line": 123,
+      "end_line": 123,
+      "callee": "str",
+      "enclosing": "LocalPluginRunner.run",
+      "expression": "str(exc)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 17,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "import time",
+      "targets": [
+        "time"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "from collections.abc import Callable",
+      "targets": [
+        "collections.abc",
+        "collections.abc.Callable"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "from dataclasses import dataclass",
+      "targets": [
+        "dataclasses",
+        "dataclasses.dataclass"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 23,
+      "source_expression": "from context_graph_sdk.errors import ModelValidationError, PluginError",
+      "targets": [
+        "context_graph_sdk.errors",
+        "context_graph_sdk.errors.ModelValidationError",
+        "context_graph_sdk.errors.PluginError"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/errors.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 24,
+      "source_expression": "from context_graph_sdk.models import FrozenMap, GraphEdge, GraphMutation, GraphNode, GraphSnapshot",
+      "targets": [
+        "context_graph_sdk.models",
+        "context_graph_sdk.models.FrozenMap",
+        "context_graph_sdk.models.GraphEdge",
+        "context_graph_sdk.models.GraphMutation",
+        "context_graph_sdk.models.GraphNode",
+        "context_graph_sdk.models.GraphSnapshot"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/models.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 25,
+      "source_expression": "from context_graph_sdk.pipeline import PluginContext, PluginDiagnostic, SourceReader",
+      "targets": [
+        "context_graph_sdk.pipeline",
+        "context_graph_sdk.pipeline.PluginContext",
+        "context_graph_sdk.pipeline.PluginDiagnostic",
+        "context_graph_sdk.pipeline.SourceReader"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/pipeline/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 27,
+      "source_expression": "from .base import PluginMetadata, PluginPhase",
+      "targets": [
+        "context_graph_sdk.plugins.base",
+        "context_graph_sdk.plugins.base.PluginMetadata",
+        "context_graph_sdk.plugins.base.PluginPhase"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/plugins/base.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 28,
+      "source_expression": "from .context import BufferedPluginReporter, CancellationToken, PluginLogRecord",
+      "targets": [
+        "context_graph_sdk.plugins.context",
+        "context_graph_sdk.plugins.context.BufferedPluginReporter",
+        "context_graph_sdk.plugins.context.CancellationToken",
+        "context_graph_sdk.plugins.context.PluginLogRecord"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/plugins/context.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 29,
+      "source_expression": "from .registry import PluginRegistry",
+      "targets": [
+        "context_graph_sdk.plugins.registry",
+        "context_graph_sdk.plugins.registry.PluginRegistry"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/plugins/registry.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

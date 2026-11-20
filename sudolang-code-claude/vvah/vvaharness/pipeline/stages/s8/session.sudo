@@ -1,0 +1,113 @@
+# vvaharness/pipeline/stages/s8/session.py
+
+The single Stage 8 model call. It runs as an agentic session with no tools and a one-call budget, wrapped in a stage deadline. On a deadline kill it re-asks once, without tools, from the recorded transcript. It also hosts the one json-repair re-ask. It raises on failure, so `s8_chain.run` can ship the deterministic report.
+
+Source: `vvaharness/pipeline/stages/s8/session.py` (lines 1-197)
+Executor: mixed
+Called from: `vvaharness/pipeline/stages/s8_chain.py` _chain_call_with_half_window_retry and _json_repair
+
+// src: vvaharness/pipeline/stages/s8/session.py:46-54
+MIN_RESPONSE_CHARS = 90
+MIN_RESPONSE_TOKENS = 15
+TAG = "s8 chain"
+_REPLAY_EFFORT = "low"   // the replay restates a transcript; it needs the smallest reasoning budget
+_REPAIRABLE_RX = /\b(ranked_findings|chains)"?\s*(?::|=|\bis\b)\s*[\[{]/   // a schema key followed by a value opener
+
+// src: vvaharness/pipeline/stages/s8/session.py:149-197
+fn chain_call(findings, ctx, cfg, labels?, allow_resend=true):executor=mixed {
+  effort = knob("step8.effort", default=null) or null
+  user = s8.prompts.build_prompt(findings, ctx, labels=labels, cfg=cfg)
+  deadline = _cap_int(step8, "deadline", 0)   // knob("step8.deadline", default=0); 0 = no stage deadline
+  replayed = false
+
+  // src: session.py:158-182
+  _dispatch(drop_thinking) {
+    session_id = session_id_for("s8", "chain")
+    transcript = Transcript()
+    middleware = [RecordTranscript(transcript)]
+    budget = _call_budget(step8)
+    if (budget != null) append budget to middleware
+    constraint OnEveryExit { release_pinned_session(session_id) }   // src: session.py:181-182
+    try {
+      return run_with_deadline(() => _agentic_leg(user, ctx, cfg, session_id, middleware, drop_thinking),
+        seconds=deadline, stage=TAG, effort=effort)   // external: vvaharness/pipeline/stages/replay.py
+    }
+    catch CallTimeoutError => {
+      // s8 is a one-call stage: a kill mid-turn leaves nothing to continue, so no resume; go straight to the transcript re-ask
+      // abstracted: console "deadline ${deadline}s hit — replaying the chain analysis from the transcript"
+      replayed = true
+      return _replay_leg(user, ctx, cfg, transcript)
+    }
+  }
+
+  // src: session.py:184-197
+  with stage_floors(TAG, min_chars=MIN_RESPONSE_CHARS, min_tokens=MIN_RESPONSE_TOKENS) {
+    return dispatch_or_retry_unforced(_dispatch, "chain", stage="s8",
+      effort=droppable_effort(cfg.models.chain, effort, agentic=true),
+      may_retry=() => allow_resend && effort != null && !replayed,   // the replay leg or the half-window caller veto the drop-tier resend
+      resend_refusal=false)   // a refused chain call loses only the enrichment, so no refusal resend
+    // external: util/response_quality.dispatch_or_retry_unforced — one resend with drop_thinking=true on a schema rejection or an at-cap clip, when may_retry() allows
+  }
+}
+
+// src: vvaharness/pipeline/stages/s8/session.py:70-95
+fn _agentic_leg(user, ctx, cfg, session_id, parent_middleware, drop_thinking):executor=model {
+  effort = knob("step8.effort", default=null) or null
+  via = resolve(cfg.models.chain).via
+  return callModel({
+    role: "chain",
+    route: "deepagents dispatch_agentic (resumable session pinned by session_id); backend via = resolve(cfg.models.chain).via",
+    system: SYSTEM,                 // see s8/prompts.sudo
+    prompt: user,                   // S8_USER_PROMPT
+    tools: [],                      // allowed_tools=() — s8 is handed its finding table whole and has nothing to look up
+    limits: {
+      max_turns: _cap_int(step8, "max_turns", 2),   // 2: turn 1 is the forced ChainReport call, turn 2 the tool result it ends on
+      timeout: deadline_bound(_cap_int(step8, "timeout", 3600), _cap_int(step8, "deadline", 0), if (drop_thinking) null else effort, via=via),
+      max_output_tokens: int(knob("step8.max_tokens", default=64000)),
+      effort: if (drop_thinking) null else effort,
+      middleware: parent_middleware   // RecordTranscript and, when configured, ModelCallBudget
+    },
+    output: if (via in RESPONSE_MODEL_VIAS) ChainReport else free text   // see s8/outcomes.sudo
+  })
+  // cwd=ctx.repo_root roots the deepagents route at the scanned repository; other routes ignore it
+}
+
+// src: vvaharness/pipeline/stages/s8/session.py:57-67
+fn _call_budget(step8):executor=code {
+  limit = _cap_int(step8, "max_model_calls", 1)   // default 1: a second turn could only re-read the prompt
+  if (limit <= 0) return null   // no budget middleware
+  return ModelCallBudget(limit=limit, outcome_tools={"ChainReport"}, counter="s8_model_call_budget_final_turn")
+  // external: backends/harness/deepagents/model_call_budget.py — on the last permitted call every tool but ChainReport is withdrawn
+}
+
+// src: vvaharness/pipeline/stages/s8/session.py:125-129
+fn _replay_leg(user, ctx, cfg, transcript):executor=mixed {
+  return _cold_call(replay_prompt(transcript, user, instruction=S8_REPLAY_INSTRUCTION, stage="s8"), ctx, cfg, tag="$TAG replay")
+  // external: vvaharness/pipeline/stages/replay.py:93-97 S8_REPLAY_INSTRUCTION ends: "Report the chain analysis NOW. Emit only the chains the transcript already evidenced and the findings whose severity it already decided to change — an unfinished chain is worth less than no chain, so drop it rather than guessing the rest of its links."
+}
+
+// src: vvaharness/pipeline/stages/s8/session.py:103-122
+fn _cold_call(prompt, ctx, cfg, tag):executor=model {
+  // one no-tool re-ask (replay or json-repair); floors are looked up by the exact tag
+  with stage_floors(tag, min_chars=MIN_RESPONSE_CHARS, min_tokens=MIN_RESPONSE_TOKENS) {
+    return callModel({
+      role: "chain",
+      route: "deepagents dispatch_prompt (single prompt); backend from cfg.models.chain",
+      system: SYSTEM,
+      prompt: prompt,
+      tools: [],
+      limits: { max_tokens: _replay_max_tokens(cfg), timeout: _cap_int(step8, "replay_timeout", 300), effort: _REPLAY_EFFORT },
+      output: if (resolve(cfg.models.chain).via in RESPONSE_MODEL_VIAS) ChainReport else free text
+    })
+  }
+}
+
+// src: vvaharness/pipeline/stages/s8/session.py:98-100
+fn _replay_max_tokens(cfg):executor=code { return _cap_int(step8, "replay_max_tokens", 16000) }   // one cap for replay and json-repair
+
+// src: vvaharness/pipeline/stages/s8/session.py:132-146
+fn repairable(raw):executor=code { return raw is a string && _REPAIRABLE_RX matches raw }   // the reply tried to answer; not prose or "{}"
+fn repair_fits(raw, cfg):executor=code { return estimate_tokens(raw) <= _replay_max_tokens(cfg) }   // a repair re-emits the whole reply; larger replies are skipped
+fn repair_call(raw, err, ctx, cfg):executor=mixed { return _cold_call(s8.prompts.repair_prompt(raw, err), ctx, cfg, tag="$TAG json-repair") }   // raises on failure
+
+// Note on _cap_int (external: vvaharness/evidence/gather.py:39-48): reads getattr(cfg.step8, key); a missing, non-integer or negative value falls back to the default; 0 survives.

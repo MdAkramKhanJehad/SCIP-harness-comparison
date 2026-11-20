@@ -1,0 +1,38 @@
+# vvaharness/cli/__init__.py — model instruction carriers
+
+Model-request representation: these constraints describe instructions addressed to a model.
+They do not execute the host workflow, prove compliance, or require every available tool to be called.
+Supply boundary: each request applies only if and when its source caller/loader supplies this content. A text classification alone does not establish delivery; the workflow map and executable source view record supported supply relationships.
+Independent clauses remain unordered unless the source explicitly says first/then/before/after or gives procedural steps.
+Qualitative words, exceptions, contradictions and example values retain their source meanings.
+Exact originals are supporting evidence; the Constraints/conditional blocks below are the behavioral representation.
+
+## _NOTES — source lines 111–112
+
+Source context: callable `<module>`; enclosing call `none`; keyword `none`.
+Executable assembly/branches remain in the matching source_detail module. This view converts the message content, not its surrounding code.
+
+Exposure boundary: this instruction-bearing text may instead be a host diagnostic. Apply this model-request view only if its caller supplies the text to a model; no such supply is invented.
+
+```sudo
+// Source: vvaharness/cli/__init__.py:111-112
+Constraints {
+  The request retains this source rule, criterion or rationale, with its original modal force: doctor --cache-probe: opt-in live prompt-cache diagnostic.
+  The request retains this source rule, criterion or rationale, with its original modal force: Spends real tokens (~65-70k/model, printed first); never runs during `scan`.
+}
+```
+
+## _COMMAND_HELP — source lines 98–98
+
+Source context: callable `<module>`; enclosing call `none`; keyword `none`.
+Executable assembly/branches remain in the matching source_detail module. This view converts the message content, not its surrounding code.
+
+Exposure boundary: this instruction-bearing text may instead be a host diagnostic. Apply this model-request view only if its caller supplies the text to a model; no such supply is invented.
+
+```sudo
+// Source: vvaharness/cli/__init__.py:98-98
+Constraints {
+  The model is asked to establish credentials + live backend connectivity (read-only)
+}
+```
+

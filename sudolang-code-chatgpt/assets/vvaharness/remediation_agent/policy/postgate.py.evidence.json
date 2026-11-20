@@ -1,0 +1,2935 @@
+{
+  "source": "vvaharness/remediation_agent/policy/postgate.py",
+  "sha256": "f2adc06bdc1cc46ed942f5c086a71f7c79c2dd220ac723731a7147baa53aaad0",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Enforce path policy and workflow-reference integrity on generated edits.\"\"\"\nfrom __future__ import annotations\n\nimport os\nfrom dataclasses import dataclass\nfrom pathlib import Path\n\nfrom vvaharness.remediation_agent.artifacts.diff import (\n    _norm_path,\n    capture_git_diff,\n    changed_files_whole_tree,\n    changed_since_snapshot,\n    synth_unified_diff,\n)\nfrom vvaharness.remediation_agent.models import RemediationVerdict\nfrom vvaharness.remediation_agent.policy.context import PolicyContext\nfrom vvaharness.remediation_agent.policy.decide import PreResult\nfrom vvaharness.remediation_agent.policy.patch_content import scan_added_lines\nfrom vvaharness.remediation_agent.policy.revert import revert_files\nfrom vvaharness.remediation_agent.policy.workflow_refs import (\n    introduced_unsafe_workflow_refs,\n)\nfrom vvaharness.remediation_agent.policy_gate import cap_verdict, inspect_diff\nfrom vvaharness.remediation_agent.policy_gate.matching import _glob_match\nfrom vvaharness.remediation_agent.target import RemediationTarget\nfrom vvaharness.util import console\nfrom vvaharness.util.git_paths import is_git_metadata\n\n# Cap the worktree glob (non-git fallback) so a huge target can't pin the post-gate.\n_WORKTREE_SCAN_MAX = 20000\n# os.walk(followlinks=False) already closes off symlink loops; this only bounds a huge acyclic tree.\n_WORKTREE_DIR_MAX = 20000\n\n\ndef worktree_forbidden_matches(repo: Path, patterns: list[str]) -> list[str]:\n    \"\"\"Return repo-relative files in *repo*'s working tree that hit any of *patterns*; non-git fallback for the post-gate, best-effort and never raises.\"\"\"\n    if not patterns:\n        return []\n    repo = Path(repo)\n    out: list[str] = []\n    seen = 0\n    dirs_seen = 0\n    try:\n        for dirpath, _dirnames, filenames in os.walk(repo, followlinks=False):\n            dirs_seen += 1\n            if dirs_seen > _WORKTREE_DIR_MAX:\n                break\n            for name in filenames:\n                p = Path(dirpath) / name\n                if not p.is_file():\n                    continue\n                # Count only FILES toward the budget — counting dirs too let vendored dirs (node_modules/.venv) consume the cap.\n                seen += 1\n                if seen > _WORKTREE_SCAN_MAX:\n                    return out\n                try:\n                    rel = p.relative_to(repo).as_posix()\n                except ValueError:\n                    continue\n                for pat in patterns:\n                    if _glob_match(rel, pat):\n                        out.append(rel)\n                        break\n    except Exception:  # noqa: BLE001 — a best-effort scan must never break a run\n        return out\n    return out\n\n\n\n@dataclass\nclass PostResult:\n    \"\"\"Outcome of the post-gate after the agent edited files.\"\"\"\n    reverted: list[str]          # repo-relative files reverted on disk\n    matched_globs: list[str]     # the policy globs that triggered the revert\n    downgraded: bool             # True if the verdict was forced to REJECT\n    final_verdict: str           # ACCEPT | REJECT\n    reason: str | None = None    # deterministic post-gate rejection reason\n\n\ndef _gates_ok(verdict: RemediationVerdict) -> bool:\n    \"\"\"True iff ALL three evidence gates in the agent's own verdict read 'pass'.\"\"\"\n    g = getattr(verdict, \"gates\", None)\n    if g is None:\n        return False\n    return (g.source == \"pass\" and g.sink == \"pass\"\n            and g.missing_control == \"pass\")\n\n\ndef enforce_post(ctx: PolicyContext, target: RemediationTarget,\n                 verdict: RemediationVerdict, pre: PreResult, *,\n                 repo: Path,\n                 before_snapshot: dict[str, str | None] | None = None,\n                 all_gates_passed: bool = True) -> PostResult:\n    \"\"\"Validate actual on-disk changes and mutate *verdict* on rejection.\"\"\"\n    changed = [c.file for c in verdict.changes if c.file]\n\n    # Observe the WHOLE working tree, not just what the agent reported, so an omitted forbidden-file edit is still caught.\n    whole_tree = changed_files_whole_tree(repo)\n\n    # Non-git fallback: walk the working tree for forbidden-glob matches, since changed_files_whole_tree returns [] off git.\n    worktree_forbidden: list[str] = []\n    if not whole_tree:\n        worktree_forbidden = worktree_forbidden_matches(\n            repo, [*ctx.gate.forbid_patch_paths, *ctx.gate.deny_paths])\n\n    # A path present and unchanged in before_snapshot pre-dates this attempt; drop it so a\n    # pre-existing file never reads as an agent edit (a path absent stays a candidate).\n    if before_snapshot:\n        unchanged_baseline = (\n            set(before_snapshot) - set(changed_since_snapshot(repo, before_snapshot)))\n        unchanged_norm = {_norm_path(f) for f in unchanged_baseline}\n        whole_tree = [f for f in whole_tree if _norm_path(f) not in unchanged_norm]\n        worktree_forbidden = [f for f in worktree_forbidden\n                              if _norm_path(f) not in unchanged_norm]\n        # A path the verdict merely names is a claim, not an edit; .git names stay a policy hit\n        changed = [f for f in changed\n                   if is_git_metadata(f) or _norm_path(f) not in unchanged_norm]\n\n    # Scope the diff to reported + whole-tree paths so omitted files still render into the synthesized (non-git) baseline.\n    diff_scope = list(dict.fromkeys([*changed, *whole_tree]))\n    # before_snapshot as baseline keeps diff (and patch_applied below) scoped to this case.\n    diff = capture_git_diff(repo, diff_scope, baseline=before_snapshot)\n    if not diff and before_snapshot is not None:\n        diff = synth_unified_diff(repo, before_snapshot, extra_files=diff_scope)\n    diff_files = inspect_diff(diff)\n    candidates = list(dict.fromkeys(\n        [*diff_files, *changed, *whole_tree, *worktree_forbidden]))\n\n    forbidden = ctx.gate.forbidden_files(candidates)\n    matched: list[str] = []\n    for f in forbidden:\n        g = (ctx.gate.patch_touches_forbidden([f])\n             or ctx.gate.changed_paths_hit_deny([f]))\n        if g:\n            matched.append(g)\n\n    unsafe_refs = introduced_unsafe_workflow_refs(repo, before_snapshot)\n\n    # The path gates above bound only WHERE the fixer wrote; _gates_ok below is\n    # the agent's own self-report. Neither looks at the patch content.\n    unsafe_content = scan_added_lines(diff)\n    bad = list(dict.fromkeys([*forbidden, *unsafe_refs, *unsafe_content]))\n\n    ceiling = pre.decision.action\n    if not bad:\n        # Gates come from verdict.gates, not the default-True flag: a no-op must never read ACCEPT\n        patch_applied = bool(diff and diff.strip())\n        gates_passed = (all_gates_passed and _gates_ok(verdict)\n                        and patch_applied\n                        and verdict.verdict in (\"Fixed\", \"Partially Fixed\"))\n        return PostResult(reverted=[], matched_globs=[], downgraded=False,\n                          final_verdict=cap_verdict(ceiling, gates_passed))\n\n    reverted = revert_files(repo, bad, before_snapshot)\n    bad_norm = {_norm_path(f) for f in bad}\n    verdict.changes = [c for c in verdict.changes\n                       if _norm_path(c.file) not in bad_norm]\n\n    notes: list[str] = []\n    if forbidden:\n        notes.append(\n            f\"Policy post-gate reverted edits to forbidden/sensitive paths \"\n            f\"({', '.join(sorted(set(matched)))}).\")\n    if unsafe_refs:\n        detail = \"; \".join(\n            f\"{path}: {', '.join(refs)}\" for path, refs in unsafe_refs.items())\n        notes.append(\n            \"Policy post-gate rejected unverified reusable-workflow refs \"\n            f\"({detail}). S10 must use a commit already established by the \"\n            \"repository or decline the fix; it must never invent a SHA.\")\n    if unsafe_content:\n        detail = \"; \".join(\n            f\"{path}: {', '.join(hits)}\"\n            for path, hits in sorted(unsafe_content.items()))\n        notes.append(\n            \"Policy post-gate rejected patch content that added forbidden \"\n            f\"constructs ({detail}). A remediation patch must not introduce \"\n            \"auth bypasses, dynamic code execution, network egress, \"\n            \"credential reads, or shells; this may indicate prompt injection \"\n            \"from the scanned source.\")\n    refused = [f for f in bad if is_git_metadata(f)]\n    if refused:\n        notes.append(\"Refused to revert version-control metadata, inspect \"\n                     f\"manually: {', '.join(refused)}.\")\n    note = (\n        f\"{' '.join(notes)} Reverted {len(reverted)} file(s): \"\n        f\"{', '.join(reverted)}. Route to a human.\"\n    )\n    verdict.remaining_risks = list(verdict.remaining_risks) + [note]\n    # Post-gate revert is a PARTIAL outcome, so route to a human rather than marking Denied (the pre-gate owns that terminal state).\n    # A content hit is treated as terminally as an invented SHA: the patch is\n    # not merely out of scope, its contents are untrustworthy.\n    if unsafe_refs or unsafe_content:\n        verdict.verdict = \"Not Fixed\"\n    elif verdict.verdict in (\"Fixed\", \"Partially Fixed\"):\n        verdict.verdict = \"Needs Review\"\n    verdict.summary = (verdict.summary + \" \" if verdict.summary else \"\") + note\n    console.write(f\"    [policy] post-gate rejected and reverted {len(reverted)} \"\n                  f\"unsafe edit(s): {', '.join(reverted)}\")\n    if unsafe_refs:\n        reason = \"unsafe_workflow_reference\"\n    elif unsafe_content:\n        reason = \"unsafe_patch_content\"\n    else:\n        reason = None\n    return PostResult(reverted=reverted, matched_globs=sorted(set(matched)),\n                      downgraded=True, final_verdict=\"REJECT\",\n                      reason=reason)\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/remediation_agent/policy/postgate.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "Enforce path policy and workflow-reference integrity on generated edits.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_50_4": {
+      "source": "vvaharness/remediation_agent/policy/postgate.py",
+      "line_start": 50,
+      "line_end": 50,
+      "value": "Return repo-relative files in *repo*'s working tree that hit any of *patterns*; non-git fallback for the post-gate, best-effort and never raises.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_86_4": {
+      "source": "vvaharness/remediation_agent/policy/postgate.py",
+      "line_start": 86,
+      "line_end": 86,
+      "value": "Outcome of the post-gate after the agent edited files.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_95_4": {
+      "source": "vvaharness/remediation_agent/policy/postgate.py",
+      "line_start": 95,
+      "line_end": 95,
+      "value": "True iff ALL three evidence gates in the agent's own verdict read 'pass'.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_108_4": {
+      "source": "vvaharness/remediation_agent/policy/postgate.py",
+      "line_start": 108,
+      "line_end": 108,
+      "value": "Validate actual on-disk changes and mutate *verdict* on rejection.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_176_12": {
+      "source": "vvaharness/remediation_agent/policy/postgate.py",
+      "line_start": 176,
+      "line_end": 177,
+      "source_expression": "f\"Policy post-gate reverted edits to forbidden/sensitive paths \"\n            f\"({', '.join(sorted(set(matched)))}).\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_180_12": {
+      "source": "vvaharness/remediation_agent/policy/postgate.py",
+      "line_start": 180,
+      "line_end": 180,
+      "source_expression": "f\"{path}: {', '.join(refs)}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_182_12": {
+      "source": "vvaharness/remediation_agent/policy/postgate.py",
+      "line_start": 182,
+      "line_end": 184,
+      "source_expression": "\"Policy post-gate rejected unverified reusable-workflow refs \"\n            f\"({detail}). S10 must use a commit already established by the \"\n            \"repository or decline the fix; it must never invent a SHA.\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_187_12": {
+      "source": "vvaharness/remediation_agent/policy/postgate.py",
+      "line_start": 187,
+      "line_end": 187,
+      "source_expression": "f\"{path}: {', '.join(hits)}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_190_12": {
+      "source": "vvaharness/remediation_agent/policy/postgate.py",
+      "line_start": 190,
+      "line_end": 194,
+      "source_expression": "\"Policy post-gate rejected patch content that added forbidden \"\n            f\"constructs ({detail}). A remediation patch must not introduce \"\n            \"auth bypasses, dynamic code execution, network egress, \"\n            \"credential reads, or shells; this may indicate prompt injection \"\n            \"from the scanned source.\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_197_21": {
+      "source": "vvaharness/remediation_agent/policy/postgate.py",
+      "line_start": 197,
+      "line_end": 198,
+      "source_expression": "\"Refused to revert version-control metadata, inspect \"\n                     f\"manually: {', '.join(refused)}.\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_200_8": {
+      "source": "vvaharness/remediation_agent/policy/postgate.py",
+      "line_start": 200,
+      "line_end": 201,
+      "source_expression": "f\"{' '.join(notes)} Reverted {len(reverted)} file(s): \"\n        f\"{', '.join(reverted)}. Route to a human.\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_212_18": {
+      "source": "vvaharness/remediation_agent/policy/postgate.py",
+      "line_start": 212,
+      "line_end": 213,
+      "source_expression": "f\"    [policy] post-gate rejected and reverted {len(reverted)} \"\n                  f\"unsafe edit(s): {', '.join(reverted)}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "Enforce path policy and workflow-reference integrity on generated edits.",
+      "context": "literal"
+    },
+    {
+      "line_start": 50,
+      "line_end": 50,
+      "column": 4,
+      "value": "Return repo-relative files in *repo*'s working tree that hit any of *patterns*; non-git fallback for the post-gate, best-effort and never raises.",
+      "context": "literal"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 4,
+      "value": "Outcome of the post-gate after the agent edited files.",
+      "context": "literal"
+    },
+    {
+      "line_start": 95,
+      "line_end": 95,
+      "column": 4,
+      "value": "True iff ALL three evidence gates in the agent's own verdict read 'pass'.",
+      "context": "literal"
+    },
+    {
+      "line_start": 108,
+      "line_end": 108,
+      "column": 4,
+      "value": "Validate actual on-disk changes and mutate *verdict* on rejection.",
+      "context": "literal"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 25,
+      "value": "gates",
+      "context": "literal"
+    },
+    {
+      "line_start": 200,
+      "line_end": 200,
+      "column": 27,
+      "value": " Reverted ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 200,
+      "line_end": 200,
+      "column": 52,
+      "value": " file(s): ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 201,
+      "line_end": 201,
+      "column": 31,
+      "value": ". Route to a human.",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 208,
+      "line_end": 208,
+      "column": 26,
+      "value": "Not Fixed",
+      "context": "literal"
+    },
+    {
+      "line_start": 215,
+      "line_end": 215,
+      "column": 17,
+      "value": "unsafe_workflow_reference",
+      "context": "literal"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 24,
+      "value": "pass",
+      "context": "literal"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 45,
+      "value": "pass",
+      "context": "literal"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 37,
+      "value": "pass",
+      "context": "literal"
+    },
+    {
+      "line_start": 210,
+      "line_end": 210,
+      "column": 26,
+      "value": "Needs Review",
+      "context": "literal"
+    },
+    {
+      "line_start": 211,
+      "line_end": 211,
+      "column": 69,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 20,
+      "value": "    [policy] post-gate rejected and reverted ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 212,
+      "line_end": 213,
+      "column": 80,
+      "value": " unsafe edit(s): ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 217,
+      "line_end": 217,
+      "column": 17,
+      "value": "unsafe_patch_content",
+      "context": "literal"
+    },
+    {
+      "line_start": 221,
+      "line_end": 221,
+      "column": 53,
+      "value": "REJECT",
+      "context": "literal"
+    },
+    {
+      "line_start": 176,
+      "line_end": 177,
+      "column": 14,
+      "value": "Policy post-gate reverted edits to forbidden/sensitive paths (",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 48,
+      "value": ").",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 17,
+      "value": "; ",
+      "context": "literal"
+    },
+    {
+      "line_start": 182,
+      "line_end": 183,
+      "column": 12,
+      "value": "Policy post-gate rejected unverified reusable-workflow refs (",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 183,
+      "line_end": 184,
+      "column": 23,
+      "value": "). S10 must use a commit already established by the repository or decline the fix; it must never invent a SHA.",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 186,
+      "line_end": 186,
+      "column": 17,
+      "value": "; ",
+      "context": "literal"
+    },
+    {
+      "line_start": 190,
+      "line_end": 191,
+      "column": 12,
+      "value": "Policy post-gate rejected patch content that added forbidden constructs (",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 191,
+      "line_end": 194,
+      "column": 34,
+      "value": "). A remediation patch must not introduce auth bypasses, dynamic code execution, network egress, credential reads, or shells; this may indicate prompt injection from the scanned source.",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 197,
+      "line_end": 198,
+      "column": 21,
+      "value": "Refused to revert version-control metadata, inspect manually: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 198,
+      "line_end": 198,
+      "column": 53,
+      "value": ".",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 209,
+      "line_end": 209,
+      "column": 29,
+      "value": "Fixed",
+      "context": "literal"
+    },
+    {
+      "line_start": 209,
+      "line_end": 209,
+      "column": 38,
+      "value": "Partially Fixed",
+      "context": "literal"
+    },
+    {
+      "line_start": 211,
+      "line_end": 211,
+      "column": 41,
+      "value": " ",
+      "context": "literal"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 48,
+      "value": "Fixed",
+      "context": "literal"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 57,
+      "value": "Partially Fixed",
+      "context": "literal"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 20,
+      "value": ": ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 20,
+      "value": ": ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 200,
+      "line_end": 200,
+      "column": 11,
+      "value": " ",
+      "context": "literal"
+    },
+    {
+      "line_start": 201,
+      "line_end": 201,
+      "column": 11,
+      "value": ", ",
+      "context": "literal"
+    },
+    {
+      "line_start": 213,
+      "line_end": 213,
+      "column": 37,
+      "value": ", ",
+      "context": "literal"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 16,
+      "value": ", ",
+      "context": "literal"
+    },
+    {
+      "line_start": 198,
+      "line_end": 198,
+      "column": 34,
+      "value": ", ",
+      "context": "literal"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 23,
+      "value": ", ",
+      "context": "literal"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 23,
+      "value": ", ",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 43,
+      "text": "# Cap the worktree glob (non-git fallback) so a huge target can't pin the post-gate."
+    },
+    {
+      "line": 45,
+      "text": "# os.walk(followlinks=False) already closes off symlink loops; this only bounds a huge acyclic tree."
+    },
+    {
+      "line": 66,
+      "text": "# Count only FILES toward the budget — counting dirs too let vendored dirs (node_modules/.venv) consume the cap."
+    },
+    {
+      "line": 78,
+      "text": "# noqa: BLE001 — a best-effort scan must never break a run"
+    },
+    {
+      "line": 87,
+      "text": "# repo-relative files reverted on disk"
+    },
+    {
+      "line": 88,
+      "text": "# the policy globs that triggered the revert"
+    },
+    {
+      "line": 89,
+      "text": "# True if the verdict was forced to REJECT"
+    },
+    {
+      "line": 90,
+      "text": "# ACCEPT | REJECT"
+    },
+    {
+      "line": 91,
+      "text": "# deterministic post-gate rejection reason"
+    },
+    {
+      "line": 111,
+      "text": "# Observe the WHOLE working tree, not just what the agent reported, so an omitted forbidden-file edit is still caught."
+    },
+    {
+      "line": 114,
+      "text": "# Non-git fallback: walk the working tree for forbidden-glob matches, since changed_files_whole_tree returns [] off git."
+    },
+    {
+      "line": 120,
+      "text": "# A path present and unchanged in before_snapshot pre-dates this attempt; drop it so a"
+    },
+    {
+      "line": 121,
+      "text": "# pre-existing file never reads as an agent edit (a path absent stays a candidate)."
+    },
+    {
+      "line": 129,
+      "text": "# A path the verdict merely names is a claim, not an edit; .git names stay a policy hit"
+    },
+    {
+      "line": 133,
+      "text": "# Scope the diff to reported + whole-tree paths so omitted files still render into the synthesized (non-git) baseline."
+    },
+    {
+      "line": 135,
+      "text": "# before_snapshot as baseline keeps diff (and patch_applied below) scoped to this case."
+    },
+    {
+      "line": 153,
+      "text": "# The path gates above bound only WHERE the fixer wrote; _gates_ok below is"
+    },
+    {
+      "line": 154,
+      "text": "# the agent's own self-report. Neither looks at the patch content."
+    },
+    {
+      "line": 160,
+      "text": "# Gates come from verdict.gates, not the default-True flag: a no-op must never read ACCEPT"
+    },
+    {
+      "line": 204,
+      "text": "# Post-gate revert is a PARTIAL outcome, so route to a human rather than marking Denied (the pre-gate owns that terminal state)."
+    },
+    {
+      "line": 205,
+      "text": "# A content hit is treated as terminally as an invented SHA: the patch is"
+    },
+    {
+      "line": 206,
+      "text": "# not merely out of scope, its contents are untrustworthy."
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 18,
+      "line_end": 18,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 28,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 29,
+      "line_end": 29,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 30,
+      "line_end": 30,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 31,
+      "line_end": 31,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 32,
+      "line_end": 32,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 33,
+      "line_end": 33,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 34,
+      "line_end": 36,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 37,
+      "line_end": 37,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 38,
+      "line_end": 38,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 39,
+      "line_end": 39,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 40,
+      "line_end": 40,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 41,
+      "line_end": 41,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "Assign",
+      "line_start": 44,
+      "line_end": 44,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "Assign",
+      "line_start": 46,
+      "line_end": 46,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 49,
+      "line_end": 80,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 9
+    },
+    {
+      "kind": "Expr",
+      "line_start": 50,
+      "line_end": 50,
+      "column": 4,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 15
+    },
+    {
+      "kind": "If",
+      "line_start": 51,
+      "line_end": 52,
+      "column": 4,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 16
+    },
+    {
+      "kind": "Return",
+      "line_start": 52,
+      "line_end": 52,
+      "column": 8,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 18
+    },
+    {
+      "kind": "Assign",
+      "line_start": 53,
+      "line_end": 53,
+      "column": 4,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 22
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 54,
+      "line_end": 54,
+      "column": 4,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 22
+    },
+    {
+      "kind": "Assign",
+      "line_start": 55,
+      "line_end": 55,
+      "column": 4,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 22
+    },
+    {
+      "kind": "Assign",
+      "line_start": 56,
+      "line_end": 56,
+      "column": 4,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 22
+    },
+    {
+      "kind": "Try",
+      "line_start": 57,
+      "line_end": 79,
+      "column": 4,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 23
+    },
+    {
+      "kind": "For",
+      "line_start": 58,
+      "line_end": 77,
+      "column": 8,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 25
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 59,
+      "line_end": 59,
+      "column": 12,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 28
+    },
+    {
+      "kind": "If",
+      "line_start": 60,
+      "line_end": 61,
+      "column": 12,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 29
+    },
+    {
+      "kind": "Break",
+      "line_start": 61,
+      "line_end": 61,
+      "column": 16,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 31
+    },
+    {
+      "kind": "For",
+      "line_start": 62,
+      "line_end": 77,
+      "column": 12,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 34
+    },
+    {
+      "kind": "Assign",
+      "line_start": 63,
+      "line_end": 63,
+      "column": 16,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 37
+    },
+    {
+      "kind": "If",
+      "line_start": 64,
+      "line_end": 65,
+      "column": 16,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 38
+    },
+    {
+      "kind": "Continue",
+      "line_start": 65,
+      "line_end": 65,
+      "column": 20,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 40
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 67,
+      "line_end": 67,
+      "column": 16,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 44
+    },
+    {
+      "kind": "If",
+      "line_start": 68,
+      "line_end": 69,
+      "column": 16,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 45
+    },
+    {
+      "kind": "Return",
+      "line_start": 69,
+      "line_end": 69,
+      "column": 20,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 47
+    },
+    {
+      "kind": "Try",
+      "line_start": 70,
+      "line_end": 73,
+      "column": 16,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 50
+    },
+    {
+      "kind": "Assign",
+      "line_start": 71,
+      "line_end": 71,
+      "column": 20,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 53
+    },
+    {
+      "kind": "Continue",
+      "line_start": 73,
+      "line_end": 73,
+      "column": 20,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 57
+    },
+    {
+      "kind": "For",
+      "line_start": 74,
+      "line_end": 77,
+      "column": 16,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 60
+    },
+    {
+      "kind": "If",
+      "line_start": 75,
+      "line_end": 77,
+      "column": 20,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 62
+    },
+    {
+      "kind": "Expr",
+      "line_start": 76,
+      "line_end": 76,
+      "column": 24,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 65
+    },
+    {
+      "kind": "Break",
+      "line_start": 77,
+      "line_end": 77,
+      "column": 24,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 66
+    },
+    {
+      "kind": "Return",
+      "line_start": 79,
+      "line_end": 79,
+      "column": 8,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 75
+    },
+    {
+      "kind": "Return",
+      "line_start": 80,
+      "line_end": 80,
+      "column": 4,
+      "owner": "worktree_forbidden_matches",
+      "representation_line": 78
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 85,
+      "line_end": 91,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 82
+    },
+    {
+      "kind": "Expr",
+      "line_start": 86,
+      "line_end": 86,
+      "column": 4,
+      "owner": "PostResult",
+      "representation_line": 90
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 87,
+      "line_end": 87,
+      "column": 4,
+      "owner": "PostResult",
+      "representation_line": 90
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 88,
+      "line_end": 88,
+      "column": 4,
+      "owner": "PostResult",
+      "representation_line": 90
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 89,
+      "line_end": 89,
+      "column": 4,
+      "owner": "PostResult",
+      "representation_line": 90
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 90,
+      "line_end": 90,
+      "column": 4,
+      "owner": "PostResult",
+      "representation_line": 90
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 91,
+      "line_end": 91,
+      "column": 4,
+      "owner": "PostResult",
+      "representation_line": 92
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 94,
+      "line_end": 100,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 95
+    },
+    {
+      "kind": "Expr",
+      "line_start": 95,
+      "line_end": 95,
+      "column": 4,
+      "owner": "_gates_ok",
+      "representation_line": 101
+    },
+    {
+      "kind": "Assign",
+      "line_start": 96,
+      "line_end": 96,
+      "column": 4,
+      "owner": "_gates_ok",
+      "representation_line": 101
+    },
+    {
+      "kind": "If",
+      "line_start": 97,
+      "line_end": 98,
+      "column": 4,
+      "owner": "_gates_ok",
+      "representation_line": 102
+    },
+    {
+      "kind": "Return",
+      "line_start": 98,
+      "line_end": 98,
+      "column": 8,
+      "owner": "_gates_ok",
+      "representation_line": 104
+    },
+    {
+      "kind": "Return",
+      "line_start": 99,
+      "line_end": 100,
+      "column": 4,
+      "owner": "_gates_ok",
+      "representation_line": 107
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 103,
+      "line_end": 222,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 111
+    },
+    {
+      "kind": "Expr",
+      "line_start": 108,
+      "line_end": 108,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 117
+    },
+    {
+      "kind": "Assign",
+      "line_start": 109,
+      "line_end": 109,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 117
+    },
+    {
+      "kind": "Assign",
+      "line_start": 112,
+      "line_end": 112,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 117
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 115,
+      "line_end": 115,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 117
+    },
+    {
+      "kind": "If",
+      "line_start": 116,
+      "line_end": 118,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 118
+    },
+    {
+      "kind": "Assign",
+      "line_start": 117,
+      "line_end": 118,
+      "column": 8,
+      "owner": "enforce_post",
+      "representation_line": 121
+    },
+    {
+      "kind": "If",
+      "line_start": 122,
+      "line_end": 131,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 123
+    },
+    {
+      "kind": "Assign",
+      "line_start": 123,
+      "line_end": 124,
+      "column": 8,
+      "owner": "enforce_post",
+      "representation_line": 126
+    },
+    {
+      "kind": "Assign",
+      "line_start": 125,
+      "line_end": 125,
+      "column": 8,
+      "owner": "enforce_post",
+      "representation_line": 126
+    },
+    {
+      "kind": "Assign",
+      "line_start": 126,
+      "line_end": 126,
+      "column": 8,
+      "owner": "enforce_post",
+      "representation_line": 126
+    },
+    {
+      "kind": "Assign",
+      "line_start": 127,
+      "line_end": 128,
+      "column": 8,
+      "owner": "enforce_post",
+      "representation_line": 126
+    },
+    {
+      "kind": "Assign",
+      "line_start": 130,
+      "line_end": 131,
+      "column": 8,
+      "owner": "enforce_post",
+      "representation_line": 126
+    },
+    {
+      "kind": "Assign",
+      "line_start": 134,
+      "line_end": 134,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 129
+    },
+    {
+      "kind": "Assign",
+      "line_start": 136,
+      "line_end": 136,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 129
+    },
+    {
+      "kind": "If",
+      "line_start": 137,
+      "line_end": 138,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 130
+    },
+    {
+      "kind": "Assign",
+      "line_start": 138,
+      "line_end": 138,
+      "column": 8,
+      "owner": "enforce_post",
+      "representation_line": 133
+    },
+    {
+      "kind": "Assign",
+      "line_start": 139,
+      "line_end": 139,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 136
+    },
+    {
+      "kind": "Assign",
+      "line_start": 140,
+      "line_end": 141,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 136
+    },
+    {
+      "kind": "Assign",
+      "line_start": 143,
+      "line_end": 143,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 136
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 144,
+      "line_end": 144,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 136
+    },
+    {
+      "kind": "For",
+      "line_start": 145,
+      "line_end": 149,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 137
+    },
+    {
+      "kind": "Assign",
+      "line_start": 146,
+      "line_end": 147,
+      "column": 8,
+      "owner": "enforce_post",
+      "representation_line": 140
+    },
+    {
+      "kind": "If",
+      "line_start": 148,
+      "line_end": 149,
+      "column": 8,
+      "owner": "enforce_post",
+      "representation_line": 141
+    },
+    {
+      "kind": "Expr",
+      "line_start": 149,
+      "line_end": 149,
+      "column": 12,
+      "owner": "enforce_post",
+      "representation_line": 144
+    },
+    {
+      "kind": "Assign",
+      "line_start": 151,
+      "line_end": 151,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 148
+    },
+    {
+      "kind": "Assign",
+      "line_start": 155,
+      "line_end": 155,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 148
+    },
+    {
+      "kind": "Assign",
+      "line_start": 156,
+      "line_end": 156,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 148
+    },
+    {
+      "kind": "Assign",
+      "line_start": 158,
+      "line_end": 158,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 148
+    },
+    {
+      "kind": "If",
+      "line_start": 159,
+      "line_end": 166,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 149
+    },
+    {
+      "kind": "Assign",
+      "line_start": 161,
+      "line_end": 161,
+      "column": 8,
+      "owner": "enforce_post",
+      "representation_line": 152
+    },
+    {
+      "kind": "Assign",
+      "line_start": 162,
+      "line_end": 164,
+      "column": 8,
+      "owner": "enforce_post",
+      "representation_line": 152
+    },
+    {
+      "kind": "Return",
+      "line_start": 165,
+      "line_end": 166,
+      "column": 8,
+      "owner": "enforce_post",
+      "representation_line": 153
+    },
+    {
+      "kind": "Assign",
+      "line_start": 168,
+      "line_end": 168,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 157
+    },
+    {
+      "kind": "Assign",
+      "line_start": 169,
+      "line_end": 169,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 157
+    },
+    {
+      "kind": "Assign",
+      "line_start": 170,
+      "line_end": 171,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 157
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 173,
+      "line_end": 173,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 157
+    },
+    {
+      "kind": "If",
+      "line_start": 174,
+      "line_end": 177,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 158
+    },
+    {
+      "kind": "Expr",
+      "line_start": 175,
+      "line_end": 177,
+      "column": 8,
+      "owner": "enforce_post",
+      "representation_line": 161
+    },
+    {
+      "kind": "If",
+      "line_start": 178,
+      "line_end": 184,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 163
+    },
+    {
+      "kind": "Assign",
+      "line_start": 179,
+      "line_end": 180,
+      "column": 8,
+      "owner": "enforce_post",
+      "representation_line": 166
+    },
+    {
+      "kind": "Expr",
+      "line_start": 181,
+      "line_end": 184,
+      "column": 8,
+      "owner": "enforce_post",
+      "representation_line": 166
+    },
+    {
+      "kind": "If",
+      "line_start": 185,
+      "line_end": 194,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 168
+    },
+    {
+      "kind": "Assign",
+      "line_start": 186,
+      "line_end": 188,
+      "column": 8,
+      "owner": "enforce_post",
+      "representation_line": 171
+    },
+    {
+      "kind": "Expr",
+      "line_start": 189,
+      "line_end": 194,
+      "column": 8,
+      "owner": "enforce_post",
+      "representation_line": 171
+    },
+    {
+      "kind": "Assign",
+      "line_start": 195,
+      "line_end": 195,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 174
+    },
+    {
+      "kind": "If",
+      "line_start": 196,
+      "line_end": 198,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 175
+    },
+    {
+      "kind": "Expr",
+      "line_start": 197,
+      "line_end": 198,
+      "column": 8,
+      "owner": "enforce_post",
+      "representation_line": 178
+    },
+    {
+      "kind": "Assign",
+      "line_start": 199,
+      "line_end": 202,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 181
+    },
+    {
+      "kind": "Assign",
+      "line_start": 203,
+      "line_end": 203,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 181
+    },
+    {
+      "kind": "If",
+      "line_start": 207,
+      "line_end": 210,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 182
+    },
+    {
+      "kind": "Assign",
+      "line_start": 208,
+      "line_end": 208,
+      "column": 8,
+      "owner": "enforce_post",
+      "representation_line": 185
+    },
+    {
+      "kind": "If",
+      "line_start": 209,
+      "line_end": 210,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 188
+    },
+    {
+      "kind": "Assign",
+      "line_start": 210,
+      "line_end": 210,
+      "column": 8,
+      "owner": "enforce_post",
+      "representation_line": 191
+    },
+    {
+      "kind": "Assign",
+      "line_start": 211,
+      "line_end": 211,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 195
+    },
+    {
+      "kind": "Expr",
+      "line_start": 212,
+      "line_end": 213,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 195
+    },
+    {
+      "kind": "If",
+      "line_start": 214,
+      "line_end": 219,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 196
+    },
+    {
+      "kind": "Assign",
+      "line_start": 215,
+      "line_end": 215,
+      "column": 8,
+      "owner": "enforce_post",
+      "representation_line": 199
+    },
+    {
+      "kind": "If",
+      "line_start": 216,
+      "line_end": 219,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 202
+    },
+    {
+      "kind": "Assign",
+      "line_start": 217,
+      "line_end": 217,
+      "column": 8,
+      "owner": "enforce_post",
+      "representation_line": 205
+    },
+    {
+      "kind": "Assign",
+      "line_start": 219,
+      "line_end": 219,
+      "column": 8,
+      "owner": "enforce_post",
+      "representation_line": 209
+    },
+    {
+      "kind": "Return",
+      "line_start": 220,
+      "line_end": 222,
+      "column": 4,
+      "owner": "enforce_post",
+      "representation_line": 212
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 44,
+      "line_end": 44,
+      "column": 21,
+      "kind": "Constant",
+      "original_ast": "Constant(value=20000)",
+      "rendered": "20000"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 20,
+      "kind": "Constant",
+      "original_ast": "Constant(value=20000)",
+      "rendered": "20000"
+    },
+    {
+      "line_start": 51,
+      "line_end": 51,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='patterns', ctx=Load()))",
+      "rendered": "not patterns"
+    },
+    {
+      "line_start": 52,
+      "line_end": 52,
+      "column": 15,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='Path', ctx=Load()), args=[Name(id='repo', ctx=Load())], keywords=[])",
+      "rendered": "Path(repo)"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 21,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 11,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 56,
+      "line_end": 56,
+      "column": 16,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 45,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='os', ctx=Load()), attr='walk', ctx=Load()), args=[Name(id='repo', ctx=Load())], keywords=[keyword(arg='followlinks', value=Constant(value=False))])",
+      "rendered": "os.walk(repo, followlinks=False)"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='dirs_seen', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "dirs_seen += 1"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='dirs_seen', ctx=Load()), ops=[Gt()], comparators=[Name(id='_WORKTREE_DIR_MAX', ctx=Load())])",
+      "rendered": "dirs_seen > _WORKTREE_DIR_MAX"
+    },
+    {
+      "line_start": 62,
+      "line_end": 62,
+      "column": 24,
+      "kind": "Name",
+      "original_ast": "Name(id='filenames', ctx=Load())",
+      "rendered": "filenames"
+    },
+    {
+      "line_start": 63,
+      "line_end": 63,
+      "column": 20,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Name(id='Path', ctx=Load()), args=[Name(id='dirpath', ctx=Load())], keywords=[]), op=Div(), right=Name(id='name', ctx=Load()))",
+      "rendered": "Path(dirpath) / name"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 19,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='p', ctx=Load()), attr='is_file', ctx=Load()), args=[], keywords=[]))",
+      "rendered": "not p.is_file()"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 16,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='seen', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "seen += 1"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 19,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='seen', ctx=Load()), ops=[Gt()], comparators=[Name(id='_WORKTREE_SCAN_MAX', ctx=Load())])",
+      "rendered": "seen > _WORKTREE_SCAN_MAX"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 27,
+      "kind": "Name",
+      "original_ast": "Name(id='out', ctx=Load())",
+      "rendered": "out"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Name(id='p', ctx=Load()), attr='relative_to', ctx=Load()), args=[Name(id='repo', ctx=Load())], keywords=[]), attr='as_posix', ctx=Load()), args=[], keywords=[])",
+      "rendered": "p.relative_to(repo).as_posix()"
+    },
+    {
+      "line_start": 72,
+      "line_end": 72,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='ValueError', ctx=Load())",
+      "rendered": "ValueError"
+    },
+    {
+      "line_start": 74,
+      "line_end": 74,
+      "column": 27,
+      "kind": "Name",
+      "original_ast": "Name(id='patterns', ctx=Load())",
+      "rendered": "patterns"
+    },
+    {
+      "line_start": 75,
+      "line_end": 75,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_glob_match', ctx=Load()), args=[Name(id='rel', ctx=Load()), Name(id='pat', ctx=Load())], keywords=[])",
+      "rendered": "_glob_match(rel, pat)"
+    },
+    {
+      "line_start": 76,
+      "line_end": 76,
+      "column": 24,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='out', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='rel', ctx=Load())], keywords=[])",
+      "rendered": "out.append(rel)"
+    },
+    {
+      "line_start": 78,
+      "line_end": 78,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 79,
+      "line_end": 79,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='out', ctx=Load())",
+      "rendered": "out"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='out', ctx=Load())",
+      "rendered": "out"
+    },
+    {
+      "line_start": 84,
+      "line_end": 84,
+      "column": 1,
+      "kind": "Name",
+      "original_ast": "Name(id='dataclass', ctx=Load())",
+      "rendered": "dataclass"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 25,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='verdict', ctx=Load()), Constant(value='gates'), Constant(value=None)], keywords=[])",
+      "rendered": "getattr(verdict, 'gates', None)"
+    },
+    {
+      "line_start": 97,
+      "line_end": 97,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='g', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "g is None"
+    },
+    {
+      "line_start": 98,
+      "line_end": 98,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 99,
+      "line_end": 100,
+      "column": 12,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Attribute(value=Name(id='g', ctx=Load()), attr='source', ctx=Load()), ops=[Eq()], comparators=[Constant(value='pass')]), Compare(left=Attribute(value=Name(id='g', ctx=Load()), attr='sink', ctx=Load()), ops=[Eq()], comparators=[Constant(value='pass')]), Compare(left=Attribute(value=Name(id='g', ctx=Load()), attr='missing_control', ctx=Load()), ops=[Eq()], comparators=[Constant(value='pass')])])",
+      "rendered": "g.source == 'pass' and g.sink == 'pass' and (g.missing_control == 'pass')"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 14,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Attribute(value=Name(id='c', ctx=Load()), attr='file', ctx=Load()), generators=[comprehension(target=Name(id='c', ctx=Store()), iter=Attribute(value=Name(id='verdict', ctx=Load()), attr='changes', ctx=Load()), ifs=[Attribute(value=Name(id='c', ctx=Load()), attr='file', ctx=Load())], is_async=0)])",
+      "rendered": "[c.file for c in verdict.changes if c.file]"
+    },
+    {
+      "line_start": 112,
+      "line_end": 112,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='changed_files_whole_tree', ctx=Load()), args=[Name(id='repo', ctx=Load())], keywords=[])",
+      "rendered": "changed_files_whole_tree(repo)"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 36,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='whole_tree', ctx=Load()))",
+      "rendered": "not whole_tree"
+    },
+    {
+      "line_start": 117,
+      "line_end": 118,
+      "column": 29,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='worktree_forbidden_matches', ctx=Load()), args=[Name(id='repo', ctx=Load()), List(elts=[Starred(value=Attribute(value=Attribute(value=Name(id='ctx', ctx=Load()), attr='gate', ctx=Load()), attr='forbid_patch_paths', ctx=Load()), ctx=Load()), Starred(value=Attribute(value=Attribute(value=Name(id='ctx', ctx=Load()), attr='gate', ctx=Load()), attr='deny_paths', ctx=Load()), ctx=Load())], ctx=Load())], keywords=[])",
+      "rendered": "worktree_forbidden_matches(repo, [*ctx.gate.forbid_patch_paths, *ctx.gate.deny_paths])"
+    },
+    {
+      "line_start": 122,
+      "line_end": 122,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='before_snapshot', ctx=Load())",
+      "rendered": "before_snapshot"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 12,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Name(id='set', ctx=Load()), args=[Name(id='before_snapshot', ctx=Load())], keywords=[]), op=Sub(), right=Call(func=Name(id='set', ctx=Load()), args=[Call(func=Name(id='changed_since_snapshot', ctx=Load()), args=[Name(id='repo', ctx=Load()), Name(id='before_snapshot', ctx=Load())], keywords=[])], keywords=[]))",
+      "rendered": "set(before_snapshot) - set(changed_since_snapshot(repo, before_snapshot))"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 25,
+      "kind": "SetComp",
+      "original_ast": "SetComp(elt=Call(func=Name(id='_norm_path', ctx=Load()), args=[Name(id='f', ctx=Load())], keywords=[]), generators=[comprehension(target=Name(id='f', ctx=Store()), iter=Name(id='unchanged_baseline', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "{_norm_path(f) for f in unchanged_baseline}"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 21,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='f', ctx=Load()), generators=[comprehension(target=Name(id='f', ctx=Store()), iter=Name(id='whole_tree', ctx=Load()), ifs=[Compare(left=Call(func=Name(id='_norm_path', ctx=Load()), args=[Name(id='f', ctx=Load())], keywords=[]), ops=[NotIn()], comparators=[Name(id='unchanged_norm', ctx=Load())])], is_async=0)])",
+      "rendered": "[f for f in whole_tree if _norm_path(f) not in unchanged_norm]"
+    },
+    {
+      "line_start": 127,
+      "line_end": 128,
+      "column": 29,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='f', ctx=Load()), generators=[comprehension(target=Name(id='f', ctx=Store()), iter=Name(id='worktree_forbidden', ctx=Load()), ifs=[Compare(left=Call(func=Name(id='_norm_path', ctx=Load()), args=[Name(id='f', ctx=Load())], keywords=[]), ops=[NotIn()], comparators=[Name(id='unchanged_norm', ctx=Load())])], is_async=0)])",
+      "rendered": "[f for f in worktree_forbidden if _norm_path(f) not in unchanged_norm]"
+    },
+    {
+      "line_start": 130,
+      "line_end": 131,
+      "column": 18,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='f', ctx=Load()), generators=[comprehension(target=Name(id='f', ctx=Store()), iter=Name(id='changed', ctx=Load()), ifs=[BoolOp(op=Or(), values=[Call(func=Name(id='is_git_metadata', ctx=Load()), args=[Name(id='f', ctx=Load())], keywords=[]), Compare(left=Call(func=Name(id='_norm_path', ctx=Load()), args=[Name(id='f', ctx=Load())], keywords=[]), ops=[NotIn()], comparators=[Name(id='unchanged_norm', ctx=Load())])])], is_async=0)])",
+      "rendered": "[f for f in changed if is_git_metadata(f) or _norm_path(f) not in unchanged_norm]"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='list', ctx=Load()), args=[Call(func=Attribute(value=Name(id='dict', ctx=Load()), attr='fromkeys', ctx=Load()), args=[List(elts=[Starred(value=Name(id='changed', ctx=Load()), ctx=Load()), Starred(value=Name(id='whole_tree', ctx=Load()), ctx=Load())], ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "list(dict.fromkeys([*changed, *whole_tree]))"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='capture_git_diff', ctx=Load()), args=[Name(id='repo', ctx=Load()), Name(id='diff_scope', ctx=Load())], keywords=[keyword(arg='baseline', value=Name(id='before_snapshot', ctx=Load()))])",
+      "rendered": "capture_git_diff(repo, diff_scope, baseline=before_snapshot)"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[UnaryOp(op=Not(), operand=Name(id='diff', ctx=Load())), Compare(left=Name(id='before_snapshot', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])])",
+      "rendered": "not diff and before_snapshot is not None"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='synth_unified_diff', ctx=Load()), args=[Name(id='repo', ctx=Load()), Name(id='before_snapshot', ctx=Load())], keywords=[keyword(arg='extra_files', value=Name(id='diff_scope', ctx=Load()))])",
+      "rendered": "synth_unified_diff(repo, before_snapshot, extra_files=diff_scope)"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='inspect_diff', ctx=Load()), args=[Name(id='diff', ctx=Load())], keywords=[])",
+      "rendered": "inspect_diff(diff)"
+    },
+    {
+      "line_start": 140,
+      "line_end": 141,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='list', ctx=Load()), args=[Call(func=Attribute(value=Name(id='dict', ctx=Load()), attr='fromkeys', ctx=Load()), args=[List(elts=[Starred(value=Name(id='diff_files', ctx=Load()), ctx=Load()), Starred(value=Name(id='changed', ctx=Load()), ctx=Load()), Starred(value=Name(id='whole_tree', ctx=Load()), ctx=Load()), Starred(value=Name(id='worktree_forbidden', ctx=Load()), ctx=Load())], ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "list(dict.fromkeys([*diff_files, *changed, *whole_tree, *worktree_forbidden]))"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='ctx', ctx=Load()), attr='gate', ctx=Load()), attr='forbidden_files', ctx=Load()), args=[Name(id='candidates', ctx=Load())], keywords=[])",
+      "rendered": "ctx.gate.forbidden_files(candidates)"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 25,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 145,
+      "line_end": 145,
+      "column": 13,
+      "kind": "Name",
+      "original_ast": "Name(id='forbidden', ctx=Load())",
+      "rendered": "forbidden"
+    },
+    {
+      "line_start": 146,
+      "line_end": 147,
+      "column": 13,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Attribute(value=Attribute(value=Name(id='ctx', ctx=Load()), attr='gate', ctx=Load()), attr='patch_touches_forbidden', ctx=Load()), args=[List(elts=[Name(id='f', ctx=Load())], ctx=Load())], keywords=[]), Call(func=Attribute(value=Attribute(value=Name(id='ctx', ctx=Load()), attr='gate', ctx=Load()), attr='changed_paths_hit_deny', ctx=Load()), args=[List(elts=[Name(id='f', ctx=Load())], ctx=Load())], keywords=[])])",
+      "rendered": "ctx.gate.patch_touches_forbidden([f]) or ctx.gate.changed_paths_hit_deny([f])"
+    },
+    {
+      "line_start": 148,
+      "line_end": 148,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='g', ctx=Load())",
+      "rendered": "g"
+    },
+    {
+      "line_start": 149,
+      "line_end": 149,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='matched', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='g', ctx=Load())], keywords=[])",
+      "rendered": "matched.append(g)"
+    },
+    {
+      "line_start": 151,
+      "line_end": 151,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='introduced_unsafe_workflow_refs', ctx=Load()), args=[Name(id='repo', ctx=Load()), Name(id='before_snapshot', ctx=Load())], keywords=[])",
+      "rendered": "introduced_unsafe_workflow_refs(repo, before_snapshot)"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='scan_added_lines', ctx=Load()), args=[Name(id='diff', ctx=Load())], keywords=[])",
+      "rendered": "scan_added_lines(diff)"
+    },
+    {
+      "line_start": 156,
+      "line_end": 156,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='list', ctx=Load()), args=[Call(func=Attribute(value=Name(id='dict', ctx=Load()), attr='fromkeys', ctx=Load()), args=[List(elts=[Starred(value=Name(id='forbidden', ctx=Load()), ctx=Load()), Starred(value=Name(id='unsafe_refs', ctx=Load()), ctx=Load()), Starred(value=Name(id='unsafe_content', ctx=Load()), ctx=Load())], ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "list(dict.fromkeys([*forbidden, *unsafe_refs, *unsafe_content]))"
+    },
+    {
+      "line_start": 158,
+      "line_end": 158,
+      "column": 14,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Attribute(value=Name(id='pre', ctx=Load()), attr='decision', ctx=Load()), attr='action', ctx=Load())",
+      "rendered": "pre.decision.action"
+    },
+    {
+      "line_start": 159,
+      "line_end": 159,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='bad', ctx=Load()))",
+      "rendered": "not bad"
+    },
+    {
+      "line_start": 161,
+      "line_end": 161,
+      "column": 24,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='bool', ctx=Load()), args=[BoolOp(op=And(), values=[Name(id='diff', ctx=Load()), Call(func=Attribute(value=Name(id='diff', ctx=Load()), attr='strip', ctx=Load()), args=[], keywords=[])])], keywords=[])",
+      "rendered": "bool(diff and diff.strip())"
+    },
+    {
+      "line_start": 162,
+      "line_end": 164,
+      "column": 24,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Name(id='all_gates_passed', ctx=Load()), Call(func=Name(id='_gates_ok', ctx=Load()), args=[Name(id='verdict', ctx=Load())], keywords=[]), Name(id='patch_applied', ctx=Load()), Compare(left=Attribute(value=Name(id='verdict', ctx=Load()), attr='verdict', ctx=Load()), ops=[In()], comparators=[Tuple(elts=[Constant(value='Fixed'), Constant(value='Partially Fixed')], ctx=Load())])])",
+      "rendered": "all_gates_passed and _gates_ok(verdict) and patch_applied and (verdict.verdict in ('Fixed', 'Partially Fixed'))"
+    },
+    {
+      "line_start": 165,
+      "line_end": 166,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='PostResult', ctx=Load()), args=[], keywords=[keyword(arg='reverted', value=List(elts=[], ctx=Load())), keyword(arg='matched_globs', value=List(elts=[], ctx=Load())), keyword(arg='downgraded', value=Constant(value=False)), keyword(arg='final_verdict', value=Call(func=Name(id='cap_verdict', ctx=Load()), args=[Name(id='ceiling', ctx=Load()), Name(id='gates_passed', ctx=Load())], keywords=[]))])",
+      "rendered": "PostResult(reverted=[], matched_globs=[], downgraded=False, final_verdict=cap_verdict(ceiling, gates_passed))"
+    },
+    {
+      "line_start": 168,
+      "line_end": 168,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='revert_files', ctx=Load()), args=[Name(id='repo', ctx=Load()), Name(id='bad', ctx=Load()), Name(id='before_snapshot', ctx=Load())], keywords=[])",
+      "rendered": "revert_files(repo, bad, before_snapshot)"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 15,
+      "kind": "SetComp",
+      "original_ast": "SetComp(elt=Call(func=Name(id='_norm_path', ctx=Load()), args=[Name(id='f', ctx=Load())], keywords=[]), generators=[comprehension(target=Name(id='f', ctx=Store()), iter=Name(id='bad', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "{_norm_path(f) for f in bad}"
+    },
+    {
+      "line_start": 170,
+      "line_end": 171,
+      "column": 22,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='c', ctx=Load()), generators=[comprehension(target=Name(id='c', ctx=Store()), iter=Attribute(value=Name(id='verdict', ctx=Load()), attr='changes', ctx=Load()), ifs=[Compare(left=Call(func=Name(id='_norm_path', ctx=Load()), args=[Attribute(value=Name(id='c', ctx=Load()), attr='file', ctx=Load())], keywords=[]), ops=[NotIn()], comparators=[Name(id='bad_norm', ctx=Load())])], is_async=0)])",
+      "rendered": "[c for c in verdict.changes if _norm_path(c.file) not in bad_norm]"
+    },
+    {
+      "line_start": 173,
+      "line_end": 173,
+      "column": 23,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='forbidden', ctx=Load())",
+      "rendered": "forbidden"
+    },
+    {
+      "line_start": 175,
+      "line_end": 177,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='notes', ctx=Load()), attr='append', ctx=Load()), args=[JoinedStr(values=[Constant(value='Policy post-gate reverted edits to forbidden/sensitive paths ('), FormattedValue(value=Call(func=Attribute(value=Constant(value=', '), attr='join', ctx=Load()), args=[Call(func=Name(id='sorted', ctx=Load()), args=[Call(func=Name(id='set', ctx=Load()), args=[Name(id='matched', ctx=Load())], keywords=[])], keywords=[])], keywords=[]), conversion=-1), Constant(value=').')])], keywords=[])",
+      "rendered": "notes.append(source_template_176_12)"
+    },
+    {
+      "line_start": 178,
+      "line_end": 178,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='unsafe_refs', ctx=Load())",
+      "rendered": "unsafe_refs"
+    },
+    {
+      "line_start": 179,
+      "line_end": 180,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Constant(value='; '), attr='join', ctx=Load()), args=[GeneratorExp(elt=JoinedStr(values=[FormattedValue(value=Name(id='path', ctx=Load()), conversion=-1), Constant(value=': '), FormattedValue(value=Call(func=Attribute(value=Constant(value=', '), attr='join', ctx=Load()), args=[Name(id='refs', ctx=Load())], keywords=[]), conversion=-1)]), generators=[comprehension(target=Tuple(elts=[Name(id='path', ctx=Store()), Name(id='refs', ctx=Store())], ctx=Store()), iter=Call(func=Attribute(value=Name(id='unsafe_refs', ctx=Load()), attr='items', ctx=Load()), args=[], keywords=[]), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "'; '.join((source_template_180_12 for path, refs in unsafe_refs.items()))"
+    },
+    {
+      "line_start": 181,
+      "line_end": 184,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='notes', ctx=Load()), attr='append', ctx=Load()), args=[JoinedStr(values=[Constant(value='Policy post-gate rejected unverified reusable-workflow refs ('), FormattedValue(value=Name(id='detail', ctx=Load()), conversion=-1), Constant(value='). S10 must use a commit already established by the repository or decline the fix; it must never invent a SHA.')])], keywords=[])",
+      "rendered": "notes.append(source_template_182_12)"
+    },
+    {
+      "line_start": 185,
+      "line_end": 185,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='unsafe_content', ctx=Load())",
+      "rendered": "unsafe_content"
+    },
+    {
+      "line_start": 186,
+      "line_end": 188,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Constant(value='; '), attr='join', ctx=Load()), args=[GeneratorExp(elt=JoinedStr(values=[FormattedValue(value=Name(id='path', ctx=Load()), conversion=-1), Constant(value=': '), FormattedValue(value=Call(func=Attribute(value=Constant(value=', '), attr='join', ctx=Load()), args=[Name(id='hits', ctx=Load())], keywords=[]), conversion=-1)]), generators=[comprehension(target=Tuple(elts=[Name(id='path', ctx=Store()), Name(id='hits', ctx=Store())], ctx=Store()), iter=Call(func=Name(id='sorted', ctx=Load()), args=[Call(func=Attribute(value=Name(id='unsafe_content', ctx=Load()), attr='items', ctx=Load()), args=[], keywords=[])], keywords=[]), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "'; '.join((source_template_187_12 for path, hits in sorted(unsafe_content.items())))"
+    },
+    {
+      "line_start": 189,
+      "line_end": 194,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='notes', ctx=Load()), attr='append', ctx=Load()), args=[JoinedStr(values=[Constant(value='Policy post-gate rejected patch content that added forbidden constructs ('), FormattedValue(value=Name(id='detail', ctx=Load()), conversion=-1), Constant(value='). A remediation patch must not introduce auth bypasses, dynamic code execution, network egress, credential reads, or shells; this may indicate prompt injection from the scanned source.')])], keywords=[])",
+      "rendered": "notes.append(source_template_190_12)"
+    },
+    {
+      "line_start": 195,
+      "line_end": 195,
+      "column": 14,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='f', ctx=Load()), generators=[comprehension(target=Name(id='f', ctx=Store()), iter=Name(id='bad', ctx=Load()), ifs=[Call(func=Name(id='is_git_metadata', ctx=Load()), args=[Name(id='f', ctx=Load())], keywords=[])], is_async=0)])",
+      "rendered": "[f for f in bad if is_git_metadata(f)]"
+    },
+    {
+      "line_start": 196,
+      "line_end": 196,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='refused', ctx=Load())",
+      "rendered": "refused"
+    },
+    {
+      "line_start": 197,
+      "line_end": 198,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='notes', ctx=Load()), attr='append', ctx=Load()), args=[JoinedStr(values=[Constant(value='Refused to revert version-control metadata, inspect manually: '), FormattedValue(value=Call(func=Attribute(value=Constant(value=', '), attr='join', ctx=Load()), args=[Name(id='refused', ctx=Load())], keywords=[]), conversion=-1), Constant(value='.')])], keywords=[])",
+      "rendered": "notes.append(source_template_197_21)"
+    },
+    {
+      "line_start": 200,
+      "line_end": 201,
+      "column": 8,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[FormattedValue(value=Call(func=Attribute(value=Constant(value=' '), attr='join', ctx=Load()), args=[Name(id='notes', ctx=Load())], keywords=[]), conversion=-1), Constant(value=' Reverted '), FormattedValue(value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='reverted', ctx=Load())], keywords=[]), conversion=-1), Constant(value=' file(s): '), FormattedValue(value=Call(func=Attribute(value=Constant(value=', '), attr='join', ctx=Load()), args=[Name(id='reverted', ctx=Load())], keywords=[]), conversion=-1), Constant(value='. Route to a human.')])",
+      "rendered": "source_template_200_8"
+    },
+    {
+      "line_start": 203,
+      "line_end": 203,
+      "column": 30,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Name(id='list', ctx=Load()), args=[Attribute(value=Name(id='verdict', ctx=Load()), attr='remaining_risks', ctx=Load())], keywords=[]), op=Add(), right=List(elts=[Name(id='note', ctx=Load())], ctx=Load()))",
+      "rendered": "list(verdict.remaining_risks) + [note]"
+    },
+    {
+      "line_start": 207,
+      "line_end": 207,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Name(id='unsafe_refs', ctx=Load()), Name(id='unsafe_content', ctx=Load())])",
+      "rendered": "unsafe_refs or unsafe_content"
+    },
+    {
+      "line_start": 208,
+      "line_end": 208,
+      "column": 26,
+      "kind": "Constant",
+      "original_ast": "Constant(value='Not Fixed')",
+      "rendered": "'Not Fixed'"
+    },
+    {
+      "line_start": 209,
+      "line_end": 209,
+      "column": 9,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='verdict', ctx=Load()), attr='verdict', ctx=Load()), ops=[In()], comparators=[Tuple(elts=[Constant(value='Fixed'), Constant(value='Partially Fixed')], ctx=Load())])",
+      "rendered": "verdict.verdict in ('Fixed', 'Partially Fixed')"
+    },
+    {
+      "line_start": 210,
+      "line_end": 210,
+      "column": 26,
+      "kind": "Constant",
+      "original_ast": "Constant(value='Needs Review')",
+      "rendered": "'Needs Review'"
+    },
+    {
+      "line_start": 211,
+      "line_end": 211,
+      "column": 22,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=IfExp(test=Attribute(value=Name(id='verdict', ctx=Load()), attr='summary', ctx=Load()), body=BinOp(left=Attribute(value=Name(id='verdict', ctx=Load()), attr='summary', ctx=Load()), op=Add(), right=Constant(value=' ')), orelse=Constant(value='')), op=Add(), right=Name(id='note', ctx=Load()))",
+      "rendered": "(verdict.summary + ' ' if verdict.summary else '') + note"
+    },
+    {
+      "line_start": 212,
+      "line_end": 213,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='    [policy] post-gate rejected and reverted '), FormattedValue(value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='reverted', ctx=Load())], keywords=[]), conversion=-1), Constant(value=' unsafe edit(s): '), FormattedValue(value=Call(func=Attribute(value=Constant(value=', '), attr='join', ctx=Load()), args=[Name(id='reverted', ctx=Load())], keywords=[]), conversion=-1)])], keywords=[])",
+      "rendered": "console.write(source_template_212_18)"
+    },
+    {
+      "line_start": 214,
+      "line_end": 214,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='unsafe_refs', ctx=Load())",
+      "rendered": "unsafe_refs"
+    },
+    {
+      "line_start": 215,
+      "line_end": 215,
+      "column": 17,
+      "kind": "Constant",
+      "original_ast": "Constant(value='unsafe_workflow_reference')",
+      "rendered": "'unsafe_workflow_reference'"
+    },
+    {
+      "line_start": 216,
+      "line_end": 216,
+      "column": 9,
+      "kind": "Name",
+      "original_ast": "Name(id='unsafe_content', ctx=Load())",
+      "rendered": "unsafe_content"
+    },
+    {
+      "line_start": 217,
+      "line_end": 217,
+      "column": 17,
+      "kind": "Constant",
+      "original_ast": "Constant(value='unsafe_patch_content')",
+      "rendered": "'unsafe_patch_content'"
+    },
+    {
+      "line_start": 219,
+      "line_end": 219,
+      "column": 17,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 220,
+      "line_end": 222,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='PostResult', ctx=Load()), args=[], keywords=[keyword(arg='reverted', value=Name(id='reverted', ctx=Load())), keyword(arg='matched_globs', value=Call(func=Name(id='sorted', ctx=Load()), args=[Call(func=Name(id='set', ctx=Load()), args=[Name(id='matched', ctx=Load())], keywords=[])], keywords=[])), keyword(arg='downgraded', value=Constant(value=True)), keyword(arg='final_verdict', value=Constant(value='REJECT')), keyword(arg='reason', value=Name(id='reason', ctx=Load()))])",
+      "rendered": "PostResult(reverted=reverted, matched_globs=sorted(set(matched)), downgraded=True, final_verdict='REJECT', reason=reason)"
+    }
+  ],
+  "calls": [
+    {
+      "line": 53,
+      "end_line": 53,
+      "callee": "Path",
+      "enclosing": "worktree_forbidden_matches",
+      "expression": "Path(repo)"
+    },
+    {
+      "line": 96,
+      "end_line": 96,
+      "callee": "getattr",
+      "enclosing": "_gates_ok",
+      "expression": "getattr(verdict, \"gates\", None)"
+    },
+    {
+      "line": 112,
+      "end_line": 112,
+      "callee": "changed_files_whole_tree",
+      "enclosing": "enforce_post",
+      "expression": "changed_files_whole_tree(repo)"
+    },
+    {
+      "line": 134,
+      "end_line": 134,
+      "callee": "list",
+      "enclosing": "enforce_post",
+      "expression": "list(dict.fromkeys([*changed, *whole_tree]))"
+    },
+    {
+      "line": 136,
+      "end_line": 136,
+      "callee": "capture_git_diff",
+      "enclosing": "enforce_post",
+      "expression": "capture_git_diff(repo, diff_scope, baseline=before_snapshot)"
+    },
+    {
+      "line": 139,
+      "end_line": 139,
+      "callee": "inspect_diff",
+      "enclosing": "enforce_post",
+      "expression": "inspect_diff(diff)"
+    },
+    {
+      "line": 140,
+      "end_line": 141,
+      "callee": "list",
+      "enclosing": "enforce_post",
+      "expression": "list(dict.fromkeys(\n        [*diff_files, *changed, *whole_tree, *worktree_forbidden]))"
+    },
+    {
+      "line": 143,
+      "end_line": 143,
+      "callee": "ctx.gate.forbidden_files",
+      "enclosing": "enforce_post",
+      "expression": "ctx.gate.forbidden_files(candidates)"
+    },
+    {
+      "line": 151,
+      "end_line": 151,
+      "callee": "introduced_unsafe_workflow_refs",
+      "enclosing": "enforce_post",
+      "expression": "introduced_unsafe_workflow_refs(repo, before_snapshot)"
+    },
+    {
+      "line": 155,
+      "end_line": 155,
+      "callee": "scan_added_lines",
+      "enclosing": "enforce_post",
+      "expression": "scan_added_lines(diff)"
+    },
+    {
+      "line": 156,
+      "end_line": 156,
+      "callee": "list",
+      "enclosing": "enforce_post",
+      "expression": "list(dict.fromkeys([*forbidden, *unsafe_refs, *unsafe_content]))"
+    },
+    {
+      "line": 168,
+      "end_line": 168,
+      "callee": "revert_files",
+      "enclosing": "enforce_post",
+      "expression": "revert_files(repo, bad, before_snapshot)"
+    },
+    {
+      "line": 212,
+      "end_line": 213,
+      "callee": "console.write",
+      "enclosing": "enforce_post",
+      "expression": "console.write(f\"    [policy] post-gate rejected and reverted {len(reverted)} \"\n                  f\"unsafe edit(s): {', '.join(reverted)}\")"
+    },
+    {
+      "line": 220,
+      "end_line": 222,
+      "callee": "PostResult",
+      "enclosing": "enforce_post",
+      "expression": "PostResult(reverted=reverted, matched_globs=sorted(set(matched)),\n                      downgraded=True, final_verdict=\"REJECT\",\n                      reason=reason)"
+    },
+    {
+      "line": 58,
+      "end_line": 58,
+      "callee": "os.walk",
+      "enclosing": "worktree_forbidden_matches",
+      "expression": "os.walk(repo, followlinks=False)"
+    },
+    {
+      "line": 117,
+      "end_line": 118,
+      "callee": "worktree_forbidden_matches",
+      "enclosing": "enforce_post",
+      "expression": "worktree_forbidden_matches(\n            repo, [*ctx.gate.forbid_patch_paths, *ctx.gate.deny_paths])"
+    },
+    {
+      "line": 134,
+      "end_line": 134,
+      "callee": "dict.fromkeys",
+      "enclosing": "enforce_post",
+      "expression": "dict.fromkeys([*changed, *whole_tree])"
+    },
+    {
+      "line": 138,
+      "end_line": 138,
+      "callee": "synth_unified_diff",
+      "enclosing": "enforce_post",
+      "expression": "synth_unified_diff(repo, before_snapshot, extra_files=diff_scope)"
+    },
+    {
+      "line": 140,
+      "end_line": 141,
+      "callee": "dict.fromkeys",
+      "enclosing": "enforce_post",
+      "expression": "dict.fromkeys(\n        [*diff_files, *changed, *whole_tree, *worktree_forbidden])"
+    },
+    {
+      "line": 156,
+      "end_line": 156,
+      "callee": "dict.fromkeys",
+      "enclosing": "enforce_post",
+      "expression": "dict.fromkeys([*forbidden, *unsafe_refs, *unsafe_content])"
+    },
+    {
+      "line": 161,
+      "end_line": 161,
+      "callee": "bool",
+      "enclosing": "enforce_post",
+      "expression": "bool(diff and diff.strip())"
+    },
+    {
+      "line": 165,
+      "end_line": 166,
+      "callee": "PostResult",
+      "enclosing": "enforce_post",
+      "expression": "PostResult(reverted=[], matched_globs=[], downgraded=False,\n                          final_verdict=cap_verdict(ceiling, gates_passed))"
+    },
+    {
+      "line": 169,
+      "end_line": 169,
+      "callee": "_norm_path",
+      "enclosing": "enforce_post",
+      "expression": "_norm_path(f)"
+    },
+    {
+      "line": 175,
+      "end_line": 177,
+      "callee": "notes.append",
+      "enclosing": "enforce_post",
+      "expression": "notes.append(\n            f\"Policy post-gate reverted edits to forbidden/sensitive paths \"\n            f\"({', '.join(sorted(set(matched)))}).\")"
+    },
+    {
+      "line": 179,
+      "end_line": 180,
+      "callee": "'; '.join",
+      "enclosing": "enforce_post",
+      "expression": "\"; \".join(\n            f\"{path}: {', '.join(refs)}\" for path, refs in unsafe_refs.items())"
+    },
+    {
+      "line": 181,
+      "end_line": 184,
+      "callee": "notes.append",
+      "enclosing": "enforce_post",
+      "expression": "notes.append(\n            \"Policy post-gate rejected unverified reusable-workflow refs \"\n            f\"({detail}). S10 must use a commit already established by the \"\n            \"repository or decline the fix; it must never invent a SHA.\")"
+    },
+    {
+      "line": 186,
+      "end_line": 188,
+      "callee": "'; '.join",
+      "enclosing": "enforce_post",
+      "expression": "\"; \".join(\n            f\"{path}: {', '.join(hits)}\"\n            for path, hits in sorted(unsafe_content.items()))"
+    },
+    {
+      "line": 189,
+      "end_line": 194,
+      "callee": "notes.append",
+      "enclosing": "enforce_post",
+      "expression": "notes.append(\n            \"Policy post-gate rejected patch content that added forbidden \"\n            f\"constructs ({detail}). A remediation patch must not introduce \"\n            \"auth bypasses, dynamic code execution, network egress, \"\n            \"credential reads, or shells; this may indicate prompt injection \"\n            \"from the scanned source.\")"
+    },
+    {
+      "line": 197,
+      "end_line": 198,
+      "callee": "notes.append",
+      "enclosing": "enforce_post",
+      "expression": "notes.append(\"Refused to revert version-control metadata, inspect \"\n                     f\"manually: {', '.join(refused)}.\")"
+    },
+    {
+      "line": 203,
+      "end_line": 203,
+      "callee": "list",
+      "enclosing": "enforce_post",
+      "expression": "list(verdict.remaining_risks)"
+    },
+    {
+      "line": 124,
+      "end_line": 124,
+      "callee": "set",
+      "enclosing": "enforce_post",
+      "expression": "set(before_snapshot)"
+    },
+    {
+      "line": 124,
+      "end_line": 124,
+      "callee": "set",
+      "enclosing": "enforce_post",
+      "expression": "set(changed_since_snapshot(repo, before_snapshot))"
+    },
+    {
+      "line": 125,
+      "end_line": 125,
+      "callee": "_norm_path",
+      "enclosing": "enforce_post",
+      "expression": "_norm_path(f)"
+    },
+    {
+      "line": 146,
+      "end_line": 146,
+      "callee": "ctx.gate.patch_touches_forbidden",
+      "enclosing": "enforce_post",
+      "expression": "ctx.gate.patch_touches_forbidden([f])"
+    },
+    {
+      "line": 147,
+      "end_line": 147,
+      "callee": "ctx.gate.changed_paths_hit_deny",
+      "enclosing": "enforce_post",
+      "expression": "ctx.gate.changed_paths_hit_deny([f])"
+    },
+    {
+      "line": 149,
+      "end_line": 149,
+      "callee": "matched.append",
+      "enclosing": "enforce_post",
+      "expression": "matched.append(g)"
+    },
+    {
+      "line": 162,
+      "end_line": 162,
+      "callee": "_gates_ok",
+      "enclosing": "enforce_post",
+      "expression": "_gates_ok(verdict)"
+    },
+    {
+      "line": 195,
+      "end_line": 195,
+      "callee": "is_git_metadata",
+      "enclosing": "enforce_post",
+      "expression": "is_git_metadata(f)"
+    },
+    {
+      "line": 200,
+      "end_line": 200,
+      "callee": "' '.join",
+      "enclosing": "enforce_post",
+      "expression": "' '.join(notes)"
+    },
+    {
+      "line": 200,
+      "end_line": 200,
+      "callee": "len",
+      "enclosing": "enforce_post",
+      "expression": "len(reverted)"
+    },
+    {
+      "line": 201,
+      "end_line": 201,
+      "callee": "', '.join",
+      "enclosing": "enforce_post",
+      "expression": "', '.join(reverted)"
+    },
+    {
+      "line": 220,
+      "end_line": 220,
+      "callee": "sorted",
+      "enclosing": "enforce_post",
+      "expression": "sorted(set(matched))"
+    },
+    {
+      "line": 124,
+      "end_line": 124,
+      "callee": "changed_since_snapshot",
+      "enclosing": "enforce_post",
+      "expression": "changed_since_snapshot(repo, before_snapshot)"
+    },
+    {
+      "line": 161,
+      "end_line": 161,
+      "callee": "diff.strip",
+      "enclosing": "enforce_post",
+      "expression": "diff.strip()"
+    },
+    {
+      "line": 166,
+      "end_line": 166,
+      "callee": "cap_verdict",
+      "enclosing": "enforce_post",
+      "expression": "cap_verdict(ceiling, gates_passed)"
+    },
+    {
+      "line": 171,
+      "end_line": 171,
+      "callee": "_norm_path",
+      "enclosing": "enforce_post",
+      "expression": "_norm_path(c.file)"
+    },
+    {
+      "line": 212,
+      "end_line": 212,
+      "callee": "len",
+      "enclosing": "enforce_post",
+      "expression": "len(reverted)"
+    },
+    {
+      "line": 213,
+      "end_line": 213,
+      "callee": "', '.join",
+      "enclosing": "enforce_post",
+      "expression": "', '.join(reverted)"
+    },
+    {
+      "line": 220,
+      "end_line": 220,
+      "callee": "set",
+      "enclosing": "enforce_post",
+      "expression": "set(matched)"
+    },
+    {
+      "line": 63,
+      "end_line": 63,
+      "callee": "Path",
+      "enclosing": "worktree_forbidden_matches",
+      "expression": "Path(dirpath)"
+    },
+    {
+      "line": 64,
+      "end_line": 64,
+      "callee": "p.is_file",
+      "enclosing": "worktree_forbidden_matches",
+      "expression": "p.is_file()"
+    },
+    {
+      "line": 71,
+      "end_line": 71,
+      "callee": "p.relative_to(repo).as_posix",
+      "enclosing": "worktree_forbidden_matches",
+      "expression": "p.relative_to(repo).as_posix()"
+    },
+    {
+      "line": 75,
+      "end_line": 75,
+      "callee": "_glob_match",
+      "enclosing": "worktree_forbidden_matches",
+      "expression": "_glob_match(rel, pat)"
+    },
+    {
+      "line": 126,
+      "end_line": 126,
+      "callee": "_norm_path",
+      "enclosing": "enforce_post",
+      "expression": "_norm_path(f)"
+    },
+    {
+      "line": 128,
+      "end_line": 128,
+      "callee": "_norm_path",
+      "enclosing": "enforce_post",
+      "expression": "_norm_path(f)"
+    },
+    {
+      "line": 131,
+      "end_line": 131,
+      "callee": "is_git_metadata",
+      "enclosing": "enforce_post",
+      "expression": "is_git_metadata(f)"
+    },
+    {
+      "line": 177,
+      "end_line": 177,
+      "callee": "', '.join",
+      "enclosing": "enforce_post",
+      "expression": "', '.join(sorted(set(matched)))"
+    },
+    {
+      "line": 180,
+      "end_line": 180,
+      "callee": "unsafe_refs.items",
+      "enclosing": "enforce_post",
+      "expression": "unsafe_refs.items()"
+    },
+    {
+      "line": 188,
+      "end_line": 188,
+      "callee": "sorted",
+      "enclosing": "enforce_post",
+      "expression": "sorted(unsafe_content.items())"
+    },
+    {
+      "line": 198,
+      "end_line": 198,
+      "callee": "', '.join",
+      "enclosing": "enforce_post",
+      "expression": "', '.join(refused)"
+    },
+    {
+      "line": 76,
+      "end_line": 76,
+      "callee": "out.append",
+      "enclosing": "worktree_forbidden_matches",
+      "expression": "out.append(rel)"
+    },
+    {
+      "line": 131,
+      "end_line": 131,
+      "callee": "_norm_path",
+      "enclosing": "enforce_post",
+      "expression": "_norm_path(f)"
+    },
+    {
+      "line": 177,
+      "end_line": 177,
+      "callee": "sorted",
+      "enclosing": "enforce_post",
+      "expression": "sorted(set(matched))"
+    },
+    {
+      "line": 180,
+      "end_line": 180,
+      "callee": "', '.join",
+      "enclosing": "enforce_post",
+      "expression": "', '.join(refs)"
+    },
+    {
+      "line": 187,
+      "end_line": 187,
+      "callee": "', '.join",
+      "enclosing": "enforce_post",
+      "expression": "', '.join(hits)"
+    },
+    {
+      "line": 188,
+      "end_line": 188,
+      "callee": "unsafe_content.items",
+      "enclosing": "enforce_post",
+      "expression": "unsafe_content.items()"
+    },
+    {
+      "line": 71,
+      "end_line": 71,
+      "callee": "p.relative_to",
+      "enclosing": "worktree_forbidden_matches",
+      "expression": "p.relative_to(repo)"
+    },
+    {
+      "line": 177,
+      "end_line": 177,
+      "callee": "set",
+      "enclosing": "enforce_post",
+      "expression": "set(matched)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 16,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 18,
+      "source_expression": "import os",
+      "targets": [
+        "os"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "from dataclasses import dataclass",
+      "targets": [
+        "dataclasses",
+        "dataclasses.dataclass"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "from pathlib import Path",
+      "targets": [
+        "pathlib",
+        "pathlib.Path"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "from vvaharness.remediation_agent.artifacts.diff import _norm_path, capture_git_diff, changed_files_whole_tree, changed_since_snapshot, synth_unified_diff",
+      "targets": [
+        "vvaharness.remediation_agent.artifacts.diff",
+        "vvaharness.remediation_agent.artifacts.diff._norm_path",
+        "vvaharness.remediation_agent.artifacts.diff.capture_git_diff",
+        "vvaharness.remediation_agent.artifacts.diff.changed_files_whole_tree",
+        "vvaharness.remediation_agent.artifacts.diff.changed_since_snapshot",
+        "vvaharness.remediation_agent.artifacts.diff.synth_unified_diff"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/artifacts/diff/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 29,
+      "source_expression": "from vvaharness.remediation_agent.models import RemediationVerdict",
+      "targets": [
+        "vvaharness.remediation_agent.models",
+        "vvaharness.remediation_agent.models.RemediationVerdict"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 30,
+      "source_expression": "from vvaharness.remediation_agent.policy.context import PolicyContext",
+      "targets": [
+        "vvaharness.remediation_agent.policy.context",
+        "vvaharness.remediation_agent.policy.context.PolicyContext"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/policy/context.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 31,
+      "source_expression": "from vvaharness.remediation_agent.policy.decide import PreResult",
+      "targets": [
+        "vvaharness.remediation_agent.policy.decide",
+        "vvaharness.remediation_agent.policy.decide.PreResult"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/policy/decide.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 32,
+      "source_expression": "from vvaharness.remediation_agent.policy.patch_content import scan_added_lines",
+      "targets": [
+        "vvaharness.remediation_agent.policy.patch_content",
+        "vvaharness.remediation_agent.policy.patch_content.scan_added_lines"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/policy/patch_content.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 33,
+      "source_expression": "from vvaharness.remediation_agent.policy.revert import revert_files",
+      "targets": [
+        "vvaharness.remediation_agent.policy.revert",
+        "vvaharness.remediation_agent.policy.revert.revert_files"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/policy/revert.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 34,
+      "source_expression": "from vvaharness.remediation_agent.policy.workflow_refs import introduced_unsafe_workflow_refs",
+      "targets": [
+        "vvaharness.remediation_agent.policy.workflow_refs",
+        "vvaharness.remediation_agent.policy.workflow_refs.introduced_unsafe_workflow_refs"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/policy/workflow_refs.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 37,
+      "source_expression": "from vvaharness.remediation_agent.policy_gate import cap_verdict, inspect_diff",
+      "targets": [
+        "vvaharness.remediation_agent.policy_gate",
+        "vvaharness.remediation_agent.policy_gate.cap_verdict",
+        "vvaharness.remediation_agent.policy_gate.inspect_diff"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/policy_gate/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 38,
+      "source_expression": "from vvaharness.remediation_agent.policy_gate.matching import _glob_match",
+      "targets": [
+        "vvaharness.remediation_agent.policy_gate.matching",
+        "vvaharness.remediation_agent.policy_gate.matching._glob_match"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/policy_gate/matching.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 39,
+      "source_expression": "from vvaharness.remediation_agent.target import RemediationTarget",
+      "targets": [
+        "vvaharness.remediation_agent.target",
+        "vvaharness.remediation_agent.target.RemediationTarget"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/target.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 40,
+      "source_expression": "from vvaharness.util import console",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.console"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/console.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 41,
+      "source_expression": "from vvaharness.util.git_paths import is_git_metadata",
+      "targets": [
+        "vvaharness.util.git_paths",
+        "vvaharness.util.git_paths.is_git_metadata"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/git_paths.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

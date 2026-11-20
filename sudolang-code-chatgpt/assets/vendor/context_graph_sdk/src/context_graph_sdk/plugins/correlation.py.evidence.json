@@ -1,0 +1,3858 @@
+{
+  "source": "vendor/context_graph_sdk/src/context_graph_sdk/plugins/correlation.py",
+  "sha256": "27cbb0acc17263e0d8ae7c73682b4615e9dc315703ba54751a516abfae43fb83",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Deterministic workspace correlation provider execution.\"\"\"\n\nfrom __future__ import annotations\n\nimport time\nfrom collections.abc import Callable, Iterable, Iterator\nfrom dataclasses import dataclass\nfrom typing import cast\n\nfrom context_graph_sdk.errors import ModelValidationError, PluginError, SnapshotLifecycleError\nfrom context_graph_sdk.identity import ProjectId, SnapshotId\nfrom context_graph_sdk.models import (\n    CorrelationEdge,\n    FrozenMap,\n    GraphNode,\n    GraphSnapshot,\n    NodeRef,\n    ProjectSnapshot,\n    ProviderManifest,\n    SnapshotLocator,\n    freeze_properties,\n)\nfrom context_graph_sdk.pipeline import AcceptedGraphReader, CorrelationContext, PluginDiagnostic\n\nfrom .base import CorrelationProvider, PluginMetadata, PluginPhase\nfrom .context import BufferedPluginReporter, CancellationToken, PluginLogRecord\n\nMAX_CORRELATION_PROVIDERS = 32\nMAX_ACCEPTED_TOUCHING_CORRELATIONS = 5_000\n\n\n@dataclass(frozen=True)\nclass ProviderRunLimits:\n    max_edges_per_provider: int = 1_000\n    max_total_edges: int = 5_000\n    max_reader_queries: int = 256\n    max_rows_per_query: int = 1_000\n    max_total_rows: int = 10_000\n\n    def __post_init__(self) -> None:\n        if (\n            min(\n                self.max_edges_per_provider,\n                self.max_total_edges,\n                self.max_reader_queries,\n                self.max_rows_per_query,\n                self.max_total_rows,\n            )\n            <= 0\n        ):\n            raise ModelValidationError(\"correlation limits must be positive\")\n\n\nclass CorrelationProviderRegistry:\n    def __init__(self, providers: Iterable[object] = ()) -> None:\n        candidates = tuple(providers)\n        if len(candidates) > MAX_CORRELATION_PROVIDERS:\n            raise ModelValidationError(\"correlation provider count exceeds bound\")\n        names: set[str] = set()\n        registered: list[CorrelationProvider] = []\n        for provider in candidates:\n            if not isinstance(provider, CorrelationProvider):\n                raise ModelValidationError(\"provider must implement CorrelationProvider\")\n            metadata = provider.metadata\n            if metadata.phase != PluginPhase.CORRELATION:\n                raise ModelValidationError(\"correlation provider must use correlation phase\")\n            if metadata.name in names:\n                raise ModelValidationError(f\"duplicate correlation provider: {metadata.name}\")\n            names.add(metadata.name)\n            registered.append(provider)\n        self._providers = tuple(\n            sorted(registered, key=lambda provider: provider.metadata.ordering_key)\n        )\n        self._versions = {\n            provider.metadata.name: provider.metadata.version for provider in self._providers\n        }\n\n    def __iter__(self) -> Iterator[CorrelationProvider]:\n        return iter(self._providers)\n\n    def __bool__(self) -> bool:\n        return bool(self._providers)\n\n    def manifests(\n        self, project_id: ProjectId, snapshot_id: SnapshotId\n    ) -> tuple[ProviderManifest, ...]:\n        return tuple(\n            ProviderManifest(\n                project_id, snapshot_id, provider.metadata.name, provider.metadata.version\n            )\n            for provider in self._providers\n        )\n\n    def preflight(\n        self,\n        project_id: ProjectId,\n        manifests: tuple[ProviderManifest, ...],\n        correlations: tuple[CorrelationEdge, ...],\n    ) -> None:\n        if len(manifests) > MAX_CORRELATION_PROVIDERS:\n            raise PluginError(\n                \"registry\",\n                PluginPhase.CORRELATION.value,\n                \"accepted provider manifest count exceeds bound\",\n                context=f\"project={project_id}\",\n            )\n        if len(correlations) > MAX_ACCEPTED_TOUCHING_CORRELATIONS:\n            raise PluginError(\n                \"registry\",\n                PluginPhase.CORRELATION.value,\n                \"accepted touching correlation count exceeds bound\",\n                context=f\"project={project_id}\",\n            )\n        required = {(manifest.provider_name, manifest.provider_version) for manifest in manifests}\n        required.update((edge.provider_name, edge.provider_version) for edge in correlations)\n        for name, version in sorted(required):\n            if self._versions.get(name) != version:\n                raise PluginError(\n                    name,\n                    PluginPhase.CORRELATION.value,\n                    f\"accepted correlations require provider version {version}\",\n                    context=f\"project={project_id}\",\n                )\n\n\nAcceptedExecute = Callable[[SnapshotLocator, str, FrozenMap, int, float], tuple[FrozenMap, ...]]\n\n\nclass CorrelationEndpointValidator:\n    \"\"\"Runner-internal endpoint checks with a budget separate from provider reads.\"\"\"\n\n    def __init__(\n        self,\n        accepted: tuple[ProjectSnapshot, ...],\n        execute: AcceptedExecute,\n        max_checks: int,\n        deadline_monotonic: float,\n    ) -> None:\n        self._accepted = {\n            (snapshot.project.project_id, snapshot.snapshot_id): snapshot.locator\n            for snapshot in accepted\n        }\n        self._execute = execute\n        self._max_checks = max_checks\n        self._deadline_monotonic = deadline_monotonic\n        self._checks = 0\n        self._cache: dict[tuple[ProjectId, SnapshotId, str, str], bool] = {}\n\n    def exists(self, ref: NodeRef) -> bool:\n        key = (ref.project_id, ref.snapshot_id, ref.node_id, ref.local_id)\n        cached = self._cache.get(key)\n        if cached is not None:\n            return cached\n        self._checks += 1\n        if self._checks > self._max_checks:\n            raise ModelValidationError(\"endpoint validation work exceeds bound\")\n        remaining = self._deadline_monotonic - time.monotonic()\n        if remaining <= 0:\n            raise ModelValidationError(\"endpoint validation deadline exceeded\")\n        locator = self._accepted.get((ref.project_id, ref.snapshot_id))\n        if locator is None:\n            return False\n        rows = self._execute(\n            locator,\n            \"MATCH (n {id:$id}) RETURN n.localId AS localId LIMIT 2\",\n            freeze_properties({\"id\": ref.node_id}),\n            2,\n            remaining,\n        )\n        exists = len(rows) == 1 and rows[0][\"localId\"] == ref.local_id\n        self._cache[key] = exists\n        return exists\n\n\nclass BoundedAcceptedGraphReader(AcceptedGraphReader):\n    def __init__(\n        self,\n        accepted: tuple[ProjectSnapshot, ...],\n        execute: AcceptedExecute,\n        limits: ProviderRunLimits,\n        deadline_monotonic: float,\n    ) -> None:\n        self._accepted = {\n            (snapshot.project.project_id, snapshot.snapshot_id): snapshot.locator\n            for snapshot in accepted\n        }\n        self._execute = execute\n        self._limits = limits\n        self._deadline_monotonic = deadline_monotonic\n        self._queries = 0\n        self._rows = 0\n\n    def query(\n        self,\n        locator: SnapshotLocator,\n        cypher: str,\n        parameters: FrozenMap,\n        row_limit: int,\n    ) -> tuple[FrozenMap, ...]:\n        expected = self._accepted.get((locator.project_id, locator.snapshot_id))\n        if expected != locator:\n            raise SnapshotLifecycleError(\"provider requested an unaccepted snapshot locator\")\n        if not 1 <= row_limit <= self._limits.max_rows_per_query:\n            raise ModelValidationError(\"provider read row limit exceeds bound\")\n        self._queries += 1\n        if self._queries > self._limits.max_reader_queries:\n            raise ModelValidationError(\"provider read query count exceeds bound\")\n        remaining = self._deadline_monotonic - time.monotonic()\n        if remaining <= 0:\n            raise ModelValidationError(\"provider read deadline exceeded\")\n        rows = self._execute(locator, cypher, parameters, row_limit, remaining)\n        self._rows += len(rows)\n        if self._rows > self._limits.max_total_rows:\n            raise ModelValidationError(\"provider read total row count exceeds bound\")\n        return rows\n\n\n@dataclass(frozen=True)\nclass CorrelationRunResult:\n    node_refs: tuple[NodeRef, ...]\n    correlations: tuple[CorrelationEdge, ...]\n    manifests: tuple[ProviderManifest, ...]\n    logs: tuple[PluginLogRecord, ...]\n    diagnostics: tuple[PluginDiagnostic, ...]\n\n\nclass CorrelationRunner:\n    def __init__(self, limits: ProviderRunLimits | None = None) -> None:\n        self._limits = limits or ProviderRunLimits()\n\n    @property\n    def limits(self) -> ProviderRunLimits:\n        return self._limits\n\n    def run(\n        self,\n        candidate: GraphSnapshot,\n        accepted: tuple[ProjectSnapshot, ...],\n        registry: CorrelationProviderRegistry,\n        *,\n        graph_reader: BoundedAcceptedGraphReader,\n        endpoint_validator: CorrelationEndpointValidator,\n        reporter: BufferedPluginReporter,\n        cancellation: CancellationToken,\n        deadline_monotonic: float,\n        configuration: FrozenMap,\n    ) -> CorrelationRunResult:\n        accepted_by_identity = {\n            (snapshot.project.project_id, snapshot.snapshot_id): snapshot for snapshot in accepted\n        }\n        candidate_nodes = {node.id: node for node in candidate.nodes}\n        correlations: list[CorrelationEdge] = []\n        seen: set[tuple[str, str, str, str, str]] = set()\n        context_label = (\n            f\"project={candidate.project.project_id.value},snapshot={candidate.snapshot_id.value}\"\n        )\n        for provider in registry:\n            metadata = provider.metadata\n            _check_lifecycle(metadata, cancellation, deadline_monotonic, context_label)\n            context = CorrelationContext(\n                candidate,\n                accepted,\n                graph_reader,\n                reporter,\n                configuration,\n                cancellation,\n                deadline_monotonic,\n            )\n            try:\n                emitted = _require_correlations(provider.correlate(context))\n                if len(emitted) > self._limits.max_edges_per_provider:\n                    raise ModelValidationError(\"provider correlation fan-out exceeds bound\")\n                for edge in emitted:\n                    _validate_correlation(\n                        edge,\n                        metadata,\n                        candidate,\n                        candidate_nodes,\n                        accepted_by_identity,\n                        endpoint_validator,\n                    )\n                    key = (\n                        edge.source.node_id,\n                        edge.relationship_type.value,\n                        edge.target.node_id,\n                        edge.provider_name,\n                        edge.provider_version,\n                    )\n                    if key in seen:\n                        raise ModelValidationError(\"provider emitted duplicate correlation\")\n                    seen.add(key)\n                    correlations.append(edge)\n                    if len(correlations) > self._limits.max_total_edges:\n                        raise ModelValidationError(\"aggregate correlation fan-out exceeds bound\")\n                _check_lifecycle(metadata, cancellation, deadline_monotonic, context_label)\n            except PluginError as exc:\n                if (\n                    exc.plugin_name == metadata.name\n                    and exc.phase == metadata.phase.value\n                    and exc.context == context_label\n                ):\n                    raise\n                raise PluginError(\n                    metadata.name,\n                    metadata.phase.value,\n                    str(exc),\n                    context=context_label,\n                ) from exc\n            except Exception as exc:\n                raise PluginError(\n                    metadata.name,\n                    metadata.phase.value,\n                    str(exc),\n                    context=context_label,\n                ) from exc\n        refs = {\n            (ref.project_id, ref.snapshot_id, ref.node_id): ref\n            for edge in correlations\n            for ref in (edge.source, edge.target)\n        }\n        return CorrelationRunResult(\n            tuple(sorted(refs.values(), key=_ref_key)),\n            tuple(sorted(correlations, key=_edge_key)),\n            registry.manifests(candidate.project.project_id, candidate.snapshot_id),\n            reporter.logs,\n            reporter.diagnostics,\n        )\n\n\ndef _require_correlations(value: object) -> tuple[CorrelationEdge, ...]:\n    if not isinstance(value, tuple):\n        raise ModelValidationError(\"provider must return a tuple of correlations\")\n    values = cast(tuple[object, ...], value)\n    if any(not isinstance(edge, CorrelationEdge) for edge in values):\n        raise ModelValidationError(\"provider must return a tuple of correlations\")\n    return cast(tuple[CorrelationEdge, ...], values)\n\n\ndef _validate_correlation(\n    edge: CorrelationEdge,\n    metadata: PluginMetadata,\n    candidate: GraphSnapshot,\n    candidate_nodes: dict[str, GraphNode],\n    accepted: dict[tuple[ProjectId, SnapshotId], ProjectSnapshot],\n    endpoint_validator: CorrelationEndpointValidator,\n) -> None:\n    if edge.provider_name != metadata.name or edge.provider_version != metadata.version:\n        raise ModelValidationError(\"correlation ownership does not match provider metadata\")\n    candidate_identity = (candidate.project.project_id, candidate.snapshot_id)\n    endpoints = (edge.source, edge.target)\n    candidate_endpoints = [\n        endpoint\n        for endpoint in endpoints\n        if (endpoint.project_id, endpoint.snapshot_id) == candidate_identity\n    ]\n    if len(candidate_endpoints) != 1:\n        raise ModelValidationError(\"correlation must have exactly one current candidate endpoint\")\n    candidate_endpoint = candidate_endpoints[0]\n    candidate_node = candidate_nodes.get(candidate_endpoint.node_id)\n    if candidate_node is None or candidate_node.local_id != candidate_endpoint.local_id:\n        raise ModelValidationError(\"candidate correlation endpoint does not exist\")\n    target = edge.target if edge.source == candidate_endpoint else edge.source\n    target_snapshot = accepted.get((target.project_id, target.snapshot_id))\n    if target_snapshot is None:\n        raise ModelValidationError(\"correlation target is not an accepted snapshot\")\n    if not endpoint_validator.exists(target):\n        raise ModelValidationError(\"accepted correlation endpoint does not exist\")\n\n\ndef _check_lifecycle(\n    metadata: PluginMetadata,\n    cancellation: CancellationToken,\n    deadline: float,\n    context: str,\n) -> None:\n    if cancellation.is_cancelled:\n        raise PluginError(\n            metadata.name, metadata.phase.value, \"provider cancelled\", context=context\n        )\n    if time.monotonic() >= deadline:\n        raise PluginError(\n            metadata.name,\n            metadata.phase.value,\n            \"provider deadline exceeded\",\n            context=context,\n        )\n\n\ndef _ref_key(ref: NodeRef) -> tuple[str, str, str]:\n    return (ref.project_id.value, ref.snapshot_id.value, ref.node_id)\n\n\ndef _edge_key(edge: CorrelationEdge) -> tuple[str, str, str, str, str]:\n    return (\n        edge.source.node_id,\n        edge.relationship_type.value,\n        edge.target.node_id,\n        edge.provider_name,\n        edge.provider_version,\n    )\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/plugins/correlation.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "Deterministic workspace correlation provider execution.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_82_43": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/plugins/correlation.py",
+      "line_start": 82,
+      "line_end": 82,
+      "source_expression": "f\"duplicate correlation provider: {metadata.name}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_119_24": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/plugins/correlation.py",
+      "line_start": 119,
+      "line_end": 119,
+      "source_expression": "f\"project={project_id}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_126_24": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/plugins/correlation.py",
+      "line_start": 126,
+      "line_end": 126,
+      "source_expression": "f\"project={project_id}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_135_20": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/plugins/correlation.py",
+      "line_start": 135,
+      "line_end": 135,
+      "source_expression": "f\"accepted correlations require provider version {version}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_136_28": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/plugins/correlation.py",
+      "line_start": 136,
+      "line_end": 136,
+      "source_expression": "f\"project={project_id}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_144_4": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/plugins/correlation.py",
+      "line_start": 144,
+      "line_end": 144,
+      "value": "Runner-internal endpoint checks with a budget separate from provider reads.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_269_12": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/plugins/correlation.py",
+      "line_start": 269,
+      "line_end": 269,
+      "source_expression": "f\"project={candidate.project.project_id.value},snapshot={candidate.snapshot_id.value}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "Deterministic workspace correlation provider execution.",
+      "context": "literal"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 4,
+      "value": "Runner-internal endpoint checks with a budget separate from provider reads.",
+      "context": "literal"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 12,
+      "value": "MATCH (n {id:$id}) RETURN n.localId AS localId LIMIT 2",
+      "context": "literal"
+    },
+    {
+      "line_start": 269,
+      "line_end": 269,
+      "column": 14,
+      "value": "project=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 269,
+      "line_end": 269,
+      "column": 58,
+      "value": ",snapshot=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 346,
+      "line_end": 346,
+      "column": 35,
+      "value": "provider must return a tuple of correlations",
+      "context": "literal"
+    },
+    {
+      "line_start": 349,
+      "line_end": 349,
+      "column": 35,
+      "value": "provider must return a tuple of correlations",
+      "context": "literal"
+    },
+    {
+      "line_start": 362,
+      "line_end": 362,
+      "column": 35,
+      "value": "correlation ownership does not match provider metadata",
+      "context": "literal"
+    },
+    {
+      "line_start": 371,
+      "line_end": 371,
+      "column": 35,
+      "value": "correlation must have exactly one current candidate endpoint",
+      "context": "literal"
+    },
+    {
+      "line_start": 375,
+      "line_end": 375,
+      "column": 35,
+      "value": "candidate correlation endpoint does not exist",
+      "context": "literal"
+    },
+    {
+      "line_start": 379,
+      "line_end": 379,
+      "column": 35,
+      "value": "correlation target is not an accepted snapshot",
+      "context": "literal"
+    },
+    {
+      "line_start": 381,
+      "line_end": 381,
+      "column": 35,
+      "value": "accepted correlation endpoint does not exist",
+      "context": "literal"
+    },
+    {
+      "line_start": 392,
+      "line_end": 392,
+      "column": 49,
+      "value": "provider cancelled",
+      "context": "literal"
+    },
+    {
+      "line_start": 398,
+      "line_end": 398,
+      "column": 12,
+      "value": "provider deadline exceeded",
+      "context": "literal"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 39,
+      "value": "correlation limits must be positive",
+      "context": "literal"
+    },
+    {
+      "line_start": 72,
+      "line_end": 72,
+      "column": 39,
+      "value": "correlation provider count exceeds bound",
+      "context": "literal"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 16,
+      "value": "registry",
+      "context": "literal"
+    },
+    {
+      "line_start": 118,
+      "line_end": 118,
+      "column": 16,
+      "value": "accepted provider manifest count exceeds bound",
+      "context": "literal"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 16,
+      "value": "registry",
+      "context": "literal"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 16,
+      "value": "accepted touching correlation count exceeds bound",
+      "context": "literal"
+    },
+    {
+      "line_start": 170,
+      "line_end": 170,
+      "column": 39,
+      "value": "endpoint validation work exceeds bound",
+      "context": "literal"
+    },
+    {
+      "line_start": 173,
+      "line_end": 173,
+      "column": 39,
+      "value": "endpoint validation deadline exceeded",
+      "context": "literal"
+    },
+    {
+      "line_start": 216,
+      "line_end": 216,
+      "column": 41,
+      "value": "provider requested an unaccepted snapshot locator",
+      "context": "literal"
+    },
+    {
+      "line_start": 218,
+      "line_end": 218,
+      "column": 39,
+      "value": "provider read row limit exceeds bound",
+      "context": "literal"
+    },
+    {
+      "line_start": 221,
+      "line_end": 221,
+      "column": 39,
+      "value": "provider read query count exceeds bound",
+      "context": "literal"
+    },
+    {
+      "line_start": 224,
+      "line_end": 224,
+      "column": 39,
+      "value": "provider read deadline exceeded",
+      "context": "literal"
+    },
+    {
+      "line_start": 228,
+      "line_end": 228,
+      "column": 39,
+      "value": "provider read total row count exceeds bound",
+      "context": "literal"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 43,
+      "value": "provider must implement CorrelationProvider",
+      "context": "literal"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 43,
+      "value": "correlation provider must use correlation phase",
+      "context": "literal"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 31,
+      "value": "id",
+      "context": "literal"
+    },
+    {
+      "line_start": 184,
+      "line_end": 184,
+      "column": 44,
+      "value": "localId",
+      "context": "literal"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 45,
+      "value": "duplicate correlation provider: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 26,
+      "value": "project=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 26,
+      "value": "project=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 22,
+      "value": "accepted correlations require provider version ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 286,
+      "line_end": 286,
+      "column": 47,
+      "value": "provider correlation fan-out exceeds bound",
+      "context": "literal"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 30,
+      "value": "project=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 304,
+      "line_end": 304,
+      "column": 51,
+      "value": "provider emitted duplicate correlation",
+      "context": "literal"
+    },
+    {
+      "line_start": 308,
+      "line_end": 308,
+      "column": 51,
+      "value": "aggregate correlation fan-out exceeds bound",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 26,
+      "line_end": 36,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 37,
+      "line_end": 37,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 39,
+      "line_end": 39,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 40,
+      "line_end": 40,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 42,
+      "line_end": 42,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 43,
+      "line_end": 43,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 47,
+      "line_end": 65,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 7
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 48,
+      "line_end": 48,
+      "column": 4,
+      "owner": "ProviderRunLimits",
+      "representation_line": 15
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 49,
+      "line_end": 49,
+      "column": 4,
+      "owner": "ProviderRunLimits",
+      "representation_line": 15
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 50,
+      "line_end": 50,
+      "column": 4,
+      "owner": "ProviderRunLimits",
+      "representation_line": 15
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 51,
+      "line_end": 51,
+      "column": 4,
+      "owner": "ProviderRunLimits",
+      "representation_line": 15
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 52,
+      "line_end": 52,
+      "column": 4,
+      "owner": "ProviderRunLimits",
+      "representation_line": 15
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 54,
+      "line_end": 65,
+      "column": 4,
+      "owner": "ProviderRunLimits",
+      "representation_line": 16
+    },
+    {
+      "kind": "If",
+      "line_start": 55,
+      "line_end": 65,
+      "column": 8,
+      "owner": "ProviderRunLimits.__post_init__",
+      "representation_line": 21
+    },
+    {
+      "kind": "Raise",
+      "line_start": 65,
+      "line_end": 65,
+      "column": 12,
+      "owner": "ProviderRunLimits.__post_init__",
+      "representation_line": 23
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 68,
+      "line_end": 137,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 30
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 69,
+      "line_end": 90,
+      "column": 4,
+      "owner": "CorrelationProviderRegistry",
+      "representation_line": 34
+    },
+    {
+      "kind": "Assign",
+      "line_start": 70,
+      "line_end": 70,
+      "column": 8,
+      "owner": "CorrelationProviderRegistry.__init__",
+      "representation_line": 40
+    },
+    {
+      "kind": "If",
+      "line_start": 71,
+      "line_end": 72,
+      "column": 8,
+      "owner": "CorrelationProviderRegistry.__init__",
+      "representation_line": 41
+    },
+    {
+      "kind": "Raise",
+      "line_start": 72,
+      "line_end": 72,
+      "column": 12,
+      "owner": "CorrelationProviderRegistry.__init__",
+      "representation_line": 43
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 73,
+      "line_end": 73,
+      "column": 8,
+      "owner": "CorrelationProviderRegistry.__init__",
+      "representation_line": 47
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 74,
+      "line_end": 74,
+      "column": 8,
+      "owner": "CorrelationProviderRegistry.__init__",
+      "representation_line": 47
+    },
+    {
+      "kind": "For",
+      "line_start": 75,
+      "line_end": 84,
+      "column": 8,
+      "owner": "CorrelationProviderRegistry.__init__",
+      "representation_line": 48
+    },
+    {
+      "kind": "If",
+      "line_start": 76,
+      "line_end": 77,
+      "column": 12,
+      "owner": "CorrelationProviderRegistry.__init__",
+      "representation_line": 50
+    },
+    {
+      "kind": "Raise",
+      "line_start": 77,
+      "line_end": 77,
+      "column": 16,
+      "owner": "CorrelationProviderRegistry.__init__",
+      "representation_line": 52
+    },
+    {
+      "kind": "Assign",
+      "line_start": 78,
+      "line_end": 78,
+      "column": 12,
+      "owner": "CorrelationProviderRegistry.__init__",
+      "representation_line": 56
+    },
+    {
+      "kind": "If",
+      "line_start": 79,
+      "line_end": 80,
+      "column": 12,
+      "owner": "CorrelationProviderRegistry.__init__",
+      "representation_line": 57
+    },
+    {
+      "kind": "Raise",
+      "line_start": 80,
+      "line_end": 80,
+      "column": 16,
+      "owner": "CorrelationProviderRegistry.__init__",
+      "representation_line": 59
+    },
+    {
+      "kind": "If",
+      "line_start": 81,
+      "line_end": 82,
+      "column": 12,
+      "owner": "CorrelationProviderRegistry.__init__",
+      "representation_line": 62
+    },
+    {
+      "kind": "Raise",
+      "line_start": 82,
+      "line_end": 82,
+      "column": 16,
+      "owner": "CorrelationProviderRegistry.__init__",
+      "representation_line": 64
+    },
+    {
+      "kind": "Expr",
+      "line_start": 83,
+      "line_end": 83,
+      "column": 12,
+      "owner": "CorrelationProviderRegistry.__init__",
+      "representation_line": 68
+    },
+    {
+      "kind": "Expr",
+      "line_start": 84,
+      "line_end": 84,
+      "column": 12,
+      "owner": "CorrelationProviderRegistry.__init__",
+      "representation_line": 68
+    },
+    {
+      "kind": "Assign",
+      "line_start": 85,
+      "line_end": 87,
+      "column": 8,
+      "owner": "CorrelationProviderRegistry.__init__",
+      "representation_line": 71
+    },
+    {
+      "kind": "Assign",
+      "line_start": 88,
+      "line_end": 90,
+      "column": 8,
+      "owner": "CorrelationProviderRegistry.__init__",
+      "representation_line": 71
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 92,
+      "line_end": 93,
+      "column": 4,
+      "owner": "CorrelationProviderRegistry",
+      "representation_line": 74
+    },
+    {
+      "kind": "Return",
+      "line_start": 93,
+      "line_end": 93,
+      "column": 8,
+      "owner": "CorrelationProviderRegistry.__iter__",
+      "representation_line": 79
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 95,
+      "line_end": 96,
+      "column": 4,
+      "owner": "CorrelationProviderRegistry",
+      "representation_line": 83
+    },
+    {
+      "kind": "Return",
+      "line_start": 96,
+      "line_end": 96,
+      "column": 8,
+      "owner": "CorrelationProviderRegistry.__bool__",
+      "representation_line": 88
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 98,
+      "line_end": 106,
+      "column": 4,
+      "owner": "CorrelationProviderRegistry",
+      "representation_line": 92
+    },
+    {
+      "kind": "Return",
+      "line_start": 101,
+      "line_end": 106,
+      "column": 8,
+      "owner": "CorrelationProviderRegistry.manifests",
+      "representation_line": 97
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 108,
+      "line_end": 137,
+      "column": 4,
+      "owner": "CorrelationProviderRegistry",
+      "representation_line": 101
+    },
+    {
+      "kind": "If",
+      "line_start": 114,
+      "line_end": 120,
+      "column": 8,
+      "owner": "CorrelationProviderRegistry.preflight",
+      "representation_line": 106
+    },
+    {
+      "kind": "Raise",
+      "line_start": 115,
+      "line_end": 120,
+      "column": 12,
+      "owner": "CorrelationProviderRegistry.preflight",
+      "representation_line": 108
+    },
+    {
+      "kind": "If",
+      "line_start": 121,
+      "line_end": 127,
+      "column": 8,
+      "owner": "CorrelationProviderRegistry.preflight",
+      "representation_line": 111
+    },
+    {
+      "kind": "Raise",
+      "line_start": 122,
+      "line_end": 127,
+      "column": 12,
+      "owner": "CorrelationProviderRegistry.preflight",
+      "representation_line": 113
+    },
+    {
+      "kind": "Assign",
+      "line_start": 128,
+      "line_end": 128,
+      "column": 8,
+      "owner": "CorrelationProviderRegistry.preflight",
+      "representation_line": 117
+    },
+    {
+      "kind": "Expr",
+      "line_start": 129,
+      "line_end": 129,
+      "column": 8,
+      "owner": "CorrelationProviderRegistry.preflight",
+      "representation_line": 117
+    },
+    {
+      "kind": "For",
+      "line_start": 130,
+      "line_end": 137,
+      "column": 8,
+      "owner": "CorrelationProviderRegistry.preflight",
+      "representation_line": 118
+    },
+    {
+      "kind": "If",
+      "line_start": 131,
+      "line_end": 137,
+      "column": 12,
+      "owner": "CorrelationProviderRegistry.preflight",
+      "representation_line": 120
+    },
+    {
+      "kind": "Raise",
+      "line_start": 132,
+      "line_end": 137,
+      "column": 16,
+      "owner": "CorrelationProviderRegistry.preflight",
+      "representation_line": 122
+    },
+    {
+      "kind": "Assign",
+      "line_start": 140,
+      "line_end": 140,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 130
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 143,
+      "line_end": 186,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 131
+    },
+    {
+      "kind": "Expr",
+      "line_start": 144,
+      "line_end": 144,
+      "column": 4,
+      "owner": "CorrelationEndpointValidator",
+      "representation_line": 136
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 146,
+      "line_end": 161,
+      "column": 4,
+      "owner": "CorrelationEndpointValidator",
+      "representation_line": 137
+    },
+    {
+      "kind": "Assign",
+      "line_start": 153,
+      "line_end": 156,
+      "column": 8,
+      "owner": "CorrelationEndpointValidator.__init__",
+      "representation_line": 143
+    },
+    {
+      "kind": "Assign",
+      "line_start": 157,
+      "line_end": 157,
+      "column": 8,
+      "owner": "CorrelationEndpointValidator.__init__",
+      "representation_line": 143
+    },
+    {
+      "kind": "Assign",
+      "line_start": 158,
+      "line_end": 158,
+      "column": 8,
+      "owner": "CorrelationEndpointValidator.__init__",
+      "representation_line": 143
+    },
+    {
+      "kind": "Assign",
+      "line_start": 159,
+      "line_end": 159,
+      "column": 8,
+      "owner": "CorrelationEndpointValidator.__init__",
+      "representation_line": 143
+    },
+    {
+      "kind": "Assign",
+      "line_start": 160,
+      "line_end": 160,
+      "column": 8,
+      "owner": "CorrelationEndpointValidator.__init__",
+      "representation_line": 143
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 161,
+      "line_end": 161,
+      "column": 8,
+      "owner": "CorrelationEndpointValidator.__init__",
+      "representation_line": 145
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 163,
+      "line_end": 186,
+      "column": 4,
+      "owner": "CorrelationEndpointValidator",
+      "representation_line": 148
+    },
+    {
+      "kind": "Assign",
+      "line_start": 164,
+      "line_end": 164,
+      "column": 8,
+      "owner": "CorrelationEndpointValidator.exists",
+      "representation_line": 154
+    },
+    {
+      "kind": "Assign",
+      "line_start": 165,
+      "line_end": 165,
+      "column": 8,
+      "owner": "CorrelationEndpointValidator.exists",
+      "representation_line": 154
+    },
+    {
+      "kind": "If",
+      "line_start": 166,
+      "line_end": 167,
+      "column": 8,
+      "owner": "CorrelationEndpointValidator.exists",
+      "representation_line": 155
+    },
+    {
+      "kind": "Return",
+      "line_start": 167,
+      "line_end": 167,
+      "column": 12,
+      "owner": "CorrelationEndpointValidator.exists",
+      "representation_line": 157
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 168,
+      "line_end": 168,
+      "column": 8,
+      "owner": "CorrelationEndpointValidator.exists",
+      "representation_line": 161
+    },
+    {
+      "kind": "If",
+      "line_start": 169,
+      "line_end": 170,
+      "column": 8,
+      "owner": "CorrelationEndpointValidator.exists",
+      "representation_line": 162
+    },
+    {
+      "kind": "Raise",
+      "line_start": 170,
+      "line_end": 170,
+      "column": 12,
+      "owner": "CorrelationEndpointValidator.exists",
+      "representation_line": 164
+    },
+    {
+      "kind": "Assign",
+      "line_start": 171,
+      "line_end": 171,
+      "column": 8,
+      "owner": "CorrelationEndpointValidator.exists",
+      "representation_line": 168
+    },
+    {
+      "kind": "If",
+      "line_start": 172,
+      "line_end": 173,
+      "column": 8,
+      "owner": "CorrelationEndpointValidator.exists",
+      "representation_line": 169
+    },
+    {
+      "kind": "Raise",
+      "line_start": 173,
+      "line_end": 173,
+      "column": 12,
+      "owner": "CorrelationEndpointValidator.exists",
+      "representation_line": 171
+    },
+    {
+      "kind": "Assign",
+      "line_start": 174,
+      "line_end": 174,
+      "column": 8,
+      "owner": "CorrelationEndpointValidator.exists",
+      "representation_line": 175
+    },
+    {
+      "kind": "If",
+      "line_start": 175,
+      "line_end": 176,
+      "column": 8,
+      "owner": "CorrelationEndpointValidator.exists",
+      "representation_line": 176
+    },
+    {
+      "kind": "Return",
+      "line_start": 176,
+      "line_end": 176,
+      "column": 12,
+      "owner": "CorrelationEndpointValidator.exists",
+      "representation_line": 178
+    },
+    {
+      "kind": "Assign",
+      "line_start": 177,
+      "line_end": 183,
+      "column": 8,
+      "owner": "CorrelationEndpointValidator.exists",
+      "representation_line": 182
+    },
+    {
+      "kind": "Assign",
+      "line_start": 184,
+      "line_end": 184,
+      "column": 8,
+      "owner": "CorrelationEndpointValidator.exists",
+      "representation_line": 182
+    },
+    {
+      "kind": "Assign",
+      "line_start": 185,
+      "line_end": 185,
+      "column": 8,
+      "owner": "CorrelationEndpointValidator.exists",
+      "representation_line": 182
+    },
+    {
+      "kind": "Return",
+      "line_start": 186,
+      "line_end": 186,
+      "column": 8,
+      "owner": "CorrelationEndpointValidator.exists",
+      "representation_line": 183
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 189,
+      "line_end": 229,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 188
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 190,
+      "line_end": 205,
+      "column": 4,
+      "owner": "BoundedAcceptedGraphReader",
+      "representation_line": 192
+    },
+    {
+      "kind": "Assign",
+      "line_start": 197,
+      "line_end": 200,
+      "column": 8,
+      "owner": "BoundedAcceptedGraphReader.__init__",
+      "representation_line": 198
+    },
+    {
+      "kind": "Assign",
+      "line_start": 201,
+      "line_end": 201,
+      "column": 8,
+      "owner": "BoundedAcceptedGraphReader.__init__",
+      "representation_line": 198
+    },
+    {
+      "kind": "Assign",
+      "line_start": 202,
+      "line_end": 202,
+      "column": 8,
+      "owner": "BoundedAcceptedGraphReader.__init__",
+      "representation_line": 198
+    },
+    {
+      "kind": "Assign",
+      "line_start": 203,
+      "line_end": 203,
+      "column": 8,
+      "owner": "BoundedAcceptedGraphReader.__init__",
+      "representation_line": 198
+    },
+    {
+      "kind": "Assign",
+      "line_start": 204,
+      "line_end": 204,
+      "column": 8,
+      "owner": "BoundedAcceptedGraphReader.__init__",
+      "representation_line": 198
+    },
+    {
+      "kind": "Assign",
+      "line_start": 205,
+      "line_end": 205,
+      "column": 8,
+      "owner": "BoundedAcceptedGraphReader.__init__",
+      "representation_line": 200
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 207,
+      "line_end": 229,
+      "column": 4,
+      "owner": "BoundedAcceptedGraphReader",
+      "representation_line": 203
+    },
+    {
+      "kind": "Assign",
+      "line_start": 214,
+      "line_end": 214,
+      "column": 8,
+      "owner": "BoundedAcceptedGraphReader.query",
+      "representation_line": 209
+    },
+    {
+      "kind": "If",
+      "line_start": 215,
+      "line_end": 216,
+      "column": 8,
+      "owner": "BoundedAcceptedGraphReader.query",
+      "representation_line": 210
+    },
+    {
+      "kind": "Raise",
+      "line_start": 216,
+      "line_end": 216,
+      "column": 12,
+      "owner": "BoundedAcceptedGraphReader.query",
+      "representation_line": 212
+    },
+    {
+      "kind": "If",
+      "line_start": 217,
+      "line_end": 218,
+      "column": 8,
+      "owner": "BoundedAcceptedGraphReader.query",
+      "representation_line": 215
+    },
+    {
+      "kind": "Raise",
+      "line_start": 218,
+      "line_end": 218,
+      "column": 12,
+      "owner": "BoundedAcceptedGraphReader.query",
+      "representation_line": 217
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 219,
+      "line_end": 219,
+      "column": 8,
+      "owner": "BoundedAcceptedGraphReader.query",
+      "representation_line": 221
+    },
+    {
+      "kind": "If",
+      "line_start": 220,
+      "line_end": 221,
+      "column": 8,
+      "owner": "BoundedAcceptedGraphReader.query",
+      "representation_line": 222
+    },
+    {
+      "kind": "Raise",
+      "line_start": 221,
+      "line_end": 221,
+      "column": 12,
+      "owner": "BoundedAcceptedGraphReader.query",
+      "representation_line": 224
+    },
+    {
+      "kind": "Assign",
+      "line_start": 222,
+      "line_end": 222,
+      "column": 8,
+      "owner": "BoundedAcceptedGraphReader.query",
+      "representation_line": 228
+    },
+    {
+      "kind": "If",
+      "line_start": 223,
+      "line_end": 224,
+      "column": 8,
+      "owner": "BoundedAcceptedGraphReader.query",
+      "representation_line": 229
+    },
+    {
+      "kind": "Raise",
+      "line_start": 224,
+      "line_end": 224,
+      "column": 12,
+      "owner": "BoundedAcceptedGraphReader.query",
+      "representation_line": 231
+    },
+    {
+      "kind": "Assign",
+      "line_start": 225,
+      "line_end": 225,
+      "column": 8,
+      "owner": "BoundedAcceptedGraphReader.query",
+      "representation_line": 235
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 226,
+      "line_end": 226,
+      "column": 8,
+      "owner": "BoundedAcceptedGraphReader.query",
+      "representation_line": 235
+    },
+    {
+      "kind": "If",
+      "line_start": 227,
+      "line_end": 228,
+      "column": 8,
+      "owner": "BoundedAcceptedGraphReader.query",
+      "representation_line": 236
+    },
+    {
+      "kind": "Raise",
+      "line_start": 228,
+      "line_end": 228,
+      "column": 12,
+      "owner": "BoundedAcceptedGraphReader.query",
+      "representation_line": 238
+    },
+    {
+      "kind": "Return",
+      "line_start": 229,
+      "line_end": 229,
+      "column": 8,
+      "owner": "BoundedAcceptedGraphReader.query",
+      "representation_line": 241
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 233,
+      "line_end": 238,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 246
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 234,
+      "line_end": 234,
+      "column": 4,
+      "owner": "CorrelationRunResult",
+      "representation_line": 254
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 235,
+      "line_end": 235,
+      "column": 4,
+      "owner": "CorrelationRunResult",
+      "representation_line": 254
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 236,
+      "line_end": 236,
+      "column": 4,
+      "owner": "CorrelationRunResult",
+      "representation_line": 254
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 237,
+      "line_end": 237,
+      "column": 4,
+      "owner": "CorrelationRunResult",
+      "representation_line": 254
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 238,
+      "line_end": 238,
+      "column": 4,
+      "owner": "CorrelationRunResult",
+      "representation_line": 254
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 241,
+      "line_end": 341,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 257
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 242,
+      "line_end": 243,
+      "column": 4,
+      "owner": "CorrelationRunner",
+      "representation_line": 261
+    },
+    {
+      "kind": "Assign",
+      "line_start": 243,
+      "line_end": 243,
+      "column": 8,
+      "owner": "CorrelationRunner.__init__",
+      "representation_line": 267
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 246,
+      "line_end": 247,
+      "column": 4,
+      "owner": "CorrelationRunner",
+      "representation_line": 270
+    },
+    {
+      "kind": "Return",
+      "line_start": 247,
+      "line_end": 247,
+      "column": 8,
+      "owner": "CorrelationRunner.limits",
+      "representation_line": 278
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 249,
+      "line_end": 341,
+      "column": 4,
+      "owner": "CorrelationRunner",
+      "representation_line": 283
+    },
+    {
+      "kind": "Assign",
+      "line_start": 262,
+      "line_end": 264,
+      "column": 8,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 289
+    },
+    {
+      "kind": "Assign",
+      "line_start": 265,
+      "line_end": 265,
+      "column": 8,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 289
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 266,
+      "line_end": 266,
+      "column": 8,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 289
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 267,
+      "line_end": 267,
+      "column": 8,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 289
+    },
+    {
+      "kind": "Assign",
+      "line_start": 268,
+      "line_end": 270,
+      "column": 8,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 289
+    },
+    {
+      "kind": "For",
+      "line_start": 271,
+      "line_end": 329,
+      "column": 8,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 290
+    },
+    {
+      "kind": "Assign",
+      "line_start": 272,
+      "line_end": 272,
+      "column": 12,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 293
+    },
+    {
+      "kind": "Expr",
+      "line_start": 273,
+      "line_end": 273,
+      "column": 12,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 293
+    },
+    {
+      "kind": "Assign",
+      "line_start": 274,
+      "line_end": 282,
+      "column": 12,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 293
+    },
+    {
+      "kind": "Try",
+      "line_start": 283,
+      "line_end": 329,
+      "column": 12,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 294
+    },
+    {
+      "kind": "Assign",
+      "line_start": 284,
+      "line_end": 284,
+      "column": 16,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 297
+    },
+    {
+      "kind": "If",
+      "line_start": 285,
+      "line_end": 286,
+      "column": 16,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 298
+    },
+    {
+      "kind": "Raise",
+      "line_start": 286,
+      "line_end": 286,
+      "column": 20,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 300
+    },
+    {
+      "kind": "For",
+      "line_start": 287,
+      "line_end": 308,
+      "column": 16,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 303
+    },
+    {
+      "kind": "Expr",
+      "line_start": 288,
+      "line_end": 295,
+      "column": 20,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 306
+    },
+    {
+      "kind": "Assign",
+      "line_start": 296,
+      "line_end": 302,
+      "column": 20,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 306
+    },
+    {
+      "kind": "If",
+      "line_start": 303,
+      "line_end": 304,
+      "column": 20,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 307
+    },
+    {
+      "kind": "Raise",
+      "line_start": 304,
+      "line_end": 304,
+      "column": 24,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 309
+    },
+    {
+      "kind": "Expr",
+      "line_start": 305,
+      "line_end": 305,
+      "column": 20,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 313
+    },
+    {
+      "kind": "Expr",
+      "line_start": 306,
+      "line_end": 306,
+      "column": 20,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 313
+    },
+    {
+      "kind": "If",
+      "line_start": 307,
+      "line_end": 308,
+      "column": 20,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 314
+    },
+    {
+      "kind": "Raise",
+      "line_start": 308,
+      "line_end": 308,
+      "column": 24,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 316
+    },
+    {
+      "kind": "Expr",
+      "line_start": 309,
+      "line_end": 309,
+      "column": 16,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 321
+    },
+    {
+      "kind": "If",
+      "line_start": 311,
+      "line_end": 316,
+      "column": 16,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 325
+    },
+    {
+      "kind": "Raise",
+      "line_start": 316,
+      "line_end": 316,
+      "column": 20,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 327
+    },
+    {
+      "kind": "Raise",
+      "line_start": 317,
+      "line_end": 322,
+      "column": 16,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 330
+    },
+    {
+      "kind": "Raise",
+      "line_start": 324,
+      "line_end": 329,
+      "column": 16,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 335
+    },
+    {
+      "kind": "Assign",
+      "line_start": 330,
+      "line_end": 334,
+      "column": 8,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 340
+    },
+    {
+      "kind": "Return",
+      "line_start": 335,
+      "line_end": 341,
+      "column": 8,
+      "owner": "CorrelationRunner.run",
+      "representation_line": 341
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 344,
+      "line_end": 350,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 346
+    },
+    {
+      "kind": "If",
+      "line_start": 345,
+      "line_end": 346,
+      "column": 4,
+      "owner": "_require_correlations",
+      "representation_line": 351
+    },
+    {
+      "kind": "Raise",
+      "line_start": 346,
+      "line_end": 346,
+      "column": 8,
+      "owner": "_require_correlations",
+      "representation_line": 353
+    },
+    {
+      "kind": "Assign",
+      "line_start": 347,
+      "line_end": 347,
+      "column": 4,
+      "owner": "_require_correlations",
+      "representation_line": 357
+    },
+    {
+      "kind": "If",
+      "line_start": 348,
+      "line_end": 349,
+      "column": 4,
+      "owner": "_require_correlations",
+      "representation_line": 358
+    },
+    {
+      "kind": "Raise",
+      "line_start": 349,
+      "line_end": 349,
+      "column": 8,
+      "owner": "_require_correlations",
+      "representation_line": 360
+    },
+    {
+      "kind": "Return",
+      "line_start": 350,
+      "line_end": 350,
+      "column": 4,
+      "owner": "_require_correlations",
+      "representation_line": 363
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 353,
+      "line_end": 381,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 367
+    },
+    {
+      "kind": "If",
+      "line_start": 361,
+      "line_end": 362,
+      "column": 4,
+      "owner": "_validate_correlation",
+      "representation_line": 372
+    },
+    {
+      "kind": "Raise",
+      "line_start": 362,
+      "line_end": 362,
+      "column": 8,
+      "owner": "_validate_correlation",
+      "representation_line": 374
+    },
+    {
+      "kind": "Assign",
+      "line_start": 363,
+      "line_end": 363,
+      "column": 4,
+      "owner": "_validate_correlation",
+      "representation_line": 378
+    },
+    {
+      "kind": "Assign",
+      "line_start": 364,
+      "line_end": 364,
+      "column": 4,
+      "owner": "_validate_correlation",
+      "representation_line": 378
+    },
+    {
+      "kind": "Assign",
+      "line_start": 365,
+      "line_end": 369,
+      "column": 4,
+      "owner": "_validate_correlation",
+      "representation_line": 378
+    },
+    {
+      "kind": "If",
+      "line_start": 370,
+      "line_end": 371,
+      "column": 4,
+      "owner": "_validate_correlation",
+      "representation_line": 379
+    },
+    {
+      "kind": "Raise",
+      "line_start": 371,
+      "line_end": 371,
+      "column": 8,
+      "owner": "_validate_correlation",
+      "representation_line": 381
+    },
+    {
+      "kind": "Assign",
+      "line_start": 372,
+      "line_end": 372,
+      "column": 4,
+      "owner": "_validate_correlation",
+      "representation_line": 385
+    },
+    {
+      "kind": "Assign",
+      "line_start": 373,
+      "line_end": 373,
+      "column": 4,
+      "owner": "_validate_correlation",
+      "representation_line": 385
+    },
+    {
+      "kind": "If",
+      "line_start": 374,
+      "line_end": 375,
+      "column": 4,
+      "owner": "_validate_correlation",
+      "representation_line": 386
+    },
+    {
+      "kind": "Raise",
+      "line_start": 375,
+      "line_end": 375,
+      "column": 8,
+      "owner": "_validate_correlation",
+      "representation_line": 388
+    },
+    {
+      "kind": "Assign",
+      "line_start": 376,
+      "line_end": 376,
+      "column": 4,
+      "owner": "_validate_correlation",
+      "representation_line": 392
+    },
+    {
+      "kind": "Assign",
+      "line_start": 377,
+      "line_end": 377,
+      "column": 4,
+      "owner": "_validate_correlation",
+      "representation_line": 392
+    },
+    {
+      "kind": "If",
+      "line_start": 378,
+      "line_end": 379,
+      "column": 4,
+      "owner": "_validate_correlation",
+      "representation_line": 393
+    },
+    {
+      "kind": "Raise",
+      "line_start": 379,
+      "line_end": 379,
+      "column": 8,
+      "owner": "_validate_correlation",
+      "representation_line": 395
+    },
+    {
+      "kind": "If",
+      "line_start": 380,
+      "line_end": 381,
+      "column": 4,
+      "owner": "_validate_correlation",
+      "representation_line": 398
+    },
+    {
+      "kind": "Raise",
+      "line_start": 381,
+      "line_end": 381,
+      "column": 8,
+      "owner": "_validate_correlation",
+      "representation_line": 400
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 384,
+      "line_end": 400,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 405
+    },
+    {
+      "kind": "If",
+      "line_start": 390,
+      "line_end": 393,
+      "column": 4,
+      "owner": "_check_lifecycle",
+      "representation_line": 410
+    },
+    {
+      "kind": "Raise",
+      "line_start": 391,
+      "line_end": 393,
+      "column": 8,
+      "owner": "_check_lifecycle",
+      "representation_line": 412
+    },
+    {
+      "kind": "If",
+      "line_start": 394,
+      "line_end": 400,
+      "column": 4,
+      "owner": "_check_lifecycle",
+      "representation_line": 415
+    },
+    {
+      "kind": "Raise",
+      "line_start": 395,
+      "line_end": 400,
+      "column": 8,
+      "owner": "_check_lifecycle",
+      "representation_line": 417
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 403,
+      "line_end": 404,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 422
+    },
+    {
+      "kind": "Return",
+      "line_start": 404,
+      "line_end": 404,
+      "column": 4,
+      "owner": "_ref_key",
+      "representation_line": 427
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 407,
+      "line_end": 414,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 431
+    },
+    {
+      "kind": "Return",
+      "line_start": 408,
+      "line_end": 414,
+      "column": 4,
+      "owner": "_edge_key",
+      "representation_line": 436
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 28,
+      "kind": "Constant",
+      "original_ast": "Constant(value=32)",
+      "rendered": "32"
+    },
+    {
+      "line_start": 43,
+      "line_end": 43,
+      "column": 37,
+      "kind": "Constant",
+      "original_ast": "Constant(value=5000)",
+      "rendered": "5000"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 1,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dataclass', ctx=Load()), args=[], keywords=[keyword(arg='frozen', value=Constant(value=True))])",
+      "rendered": "dataclass(frozen=True)"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 34,
+      "kind": "Constant",
+      "original_ast": "Constant(value=1000)",
+      "rendered": "1000"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 27,
+      "kind": "Constant",
+      "original_ast": "Constant(value=5000)",
+      "rendered": "5000"
+    },
+    {
+      "line_start": 50,
+      "line_end": 50,
+      "column": 30,
+      "kind": "Constant",
+      "original_ast": "Constant(value=256)",
+      "rendered": "256"
+    },
+    {
+      "line_start": 51,
+      "line_end": 51,
+      "column": 30,
+      "kind": "Constant",
+      "original_ast": "Constant(value=1000)",
+      "rendered": "1000"
+    },
+    {
+      "line_start": 52,
+      "line_end": 52,
+      "column": 26,
+      "kind": "Constant",
+      "original_ast": "Constant(value=10000)",
+      "rendered": "10000"
+    },
+    {
+      "line_start": 56,
+      "line_end": 63,
+      "column": 12,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='min', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='max_edges_per_provider', ctx=Load()), Attribute(value=Name(id='self', ctx=Load()), attr='max_total_edges', ctx=Load()), Attribute(value=Name(id='self', ctx=Load()), attr='max_reader_queries', ctx=Load()), Attribute(value=Name(id='self', ctx=Load()), attr='max_rows_per_query', ctx=Load()), Attribute(value=Name(id='self', ctx=Load()), attr='max_total_rows', ctx=Load())], keywords=[]), ops=[LtE()], comparators=[Constant(value=0)])",
+      "rendered": "min(self.max_edges_per_provider, self.max_total_edges, self.max_reader_queries, self.max_rows_per_query, self.max_total_rows) <= 0"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='correlation limits must be positive')], keywords=[])",
+      "rendered": "ModelValidationError('correlation limits must be positive')"
+    },
+    {
+      "line_start": 70,
+      "line_end": 70,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='tuple', ctx=Load()), args=[Name(id='providers', ctx=Load())], keywords=[])",
+      "rendered": "tuple(providers)"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='candidates', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Name(id='MAX_CORRELATION_PROVIDERS', ctx=Load())])",
+      "rendered": "len(candidates) > MAX_CORRELATION_PROVIDERS"
+    },
+    {
+      "line_start": 72,
+      "line_end": 72,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='correlation provider count exceeds bound')], keywords=[])",
+      "rendered": "ModelValidationError('correlation provider count exceeds bound')"
+    },
+    {
+      "line_start": 73,
+      "line_end": 73,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 74,
+      "line_end": 74,
+      "column": 48,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 75,
+      "line_end": 75,
+      "column": 24,
+      "kind": "Name",
+      "original_ast": "Name(id='candidates', ctx=Load())",
+      "rendered": "candidates"
+    },
+    {
+      "line_start": 76,
+      "line_end": 76,
+      "column": 15,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='provider', ctx=Load()), Name(id='CorrelationProvider', ctx=Load())], keywords=[]))",
+      "rendered": "not isinstance(provider, CorrelationProvider)"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='provider must implement CorrelationProvider')], keywords=[])",
+      "rendered": "ModelValidationError('provider must implement CorrelationProvider')"
+    },
+    {
+      "line_start": 78,
+      "line_end": 78,
+      "column": 23,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='provider', ctx=Load()), attr='metadata', ctx=Load())",
+      "rendered": "provider.metadata"
+    },
+    {
+      "line_start": 79,
+      "line_end": 79,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='metadata', ctx=Load()), attr='phase', ctx=Load()), ops=[NotEq()], comparators=[Attribute(value=Name(id='PluginPhase', ctx=Load()), attr='CORRELATION', ctx=Load())])",
+      "rendered": "metadata.phase != PluginPhase.CORRELATION"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='correlation provider must use correlation phase')], keywords=[])",
+      "rendered": "ModelValidationError('correlation provider must use correlation phase')"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='metadata', ctx=Load()), attr='name', ctx=Load()), ops=[In()], comparators=[Name(id='names', ctx=Load())])",
+      "rendered": "metadata.name in names"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[JoinedStr(values=[Constant(value='duplicate correlation provider: '), FormattedValue(value=Attribute(value=Name(id='metadata', ctx=Load()), attr='name', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "ModelValidationError(source_template_82_43)"
+    },
+    {
+      "line_start": 83,
+      "line_end": 83,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='names', ctx=Load()), attr='add', ctx=Load()), args=[Attribute(value=Name(id='metadata', ctx=Load()), attr='name', ctx=Load())], keywords=[])",
+      "rendered": "names.add(metadata.name)"
+    },
+    {
+      "line_start": 84,
+      "line_end": 84,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='registered', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='provider', ctx=Load())], keywords=[])",
+      "rendered": "registered.append(provider)"
+    },
+    {
+      "line_start": 85,
+      "line_end": 87,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='tuple', ctx=Load()), args=[Call(func=Name(id='sorted', ctx=Load()), args=[Name(id='registered', ctx=Load())], keywords=[keyword(arg='key', value=Lambda(args=arguments(posonlyargs=[], args=[arg(arg='provider')], kwonlyargs=[], kw_defaults=[], defaults=[]), body=Attribute(value=Attribute(value=Name(id='provider', ctx=Load()), attr='metadata', ctx=Load()), attr='ordering_key', ctx=Load())))])], keywords=[])",
+      "rendered": "tuple(sorted(registered, key=lambda provider: provider.metadata.ordering_key))"
+    },
+    {
+      "line_start": 88,
+      "line_end": 90,
+      "column": 25,
+      "kind": "DictComp",
+      "original_ast": "DictComp(key=Attribute(value=Attribute(value=Name(id='provider', ctx=Load()), attr='metadata', ctx=Load()), attr='name', ctx=Load()), value=Attribute(value=Attribute(value=Name(id='provider', ctx=Load()), attr='metadata', ctx=Load()), attr='version', ctx=Load()), generators=[comprehension(target=Name(id='provider', ctx=Store()), iter=Attribute(value=Name(id='self', ctx=Load()), attr='_providers', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "{provider.metadata.name: provider.metadata.version for provider in self._providers}"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='iter', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='_providers', ctx=Load())], keywords=[])",
+      "rendered": "iter(self._providers)"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='bool', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='_providers', ctx=Load())], keywords=[])",
+      "rendered": "bool(self._providers)"
+    },
+    {
+      "line_start": 101,
+      "line_end": 106,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='tuple', ctx=Load()), args=[GeneratorExp(elt=Call(func=Name(id='ProviderManifest', ctx=Load()), args=[Name(id='project_id', ctx=Load()), Name(id='snapshot_id', ctx=Load()), Attribute(value=Attribute(value=Name(id='provider', ctx=Load()), attr='metadata', ctx=Load()), attr='name', ctx=Load()), Attribute(value=Attribute(value=Name(id='provider', ctx=Load()), attr='metadata', ctx=Load()), attr='version', ctx=Load())], keywords=[]), generators=[comprehension(target=Name(id='provider', ctx=Store()), iter=Attribute(value=Name(id='self', ctx=Load()), attr='_providers', ctx=Load()), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "tuple((ProviderManifest(project_id, snapshot_id, provider.metadata.name, provider.metadata.version) for provider in self._providers))"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='manifests', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Name(id='MAX_CORRELATION_PROVIDERS', ctx=Load())])",
+      "rendered": "len(manifests) > MAX_CORRELATION_PROVIDERS"
+    },
+    {
+      "line_start": 115,
+      "line_end": 120,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='PluginError', ctx=Load()), args=[Constant(value='registry'), Attribute(value=Attribute(value=Name(id='PluginPhase', ctx=Load()), attr='CORRELATION', ctx=Load()), attr='value', ctx=Load()), Constant(value='accepted provider manifest count exceeds bound')], keywords=[keyword(arg='context', value=JoinedStr(values=[Constant(value='project='), FormattedValue(value=Name(id='project_id', ctx=Load()), conversion=-1)]))])",
+      "rendered": "PluginError('registry', PluginPhase.CORRELATION.value, 'accepted provider manifest count exceeds bound', context=source_template_119_24)"
+    },
+    {
+      "line_start": 121,
+      "line_end": 121,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='correlations', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Name(id='MAX_ACCEPTED_TOUCHING_CORRELATIONS', ctx=Load())])",
+      "rendered": "len(correlations) > MAX_ACCEPTED_TOUCHING_CORRELATIONS"
+    },
+    {
+      "line_start": 122,
+      "line_end": 127,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='PluginError', ctx=Load()), args=[Constant(value='registry'), Attribute(value=Attribute(value=Name(id='PluginPhase', ctx=Load()), attr='CORRELATION', ctx=Load()), attr='value', ctx=Load()), Constant(value='accepted touching correlation count exceeds bound')], keywords=[keyword(arg='context', value=JoinedStr(values=[Constant(value='project='), FormattedValue(value=Name(id='project_id', ctx=Load()), conversion=-1)]))])",
+      "rendered": "PluginError('registry', PluginPhase.CORRELATION.value, 'accepted touching correlation count exceeds bound', context=source_template_126_24)"
+    },
+    {
+      "line_start": 128,
+      "line_end": 128,
+      "column": 19,
+      "kind": "SetComp",
+      "original_ast": "SetComp(elt=Tuple(elts=[Attribute(value=Name(id='manifest', ctx=Load()), attr='provider_name', ctx=Load()), Attribute(value=Name(id='manifest', ctx=Load()), attr='provider_version', ctx=Load())], ctx=Load()), generators=[comprehension(target=Name(id='manifest', ctx=Store()), iter=Name(id='manifests', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "{(manifest.provider_name, manifest.provider_version) for manifest in manifests}"
+    },
+    {
+      "line_start": 129,
+      "line_end": 129,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='required', ctx=Load()), attr='update', ctx=Load()), args=[GeneratorExp(elt=Tuple(elts=[Attribute(value=Name(id='edge', ctx=Load()), attr='provider_name', ctx=Load()), Attribute(value=Name(id='edge', ctx=Load()), attr='provider_version', ctx=Load())], ctx=Load()), generators=[comprehension(target=Name(id='edge', ctx=Store()), iter=Name(id='correlations', ctx=Load()), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "required.update(((edge.provider_name, edge.provider_version) for edge in correlations))"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 29,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[Name(id='required', ctx=Load())], keywords=[])",
+      "rendered": "sorted(required)"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_versions', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='name', ctx=Load())], keywords=[]), ops=[NotEq()], comparators=[Name(id='version', ctx=Load())])",
+      "rendered": "self._versions.get(name) != version"
+    },
+    {
+      "line_start": 132,
+      "line_end": 137,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='PluginError', ctx=Load()), args=[Name(id='name', ctx=Load()), Attribute(value=Attribute(value=Name(id='PluginPhase', ctx=Load()), attr='CORRELATION', ctx=Load()), attr='value', ctx=Load()), JoinedStr(values=[Constant(value='accepted correlations require provider version '), FormattedValue(value=Name(id='version', ctx=Load()), conversion=-1)])], keywords=[keyword(arg='context', value=JoinedStr(values=[Constant(value='project='), FormattedValue(value=Name(id='project_id', ctx=Load()), conversion=-1)]))])",
+      "rendered": "PluginError(name, PluginPhase.CORRELATION.value, source_template_135_20, context=source_template_136_28)"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 18,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Name(id='Callable', ctx=Load()), slice=Tuple(elts=[List(elts=[Name(id='SnapshotLocator', ctx=Load()), Name(id='str', ctx=Load()), Name(id='FrozenMap', ctx=Load()), Name(id='int', ctx=Load()), Name(id='float', ctx=Load())], ctx=Load()), Subscript(value=Name(id='tuple', ctx=Load()), slice=Tuple(elts=[Name(id='FrozenMap', ctx=Load()), Constant(value=Ellipsis)], ctx=Load()), ctx=Load())], ctx=Load()), ctx=Load())",
+      "rendered": "Callable[[SnapshotLocator, str, FrozenMap, int, float], tuple[FrozenMap, ...]]"
+    },
+    {
+      "line_start": 153,
+      "line_end": 156,
+      "column": 25,
+      "kind": "DictComp",
+      "original_ast": "DictComp(key=Tuple(elts=[Attribute(value=Attribute(value=Name(id='snapshot', ctx=Load()), attr='project', ctx=Load()), attr='project_id', ctx=Load()), Attribute(value=Name(id='snapshot', ctx=Load()), attr='snapshot_id', ctx=Load())], ctx=Load()), value=Attribute(value=Name(id='snapshot', ctx=Load()), attr='locator', ctx=Load()), generators=[comprehension(target=Name(id='snapshot', ctx=Store()), iter=Name(id='accepted', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "{(snapshot.project.project_id, snapshot.snapshot_id): snapshot.locator for snapshot in accepted}"
+    },
+    {
+      "line_start": 157,
+      "line_end": 157,
+      "column": 24,
+      "kind": "Name",
+      "original_ast": "Name(id='execute', ctx=Load())",
+      "rendered": "execute"
+    },
+    {
+      "line_start": 158,
+      "line_end": 158,
+      "column": 27,
+      "kind": "Name",
+      "original_ast": "Name(id='max_checks', ctx=Load())",
+      "rendered": "max_checks"
+    },
+    {
+      "line_start": 159,
+      "line_end": 159,
+      "column": 35,
+      "kind": "Name",
+      "original_ast": "Name(id='deadline_monotonic', ctx=Load())",
+      "rendered": "deadline_monotonic"
+    },
+    {
+      "line_start": 160,
+      "line_end": 160,
+      "column": 23,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 161,
+      "line_end": 161,
+      "column": 74,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 14,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Attribute(value=Name(id='ref', ctx=Load()), attr='project_id', ctx=Load()), Attribute(value=Name(id='ref', ctx=Load()), attr='snapshot_id', ctx=Load()), Attribute(value=Name(id='ref', ctx=Load()), attr='node_id', ctx=Load()), Attribute(value=Name(id='ref', ctx=Load()), attr='local_id', ctx=Load())], ctx=Load())",
+      "rendered": "(ref.project_id, ref.snapshot_id, ref.node_id, ref.local_id)"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_cache', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='key', ctx=Load())], keywords=[])",
+      "rendered": "self._cache.get(key)"
+    },
+    {
+      "line_start": 166,
+      "line_end": 166,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='cached', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "cached is not None"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='cached', ctx=Load())",
+      "rendered": "cached"
+    },
+    {
+      "line_start": 168,
+      "line_end": 168,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Attribute(value=Name(id='self', ctx=Load()), attr='_checks', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "self._checks += 1"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='self', ctx=Load()), attr='_checks', ctx=Load()), ops=[Gt()], comparators=[Attribute(value=Name(id='self', ctx=Load()), attr='_max_checks', ctx=Load())])",
+      "rendered": "self._checks > self._max_checks"
+    },
+    {
+      "line_start": 170,
+      "line_end": 170,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='endpoint validation work exceeds bound')], keywords=[])",
+      "rendered": "ModelValidationError('endpoint validation work exceeds bound')"
+    },
+    {
+      "line_start": 171,
+      "line_end": 171,
+      "column": 20,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Attribute(value=Name(id='self', ctx=Load()), attr='_deadline_monotonic', ctx=Load()), op=Sub(), right=Call(func=Attribute(value=Name(id='time', ctx=Load()), attr='monotonic', ctx=Load()), args=[], keywords=[]))",
+      "rendered": "self._deadline_monotonic - time.monotonic()"
+    },
+    {
+      "line_start": 172,
+      "line_end": 172,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='remaining', ctx=Load()), ops=[LtE()], comparators=[Constant(value=0)])",
+      "rendered": "remaining <= 0"
+    },
+    {
+      "line_start": 173,
+      "line_end": 173,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='endpoint validation deadline exceeded')], keywords=[])",
+      "rendered": "ModelValidationError('endpoint validation deadline exceeded')"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_accepted', ctx=Load()), attr='get', ctx=Load()), args=[Tuple(elts=[Attribute(value=Name(id='ref', ctx=Load()), attr='project_id', ctx=Load()), Attribute(value=Name(id='ref', ctx=Load()), attr='snapshot_id', ctx=Load())], ctx=Load())], keywords=[])",
+      "rendered": "self._accepted.get((ref.project_id, ref.snapshot_id))"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='locator', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "locator is None"
+    },
+    {
+      "line_start": 176,
+      "line_end": 176,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 177,
+      "line_end": 183,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_execute', ctx=Load()), args=[Name(id='locator', ctx=Load()), Constant(value='MATCH (n {id:$id}) RETURN n.localId AS localId LIMIT 2'), Call(func=Name(id='freeze_properties', ctx=Load()), args=[Dict(keys=[Constant(value='id')], values=[Attribute(value=Name(id='ref', ctx=Load()), attr='node_id', ctx=Load())])], keywords=[]), Constant(value=2), Name(id='remaining', ctx=Load())], keywords=[])",
+      "rendered": "self._execute(locator, 'MATCH (n {id:$id}) RETURN n.localId AS localId LIMIT 2', freeze_properties({'id': ref.node_id}), 2, remaining)"
+    },
+    {
+      "line_start": 184,
+      "line_end": 184,
+      "column": 17,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='rows', ctx=Load())], keywords=[]), ops=[Eq()], comparators=[Constant(value=1)]), Compare(left=Subscript(value=Subscript(value=Name(id='rows', ctx=Load()), slice=Constant(value=0), ctx=Load()), slice=Constant(value='localId'), ctx=Load()), ops=[Eq()], comparators=[Attribute(value=Name(id='ref', ctx=Load()), attr='local_id', ctx=Load())])])",
+      "rendered": "len(rows) == 1 and rows[0]['localId'] == ref.local_id"
+    },
+    {
+      "line_start": 185,
+      "line_end": 185,
+      "column": 27,
+      "kind": "Name",
+      "original_ast": "Name(id='exists', ctx=Load())",
+      "rendered": "exists"
+    },
+    {
+      "line_start": 186,
+      "line_end": 186,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='exists', ctx=Load())",
+      "rendered": "exists"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 33,
+      "kind": "Name",
+      "original_ast": "Name(id='AcceptedGraphReader', ctx=Load())",
+      "rendered": "AcceptedGraphReader"
+    },
+    {
+      "line_start": 197,
+      "line_end": 200,
+      "column": 25,
+      "kind": "DictComp",
+      "original_ast": "DictComp(key=Tuple(elts=[Attribute(value=Attribute(value=Name(id='snapshot', ctx=Load()), attr='project', ctx=Load()), attr='project_id', ctx=Load()), Attribute(value=Name(id='snapshot', ctx=Load()), attr='snapshot_id', ctx=Load())], ctx=Load()), value=Attribute(value=Name(id='snapshot', ctx=Load()), attr='locator', ctx=Load()), generators=[comprehension(target=Name(id='snapshot', ctx=Store()), iter=Name(id='accepted', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "{(snapshot.project.project_id, snapshot.snapshot_id): snapshot.locator for snapshot in accepted}"
+    },
+    {
+      "line_start": 201,
+      "line_end": 201,
+      "column": 24,
+      "kind": "Name",
+      "original_ast": "Name(id='execute', ctx=Load())",
+      "rendered": "execute"
+    },
+    {
+      "line_start": 202,
+      "line_end": 202,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='limits', ctx=Load())",
+      "rendered": "limits"
+    },
+    {
+      "line_start": 203,
+      "line_end": 203,
+      "column": 35,
+      "kind": "Name",
+      "original_ast": "Name(id='deadline_monotonic', ctx=Load())",
+      "rendered": "deadline_monotonic"
+    },
+    {
+      "line_start": 204,
+      "line_end": 204,
+      "column": 24,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 21,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 214,
+      "line_end": 214,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_accepted', ctx=Load()), attr='get', ctx=Load()), args=[Tuple(elts=[Attribute(value=Name(id='locator', ctx=Load()), attr='project_id', ctx=Load()), Attribute(value=Name(id='locator', ctx=Load()), attr='snapshot_id', ctx=Load())], ctx=Load())], keywords=[])",
+      "rendered": "self._accepted.get((locator.project_id, locator.snapshot_id))"
+    },
+    {
+      "line_start": 215,
+      "line_end": 215,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='expected', ctx=Load()), ops=[NotEq()], comparators=[Name(id='locator', ctx=Load())])",
+      "rendered": "expected != locator"
+    },
+    {
+      "line_start": 216,
+      "line_end": 216,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='SnapshotLifecycleError', ctx=Load()), args=[Constant(value='provider requested an unaccepted snapshot locator')], keywords=[])",
+      "rendered": "SnapshotLifecycleError('provider requested an unaccepted snapshot locator')"
+    },
+    {
+      "line_start": 217,
+      "line_end": 217,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Compare(left=Constant(value=1), ops=[LtE(), LtE()], comparators=[Name(id='row_limit', ctx=Load()), Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_limits', ctx=Load()), attr='max_rows_per_query', ctx=Load())]))",
+      "rendered": "not 1 <= row_limit <= self._limits.max_rows_per_query"
+    },
+    {
+      "line_start": 218,
+      "line_end": 218,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='provider read row limit exceeds bound')], keywords=[])",
+      "rendered": "ModelValidationError('provider read row limit exceeds bound')"
+    },
+    {
+      "line_start": 219,
+      "line_end": 219,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Attribute(value=Name(id='self', ctx=Load()), attr='_queries', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "self._queries += 1"
+    },
+    {
+      "line_start": 220,
+      "line_end": 220,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='self', ctx=Load()), attr='_queries', ctx=Load()), ops=[Gt()], comparators=[Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_limits', ctx=Load()), attr='max_reader_queries', ctx=Load())])",
+      "rendered": "self._queries > self._limits.max_reader_queries"
+    },
+    {
+      "line_start": 221,
+      "line_end": 221,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='provider read query count exceeds bound')], keywords=[])",
+      "rendered": "ModelValidationError('provider read query count exceeds bound')"
+    },
+    {
+      "line_start": 222,
+      "line_end": 222,
+      "column": 20,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Attribute(value=Name(id='self', ctx=Load()), attr='_deadline_monotonic', ctx=Load()), op=Sub(), right=Call(func=Attribute(value=Name(id='time', ctx=Load()), attr='monotonic', ctx=Load()), args=[], keywords=[]))",
+      "rendered": "self._deadline_monotonic - time.monotonic()"
+    },
+    {
+      "line_start": 223,
+      "line_end": 223,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='remaining', ctx=Load()), ops=[LtE()], comparators=[Constant(value=0)])",
+      "rendered": "remaining <= 0"
+    },
+    {
+      "line_start": 224,
+      "line_end": 224,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='provider read deadline exceeded')], keywords=[])",
+      "rendered": "ModelValidationError('provider read deadline exceeded')"
+    },
+    {
+      "line_start": 225,
+      "line_end": 225,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_execute', ctx=Load()), args=[Name(id='locator', ctx=Load()), Name(id='cypher', ctx=Load()), Name(id='parameters', ctx=Load()), Name(id='row_limit', ctx=Load()), Name(id='remaining', ctx=Load())], keywords=[])",
+      "rendered": "self._execute(locator, cypher, parameters, row_limit, remaining)"
+    },
+    {
+      "line_start": 226,
+      "line_end": 226,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Attribute(value=Name(id='self', ctx=Load()), attr='_rows', ctx=Store()), op=Add(), value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='rows', ctx=Load())], keywords=[]))",
+      "rendered": "self._rows += len(rows)"
+    },
+    {
+      "line_start": 227,
+      "line_end": 227,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='self', ctx=Load()), attr='_rows', ctx=Load()), ops=[Gt()], comparators=[Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_limits', ctx=Load()), attr='max_total_rows', ctx=Load())])",
+      "rendered": "self._rows > self._limits.max_total_rows"
+    },
+    {
+      "line_start": 228,
+      "line_end": 228,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='provider read total row count exceeds bound')], keywords=[])",
+      "rendered": "ModelValidationError('provider read total row count exceeds bound')"
+    },
+    {
+      "line_start": 229,
+      "line_end": 229,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='rows', ctx=Load())",
+      "rendered": "rows"
+    },
+    {
+      "line_start": 232,
+      "line_end": 232,
+      "column": 1,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dataclass', ctx=Load()), args=[], keywords=[keyword(arg='frozen', value=Constant(value=True))])",
+      "rendered": "dataclass(frozen=True)"
+    },
+    {
+      "line_start": 243,
+      "line_end": 243,
+      "column": 23,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Name(id='limits', ctx=Load()), Call(func=Name(id='ProviderRunLimits', ctx=Load()), args=[], keywords=[])])",
+      "rendered": "limits or ProviderRunLimits()"
+    },
+    {
+      "line_start": 245,
+      "line_end": 245,
+      "column": 5,
+      "kind": "Name",
+      "original_ast": "Name(id='property', ctx=Load())",
+      "rendered": "property"
+    },
+    {
+      "line_start": 247,
+      "line_end": 247,
+      "column": 15,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_limits', ctx=Load())",
+      "rendered": "self._limits"
+    },
+    {
+      "line_start": 262,
+      "line_end": 264,
+      "column": 31,
+      "kind": "DictComp",
+      "original_ast": "DictComp(key=Tuple(elts=[Attribute(value=Attribute(value=Name(id='snapshot', ctx=Load()), attr='project', ctx=Load()), attr='project_id', ctx=Load()), Attribute(value=Name(id='snapshot', ctx=Load()), attr='snapshot_id', ctx=Load())], ctx=Load()), value=Name(id='snapshot', ctx=Load()), generators=[comprehension(target=Name(id='snapshot', ctx=Store()), iter=Name(id='accepted', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "{(snapshot.project.project_id, snapshot.snapshot_id): snapshot for snapshot in accepted}"
+    },
+    {
+      "line_start": 265,
+      "line_end": 265,
+      "column": 26,
+      "kind": "DictComp",
+      "original_ast": "DictComp(key=Attribute(value=Name(id='node', ctx=Load()), attr='id', ctx=Load()), value=Name(id='node', ctx=Load()), generators=[comprehension(target=Name(id='node', ctx=Store()), iter=Attribute(value=Name(id='candidate', ctx=Load()), attr='nodes', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "{node.id: node for node in candidate.nodes}"
+    },
+    {
+      "line_start": 266,
+      "line_end": 266,
+      "column": 46,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 267,
+      "line_end": 267,
+      "column": 52,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 269,
+      "line_end": 269,
+      "column": 12,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[Constant(value='project='), FormattedValue(value=Attribute(value=Attribute(value=Attribute(value=Name(id='candidate', ctx=Load()), attr='project', ctx=Load()), attr='project_id', ctx=Load()), attr='value', ctx=Load()), conversion=-1), Constant(value=',snapshot='), FormattedValue(value=Attribute(value=Attribute(value=Name(id='candidate', ctx=Load()), attr='snapshot_id', ctx=Load()), attr='value', ctx=Load()), conversion=-1)])",
+      "rendered": "source_template_269_12"
+    },
+    {
+      "line_start": 271,
+      "line_end": 271,
+      "column": 24,
+      "kind": "Name",
+      "original_ast": "Name(id='registry', ctx=Load())",
+      "rendered": "registry"
+    },
+    {
+      "line_start": 272,
+      "line_end": 272,
+      "column": 23,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='provider', ctx=Load()), attr='metadata', ctx=Load())",
+      "rendered": "provider.metadata"
+    },
+    {
+      "line_start": 273,
+      "line_end": 273,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_check_lifecycle', ctx=Load()), args=[Name(id='metadata', ctx=Load()), Name(id='cancellation', ctx=Load()), Name(id='deadline_monotonic', ctx=Load()), Name(id='context_label', ctx=Load())], keywords=[])",
+      "rendered": "_check_lifecycle(metadata, cancellation, deadline_monotonic, context_label)"
+    },
+    {
+      "line_start": 274,
+      "line_end": 282,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='CorrelationContext', ctx=Load()), args=[Name(id='candidate', ctx=Load()), Name(id='accepted', ctx=Load()), Name(id='graph_reader', ctx=Load()), Name(id='reporter', ctx=Load()), Name(id='configuration', ctx=Load()), Name(id='cancellation', ctx=Load()), Name(id='deadline_monotonic', ctx=Load())], keywords=[])",
+      "rendered": "CorrelationContext(candidate, accepted, graph_reader, reporter, configuration, cancellation, deadline_monotonic)"
+    },
+    {
+      "line_start": 284,
+      "line_end": 284,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_require_correlations', ctx=Load()), args=[Call(func=Attribute(value=Name(id='provider', ctx=Load()), attr='correlate', ctx=Load()), args=[Name(id='context', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "_require_correlations(provider.correlate(context))"
+    },
+    {
+      "line_start": 285,
+      "line_end": 285,
+      "column": 19,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='emitted', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_limits', ctx=Load()), attr='max_edges_per_provider', ctx=Load())])",
+      "rendered": "len(emitted) > self._limits.max_edges_per_provider"
+    },
+    {
+      "line_start": 286,
+      "line_end": 286,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='provider correlation fan-out exceeds bound')], keywords=[])",
+      "rendered": "ModelValidationError('provider correlation fan-out exceeds bound')"
+    },
+    {
+      "line_start": 287,
+      "line_end": 287,
+      "column": 28,
+      "kind": "Name",
+      "original_ast": "Name(id='emitted', ctx=Load())",
+      "rendered": "emitted"
+    },
+    {
+      "line_start": 288,
+      "line_end": 295,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_validate_correlation', ctx=Load()), args=[Name(id='edge', ctx=Load()), Name(id='metadata', ctx=Load()), Name(id='candidate', ctx=Load()), Name(id='candidate_nodes', ctx=Load()), Name(id='accepted_by_identity', ctx=Load()), Name(id='endpoint_validator', ctx=Load())], keywords=[])",
+      "rendered": "_validate_correlation(edge, metadata, candidate, candidate_nodes, accepted_by_identity, endpoint_validator)"
+    },
+    {
+      "line_start": 296,
+      "line_end": 302,
+      "column": 26,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Attribute(value=Attribute(value=Name(id='edge', ctx=Load()), attr='source', ctx=Load()), attr='node_id', ctx=Load()), Attribute(value=Attribute(value=Name(id='edge', ctx=Load()), attr='relationship_type', ctx=Load()), attr='value', ctx=Load()), Attribute(value=Attribute(value=Name(id='edge', ctx=Load()), attr='target', ctx=Load()), attr='node_id', ctx=Load()), Attribute(value=Name(id='edge', ctx=Load()), attr='provider_name', ctx=Load()), Attribute(value=Name(id='edge', ctx=Load()), attr='provider_version', ctx=Load())], ctx=Load())",
+      "rendered": "(edge.source.node_id, edge.relationship_type.value, edge.target.node_id, edge.provider_name, edge.provider_version)"
+    },
+    {
+      "line_start": 303,
+      "line_end": 303,
+      "column": 23,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='key', ctx=Load()), ops=[In()], comparators=[Name(id='seen', ctx=Load())])",
+      "rendered": "key in seen"
+    },
+    {
+      "line_start": 304,
+      "line_end": 304,
+      "column": 30,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='provider emitted duplicate correlation')], keywords=[])",
+      "rendered": "ModelValidationError('provider emitted duplicate correlation')"
+    },
+    {
+      "line_start": 305,
+      "line_end": 305,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='seen', ctx=Load()), attr='add', ctx=Load()), args=[Name(id='key', ctx=Load())], keywords=[])",
+      "rendered": "seen.add(key)"
+    },
+    {
+      "line_start": 306,
+      "line_end": 306,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='correlations', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='edge', ctx=Load())], keywords=[])",
+      "rendered": "correlations.append(edge)"
+    },
+    {
+      "line_start": 307,
+      "line_end": 307,
+      "column": 23,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='correlations', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_limits', ctx=Load()), attr='max_total_edges', ctx=Load())])",
+      "rendered": "len(correlations) > self._limits.max_total_edges"
+    },
+    {
+      "line_start": 308,
+      "line_end": 308,
+      "column": 30,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='aggregate correlation fan-out exceeds bound')], keywords=[])",
+      "rendered": "ModelValidationError('aggregate correlation fan-out exceeds bound')"
+    },
+    {
+      "line_start": 309,
+      "line_end": 309,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_check_lifecycle', ctx=Load()), args=[Name(id='metadata', ctx=Load()), Name(id='cancellation', ctx=Load()), Name(id='deadline_monotonic', ctx=Load()), Name(id='context_label', ctx=Load())], keywords=[])",
+      "rendered": "_check_lifecycle(metadata, cancellation, deadline_monotonic, context_label)"
+    },
+    {
+      "line_start": 310,
+      "line_end": 310,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='PluginError', ctx=Load())",
+      "rendered": "PluginError"
+    },
+    {
+      "line_start": 312,
+      "line_end": 314,
+      "column": 20,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Attribute(value=Name(id='exc', ctx=Load()), attr='plugin_name', ctx=Load()), ops=[Eq()], comparators=[Attribute(value=Name(id='metadata', ctx=Load()), attr='name', ctx=Load())]), Compare(left=Attribute(value=Name(id='exc', ctx=Load()), attr='phase', ctx=Load()), ops=[Eq()], comparators=[Attribute(value=Attribute(value=Name(id='metadata', ctx=Load()), attr='phase', ctx=Load()), attr='value', ctx=Load())]), Compare(left=Attribute(value=Name(id='exc', ctx=Load()), attr='context', ctx=Load()), ops=[Eq()], comparators=[Name(id='context_label', ctx=Load())])])",
+      "rendered": "exc.plugin_name == metadata.name and exc.phase == metadata.phase.value and (exc.context == context_label)"
+    },
+    {
+      "line_start": 317,
+      "line_end": 322,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='PluginError', ctx=Load()), args=[Attribute(value=Name(id='metadata', ctx=Load()), attr='name', ctx=Load()), Attribute(value=Attribute(value=Name(id='metadata', ctx=Load()), attr='phase', ctx=Load()), attr='value', ctx=Load()), Call(func=Name(id='str', ctx=Load()), args=[Name(id='exc', ctx=Load())], keywords=[])], keywords=[keyword(arg='context', value=Name(id='context_label', ctx=Load()))])",
+      "rendered": "PluginError(metadata.name, metadata.phase.value, str(exc), context=context_label)"
+    },
+    {
+      "line_start": 322,
+      "line_end": 322,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='exc', ctx=Load())",
+      "rendered": "exc"
+    },
+    {
+      "line_start": 323,
+      "line_end": 323,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 324,
+      "line_end": 329,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='PluginError', ctx=Load()), args=[Attribute(value=Name(id='metadata', ctx=Load()), attr='name', ctx=Load()), Attribute(value=Attribute(value=Name(id='metadata', ctx=Load()), attr='phase', ctx=Load()), attr='value', ctx=Load()), Call(func=Name(id='str', ctx=Load()), args=[Name(id='exc', ctx=Load())], keywords=[])], keywords=[keyword(arg='context', value=Name(id='context_label', ctx=Load()))])",
+      "rendered": "PluginError(metadata.name, metadata.phase.value, str(exc), context=context_label)"
+    },
+    {
+      "line_start": 329,
+      "line_end": 329,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='exc', ctx=Load())",
+      "rendered": "exc"
+    },
+    {
+      "line_start": 330,
+      "line_end": 334,
+      "column": 15,
+      "kind": "DictComp",
+      "original_ast": "DictComp(key=Tuple(elts=[Attribute(value=Name(id='ref', ctx=Load()), attr='project_id', ctx=Load()), Attribute(value=Name(id='ref', ctx=Load()), attr='snapshot_id', ctx=Load()), Attribute(value=Name(id='ref', ctx=Load()), attr='node_id', ctx=Load())], ctx=Load()), value=Name(id='ref', ctx=Load()), generators=[comprehension(target=Name(id='edge', ctx=Store()), iter=Name(id='correlations', ctx=Load()), ifs=[], is_async=0), comprehension(target=Name(id='ref', ctx=Store()), iter=Tuple(elts=[Attribute(value=Name(id='edge', ctx=Load()), attr='source', ctx=Load()), Attribute(value=Name(id='edge', ctx=Load()), attr='target', ctx=Load())], ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "{(ref.project_id, ref.snapshot_id, ref.node_id): ref for edge in correlations for ref in (edge.source, edge.target)}"
+    },
+    {
+      "line_start": 335,
+      "line_end": 341,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='CorrelationRunResult', ctx=Load()), args=[Call(func=Name(id='tuple', ctx=Load()), args=[Call(func=Name(id='sorted', ctx=Load()), args=[Call(func=Attribute(value=Name(id='refs', ctx=Load()), attr='values', ctx=Load()), args=[], keywords=[])], keywords=[keyword(arg='key', value=Name(id='_ref_key', ctx=Load()))])], keywords=[]), Call(func=Name(id='tuple', ctx=Load()), args=[Call(func=Name(id='sorted', ctx=Load()), args=[Name(id='correlations', ctx=Load())], keywords=[keyword(arg='key', value=Name(id='_edge_key', ctx=Load()))])], keywords=[]), Call(func=Attribute(value=Name(id='registry', ctx=Load()), attr='manifests', ctx=Load()), args=[Attribute(value=Attribute(value=Name(id='candidate', ctx=Load()), attr='project', ctx=Load()), attr='project_id', ctx=Load()), Attribute(value=Name(id='candidate', ctx=Load()), attr='snapshot_id', ctx=Load())], keywords=[]), Attribute(value=Name(id='reporter', ctx=Load()), attr='logs', ctx=Load()), Attribute(value=Name(id='reporter', ctx=Load()), attr='diagnostics', ctx=Load())], keywords=[])",
+      "rendered": "CorrelationRunResult(tuple(sorted(refs.values(), key=_ref_key)), tuple(sorted(correlations, key=_edge_key)), registry.manifests(candidate.project.project_id, candidate.snapshot_id), reporter.logs, reporter.diagnostics)"
+    },
+    {
+      "line_start": 345,
+      "line_end": 345,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='value', ctx=Load()), Name(id='tuple', ctx=Load())], keywords=[]))",
+      "rendered": "not isinstance(value, tuple)"
+    },
+    {
+      "line_start": 346,
+      "line_end": 346,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='provider must return a tuple of correlations')], keywords=[])",
+      "rendered": "ModelValidationError('provider must return a tuple of correlations')"
+    },
+    {
+      "line_start": 347,
+      "line_end": 347,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='cast', ctx=Load()), args=[Subscript(value=Name(id='tuple', ctx=Load()), slice=Tuple(elts=[Name(id='object', ctx=Load()), Constant(value=Ellipsis)], ctx=Load()), ctx=Load()), Name(id='value', ctx=Load())], keywords=[])",
+      "rendered": "cast(tuple[object, ...], value)"
+    },
+    {
+      "line_start": 348,
+      "line_end": 348,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='any', ctx=Load()), args=[GeneratorExp(elt=UnaryOp(op=Not(), operand=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='edge', ctx=Load()), Name(id='CorrelationEdge', ctx=Load())], keywords=[])), generators=[comprehension(target=Name(id='edge', ctx=Store()), iter=Name(id='values', ctx=Load()), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "any((not isinstance(edge, CorrelationEdge) for edge in values))"
+    },
+    {
+      "line_start": 349,
+      "line_end": 349,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='provider must return a tuple of correlations')], keywords=[])",
+      "rendered": "ModelValidationError('provider must return a tuple of correlations')"
+    },
+    {
+      "line_start": 350,
+      "line_end": 350,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='cast', ctx=Load()), args=[Subscript(value=Name(id='tuple', ctx=Load()), slice=Tuple(elts=[Name(id='CorrelationEdge', ctx=Load()), Constant(value=Ellipsis)], ctx=Load()), ctx=Load()), Name(id='values', ctx=Load())], keywords=[])",
+      "rendered": "cast(tuple[CorrelationEdge, ...], values)"
+    },
+    {
+      "line_start": 361,
+      "line_end": 361,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Compare(left=Attribute(value=Name(id='edge', ctx=Load()), attr='provider_name', ctx=Load()), ops=[NotEq()], comparators=[Attribute(value=Name(id='metadata', ctx=Load()), attr='name', ctx=Load())]), Compare(left=Attribute(value=Name(id='edge', ctx=Load()), attr='provider_version', ctx=Load()), ops=[NotEq()], comparators=[Attribute(value=Name(id='metadata', ctx=Load()), attr='version', ctx=Load())])])",
+      "rendered": "edge.provider_name != metadata.name or edge.provider_version != metadata.version"
+    },
+    {
+      "line_start": 362,
+      "line_end": 362,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='correlation ownership does not match provider metadata')], keywords=[])",
+      "rendered": "ModelValidationError('correlation ownership does not match provider metadata')"
+    },
+    {
+      "line_start": 363,
+      "line_end": 363,
+      "column": 25,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Attribute(value=Attribute(value=Name(id='candidate', ctx=Load()), attr='project', ctx=Load()), attr='project_id', ctx=Load()), Attribute(value=Name(id='candidate', ctx=Load()), attr='snapshot_id', ctx=Load())], ctx=Load())",
+      "rendered": "(candidate.project.project_id, candidate.snapshot_id)"
+    },
+    {
+      "line_start": 364,
+      "line_end": 364,
+      "column": 16,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Attribute(value=Name(id='edge', ctx=Load()), attr='source', ctx=Load()), Attribute(value=Name(id='edge', ctx=Load()), attr='target', ctx=Load())], ctx=Load())",
+      "rendered": "(edge.source, edge.target)"
+    },
+    {
+      "line_start": 365,
+      "line_end": 369,
+      "column": 26,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='endpoint', ctx=Load()), generators=[comprehension(target=Name(id='endpoint', ctx=Store()), iter=Name(id='endpoints', ctx=Load()), ifs=[Compare(left=Tuple(elts=[Attribute(value=Name(id='endpoint', ctx=Load()), attr='project_id', ctx=Load()), Attribute(value=Name(id='endpoint', ctx=Load()), attr='snapshot_id', ctx=Load())], ctx=Load()), ops=[Eq()], comparators=[Name(id='candidate_identity', ctx=Load())])], is_async=0)])",
+      "rendered": "[endpoint for endpoint in endpoints if (endpoint.project_id, endpoint.snapshot_id) == candidate_identity]"
+    },
+    {
+      "line_start": 370,
+      "line_end": 370,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='candidate_endpoints', ctx=Load())], keywords=[]), ops=[NotEq()], comparators=[Constant(value=1)])",
+      "rendered": "len(candidate_endpoints) != 1"
+    },
+    {
+      "line_start": 371,
+      "line_end": 371,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='correlation must have exactly one current candidate endpoint')], keywords=[])",
+      "rendered": "ModelValidationError('correlation must have exactly one current candidate endpoint')"
+    },
+    {
+      "line_start": 372,
+      "line_end": 372,
+      "column": 25,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Name(id='candidate_endpoints', ctx=Load()), slice=Constant(value=0), ctx=Load())",
+      "rendered": "candidate_endpoints[0]"
+    },
+    {
+      "line_start": 373,
+      "line_end": 373,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='candidate_nodes', ctx=Load()), attr='get', ctx=Load()), args=[Attribute(value=Name(id='candidate_endpoint', ctx=Load()), attr='node_id', ctx=Load())], keywords=[])",
+      "rendered": "candidate_nodes.get(candidate_endpoint.node_id)"
+    },
+    {
+      "line_start": 374,
+      "line_end": 374,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Compare(left=Name(id='candidate_node', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)]), Compare(left=Attribute(value=Name(id='candidate_node', ctx=Load()), attr='local_id', ctx=Load()), ops=[NotEq()], comparators=[Attribute(value=Name(id='candidate_endpoint', ctx=Load()), attr='local_id', ctx=Load())])])",
+      "rendered": "candidate_node is None or candidate_node.local_id != candidate_endpoint.local_id"
+    },
+    {
+      "line_start": 375,
+      "line_end": 375,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='candidate correlation endpoint does not exist')], keywords=[])",
+      "rendered": "ModelValidationError('candidate correlation endpoint does not exist')"
+    },
+    {
+      "line_start": 376,
+      "line_end": 376,
+      "column": 13,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=Attribute(value=Name(id='edge', ctx=Load()), attr='source', ctx=Load()), ops=[Eq()], comparators=[Name(id='candidate_endpoint', ctx=Load())]), body=Attribute(value=Name(id='edge', ctx=Load()), attr='target', ctx=Load()), orelse=Attribute(value=Name(id='edge', ctx=Load()), attr='source', ctx=Load()))",
+      "rendered": "edge.target if edge.source == candidate_endpoint else edge.source"
+    },
+    {
+      "line_start": 377,
+      "line_end": 377,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='accepted', ctx=Load()), attr='get', ctx=Load()), args=[Tuple(elts=[Attribute(value=Name(id='target', ctx=Load()), attr='project_id', ctx=Load()), Attribute(value=Name(id='target', ctx=Load()), attr='snapshot_id', ctx=Load())], ctx=Load())], keywords=[])",
+      "rendered": "accepted.get((target.project_id, target.snapshot_id))"
+    },
+    {
+      "line_start": 378,
+      "line_end": 378,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='target_snapshot', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "target_snapshot is None"
+    },
+    {
+      "line_start": 379,
+      "line_end": 379,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='correlation target is not an accepted snapshot')], keywords=[])",
+      "rendered": "ModelValidationError('correlation target is not an accepted snapshot')"
+    },
+    {
+      "line_start": 380,
+      "line_end": 380,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='endpoint_validator', ctx=Load()), attr='exists', ctx=Load()), args=[Name(id='target', ctx=Load())], keywords=[]))",
+      "rendered": "not endpoint_validator.exists(target)"
+    },
+    {
+      "line_start": 381,
+      "line_end": 381,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='accepted correlation endpoint does not exist')], keywords=[])",
+      "rendered": "ModelValidationError('accepted correlation endpoint does not exist')"
+    },
+    {
+      "line_start": 390,
+      "line_end": 390,
+      "column": 7,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='cancellation', ctx=Load()), attr='is_cancelled', ctx=Load())",
+      "rendered": "cancellation.is_cancelled"
+    },
+    {
+      "line_start": 391,
+      "line_end": 393,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='PluginError', ctx=Load()), args=[Attribute(value=Name(id='metadata', ctx=Load()), attr='name', ctx=Load()), Attribute(value=Attribute(value=Name(id='metadata', ctx=Load()), attr='phase', ctx=Load()), attr='value', ctx=Load()), Constant(value='provider cancelled')], keywords=[keyword(arg='context', value=Name(id='context', ctx=Load()))])",
+      "rendered": "PluginError(metadata.name, metadata.phase.value, 'provider cancelled', context=context)"
+    },
+    {
+      "line_start": 394,
+      "line_end": 394,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Attribute(value=Name(id='time', ctx=Load()), attr='monotonic', ctx=Load()), args=[], keywords=[]), ops=[GtE()], comparators=[Name(id='deadline', ctx=Load())])",
+      "rendered": "time.monotonic() >= deadline"
+    },
+    {
+      "line_start": 395,
+      "line_end": 400,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='PluginError', ctx=Load()), args=[Attribute(value=Name(id='metadata', ctx=Load()), attr='name', ctx=Load()), Attribute(value=Attribute(value=Name(id='metadata', ctx=Load()), attr='phase', ctx=Load()), attr='value', ctx=Load()), Constant(value='provider deadline exceeded')], keywords=[keyword(arg='context', value=Name(id='context', ctx=Load()))])",
+      "rendered": "PluginError(metadata.name, metadata.phase.value, 'provider deadline exceeded', context=context)"
+    },
+    {
+      "line_start": 404,
+      "line_end": 404,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Attribute(value=Attribute(value=Name(id='ref', ctx=Load()), attr='project_id', ctx=Load()), attr='value', ctx=Load()), Attribute(value=Attribute(value=Name(id='ref', ctx=Load()), attr='snapshot_id', ctx=Load()), attr='value', ctx=Load()), Attribute(value=Name(id='ref', ctx=Load()), attr='node_id', ctx=Load())], ctx=Load())",
+      "rendered": "(ref.project_id.value, ref.snapshot_id.value, ref.node_id)"
+    },
+    {
+      "line_start": 408,
+      "line_end": 414,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Attribute(value=Attribute(value=Name(id='edge', ctx=Load()), attr='source', ctx=Load()), attr='node_id', ctx=Load()), Attribute(value=Attribute(value=Name(id='edge', ctx=Load()), attr='relationship_type', ctx=Load()), attr='value', ctx=Load()), Attribute(value=Attribute(value=Name(id='edge', ctx=Load()), attr='target', ctx=Load()), attr='node_id', ctx=Load()), Attribute(value=Name(id='edge', ctx=Load()), attr='provider_name', ctx=Load()), Attribute(value=Name(id='edge', ctx=Load()), attr='provider_version', ctx=Load())], ctx=Load())",
+      "rendered": "(edge.source.node_id, edge.relationship_type.value, edge.target.node_id, edge.provider_name, edge.provider_version)"
+    }
+  ],
+  "calls": [
+    {
+      "line": 46,
+      "end_line": 46,
+      "callee": "dataclass",
+      "enclosing": "ProviderRunLimits",
+      "expression": "dataclass(frozen=True)"
+    },
+    {
+      "line": 232,
+      "end_line": 232,
+      "callee": "dataclass",
+      "enclosing": "CorrelationRunResult",
+      "expression": "dataclass(frozen=True)"
+    },
+    {
+      "line": 347,
+      "end_line": 347,
+      "callee": "cast",
+      "enclosing": "_require_correlations",
+      "expression": "cast(tuple[object, ...], value)"
+    },
+    {
+      "line": 348,
+      "end_line": 348,
+      "callee": "any",
+      "enclosing": "_require_correlations",
+      "expression": "any(not isinstance(edge, CorrelationEdge) for edge in values)"
+    },
+    {
+      "line": 350,
+      "end_line": 350,
+      "callee": "cast",
+      "enclosing": "_require_correlations",
+      "expression": "cast(tuple[CorrelationEdge, ...], values)"
+    },
+    {
+      "line": 373,
+      "end_line": 373,
+      "callee": "candidate_nodes.get",
+      "enclosing": "_validate_correlation",
+      "expression": "candidate_nodes.get(candidate_endpoint.node_id)"
+    },
+    {
+      "line": 377,
+      "end_line": 377,
+      "callee": "accepted.get",
+      "enclosing": "_validate_correlation",
+      "expression": "accepted.get((target.project_id, target.snapshot_id))"
+    },
+    {
+      "line": 70,
+      "end_line": 70,
+      "callee": "tuple",
+      "enclosing": "CorrelationProviderRegistry.__init__",
+      "expression": "tuple(providers)"
+    },
+    {
+      "line": 73,
+      "end_line": 73,
+      "callee": "set",
+      "enclosing": "CorrelationProviderRegistry.__init__",
+      "expression": "set()"
+    },
+    {
+      "line": 85,
+      "end_line": 87,
+      "callee": "tuple",
+      "enclosing": "CorrelationProviderRegistry.__init__",
+      "expression": "tuple(\n            sorted(registered, key=lambda provider: provider.metadata.ordering_key)\n        )"
+    },
+    {
+      "line": 93,
+      "end_line": 93,
+      "callee": "iter",
+      "enclosing": "CorrelationProviderRegistry.__iter__",
+      "expression": "iter(self._providers)"
+    },
+    {
+      "line": 96,
+      "end_line": 96,
+      "callee": "bool",
+      "enclosing": "CorrelationProviderRegistry.__bool__",
+      "expression": "bool(self._providers)"
+    },
+    {
+      "line": 101,
+      "end_line": 106,
+      "callee": "tuple",
+      "enclosing": "CorrelationProviderRegistry.manifests",
+      "expression": "tuple(\n            ProviderManifest(\n                project_id, snapshot_id, provider.metadata.name, provider.metadata.version\n            )\n            for provider in self._providers\n        )"
+    },
+    {
+      "line": 129,
+      "end_line": 129,
+      "callee": "required.update",
+      "enclosing": "CorrelationProviderRegistry.preflight",
+      "expression": "required.update((edge.provider_name, edge.provider_version) for edge in correlations)"
+    },
+    {
+      "line": 130,
+      "end_line": 130,
+      "callee": "sorted",
+      "enclosing": "CorrelationProviderRegistry.preflight",
+      "expression": "sorted(required)"
+    },
+    {
+      "line": 165,
+      "end_line": 165,
+      "callee": "self._cache.get",
+      "enclosing": "CorrelationEndpointValidator.exists",
+      "expression": "self._cache.get(key)"
+    },
+    {
+      "line": 174,
+      "end_line": 174,
+      "callee": "self._accepted.get",
+      "enclosing": "CorrelationEndpointValidator.exists",
+      "expression": "self._accepted.get((ref.project_id, ref.snapshot_id))"
+    },
+    {
+      "line": 177,
+      "end_line": 183,
+      "callee": "self._execute",
+      "enclosing": "CorrelationEndpointValidator.exists",
+      "expression": "self._execute(\n            locator,\n            \"MATCH (n {id:$id}) RETURN n.localId AS localId LIMIT 2\",\n            freeze_properties({\"id\": ref.node_id}),\n            2,\n            remaining,\n        )"
+    },
+    {
+      "line": 214,
+      "end_line": 214,
+      "callee": "self._accepted.get",
+      "enclosing": "BoundedAcceptedGraphReader.query",
+      "expression": "self._accepted.get((locator.project_id, locator.snapshot_id))"
+    },
+    {
+      "line": 225,
+      "end_line": 225,
+      "callee": "self._execute",
+      "enclosing": "BoundedAcceptedGraphReader.query",
+      "expression": "self._execute(locator, cypher, parameters, row_limit, remaining)"
+    },
+    {
+      "line": 226,
+      "end_line": 226,
+      "callee": "len",
+      "enclosing": "BoundedAcceptedGraphReader.query",
+      "expression": "len(rows)"
+    },
+    {
+      "line": 267,
+      "end_line": 267,
+      "callee": "set",
+      "enclosing": "CorrelationRunner.run",
+      "expression": "set()"
+    },
+    {
+      "line": 335,
+      "end_line": 341,
+      "callee": "CorrelationRunResult",
+      "enclosing": "CorrelationRunner.run",
+      "expression": "CorrelationRunResult(\n            tuple(sorted(refs.values(), key=_ref_key)),\n            tuple(sorted(correlations, key=_edge_key)),\n            registry.manifests(candidate.project.project_id, candidate.snapshot_id),\n            reporter.logs,\n            reporter.diagnostics,\n        )"
+    },
+    {
+      "line": 345,
+      "end_line": 345,
+      "callee": "isinstance",
+      "enclosing": "_require_correlations",
+      "expression": "isinstance(value, tuple)"
+    },
+    {
+      "line": 346,
+      "end_line": 346,
+      "callee": "ModelValidationError",
+      "enclosing": "_require_correlations",
+      "expression": "ModelValidationError(\"provider must return a tuple of correlations\")"
+    },
+    {
+      "line": 349,
+      "end_line": 349,
+      "callee": "ModelValidationError",
+      "enclosing": "_require_correlations",
+      "expression": "ModelValidationError(\"provider must return a tuple of correlations\")"
+    },
+    {
+      "line": 362,
+      "end_line": 362,
+      "callee": "ModelValidationError",
+      "enclosing": "_validate_correlation",
+      "expression": "ModelValidationError(\"correlation ownership does not match provider metadata\")"
+    },
+    {
+      "line": 370,
+      "end_line": 370,
+      "callee": "len",
+      "enclosing": "_validate_correlation",
+      "expression": "len(candidate_endpoints)"
+    },
+    {
+      "line": 371,
+      "end_line": 371,
+      "callee": "ModelValidationError",
+      "enclosing": "_validate_correlation",
+      "expression": "ModelValidationError(\"correlation must have exactly one current candidate endpoint\")"
+    },
+    {
+      "line": 375,
+      "end_line": 375,
+      "callee": "ModelValidationError",
+      "enclosing": "_validate_correlation",
+      "expression": "ModelValidationError(\"candidate correlation endpoint does not exist\")"
+    },
+    {
+      "line": 379,
+      "end_line": 379,
+      "callee": "ModelValidationError",
+      "enclosing": "_validate_correlation",
+      "expression": "ModelValidationError(\"correlation target is not an accepted snapshot\")"
+    },
+    {
+      "line": 380,
+      "end_line": 380,
+      "callee": "endpoint_validator.exists",
+      "enclosing": "_validate_correlation",
+      "expression": "endpoint_validator.exists(target)"
+    },
+    {
+      "line": 381,
+      "end_line": 381,
+      "callee": "ModelValidationError",
+      "enclosing": "_validate_correlation",
+      "expression": "ModelValidationError(\"accepted correlation endpoint does not exist\")"
+    },
+    {
+      "line": 391,
+      "end_line": 393,
+      "callee": "PluginError",
+      "enclosing": "_check_lifecycle",
+      "expression": "PluginError(\n            metadata.name, metadata.phase.value, \"provider cancelled\", context=context\n        )"
+    },
+    {
+      "line": 394,
+      "end_line": 394,
+      "callee": "time.monotonic",
+      "enclosing": "_check_lifecycle",
+      "expression": "time.monotonic()"
+    },
+    {
+      "line": 395,
+      "end_line": 400,
+      "callee": "PluginError",
+      "enclosing": "_check_lifecycle",
+      "expression": "PluginError(\n            metadata.name,\n            metadata.phase.value,\n            \"provider deadline exceeded\",\n            context=context,\n        )"
+    },
+    {
+      "line": 56,
+      "end_line": 62,
+      "callee": "min",
+      "enclosing": "ProviderRunLimits.__post_init__",
+      "expression": "min(\n                self.max_edges_per_provider,\n                self.max_total_edges,\n                self.max_reader_queries,\n                self.max_rows_per_query,\n                self.max_total_rows,\n            )"
+    },
+    {
+      "line": 65,
+      "end_line": 65,
+      "callee": "ModelValidationError",
+      "enclosing": "ProviderRunLimits.__post_init__",
+      "expression": "ModelValidationError(\"correlation limits must be positive\")"
+    },
+    {
+      "line": 71,
+      "end_line": 71,
+      "callee": "len",
+      "enclosing": "CorrelationProviderRegistry.__init__",
+      "expression": "len(candidates)"
+    },
+    {
+      "line": 72,
+      "end_line": 72,
+      "callee": "ModelValidationError",
+      "enclosing": "CorrelationProviderRegistry.__init__",
+      "expression": "ModelValidationError(\"correlation provider count exceeds bound\")"
+    },
+    {
+      "line": 83,
+      "end_line": 83,
+      "callee": "names.add",
+      "enclosing": "CorrelationProviderRegistry.__init__",
+      "expression": "names.add(metadata.name)"
+    },
+    {
+      "line": 84,
+      "end_line": 84,
+      "callee": "registered.append",
+      "enclosing": "CorrelationProviderRegistry.__init__",
+      "expression": "registered.append(provider)"
+    },
+    {
+      "line": 86,
+      "end_line": 86,
+      "callee": "sorted",
+      "enclosing": "CorrelationProviderRegistry.__init__",
+      "expression": "sorted(registered, key=lambda provider: provider.metadata.ordering_key)"
+    },
+    {
+      "line": 114,
+      "end_line": 114,
+      "callee": "len",
+      "enclosing": "CorrelationProviderRegistry.preflight",
+      "expression": "len(manifests)"
+    },
+    {
+      "line": 115,
+      "end_line": 120,
+      "callee": "PluginError",
+      "enclosing": "CorrelationProviderRegistry.preflight",
+      "expression": "PluginError(\n                \"registry\",\n                PluginPhase.CORRELATION.value,\n                \"accepted provider manifest count exceeds bound\",\n                context=f\"project={project_id}\",\n            )"
+    },
+    {
+      "line": 121,
+      "end_line": 121,
+      "callee": "len",
+      "enclosing": "CorrelationProviderRegistry.preflight",
+      "expression": "len(correlations)"
+    },
+    {
+      "line": 122,
+      "end_line": 127,
+      "callee": "PluginError",
+      "enclosing": "CorrelationProviderRegistry.preflight",
+      "expression": "PluginError(\n                \"registry\",\n                PluginPhase.CORRELATION.value,\n                \"accepted touching correlation count exceeds bound\",\n                context=f\"project={project_id}\",\n            )"
+    },
+    {
+      "line": 170,
+      "end_line": 170,
+      "callee": "ModelValidationError",
+      "enclosing": "CorrelationEndpointValidator.exists",
+      "expression": "ModelValidationError(\"endpoint validation work exceeds bound\")"
+    },
+    {
+      "line": 171,
+      "end_line": 171,
+      "callee": "time.monotonic",
+      "enclosing": "CorrelationEndpointValidator.exists",
+      "expression": "time.monotonic()"
+    },
+    {
+      "line": 173,
+      "end_line": 173,
+      "callee": "ModelValidationError",
+      "enclosing": "CorrelationEndpointValidator.exists",
+      "expression": "ModelValidationError(\"endpoint validation deadline exceeded\")"
+    },
+    {
+      "line": 180,
+      "end_line": 180,
+      "callee": "freeze_properties",
+      "enclosing": "CorrelationEndpointValidator.exists",
+      "expression": "freeze_properties({\"id\": ref.node_id})"
+    },
+    {
+      "line": 216,
+      "end_line": 216,
+      "callee": "SnapshotLifecycleError",
+      "enclosing": "BoundedAcceptedGraphReader.query",
+      "expression": "SnapshotLifecycleError(\"provider requested an unaccepted snapshot locator\")"
+    },
+    {
+      "line": 218,
+      "end_line": 218,
+      "callee": "ModelValidationError",
+      "enclosing": "BoundedAcceptedGraphReader.query",
+      "expression": "ModelValidationError(\"provider read row limit exceeds bound\")"
+    },
+    {
+      "line": 221,
+      "end_line": 221,
+      "callee": "ModelValidationError",
+      "enclosing": "BoundedAcceptedGraphReader.query",
+      "expression": "ModelValidationError(\"provider read query count exceeds bound\")"
+    },
+    {
+      "line": 222,
+      "end_line": 222,
+      "callee": "time.monotonic",
+      "enclosing": "BoundedAcceptedGraphReader.query",
+      "expression": "time.monotonic()"
+    },
+    {
+      "line": 224,
+      "end_line": 224,
+      "callee": "ModelValidationError",
+      "enclosing": "BoundedAcceptedGraphReader.query",
+      "expression": "ModelValidationError(\"provider read deadline exceeded\")"
+    },
+    {
+      "line": 228,
+      "end_line": 228,
+      "callee": "ModelValidationError",
+      "enclosing": "BoundedAcceptedGraphReader.query",
+      "expression": "ModelValidationError(\"provider read total row count exceeds bound\")"
+    },
+    {
+      "line": 243,
+      "end_line": 243,
+      "callee": "ProviderRunLimits",
+      "enclosing": "CorrelationRunner.__init__",
+      "expression": "ProviderRunLimits()"
+    },
+    {
+      "line": 273,
+      "end_line": 273,
+      "callee": "_check_lifecycle",
+      "enclosing": "CorrelationRunner.run",
+      "expression": "_check_lifecycle(metadata, cancellation, deadline_monotonic, context_label)"
+    },
+    {
+      "line": 274,
+      "end_line": 282,
+      "callee": "CorrelationContext",
+      "enclosing": "CorrelationRunner.run",
+      "expression": "CorrelationContext(\n                candidate,\n                accepted,\n                graph_reader,\n                reporter,\n                configuration,\n                cancellation,\n                deadline_monotonic,\n            )"
+    },
+    {
+      "line": 336,
+      "end_line": 336,
+      "callee": "tuple",
+      "enclosing": "CorrelationRunner.run",
+      "expression": "tuple(sorted(refs.values(), key=_ref_key))"
+    },
+    {
+      "line": 337,
+      "end_line": 337,
+      "callee": "tuple",
+      "enclosing": "CorrelationRunner.run",
+      "expression": "tuple(sorted(correlations, key=_edge_key))"
+    },
+    {
+      "line": 338,
+      "end_line": 338,
+      "callee": "registry.manifests",
+      "enclosing": "CorrelationRunner.run",
+      "expression": "registry.manifests(candidate.project.project_id, candidate.snapshot_id)"
+    },
+    {
+      "line": 76,
+      "end_line": 76,
+      "callee": "isinstance",
+      "enclosing": "CorrelationProviderRegistry.__init__",
+      "expression": "isinstance(provider, CorrelationProvider)"
+    },
+    {
+      "line": 77,
+      "end_line": 77,
+      "callee": "ModelValidationError",
+      "enclosing": "CorrelationProviderRegistry.__init__",
+      "expression": "ModelValidationError(\"provider must implement CorrelationProvider\")"
+    },
+    {
+      "line": 80,
+      "end_line": 80,
+      "callee": "ModelValidationError",
+      "enclosing": "CorrelationProviderRegistry.__init__",
+      "expression": "ModelValidationError(\"correlation provider must use correlation phase\")"
+    },
+    {
+      "line": 82,
+      "end_line": 82,
+      "callee": "ModelValidationError",
+      "enclosing": "CorrelationProviderRegistry.__init__",
+      "expression": "ModelValidationError(f\"duplicate correlation provider: {metadata.name}\")"
+    },
+    {
+      "line": 102,
+      "end_line": 104,
+      "callee": "ProviderManifest",
+      "enclosing": "CorrelationProviderRegistry.manifests",
+      "expression": "ProviderManifest(\n                project_id, snapshot_id, provider.metadata.name, provider.metadata.version\n            )"
+    },
+    {
+      "line": 131,
+      "end_line": 131,
+      "callee": "self._versions.get",
+      "enclosing": "CorrelationProviderRegistry.preflight",
+      "expression": "self._versions.get(name)"
+    },
+    {
+      "line": 132,
+      "end_line": 137,
+      "callee": "PluginError",
+      "enclosing": "CorrelationProviderRegistry.preflight",
+      "expression": "PluginError(\n                    name,\n                    PluginPhase.CORRELATION.value,\n                    f\"accepted correlations require provider version {version}\",\n                    context=f\"project={project_id}\",\n                )"
+    },
+    {
+      "line": 184,
+      "end_line": 184,
+      "callee": "len",
+      "enclosing": "CorrelationEndpointValidator.exists",
+      "expression": "len(rows)"
+    },
+    {
+      "line": 284,
+      "end_line": 284,
+      "callee": "_require_correlations",
+      "enclosing": "CorrelationRunner.run",
+      "expression": "_require_correlations(provider.correlate(context))"
+    },
+    {
+      "line": 309,
+      "end_line": 309,
+      "callee": "_check_lifecycle",
+      "enclosing": "CorrelationRunner.run",
+      "expression": "_check_lifecycle(metadata, cancellation, deadline_monotonic, context_label)"
+    },
+    {
+      "line": 336,
+      "end_line": 336,
+      "callee": "sorted",
+      "enclosing": "CorrelationRunner.run",
+      "expression": "sorted(refs.values(), key=_ref_key)"
+    },
+    {
+      "line": 337,
+      "end_line": 337,
+      "callee": "sorted",
+      "enclosing": "CorrelationRunner.run",
+      "expression": "sorted(correlations, key=_edge_key)"
+    },
+    {
+      "line": 348,
+      "end_line": 348,
+      "callee": "isinstance",
+      "enclosing": "_require_correlations",
+      "expression": "isinstance(edge, CorrelationEdge)"
+    },
+    {
+      "line": 284,
+      "end_line": 284,
+      "callee": "provider.correlate",
+      "enclosing": "CorrelationRunner.run",
+      "expression": "provider.correlate(context)"
+    },
+    {
+      "line": 285,
+      "end_line": 285,
+      "callee": "len",
+      "enclosing": "CorrelationRunner.run",
+      "expression": "len(emitted)"
+    },
+    {
+      "line": 286,
+      "end_line": 286,
+      "callee": "ModelValidationError",
+      "enclosing": "CorrelationRunner.run",
+      "expression": "ModelValidationError(\"provider correlation fan-out exceeds bound\")"
+    },
+    {
+      "line": 288,
+      "end_line": 295,
+      "callee": "_validate_correlation",
+      "enclosing": "CorrelationRunner.run",
+      "expression": "_validate_correlation(\n                        edge,\n                        metadata,\n                        candidate,\n                        candidate_nodes,\n                        accepted_by_identity,\n                        endpoint_validator,\n                    )"
+    },
+    {
+      "line": 305,
+      "end_line": 305,
+      "callee": "seen.add",
+      "enclosing": "CorrelationRunner.run",
+      "expression": "seen.add(key)"
+    },
+    {
+      "line": 306,
+      "end_line": 306,
+      "callee": "correlations.append",
+      "enclosing": "CorrelationRunner.run",
+      "expression": "correlations.append(edge)"
+    },
+    {
+      "line": 317,
+      "end_line": 322,
+      "callee": "PluginError",
+      "enclosing": "CorrelationRunner.run",
+      "expression": "PluginError(\n                    metadata.name,\n                    metadata.phase.value,\n                    str(exc),\n                    context=context_label,\n                )"
+    },
+    {
+      "line": 324,
+      "end_line": 329,
+      "callee": "PluginError",
+      "enclosing": "CorrelationRunner.run",
+      "expression": "PluginError(\n                    metadata.name,\n                    metadata.phase.value,\n                    str(exc),\n                    context=context_label,\n                )"
+    },
+    {
+      "line": 336,
+      "end_line": 336,
+      "callee": "refs.values",
+      "enclosing": "CorrelationRunner.run",
+      "expression": "refs.values()"
+    },
+    {
+      "line": 304,
+      "end_line": 304,
+      "callee": "ModelValidationError",
+      "enclosing": "CorrelationRunner.run",
+      "expression": "ModelValidationError(\"provider emitted duplicate correlation\")"
+    },
+    {
+      "line": 307,
+      "end_line": 307,
+      "callee": "len",
+      "enclosing": "CorrelationRunner.run",
+      "expression": "len(correlations)"
+    },
+    {
+      "line": 308,
+      "end_line": 308,
+      "callee": "ModelValidationError",
+      "enclosing": "CorrelationRunner.run",
+      "expression": "ModelValidationError(\"aggregate correlation fan-out exceeds bound\")"
+    },
+    {
+      "line": 320,
+      "end_line": 320,
+      "callee": "str",
+      "enclosing": "CorrelationRunner.run",
+      "expression": "str(exc)"
+    },
+    {
+      "line": 327,
+      "end_line": 327,
+      "callee": "str",
+      "enclosing": "CorrelationRunner.run",
+      "expression": "str(exc)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 17,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "import time",
+      "targets": [
+        "time"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "from collections.abc import Callable, Iterable, Iterator",
+      "targets": [
+        "collections.abc",
+        "collections.abc.Callable",
+        "collections.abc.Iterable",
+        "collections.abc.Iterator"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "from dataclasses import dataclass",
+      "targets": [
+        "dataclasses",
+        "dataclasses.dataclass"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "from typing import cast",
+      "targets": [
+        "typing",
+        "typing.cast"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 24,
+      "source_expression": "from context_graph_sdk.errors import ModelValidationError, PluginError, SnapshotLifecycleError",
+      "targets": [
+        "context_graph_sdk.errors",
+        "context_graph_sdk.errors.ModelValidationError",
+        "context_graph_sdk.errors.PluginError",
+        "context_graph_sdk.errors.SnapshotLifecycleError"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/errors.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 25,
+      "source_expression": "from context_graph_sdk.identity import ProjectId, SnapshotId",
+      "targets": [
+        "context_graph_sdk.identity",
+        "context_graph_sdk.identity.ProjectId",
+        "context_graph_sdk.identity.SnapshotId"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/identity.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 26,
+      "source_expression": "from context_graph_sdk.models import CorrelationEdge, FrozenMap, GraphNode, GraphSnapshot, NodeRef, ProjectSnapshot, ProviderManifest, SnapshotLocator, freeze_properties",
+      "targets": [
+        "context_graph_sdk.models",
+        "context_graph_sdk.models.CorrelationEdge",
+        "context_graph_sdk.models.FrozenMap",
+        "context_graph_sdk.models.GraphNode",
+        "context_graph_sdk.models.GraphSnapshot",
+        "context_graph_sdk.models.NodeRef",
+        "context_graph_sdk.models.ProjectSnapshot",
+        "context_graph_sdk.models.ProviderManifest",
+        "context_graph_sdk.models.SnapshotLocator",
+        "context_graph_sdk.models.freeze_properties"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/models.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 37,
+      "source_expression": "from context_graph_sdk.pipeline import AcceptedGraphReader, CorrelationContext, PluginDiagnostic",
+      "targets": [
+        "context_graph_sdk.pipeline",
+        "context_graph_sdk.pipeline.AcceptedGraphReader",
+        "context_graph_sdk.pipeline.CorrelationContext",
+        "context_graph_sdk.pipeline.PluginDiagnostic"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/pipeline/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 39,
+      "source_expression": "from .base import CorrelationProvider, PluginMetadata, PluginPhase",
+      "targets": [
+        "context_graph_sdk.plugins.base",
+        "context_graph_sdk.plugins.base.CorrelationProvider",
+        "context_graph_sdk.plugins.base.PluginMetadata",
+        "context_graph_sdk.plugins.base.PluginPhase"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/plugins/base.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 40,
+      "source_expression": "from .context import BufferedPluginReporter, CancellationToken, PluginLogRecord",
+      "targets": [
+        "context_graph_sdk.plugins.context",
+        "context_graph_sdk.plugins.context.BufferedPluginReporter",
+        "context_graph_sdk.plugins.context.CancellationToken",
+        "context_graph_sdk.plugins.context.PluginLogRecord"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/plugins/context.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

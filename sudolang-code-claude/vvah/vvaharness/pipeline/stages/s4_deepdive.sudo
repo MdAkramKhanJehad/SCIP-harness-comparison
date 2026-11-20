@@ -1,0 +1,330 @@
+# vvaharness/pipeline/stages/s4_deepdive.py
+
+Stage 4 ("Step 4 — Deep-dive"). Every investigation unit from Stage 3 gets its own agentic session (or shares one with file-overlapping units when `step4.batch_size` > 1). Units run serially or in a thread pool, a content-guardrail circuit breaker can abort the run, a halt-class error stops all dispatching, and a failed batch member may be retried alone. The module also builds the scan-constant cached context prefix and the redacted, line-numbered source dump used by Stage 4, Stage 6 and Stage 8 prompts.
+
+Source: `vvaharness/pipeline/stages/s4_deepdive.py` (lines 1-527)
+Executor: mixed (this module is code; each unit's session in `s4/session.sudo` is a model call)
+Called from: `vvaharness/orchestrator/scan.py` scan_repo (Stage 4 block)
+
+// src: vvaharness/pipeline/stages/s4_deepdive.py:43-362
+fn run(units, ctx, cfg):executor=code {
+  // returns [findings, outcomes]; outcomes maps unit id -> "completed" | "error" | "guardrail" | "skipped" | "uninvestigated" | "failed" | "halted"
+  tracker = cfg._scan_progress   // abstracted: progress display only
+  repo_root = ctx.repo_root
+  units = units sorted by risk_rank   // src: :49
+  parallel = knob("step4.parallel", default=12)   // src: :50 (getattr(cfg.step4, "parallel", 12))
+  // src: :51-53 — fail closed before the pool: a bad step4.allowed_tools raises here once instead of failing every unit
+  s4.session.deepdive_tools(cfg)
+  investigate = s4.session.investigate_unit
+
+  guardrail_hits = 0
+  guardrailGate = max(3, parallel)   // src: :63
+  successes = 0
+  outcomes = {}
+
+  // src: :67-82 — second, independent layer after s3_decompose: a unit with no files is skipped before any model call
+  for each unit in units {
+    if (unit.files is empty) {
+      errlog.log("s4", unit.id, "unit carries no files after upstream normalisation; skipped before any model call", scope="unit", reason="empty_chunk_skipped")
+      // preserved: not logged as recovered, and "skipped" is kept out of the failed-unit count
+      outcomes[unit.id] = "skipped"
+    }
+  }
+  units = units where files is non-empty
+
+  // src: :84-91 — only a content-guardrail block counts toward the gate, never a ModelRefusal (refusals return fast and would dominate the first completions)
+  fn _guardrail_fail_fast(e):executor=code {
+    throw RuntimeError("s4-deepdive: $guardrail_hits content-guardrail blocks on the CLI/OAuth path with zero successful units — aborting run. A content classifier on this path rejects the prompts; switch models.deepdive.via to 'sdk' or 'deepagents'.")
+  }
+
+  // ---------- serial path ----------
+  // src: :93-152
+  if (parallel <= 1) {
+    all_findings = []
+    for each [i, unit] in units {
+      unit_stats = {}
+      try findings = investigate(unit, ctx, repo_root, cfg, stats=unit_stats);
+      catch error => match (error) {
+        // src: :102-112
+        case GuardrailBlocked => {
+          [guardrail_hits, gate_label] = guardrail_gate_hit(error, guardrail_hits, guardrailGate)   // a ModelRefusal leaves the count unchanged
+          errlog.log("s4", "guardrail:${unit.id}", error, scope="unit")
+          outcomes[unit.id] = "guardrail"
+          if (guardrail_hits >= guardrailGate && successes == 0) _guardrail_fail_fast(error)
+          continue
+        }
+        // src: :113-115
+        case cli.aborted() => throw error
+        // src: :116-128 — every remaining unit would fail identically
+        case is_halt_error(error) => {
+          remaining = units[i..end]   // includes the current unit
+          errlog.log("s4", unit.id, error, scope="unit")
+          COUNTERS.bump("s4_units_halted", length(remaining))
+          for each skipped in remaining, outcomes[skipped.id] = "halted";
+          break out of the unit loop
+        }
+        // src: :129-136 — every retry inside the session already failed; recorded so the report discloses the gap
+        default => {
+          errlog.log("s4", unit.id, error, scope="unit")
+          outcomes[unit.id] = "error"
+          continue
+        }
+      }
+      // src: :137-144
+      successes += 1
+      outcomes[unit.id] = "completed"
+      all_findings += findings
+    }
+    // abstracted: :145-151 per-outcome counts are logged and the progress summary printed; no decision
+    return [all_findings, outcomes]
+  }
+
+  // ---------- parallel path ----------
+  // src: :154-162
+  results = {}
+  batches = s4.batching.plan_batches(units, _batch_size(cfg))
+  split_retry = knob("step4.split_retry", default=true)
+  ex = thread pool with max_workers = parallel
+  futs = {}        // future -> batch
+  retry_futs = {}  // future -> [unit], only the split retries
+
+  // src: :164-168
+  fn _resubmit(unit):executor=code {
+    fut = _submit_batch(ex, [unit], investigate, ctx, repo_root, cfg)
+    futs[fut] = [unit]; retry_futs[fut] = [unit]
+    COUNTERS.bump("s4_batch_member_resubmitted")
+  }
+
+  // src: :170-183 — tag every not-yet-recorded unit "halted"; such a unit is never dispatched again
+  fn _mark_halted(batches_to_mark):executor=code {
+    for each b in batches_to_mark, for each unit in b {
+      if (unit.id not in outcomes) { outcomes[unit.id] = "halted"; results[unit.id] = [] }
+    }
+  }
+
+  // src: :185-190 — every batch is submitted up front
+  // runConcurrently(batches, workers=parallel, fn=batch => _submit_batch(ex, batch, investigate, ctx, repo_root, cfg)):order=completion
+  for each batch in batches, futs[_submit_batch(ex, batch, investigate, ctx, repo_root, cfg)] = batch;
+  halted = false
+
+  // src: :343-344
+  constraint OnEveryExit {
+    ex.shutdown(wait=true)
+  }
+
+  try {
+    // ----- first pass: original batches, consumed in completion order -----
+    // src: :193-279
+    for each fut in completed(futs) {
+      batch = futs[fut]
+      try [found, merged_by_unit, verdict_by_unit] = fut.result();
+      catch error => match (error) {
+        // src: :197-211
+        case GuardrailBlocked => {
+          [guardrail_hits, gate_label] = guardrail_gate_hit(error, guardrail_hits, guardrailGate)   // one batch counts once
+          for each unit in batch { errlog.log("s4", "guardrail:${unit.id}", error, scope="unit"); results[unit.id] = []; outcomes[unit.id] = "guardrail" }
+          if (guardrail_hits >= guardrailGate && successes == 0) {
+            cli.abort(); ex.shutdown(wait=false, cancel_futures=true)
+            _guardrail_fail_fast(error)
+          }
+          continue
+        }
+        // src: :213-227
+        case is_halt_error(error) => {
+          pending_batches = batches of futs not yet done
+          n_pending = total units in pending_batches
+          _mark_halted([batch, ...pending_batches])
+          errlog.log("s4", unit.id, error, scope="unit") for each unit in batch
+          COUNTERS.bump("s4_units_halted", length(batch) + n_pending)
+          cli.abort(); ex.shutdown(wait=false, cancel_futures=true)
+          halted = true
+          break out of the first pass
+        }
+        // src: :228-245
+        default => {
+          retryable = split_retry && length(batch) > 1 && !is_deterministic_failure(error) && !cli.aborted()
+          for each unit in batch {
+            outcomes[unit.id] = "error"
+            if (retryable) {
+              errlog.log("s4", unit.id, error, scope="unit", recovered=true)   // the retry logs its own row if it fails
+              _resubmit(unit)
+              continue
+            }
+            errlog.log("s4", unit.id, error, scope="unit")
+            results[unit.id] = []
+          }
+          continue
+        }
+      }
+      // src: :246-279 — success; a batch success counts once
+      successes += 1
+      for each unit in batch {
+        findings = found[unit.id] or []
+        verdict = verdict_by_unit[unit.id]
+        if (verdict in ["uninvestigated", "failed"]) {
+          outcomes[unit.id] = verdict
+          retryable = split_retry && length(batch) > 1 && !cli.aborted()
+          msg = if (verdict == "uninvestigated") "model omitted this unit from the shared batch reply" else "this unit's entry in the shared batch reply did not parse"
+          if (retryable) {
+            errlog.log("s4", unit.id, msg, scope="unit", recovered=true)
+            _resubmit(unit)
+            continue
+          }
+          errlog.log("s4", unit.id, msg, scope="unit", reason="s4_batch_member_$verdict")
+          results[unit.id] = []
+          continue
+        }
+        results[unit.id] = findings
+        outcomes[unit.id] = "completed"
+        // preserved: a member the model judged "refuted" or "inconclusive" is also recorded "completed"
+      }
+    }
+
+    // ----- second pass: split retries (each a single unit) -----
+    // src: :281-336 — skipped entirely after a halt
+    if (!halted) {
+      for each fut in completed(retry_futs) {
+        batch = retry_futs[fut]
+        try [found, merged_by_unit, verdict_by_unit] = fut.result();
+        catch error => match (error) {
+          // src: :286-300 — same guardrail gate as the first pass
+          case GuardrailBlocked => {
+            [guardrail_hits, gate_label] = guardrail_gate_hit(error, guardrail_hits, guardrailGate)
+            for each unit in batch { errlog.log("s4", "guardrail:${unit.id}", error, scope="unit"); results[unit.id] = []; outcomes[unit.id] = "guardrail" }
+            if (guardrail_hits >= guardrailGate && successes == 0) {
+              cli.abort(); ex.shutdown(wait=false, cancel_futures=true); _guardrail_fail_fast(error)
+            }
+            continue
+          }
+          // src: :301-316
+          case is_halt_error(error) => {
+            pending_batches = (batches of futs not yet done) + (batches of retry_futs not yet done)
+            _mark_halted([batch, ...pending_batches])
+            COUNTERS.bump("s4_units_halted", length(batch) + total units in pending_batches)
+            cli.abort(); ex.shutdown(wait=false, cancel_futures=true)
+            halted = true
+            break out of the second pass
+          }
+          // src: :317-325 — a retry is never retried again
+          default => {
+            for each unit in batch { errlog.log("s4", unit.id, error, scope="unit"); results[unit.id] = []; outcomes[unit.id] = "error" }
+            continue
+          }
+        }
+        // src: :326-336
+        successes += 1
+        for each unit in batch {
+          results[unit.id] = found[unit.id] or []
+          outcomes[unit.id] = "completed"
+          // preserved: verdict_by_unit is not consulted here; it is always {} for a single-unit submission
+          COUNTERS.bump("s4_batch_member_recovered")
+        }
+      }
+    }
+  }
+  // src: :337-342
+  catch (KeyboardInterrupt or SystemExit) => {
+    cli.abort()   // kills running subprocesses
+    ex.shutdown(wait=false, cancel_futures=true)
+    throw
+  }
+
+  // src: :346-349 — reassemble in risk-rank order so downstream ordering is stable
+  all_findings = []
+  for each unit in units, all_findings += results[unit.id] or [];
+  // abstracted: :350-361 per-outcome counts logged; progress summary printed
+  return [all_findings, outcomes]
+}
+
+// src: vvaharness/pipeline/stages/s4_deepdive.py:365-367
+fn _batch_size(cfg):executor=code {
+  return _cap_int(cfg.step4, "batch_size", 1)   // a negative or unusable value falls back to 1; 0 survives
+}
+
+// src: vvaharness/pipeline/stages/s4_deepdive.py:370-390
+fn _submit_batch(ex, batch, investigate, ctx, repo_root, cfg):executor=code {
+  // the future resolves to [findings_by_unit, merged_by_unit, verdict_by_unit]
+  if (length(batch) == 1) {
+    unit = batch[0]
+    return ex.submit(() => {
+      stats = {}
+      findings = investigate(unit, ctx, repo_root, cfg, stats)   // s4.session.investigate_unit
+      return [{ [unit.id]: findings }, { [unit.id]: stats.merged or 0 }, {}]
+    })
+  }
+  return ex.submit(() => {
+    stats = {}
+    [out, verdict_by_unit] = s4.session.investigate_batch(batch, ctx, repo_root, cfg, stats)
+    return [out, stats.merged_by_unit or {}, verdict_by_unit]
+  })
+}
+
+// src: vvaharness/pipeline/stages/s4_deepdive.py:393-398 — sized so the shared prefix clears the provider's 1024-token cache minimum even on a small repository
+_SHARED_CTX_MAX_SYSTEM_CHARS = 4000
+_SHARED_CTX_MAX_THREATS = 25
+_SHARED_CTX_MAX_BOUNDARIES = 15
+_SHARED_CTX_MAX_ASSETS = 10
+_SHARED_CTX_MAX_EPS = 60
+
+// src: vvaharness/pipeline/stages/s4_deepdive.py:401-440
+// prompt-src: vvaharness/pipeline/stages/s4_deepdive.py:405-438
+// The never-empty, cache-marked prefix that is byte-identical for every unit of the scan (passed as cache_prefix to every Stage 4 session).
+_build_shared_context_block {
+  $app_profile_block    // if ctx.app_profile: ctx.app_profile.to_prompt_block()
+  $threat_model_block   // if ctx.threat_model: to_compact_prompt_block(max_context_chars=4000, max_assets=10, max_boundaries=15, max_threats=25)
+  $entry_point_inventory {
+    // if ctx.entry_points: sorted by (file, function), first 60 kept, so the bytes are identical on every call
+    "ENTRY POINT INVENTORY ($shown/$total total):"
+    one line per entry point: "  [unauth]|[auth] [$kind] $file::$function"   // [unauth] when reachable_from_unauth
+    if (total > 60) "  …($omitted more omitted)"
+  }
+  Constraints {
+    "TRUST RULE: Operator argv/env on the operator's OWN host is TRUSTED."
+    "CI job parameters, scheduler args, shared config/CSV/test-data files editable by other principals, and framework-overridable variables ARE attack surface even on an internal app — report those (typically LOW)."
+    "See OUT-OF-SCOPE rule A."
+    // preserved: "OUT-OF-SCOPE rule A" is defined only in Stage 6's EXCLUSION_RULES (s6/prompts.sudo); no Stage 4 prompt contains it
+  }
+  // blocks joined by blank lines; empty blocks omitted
+}
+
+// src: vvaharness/pipeline/stages/s4_deepdive.py:445-451
+_PAN_RX = /\b(?:\d[\s\-]?){13,19}\b/
+_CARD_CTX = case-insensitive /\b(pan|card(?:[\s_-]*(?:no|num|number))?|cc(?:[\s_-]*(?:no|num|number))?|credit[\s_-]*card|acct|account(?:[\s_-]*(?:no|num|number))?)\b/
+
+// src: vvaharness/pipeline/stages/s4_deepdive.py:454-471
+fn _mask_pan(match):executor=code {
+  digits = digits of match
+  if (length(digits) < 13) return match unchanged
+  window = the 48 characters just before the match
+  // Luhn-or-keyword gate: length alone would mangle timestamps and identifiers
+  if (!(_luhn(digits) || _CARD_CTX matches window)) return match unchanged
+  return match with every digit after the first 4 replaced by "X"   // separators kept, so the layout survives
+}
+
+// src: vvaharness/pipeline/stages/s4_deepdive.py:478-501
+fn _redact_source(text, rel, stage="s4"):executor=code {
+  text = sanitize_packed_text(text, rel)   // external to this batch: backends/llm/tools; an endpoint can reject an embedded data: URI
+  masked = replace each _PAN_RX match with _mask_pan(match); n_pan = count actually changed
+  [masked, counts] = redact_counts(masked)   // redact_counts, not redact: Stage 4 runs concurrently and must not race shared counters
+  // neither layer adds or removes newlines, so finding line numbers stay accurate
+  if (n_pan || sum(counts)) warn_once("$stage:$rel", "redacted $n_pan PAN-prefix + $n_other sensitive token(s) in $rel")
+  return masked
+}
+
+// src: vvaharness/pipeline/stages/s4_deepdive.py:505
+MAX_LINE_CHARS = 8000   // per-line cap so a minified one-line file does not become one enormous line
+
+// src: vvaharness/pipeline/stages/s4_deepdive.py:508-525
+fn _load_files_full(files, repo_root, stage="s4"):executor=code {
+  for each rel in files {
+    if (repo_root/rel is not a file) { emit "=== $rel ===\n[FILE NOT FOUND]"; continue }
+    try text = read repo_root/rel as UTF-8 with replacement;
+    catch error => { emit "=== $rel ===\n[READ ERROR: $error]"; continue }
+    text = _redact_source(text, rel, stage)
+    emit "=== $rel ===" then each line as "%5d| " + first 8000 characters of the line
+  }
+  return emitted parts joined by newlines
+  // preserved: the path is joined to repo_root without a containment check here (contrast s5.enrich.FileCache)
+}
+
+// abstracted: s4_deepdive.py:56-60 (_label console line per unit) and all tracker.scanning/scanned calls; display only.

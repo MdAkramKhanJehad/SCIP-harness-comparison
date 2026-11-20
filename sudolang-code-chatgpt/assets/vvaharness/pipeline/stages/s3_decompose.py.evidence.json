@@ -1,0 +1,2735 @@
+{
+  "source": "vvaharness/pipeline/stages/s3_decompose.py",
+  "sha256": "14653c37b3fd103260f3593effcfe54c74420b7a972031c94a91ccd5fb9500e8",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Step 3 — builds the risk-ranked TaskManifest deterministically from S2's ThreatModel, one InvestigationUnit per threat.\"\"\"\nfrom __future__ import annotations\n\nfrom pathlib import Path\n\nfrom vvaharness.util import logs\n\nlog = logs.get_logger(__name__)\n\nfrom vvaharness.lang.detect import detect_languages\nfrom vvaharness.models import ContextPackage, InvestigationUnit, TaskManifest, UnitSize\nfrom vvaharness.models.scan.work import threat_unit_id\nfrom vvaharness.util import console\n\n_LOC_KILO = 1_000       # for the \"12.3k\"-style LOC report formatting\n_P90_FRACTION = 0.9\n\n_SMALL_UNIT_LOC_MAX = 2_000\n_MEDIUM_UNIT_LOC_MAX = 8_000\n\n_IMPACT_ORDINAL = {\"low\": 1, \"medium\": 2, \"high\": 3, \"critical\": 4, \"existential\": 5}\n_LIKELIHOOD_ORDINAL = {\n    \"very_rare\": 1, \"rare\": 2, \"possible\": 3, \"likely\": 4, \"almost_certain\": 5,\n}\n_DEFAULT_IMPACT_ORDINAL = _IMPACT_ORDINAL[\"medium\"]\n_DEFAULT_LIKELIHOOD_ORDINAL = _LIKELIHOOD_ORDINAL[\"possible\"]\n_MAX_RISK_SCORE = max(_IMPACT_ORDINAL.values()) * max(_LIKELIHOOD_ORDINAL.values())\n\n\ndef run(ctx: ContextPackage, cfg) -> TaskManifest:\n    log.info(\"s3/decompose: starting task decomposition - threats=%d modules=%d\",\n             len(ctx.threat_model.threats) if ctx.threat_model else 0, len(ctx.modules))\n    manifest = TaskManifest(units=[])\n\n    n_threat = _investigation_units(manifest, ctx)\n\n    repo_root = Path(ctx.repo_root)\n    for u in manifest.units:\n        u.languages = detect_languages(u.files, repo_root=repo_root)\n\n    manifest.unreachable_files = _coverage_report(manifest, ctx)\n    _report_unit_loc(manifest, repo_root)\n\n    tracker = getattr(cfg, \"_scan_progress\", None)\n    if tracker is not None:\n        for unit in manifest.units:\n            tracker.queued(unit)\n\n    console.write(\n        f\"  [s3] done: {len(manifest.units)} unit(s) ({n_threat} threat(s)), \"\n        f\"top risk = {manifest.sorted_units()[0].id if manifest.units else 'none'}\"\n    )\n    log.info(\n        \"s3/decompose: decomposition complete - units=%d (threat=%d)\",\n        len(manifest.units), n_threat,\n    )\n    return manifest\n\n\ndef _threat_risk_rank(t) -> int:\n    \"\"\"Returns 1 (most urgent) .. `_MAX_RISK_SCORE` (least) from Threat.impact x Threat.likelihood.\"\"\"\n    score = (_IMPACT_ORDINAL.get(t.impact, _DEFAULT_IMPACT_ORDINAL)\n            * _LIKELIHOOD_ORDINAL.get(t.likelihood, _DEFAULT_LIKELIHOOD_ORDINAL))\n    return _MAX_RISK_SCORE + 1 - score\n\n\ndef _file_module_index(ctx: ContextPackage) -> dict[str, str]:\n    \"\"\"Returns ``file -> community name`` from `ctx.modules`, a reported annotation that nothing groups or splits files by.\"\"\"\n    file_community: dict[str, str] = {}\n    for m in ctx.modules:\n        for f in m.files:\n            file_community.setdefault(f, m.name)\n    return file_community\n\n\ndef _investigation_units(manifest: TaskManifest, ctx: ContextPackage) -> int:\n    \"\"\"Appends one InvestigationUnit per threat, carrying that threat's whole validated surface uncut, and returns how many it added.\"\"\"\n    tm = ctx.threat_model\n    if not tm or not tm.threats:\n        return 0\n\n    all_files = set(ctx.all_files)\n    file_community = _file_module_index(ctx)\n    repo_root = Path(ctx.repo_root)\n    base_rank = max((u.risk_rank for u in manifest.units), default=0)\n\n    added = 0\n    with_surface = 0\n    used_ids = {u.id for u in manifest.units}\n    for threat_id, t in zip(tm.threat_ids(), tm.threats, strict=True):\n        files = [f for f in dict.fromkeys(t.surface_files) if f in all_files]\n        if not files:\n            manifest.threats_without_unit.append(threat_id)\n            console.write(f\"    [s3] {threat_id}: no validated surface file — \"\n                          \"never reviewed\")\n            continue\n        with_surface += 1\n\n        cid = threat_unit_id(threat_id)\n        if cid in used_ids:\n            n = 2\n            while f\"{cid}-{n}\" in used_ids:\n                n += 1\n            cid = f\"{cid}-{n}\"\n        used_ids.add(cid)\n\n        fset = set(files)\n        sinks = [s for s in ctx.unsafe_sinks if s.file in fset]\n        loc = sum(_count_loc(repo_root / f) for f in files)\n\n        manifest.units.append(InvestigationUnit(\n            id=cid,\n            threat=t.threat,\n            surface=t.surface,\n            actor=t.actor,\n            asset=t.asset,\n            impact=t.impact,\n            likelihood=t.likelihood,\n            controls=t.controls,\n            evidence=t.evidence,\n            file_ids=files,\n            sinks=sinks,\n            entry_points=[e for e in ctx.entry_points if e.file in fset],\n            related_cves=[c.id for c in ctx.known_cves\n                         if set(c.affected_files) & fset],\n            communities=sorted({file_community.get(f, f\"file:{f}\") for f in files}),\n            cwes=sorted({c for s in sinks for c in s.cwe}),\n            risk_rank=base_rank + _threat_risk_rank(t),\n            size=_size_for(loc),\n        ))\n        added += 1\n\n    console.write(f\"    [s3] threats: {added} unit(s) from \"\n                  f\"{with_surface}/{len(tm.threats)} threat(s) with a validated \"\n                  \"surface\")\n    return added\n\n\ndef _size_for(loc: int) -> UnitSize:\n    if loc < _SMALL_UNIT_LOC_MAX:\n        return UnitSize.SMALL\n    if loc < _MEDIUM_UNIT_LOC_MAX:\n        return UnitSize.MEDIUM\n    return UnitSize.LARGE\n\n\ndef _coverage_report(manifest: TaskManifest, ctx: ContextPackage) -> list[str]:\n    \"\"\"Returns the files named by no unit, also printing that coverage gap to stderr.\"\"\"\n    covered: set[str] = set()\n    for u in manifest.units:\n        covered.update(u.files)\n    unreachable = sorted(set(ctx.all_files) - covered)\n    if unreachable:\n        console.write(f\"    [s3] coverage: {len(unreachable)}/{len(ctx.all_files)} \"\n                      \"file(s) named by no threat's surface — never reviewed\")\n    # No COUNTERS bump: metrics.build() reads manifest.unreachable_files, which survives --resume\n    return unreachable\n\n\ndef _report_unit_loc(manifest: TaskManifest, repo_root: Path) -> None:\n    locs = sorted(sum(_count_loc(repo_root / f) for f in u.files)\n                  for u in manifest.units)\n    if not locs:\n        return\n    n = len(locs)\n    fmt = lambda x: f\"{x / _LOC_KILO:.1f}k\" if x >= _LOC_KILO else str(x)\n    p90 = locs[min(n - 1, int(n * _P90_FRACTION))]\n    console.write(f\"    [s3] unit LOC: n={n} min={fmt(locs[0])} \"\n                  f\"p50={fmt(locs[n // 2])} p90={fmt(p90)} max={fmt(locs[-1])}\")\n\n\n_LOC_CACHE: dict[str, int] = {}\n\n\ndef _count_loc(p: Path) -> int:\n    \"\"\"Returns the file's line count, memoised on its (always absolute) path string.\"\"\"\n    k = str(p)\n    v = _LOC_CACHE.get(k)\n    if v is not None:\n        return v\n    try:\n        with p.open(\"r\", encoding=\"utf-8\", errors=\"replace\") as fh:\n            v = sum(1 for _ in fh)\n    except OSError:\n        v = 0\n    _LOC_CACHE[k] = v\n    return v\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/pipeline/stages/s3_decompose.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "Step 3 — builds the risk-ranked TaskManifest deterministically from S2's ThreatModel, one InvestigationUnit per threat.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_64_8": {
+      "source": "vvaharness/pipeline/stages/s3_decompose.py",
+      "line_start": 64,
+      "line_end": 65,
+      "source_expression": "f\"  [s3] done: {len(manifest.units)} unit(s) ({n_threat} threat(s)), \"\n        f\"top risk = {manifest.sorted_units()[0].id if manifest.units else 'none'}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_75_4": {
+      "source": "vvaharness/pipeline/stages/s3_decompose.py",
+      "line_start": 75,
+      "line_end": 75,
+      "value": "Returns 1 (most urgent) .. `_MAX_RISK_SCORE` (least) from Threat.impact x Threat.likelihood.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_82_4": {
+      "source": "vvaharness/pipeline/stages/s3_decompose.py",
+      "line_start": 82,
+      "line_end": 82,
+      "value": "Returns ``file -> community name`` from `ctx.modules`, a reported annotation that nothing groups or splits files by.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_91_4": {
+      "source": "vvaharness/pipeline/stages/s3_decompose.py",
+      "line_start": 91,
+      "line_end": 91,
+      "value": "Appends one InvestigationUnit per threat, carrying that threat's whole validated surface uncut, and returns how many it added.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_108_26": {
+      "source": "vvaharness/pipeline/stages/s3_decompose.py",
+      "line_start": 108,
+      "line_end": 109,
+      "source_expression": "f\"    [s3] {threat_id}: no validated surface file — \"\n                          \"never reviewed\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_116_18": {
+      "source": "vvaharness/pipeline/stages/s3_decompose.py",
+      "line_start": 116,
+      "line_end": 116,
+      "source_expression": "f\"{cid}-{n}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_118_18": {
+      "source": "vvaharness/pipeline/stages/s3_decompose.py",
+      "line_start": 118,
+      "line_end": 118,
+      "source_expression": "f\"{cid}-{n}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_140_54": {
+      "source": "vvaharness/pipeline/stages/s3_decompose.py",
+      "line_start": 140,
+      "line_end": 140,
+      "source_expression": "f\"file:{f}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_147_18": {
+      "source": "vvaharness/pipeline/stages/s3_decompose.py",
+      "line_start": 147,
+      "line_end": 149,
+      "source_expression": "f\"    [s3] threats: {added} unit(s) from \"\n                  f\"{with_surface}/{len(tm.threats)} threat(s) with a validated \"\n                  \"surface\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_162_4": {
+      "source": "vvaharness/pipeline/stages/s3_decompose.py",
+      "line_start": 162,
+      "line_end": 162,
+      "value": "Returns the files named by no unit, also printing that coverage gap to stderr.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_168_22": {
+      "source": "vvaharness/pipeline/stages/s3_decompose.py",
+      "line_start": 168,
+      "line_end": 169,
+      "source_expression": "f\"    [s3] coverage: {len(unreachable)}/{len(ctx.all_files)} \"\n                      \"file(s) named by no threat's surface — never reviewed\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_180_20": {
+      "source": "vvaharness/pipeline/stages/s3_decompose.py",
+      "line_start": 180,
+      "line_end": 180,
+      "source_expression": "f\"{x / _LOC_KILO:.1f}k\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_182_18": {
+      "source": "vvaharness/pipeline/stages/s3_decompose.py",
+      "line_start": 182,
+      "line_end": 183,
+      "source_expression": "f\"    [s3] unit LOC: n={n} min={fmt(locs[0])} \"\n                  f\"p50={fmt(locs[n // 2])} p90={fmt(p90)} max={fmt(locs[-1])}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_190_4": {
+      "source": "vvaharness/pipeline/stages/s3_decompose.py",
+      "line_start": 190,
+      "line_end": 190,
+      "value": "Returns the file's line count, memoised on its (always absolute) path string.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "Step 3 — builds the risk-ranked TaskManifest deterministically from S2's ThreatModel, one InvestigationUnit per threat.",
+      "context": "literal"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 19,
+      "value": "low",
+      "context": "literal"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 29,
+      "value": "medium",
+      "context": "literal"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 42,
+      "value": "high",
+      "context": "literal"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 53,
+      "value": "critical",
+      "context": "literal"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 68,
+      "value": "existential",
+      "context": "literal"
+    },
+    {
+      "line_start": 37,
+      "line_end": 37,
+      "column": 4,
+      "value": "very_rare",
+      "context": "literal"
+    },
+    {
+      "line_start": 37,
+      "line_end": 37,
+      "column": 20,
+      "value": "rare",
+      "context": "literal"
+    },
+    {
+      "line_start": 37,
+      "line_end": 37,
+      "column": 31,
+      "value": "possible",
+      "context": "literal"
+    },
+    {
+      "line_start": 37,
+      "line_end": 37,
+      "column": 46,
+      "value": "likely",
+      "context": "literal"
+    },
+    {
+      "line_start": 37,
+      "line_end": 37,
+      "column": 59,
+      "value": "almost_certain",
+      "context": "literal"
+    },
+    {
+      "line_start": 39,
+      "line_end": 39,
+      "column": 42,
+      "value": "medium",
+      "context": "literal"
+    },
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 50,
+      "value": "possible",
+      "context": "literal"
+    },
+    {
+      "line_start": 75,
+      "line_end": 75,
+      "column": 4,
+      "value": "Returns 1 (most urgent) .. `_MAX_RISK_SCORE` (least) from Threat.impact x Threat.likelihood.",
+      "context": "literal"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 4,
+      "value": "Returns ``file -> community name`` from `ctx.modules`, a reported annotation that nothing groups or splits files by.",
+      "context": "literal"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 4,
+      "value": "Appends one InvestigationUnit per threat, carrying that threat's whole validated surface uncut, and returns how many it added.",
+      "context": "literal"
+    },
+    {
+      "line_start": 162,
+      "line_end": 162,
+      "column": 4,
+      "value": "Returns the files named by no unit, also printing that coverage gap to stderr.",
+      "context": "literal"
+    },
+    {
+      "line_start": 190,
+      "line_end": 190,
+      "column": 4,
+      "value": "Returns the file's line count, memoised on its (always absolute) path string.",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 13,
+      "value": "s3/decompose: starting task decomposition - threats=%d modules=%d",
+      "context": "literal"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 27,
+      "value": "_scan_progress",
+      "context": "literal"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 8,
+      "value": "s3/decompose: decomposition complete - units=%d (threat=%d)",
+      "context": "literal"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 10,
+      "value": "  [s3] done: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 44,
+      "value": " unit(s) (",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 64,
+      "line_end": 65,
+      "column": 64,
+      "value": " threat(s)), top risk = ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 20,
+      "value": "    [s3] threats: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 45,
+      "value": " unit(s) from ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 148,
+      "line_end": 148,
+      "column": 34,
+      "value": "/",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 148,
+      "line_end": 149,
+      "column": 52,
+      "value": " threat(s) with a validated surface",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 20,
+      "value": "    [s3] unit LOC: n=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 44,
+      "value": " min=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 182,
+      "line_end": 183,
+      "column": 63,
+      "value": " p50=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 183,
+      "line_end": 183,
+      "column": 43,
+      "value": " p90=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 183,
+      "line_end": 183,
+      "column": 58,
+      "value": " max=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 118,
+      "line_end": 118,
+      "column": 25,
+      "value": "-",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 168,
+      "line_end": 168,
+      "column": 24,
+      "value": "    [s3] coverage: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 168,
+      "line_end": 168,
+      "column": 61,
+      "value": "/",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 168,
+      "line_end": 169,
+      "column": 82,
+      "value": " file(s) named by no threat's surface — never reviewed",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 41,
+      "value": "k",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 196,
+      "line_end": 196,
+      "column": 20,
+      "value": "r",
+      "context": "literal"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 75,
+      "value": "none",
+      "context": "literal"
+    },
+    {
+      "line_start": 108,
+      "line_end": 108,
+      "column": 28,
+      "value": "    [s3] ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 108,
+      "line_end": 109,
+      "column": 48,
+      "value": ": no validated surface file — never reviewed",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 25,
+      "value": "-",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 196,
+      "line_end": 196,
+      "column": 34,
+      "value": "utf-8",
+      "context": "literal"
+    },
+    {
+      "line_start": 196,
+      "line_end": 196,
+      "column": 50,
+      "value": "replace",
+      "context": "literal"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 37,
+      "value": ".1f",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 56,
+      "value": "file:",
+      "context": "f-string segment"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 29,
+      "text": "# for the \"12.3k\"-style LOC report formatting"
+    },
+    {
+      "line": 170,
+      "text": "# No COUNTERS bump: metrics.build() reads manifest.unreachable_files, which survives --resume"
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 18,
+      "line_end": 18,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Assign",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 26,
+      "line_end": 26,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 27,
+      "line_end": 27,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "Assign",
+      "line_start": 29,
+      "line_end": 29,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "Assign",
+      "line_start": 30,
+      "line_end": 30,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 32,
+      "line_end": 32,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 33,
+      "line_end": 33,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 35,
+      "line_end": 35,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 36,
+      "line_end": 38,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 39,
+      "line_end": 39,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "Assign",
+      "line_start": 40,
+      "line_end": 40,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "Assign",
+      "line_start": 41,
+      "line_end": 41,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 44,
+      "line_end": 71,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 9
+    },
+    {
+      "kind": "Expr",
+      "line_start": 45,
+      "line_end": 46,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 15
+    },
+    {
+      "kind": "Assign",
+      "line_start": 47,
+      "line_end": 47,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 15
+    },
+    {
+      "kind": "Assign",
+      "line_start": 49,
+      "line_end": 49,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 15
+    },
+    {
+      "kind": "Assign",
+      "line_start": 51,
+      "line_end": 51,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 15
+    },
+    {
+      "kind": "For",
+      "line_start": 52,
+      "line_end": 53,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 16
+    },
+    {
+      "kind": "Assign",
+      "line_start": 53,
+      "line_end": 53,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 19
+    },
+    {
+      "kind": "Assign",
+      "line_start": 55,
+      "line_end": 55,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 22
+    },
+    {
+      "kind": "Expr",
+      "line_start": 56,
+      "line_end": 56,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 22
+    },
+    {
+      "kind": "Assign",
+      "line_start": 58,
+      "line_end": 58,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 22
+    },
+    {
+      "kind": "If",
+      "line_start": 59,
+      "line_end": 61,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 23
+    },
+    {
+      "kind": "For",
+      "line_start": 60,
+      "line_end": 61,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 25
+    },
+    {
+      "kind": "Expr",
+      "line_start": 61,
+      "line_end": 61,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 28
+    },
+    {
+      "kind": "Expr",
+      "line_start": 63,
+      "line_end": 66,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 32
+    },
+    {
+      "kind": "Expr",
+      "line_start": 67,
+      "line_end": 70,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 32
+    },
+    {
+      "kind": "Return",
+      "line_start": 71,
+      "line_end": 71,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 33
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 74,
+      "line_end": 78,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 37
+    },
+    {
+      "kind": "Expr",
+      "line_start": 75,
+      "line_end": 75,
+      "column": 4,
+      "owner": "_threat_risk_rank",
+      "representation_line": 43
+    },
+    {
+      "kind": "Assign",
+      "line_start": 76,
+      "line_end": 77,
+      "column": 4,
+      "owner": "_threat_risk_rank",
+      "representation_line": 43
+    },
+    {
+      "kind": "Return",
+      "line_start": 78,
+      "line_end": 78,
+      "column": 4,
+      "owner": "_threat_risk_rank",
+      "representation_line": 44
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 81,
+      "line_end": 87,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 48
+    },
+    {
+      "kind": "Expr",
+      "line_start": 82,
+      "line_end": 82,
+      "column": 4,
+      "owner": "_file_module_index",
+      "representation_line": 54
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 83,
+      "line_end": 83,
+      "column": 4,
+      "owner": "_file_module_index",
+      "representation_line": 54
+    },
+    {
+      "kind": "For",
+      "line_start": 84,
+      "line_end": 86,
+      "column": 4,
+      "owner": "_file_module_index",
+      "representation_line": 55
+    },
+    {
+      "kind": "For",
+      "line_start": 85,
+      "line_end": 86,
+      "column": 8,
+      "owner": "_file_module_index",
+      "representation_line": 57
+    },
+    {
+      "kind": "Expr",
+      "line_start": 86,
+      "line_end": 86,
+      "column": 12,
+      "owner": "_file_module_index",
+      "representation_line": 60
+    },
+    {
+      "kind": "Return",
+      "line_start": 87,
+      "line_end": 87,
+      "column": 4,
+      "owner": "_file_module_index",
+      "representation_line": 63
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 90,
+      "line_end": 150,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 67
+    },
+    {
+      "kind": "Expr",
+      "line_start": 91,
+      "line_end": 91,
+      "column": 4,
+      "owner": "_investigation_units",
+      "representation_line": 73
+    },
+    {
+      "kind": "Assign",
+      "line_start": 92,
+      "line_end": 92,
+      "column": 4,
+      "owner": "_investigation_units",
+      "representation_line": 73
+    },
+    {
+      "kind": "If",
+      "line_start": 93,
+      "line_end": 94,
+      "column": 4,
+      "owner": "_investigation_units",
+      "representation_line": 74
+    },
+    {
+      "kind": "Return",
+      "line_start": 94,
+      "line_end": 94,
+      "column": 8,
+      "owner": "_investigation_units",
+      "representation_line": 76
+    },
+    {
+      "kind": "Assign",
+      "line_start": 96,
+      "line_end": 96,
+      "column": 4,
+      "owner": "_investigation_units",
+      "representation_line": 80
+    },
+    {
+      "kind": "Assign",
+      "line_start": 97,
+      "line_end": 97,
+      "column": 4,
+      "owner": "_investigation_units",
+      "representation_line": 80
+    },
+    {
+      "kind": "Assign",
+      "line_start": 98,
+      "line_end": 98,
+      "column": 4,
+      "owner": "_investigation_units",
+      "representation_line": 80
+    },
+    {
+      "kind": "Assign",
+      "line_start": 99,
+      "line_end": 99,
+      "column": 4,
+      "owner": "_investigation_units",
+      "representation_line": 80
+    },
+    {
+      "kind": "Assign",
+      "line_start": 101,
+      "line_end": 101,
+      "column": 4,
+      "owner": "_investigation_units",
+      "representation_line": 80
+    },
+    {
+      "kind": "Assign",
+      "line_start": 102,
+      "line_end": 102,
+      "column": 4,
+      "owner": "_investigation_units",
+      "representation_line": 82
+    },
+    {
+      "kind": "Assign",
+      "line_start": 103,
+      "line_end": 103,
+      "column": 4,
+      "owner": "_investigation_units",
+      "representation_line": 82
+    },
+    {
+      "kind": "For",
+      "line_start": 104,
+      "line_end": 145,
+      "column": 4,
+      "owner": "_investigation_units",
+      "representation_line": 83
+    },
+    {
+      "kind": "Assign",
+      "line_start": 105,
+      "line_end": 105,
+      "column": 8,
+      "owner": "_investigation_units",
+      "representation_line": 86
+    },
+    {
+      "kind": "If",
+      "line_start": 106,
+      "line_end": 110,
+      "column": 8,
+      "owner": "_investigation_units",
+      "representation_line": 87
+    },
+    {
+      "kind": "Expr",
+      "line_start": 107,
+      "line_end": 107,
+      "column": 12,
+      "owner": "_investigation_units",
+      "representation_line": 90
+    },
+    {
+      "kind": "Expr",
+      "line_start": 108,
+      "line_end": 109,
+      "column": 12,
+      "owner": "_investigation_units",
+      "representation_line": 90
+    },
+    {
+      "kind": "Continue",
+      "line_start": 110,
+      "line_end": 110,
+      "column": 12,
+      "owner": "_investigation_units",
+      "representation_line": 91
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 111,
+      "line_end": 111,
+      "column": 8,
+      "owner": "_investigation_units",
+      "representation_line": 95
+    },
+    {
+      "kind": "Assign",
+      "line_start": 113,
+      "line_end": 113,
+      "column": 8,
+      "owner": "_investigation_units",
+      "representation_line": 95
+    },
+    {
+      "kind": "If",
+      "line_start": 114,
+      "line_end": 118,
+      "column": 8,
+      "owner": "_investigation_units",
+      "representation_line": 96
+    },
+    {
+      "kind": "Assign",
+      "line_start": 115,
+      "line_end": 115,
+      "column": 12,
+      "owner": "_investigation_units",
+      "representation_line": 99
+    },
+    {
+      "kind": "While",
+      "line_start": 116,
+      "line_end": 117,
+      "column": 12,
+      "owner": "_investigation_units",
+      "representation_line": 100
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 117,
+      "line_end": 117,
+      "column": 16,
+      "owner": "_investigation_units",
+      "representation_line": 103
+    },
+    {
+      "kind": "Assign",
+      "line_start": 118,
+      "line_end": 118,
+      "column": 12,
+      "owner": "_investigation_units",
+      "representation_line": 106
+    },
+    {
+      "kind": "Expr",
+      "line_start": 119,
+      "line_end": 119,
+      "column": 8,
+      "owner": "_investigation_units",
+      "representation_line": 109
+    },
+    {
+      "kind": "Assign",
+      "line_start": 121,
+      "line_end": 121,
+      "column": 8,
+      "owner": "_investigation_units",
+      "representation_line": 109
+    },
+    {
+      "kind": "Assign",
+      "line_start": 122,
+      "line_end": 122,
+      "column": 8,
+      "owner": "_investigation_units",
+      "representation_line": 109
+    },
+    {
+      "kind": "Assign",
+      "line_start": 123,
+      "line_end": 123,
+      "column": 8,
+      "owner": "_investigation_units",
+      "representation_line": 109
+    },
+    {
+      "kind": "Expr",
+      "line_start": 125,
+      "line_end": 144,
+      "column": 8,
+      "owner": "_investigation_units",
+      "representation_line": 109
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 145,
+      "line_end": 145,
+      "column": 8,
+      "owner": "_investigation_units",
+      "representation_line": 111
+    },
+    {
+      "kind": "Expr",
+      "line_start": 147,
+      "line_end": 149,
+      "column": 4,
+      "owner": "_investigation_units",
+      "representation_line": 114
+    },
+    {
+      "kind": "Return",
+      "line_start": 150,
+      "line_end": 150,
+      "column": 4,
+      "owner": "_investigation_units",
+      "representation_line": 115
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 153,
+      "line_end": 158,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 119
+    },
+    {
+      "kind": "If",
+      "line_start": 154,
+      "line_end": 155,
+      "column": 4,
+      "owner": "_size_for",
+      "representation_line": 124
+    },
+    {
+      "kind": "Return",
+      "line_start": 155,
+      "line_end": 155,
+      "column": 8,
+      "owner": "_size_for",
+      "representation_line": 126
+    },
+    {
+      "kind": "If",
+      "line_start": 156,
+      "line_end": 157,
+      "column": 4,
+      "owner": "_size_for",
+      "representation_line": 129
+    },
+    {
+      "kind": "Return",
+      "line_start": 157,
+      "line_end": 157,
+      "column": 8,
+      "owner": "_size_for",
+      "representation_line": 131
+    },
+    {
+      "kind": "Return",
+      "line_start": 158,
+      "line_end": 158,
+      "column": 4,
+      "owner": "_size_for",
+      "representation_line": 134
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 161,
+      "line_end": 171,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 138
+    },
+    {
+      "kind": "Expr",
+      "line_start": 162,
+      "line_end": 162,
+      "column": 4,
+      "owner": "_coverage_report",
+      "representation_line": 144
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 163,
+      "line_end": 163,
+      "column": 4,
+      "owner": "_coverage_report",
+      "representation_line": 144
+    },
+    {
+      "kind": "For",
+      "line_start": 164,
+      "line_end": 165,
+      "column": 4,
+      "owner": "_coverage_report",
+      "representation_line": 145
+    },
+    {
+      "kind": "Expr",
+      "line_start": 165,
+      "line_end": 165,
+      "column": 8,
+      "owner": "_coverage_report",
+      "representation_line": 148
+    },
+    {
+      "kind": "Assign",
+      "line_start": 166,
+      "line_end": 166,
+      "column": 4,
+      "owner": "_coverage_report",
+      "representation_line": 151
+    },
+    {
+      "kind": "If",
+      "line_start": 167,
+      "line_end": 169,
+      "column": 4,
+      "owner": "_coverage_report",
+      "representation_line": 152
+    },
+    {
+      "kind": "Expr",
+      "line_start": 168,
+      "line_end": 169,
+      "column": 8,
+      "owner": "_coverage_report",
+      "representation_line": 155
+    },
+    {
+      "kind": "Return",
+      "line_start": 171,
+      "line_end": 171,
+      "column": 4,
+      "owner": "_coverage_report",
+      "representation_line": 157
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 174,
+      "line_end": 183,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 161
+    },
+    {
+      "kind": "Assign",
+      "line_start": 175,
+      "line_end": 176,
+      "column": 4,
+      "owner": "_report_unit_loc",
+      "representation_line": 167
+    },
+    {
+      "kind": "If",
+      "line_start": 177,
+      "line_end": 178,
+      "column": 4,
+      "owner": "_report_unit_loc",
+      "representation_line": 168
+    },
+    {
+      "kind": "Return",
+      "line_start": 178,
+      "line_end": 178,
+      "column": 8,
+      "owner": "_report_unit_loc",
+      "representation_line": 170
+    },
+    {
+      "kind": "Assign",
+      "line_start": 179,
+      "line_end": 179,
+      "column": 4,
+      "owner": "_report_unit_loc",
+      "representation_line": 174
+    },
+    {
+      "kind": "Assign",
+      "line_start": 180,
+      "line_end": 180,
+      "column": 4,
+      "owner": "_report_unit_loc",
+      "representation_line": 174
+    },
+    {
+      "kind": "Assign",
+      "line_start": 181,
+      "line_end": 181,
+      "column": 4,
+      "owner": "_report_unit_loc",
+      "representation_line": 174
+    },
+    {
+      "kind": "Expr",
+      "line_start": 182,
+      "line_end": 183,
+      "column": 4,
+      "owner": "_report_unit_loc",
+      "representation_line": 174
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 186,
+      "line_end": 186,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 178
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 189,
+      "line_end": 201,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 179
+    },
+    {
+      "kind": "Expr",
+      "line_start": 190,
+      "line_end": 190,
+      "column": 4,
+      "owner": "_count_loc",
+      "representation_line": 185
+    },
+    {
+      "kind": "Assign",
+      "line_start": 191,
+      "line_end": 191,
+      "column": 4,
+      "owner": "_count_loc",
+      "representation_line": 185
+    },
+    {
+      "kind": "Assign",
+      "line_start": 192,
+      "line_end": 192,
+      "column": 4,
+      "owner": "_count_loc",
+      "representation_line": 185
+    },
+    {
+      "kind": "If",
+      "line_start": 193,
+      "line_end": 194,
+      "column": 4,
+      "owner": "_count_loc",
+      "representation_line": 186
+    },
+    {
+      "kind": "Return",
+      "line_start": 194,
+      "line_end": 194,
+      "column": 8,
+      "owner": "_count_loc",
+      "representation_line": 188
+    },
+    {
+      "kind": "Try",
+      "line_start": 195,
+      "line_end": 199,
+      "column": 4,
+      "owner": "_count_loc",
+      "representation_line": 191
+    },
+    {
+      "kind": "With",
+      "line_start": 196,
+      "line_end": 197,
+      "column": 8,
+      "owner": "_count_loc",
+      "representation_line": 193
+    },
+    {
+      "kind": "Assign",
+      "line_start": 197,
+      "line_end": 197,
+      "column": 12,
+      "owner": "_count_loc",
+      "representation_line": 196
+    },
+    {
+      "kind": "Assign",
+      "line_start": 199,
+      "line_end": 199,
+      "column": 8,
+      "owner": "_count_loc",
+      "representation_line": 203
+    },
+    {
+      "kind": "Assign",
+      "line_start": 200,
+      "line_end": 200,
+      "column": 4,
+      "owner": "_count_loc",
+      "representation_line": 206
+    },
+    {
+      "kind": "Return",
+      "line_start": 201,
+      "line_end": 201,
+      "column": 4,
+      "owner": "_count_loc",
+      "representation_line": 207
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 22,
+      "line_end": 22,
+      "column": 6,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='logs', ctx=Load()), attr='get_logger', ctx=Load()), args=[Name(id='__name__', ctx=Load())], keywords=[])",
+      "rendered": "logs.get_logger(__name__)"
+    },
+    {
+      "line_start": 29,
+      "line_end": 29,
+      "column": 12,
+      "kind": "Constant",
+      "original_ast": "Constant(value=1000)",
+      "rendered": "1000"
+    },
+    {
+      "line_start": 30,
+      "line_end": 30,
+      "column": 16,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0.9)",
+      "rendered": "0.9"
+    },
+    {
+      "line_start": 32,
+      "line_end": 32,
+      "column": 22,
+      "kind": "Constant",
+      "original_ast": "Constant(value=2000)",
+      "rendered": "2000"
+    },
+    {
+      "line_start": 33,
+      "line_end": 33,
+      "column": 23,
+      "kind": "Constant",
+      "original_ast": "Constant(value=8000)",
+      "rendered": "8000"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 18,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='low'), Constant(value='medium'), Constant(value='high'), Constant(value='critical'), Constant(value='existential')], values=[Constant(value=1), Constant(value=2), Constant(value=3), Constant(value=4), Constant(value=5)])",
+      "rendered": "{'low': 1, 'medium': 2, 'high': 3, 'critical': 4, 'existential': 5}"
+    },
+    {
+      "line_start": 36,
+      "line_end": 38,
+      "column": 22,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='very_rare'), Constant(value='rare'), Constant(value='possible'), Constant(value='likely'), Constant(value='almost_certain')], values=[Constant(value=1), Constant(value=2), Constant(value=3), Constant(value=4), Constant(value=5)])",
+      "rendered": "{'very_rare': 1, 'rare': 2, 'possible': 3, 'likely': 4, 'almost_certain': 5}"
+    },
+    {
+      "line_start": 39,
+      "line_end": 39,
+      "column": 26,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Name(id='_IMPACT_ORDINAL', ctx=Load()), slice=Constant(value='medium'), ctx=Load())",
+      "rendered": "_IMPACT_ORDINAL['medium']"
+    },
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 30,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Name(id='_LIKELIHOOD_ORDINAL', ctx=Load()), slice=Constant(value='possible'), ctx=Load())",
+      "rendered": "_LIKELIHOOD_ORDINAL['possible']"
+    },
+    {
+      "line_start": 41,
+      "line_end": 41,
+      "column": 18,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Name(id='max', ctx=Load()), args=[Call(func=Attribute(value=Name(id='_IMPACT_ORDINAL', ctx=Load()), attr='values', ctx=Load()), args=[], keywords=[])], keywords=[]), op=Mult(), right=Call(func=Name(id='max', ctx=Load()), args=[Call(func=Attribute(value=Name(id='_LIKELIHOOD_ORDINAL', ctx=Load()), attr='values', ctx=Load()), args=[], keywords=[])], keywords=[]))",
+      "rendered": "max(_IMPACT_ORDINAL.values()) * max(_LIKELIHOOD_ORDINAL.values())"
+    },
+    {
+      "line_start": 45,
+      "line_end": 46,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='info', ctx=Load()), args=[Constant(value='s3/decompose: starting task decomposition - threats=%d modules=%d'), IfExp(test=Attribute(value=Name(id='ctx', ctx=Load()), attr='threat_model', ctx=Load()), body=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Attribute(value=Name(id='ctx', ctx=Load()), attr='threat_model', ctx=Load()), attr='threats', ctx=Load())], keywords=[]), orelse=Constant(value=0)), Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='ctx', ctx=Load()), attr='modules', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "log.info('s3/decompose: starting task decomposition - threats=%d modules=%d', len(ctx.threat_model.threats) if ctx.threat_model else 0, len(ctx.modules))"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='TaskManifest', ctx=Load()), args=[], keywords=[keyword(arg='units', value=List(elts=[], ctx=Load()))])",
+      "rendered": "TaskManifest(units=[])"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_investigation_units', ctx=Load()), args=[Name(id='manifest', ctx=Load()), Name(id='ctx', ctx=Load())], keywords=[])",
+      "rendered": "_investigation_units(manifest, ctx)"
+    },
+    {
+      "line_start": 51,
+      "line_end": 51,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='Path', ctx=Load()), args=[Attribute(value=Name(id='ctx', ctx=Load()), attr='repo_root', ctx=Load())], keywords=[])",
+      "rendered": "Path(ctx.repo_root)"
+    },
+    {
+      "line_start": 52,
+      "line_end": 52,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='manifest', ctx=Load()), attr='units', ctx=Load())",
+      "rendered": "manifest.units"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='detect_languages', ctx=Load()), args=[Attribute(value=Name(id='u', ctx=Load()), attr='files', ctx=Load())], keywords=[keyword(arg='repo_root', value=Name(id='repo_root', ctx=Load()))])",
+      "rendered": "detect_languages(u.files, repo_root=repo_root)"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 33,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_coverage_report', ctx=Load()), args=[Name(id='manifest', ctx=Load()), Name(id='ctx', ctx=Load())], keywords=[])",
+      "rendered": "_coverage_report(manifest, ctx)"
+    },
+    {
+      "line_start": 56,
+      "line_end": 56,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_report_unit_loc', ctx=Load()), args=[Name(id='manifest', ctx=Load()), Name(id='repo_root', ctx=Load())], keywords=[])",
+      "rendered": "_report_unit_loc(manifest, repo_root)"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='cfg', ctx=Load()), Constant(value='_scan_progress'), Constant(value=None)], keywords=[])",
+      "rendered": "getattr(cfg, '_scan_progress', None)"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='tracker', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "tracker is not None"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 20,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='manifest', ctx=Load()), attr='units', ctx=Load())",
+      "rendered": "manifest.units"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='tracker', ctx=Load()), attr='queued', ctx=Load()), args=[Name(id='unit', ctx=Load())], keywords=[])",
+      "rendered": "tracker.queued(unit)"
+    },
+    {
+      "line_start": 63,
+      "line_end": 66,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='  [s3] done: '), FormattedValue(value=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='manifest', ctx=Load()), attr='units', ctx=Load())], keywords=[]), conversion=-1), Constant(value=' unit(s) ('), FormattedValue(value=Name(id='n_threat', ctx=Load()), conversion=-1), Constant(value=' threat(s)), top risk = '), FormattedValue(value=IfExp(test=Attribute(value=Name(id='manifest', ctx=Load()), attr='units', ctx=Load()), body=Attribute(value=Subscript(value=Call(func=Attribute(value=Name(id='manifest', ctx=Load()), attr='sorted_units', ctx=Load()), args=[], keywords=[]), slice=Constant(value=0), ctx=Load()), attr='id', ctx=Load()), orelse=Constant(value='none')), conversion=-1)])], keywords=[])",
+      "rendered": "console.write(source_template_64_8)"
+    },
+    {
+      "line_start": 67,
+      "line_end": 70,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='info', ctx=Load()), args=[Constant(value='s3/decompose: decomposition complete - units=%d (threat=%d)'), Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='manifest', ctx=Load()), attr='units', ctx=Load())], keywords=[]), Name(id='n_threat', ctx=Load())], keywords=[])",
+      "rendered": "log.info('s3/decompose: decomposition complete - units=%d (threat=%d)', len(manifest.units), n_threat)"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='manifest', ctx=Load())",
+      "rendered": "manifest"
+    },
+    {
+      "line_start": 76,
+      "line_end": 77,
+      "column": 13,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Attribute(value=Name(id='_IMPACT_ORDINAL', ctx=Load()), attr='get', ctx=Load()), args=[Attribute(value=Name(id='t', ctx=Load()), attr='impact', ctx=Load()), Name(id='_DEFAULT_IMPACT_ORDINAL', ctx=Load())], keywords=[]), op=Mult(), right=Call(func=Attribute(value=Name(id='_LIKELIHOOD_ORDINAL', ctx=Load()), attr='get', ctx=Load()), args=[Attribute(value=Name(id='t', ctx=Load()), attr='likelihood', ctx=Load()), Name(id='_DEFAULT_LIKELIHOOD_ORDINAL', ctx=Load())], keywords=[]))",
+      "rendered": "_IMPACT_ORDINAL.get(t.impact, _DEFAULT_IMPACT_ORDINAL) * _LIKELIHOOD_ORDINAL.get(t.likelihood, _DEFAULT_LIKELIHOOD_ORDINAL)"
+    },
+    {
+      "line_start": 78,
+      "line_end": 78,
+      "column": 11,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=BinOp(left=Name(id='_MAX_RISK_SCORE', ctx=Load()), op=Add(), right=Constant(value=1)), op=Sub(), right=Name(id='score', ctx=Load()))",
+      "rendered": "_MAX_RISK_SCORE + 1 - score"
+    },
+    {
+      "line_start": 83,
+      "line_end": 83,
+      "column": 37,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 84,
+      "line_end": 84,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='ctx', ctx=Load()), attr='modules', ctx=Load())",
+      "rendered": "ctx.modules"
+    },
+    {
+      "line_start": 85,
+      "line_end": 85,
+      "column": 17,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='m', ctx=Load()), attr='files', ctx=Load())",
+      "rendered": "m.files"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='file_community', ctx=Load()), attr='setdefault', ctx=Load()), args=[Name(id='f', ctx=Load()), Attribute(value=Name(id='m', ctx=Load()), attr='name', ctx=Load())], keywords=[])",
+      "rendered": "file_community.setdefault(f, m.name)"
+    },
+    {
+      "line_start": 87,
+      "line_end": 87,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='file_community', ctx=Load())",
+      "rendered": "file_community"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 9,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='ctx', ctx=Load()), attr='threat_model', ctx=Load())",
+      "rendered": "ctx.threat_model"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[UnaryOp(op=Not(), operand=Name(id='tm', ctx=Load())), UnaryOp(op=Not(), operand=Attribute(value=Name(id='tm', ctx=Load()), attr='threats', ctx=Load()))])",
+      "rendered": "not tm or not tm.threats"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[Attribute(value=Name(id='ctx', ctx=Load()), attr='all_files', ctx=Load())], keywords=[])",
+      "rendered": "set(ctx.all_files)"
+    },
+    {
+      "line_start": 97,
+      "line_end": 97,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_file_module_index', ctx=Load()), args=[Name(id='ctx', ctx=Load())], keywords=[])",
+      "rendered": "_file_module_index(ctx)"
+    },
+    {
+      "line_start": 98,
+      "line_end": 98,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='Path', ctx=Load()), args=[Attribute(value=Name(id='ctx', ctx=Load()), attr='repo_root', ctx=Load())], keywords=[])",
+      "rendered": "Path(ctx.repo_root)"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='max', ctx=Load()), args=[GeneratorExp(elt=Attribute(value=Name(id='u', ctx=Load()), attr='risk_rank', ctx=Load()), generators=[comprehension(target=Name(id='u', ctx=Store()), iter=Attribute(value=Name(id='manifest', ctx=Load()), attr='units', ctx=Load()), ifs=[], is_async=0)])], keywords=[keyword(arg='default', value=Constant(value=0))])",
+      "rendered": "max((u.risk_rank for u in manifest.units), default=0)"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 12,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 102,
+      "line_end": 102,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 103,
+      "line_end": 103,
+      "column": 15,
+      "kind": "SetComp",
+      "original_ast": "SetComp(elt=Attribute(value=Name(id='u', ctx=Load()), attr='id', ctx=Load()), generators=[comprehension(target=Name(id='u', ctx=Store()), iter=Attribute(value=Name(id='manifest', ctx=Load()), attr='units', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "{u.id for u in manifest.units}"
+    },
+    {
+      "line_start": 104,
+      "line_end": 104,
+      "column": 24,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='zip', ctx=Load()), args=[Call(func=Attribute(value=Name(id='tm', ctx=Load()), attr='threat_ids', ctx=Load()), args=[], keywords=[]), Attribute(value=Name(id='tm', ctx=Load()), attr='threats', ctx=Load())], keywords=[keyword(arg='strict', value=Constant(value=True))])",
+      "rendered": "zip(tm.threat_ids(), tm.threats, strict=True)"
+    },
+    {
+      "line_start": 105,
+      "line_end": 105,
+      "column": 16,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='f', ctx=Load()), generators=[comprehension(target=Name(id='f', ctx=Store()), iter=Call(func=Attribute(value=Name(id='dict', ctx=Load()), attr='fromkeys', ctx=Load()), args=[Attribute(value=Name(id='t', ctx=Load()), attr='surface_files', ctx=Load())], keywords=[]), ifs=[Compare(left=Name(id='f', ctx=Load()), ops=[In()], comparators=[Name(id='all_files', ctx=Load())])], is_async=0)])",
+      "rendered": "[f for f in dict.fromkeys(t.surface_files) if f in all_files]"
+    },
+    {
+      "line_start": 106,
+      "line_end": 106,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='files', ctx=Load()))",
+      "rendered": "not files"
+    },
+    {
+      "line_start": 107,
+      "line_end": 107,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='manifest', ctx=Load()), attr='threats_without_unit', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='threat_id', ctx=Load())], keywords=[])",
+      "rendered": "manifest.threats_without_unit.append(threat_id)"
+    },
+    {
+      "line_start": 108,
+      "line_end": 109,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='    [s3] '), FormattedValue(value=Name(id='threat_id', ctx=Load()), conversion=-1), Constant(value=': no validated surface file — never reviewed')])], keywords=[])",
+      "rendered": "console.write(source_template_108_26)"
+    },
+    {
+      "line_start": 111,
+      "line_end": 111,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='with_surface', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "with_surface += 1"
+    },
+    {
+      "line_start": 113,
+      "line_end": 113,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='threat_unit_id', ctx=Load()), args=[Name(id='threat_id', ctx=Load())], keywords=[])",
+      "rendered": "threat_unit_id(threat_id)"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='cid', ctx=Load()), ops=[In()], comparators=[Name(id='used_ids', ctx=Load())])",
+      "rendered": "cid in used_ids"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 16,
+      "kind": "Constant",
+      "original_ast": "Constant(value=2)",
+      "rendered": "2"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 18,
+      "kind": "Compare",
+      "original_ast": "Compare(left=JoinedStr(values=[FormattedValue(value=Name(id='cid', ctx=Load()), conversion=-1), Constant(value='-'), FormattedValue(value=Name(id='n', ctx=Load()), conversion=-1)]), ops=[In()], comparators=[Name(id='used_ids', ctx=Load())])",
+      "rendered": "source_template_116_18 in used_ids"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 16,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='n', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "n += 1"
+    },
+    {
+      "line_start": 118,
+      "line_end": 118,
+      "column": 18,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[FormattedValue(value=Name(id='cid', ctx=Load()), conversion=-1), Constant(value='-'), FormattedValue(value=Name(id='n', ctx=Load()), conversion=-1)])",
+      "rendered": "source_template_118_18"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='used_ids', ctx=Load()), attr='add', ctx=Load()), args=[Name(id='cid', ctx=Load())], keywords=[])",
+      "rendered": "used_ids.add(cid)"
+    },
+    {
+      "line_start": 121,
+      "line_end": 121,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[Name(id='files', ctx=Load())], keywords=[])",
+      "rendered": "set(files)"
+    },
+    {
+      "line_start": 122,
+      "line_end": 122,
+      "column": 16,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='s', ctx=Load()), generators=[comprehension(target=Name(id='s', ctx=Store()), iter=Attribute(value=Name(id='ctx', ctx=Load()), attr='unsafe_sinks', ctx=Load()), ifs=[Compare(left=Attribute(value=Name(id='s', ctx=Load()), attr='file', ctx=Load()), ops=[In()], comparators=[Name(id='fset', ctx=Load())])], is_async=0)])",
+      "rendered": "[s for s in ctx.unsafe_sinks if s.file in fset]"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sum', ctx=Load()), args=[GeneratorExp(elt=Call(func=Name(id='_count_loc', ctx=Load()), args=[BinOp(left=Name(id='repo_root', ctx=Load()), op=Div(), right=Name(id='f', ctx=Load()))], keywords=[]), generators=[comprehension(target=Name(id='f', ctx=Store()), iter=Name(id='files', ctx=Load()), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "sum((_count_loc(repo_root / f) for f in files))"
+    },
+    {
+      "line_start": 125,
+      "line_end": 144,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='manifest', ctx=Load()), attr='units', ctx=Load()), attr='append', ctx=Load()), args=[Call(func=Name(id='InvestigationUnit', ctx=Load()), args=[], keywords=[keyword(arg='id', value=Name(id='cid', ctx=Load())), keyword(arg='threat', value=Attribute(value=Name(id='t', ctx=Load()), attr='threat', ctx=Load())), keyword(arg='surface', value=Attribute(value=Name(id='t', ctx=Load()), attr='surface', ctx=Load())), keyword(arg='actor', value=Attribute(value=Name(id='t', ctx=Load()), attr='actor', ctx=Load())), keyword(arg='asset', value=Attribute(value=Name(id='t', ctx=Load()), attr='asset', ctx=Load())), keyword(arg='impact', value=Attribute(value=Name(id='t', ctx=Load()), attr='impact', ctx=Load())), keyword(arg='likelihood', value=Attribute(value=Name(id='t', ctx=Load()), attr='likelihood', ctx=Load())), keyword(arg='controls', value=Attribute(value=Name(id='t', ctx=Load()), attr='controls', ctx=Load())), keyword(arg='evidence', value=Attribute(value=Name(id='t', ctx=Load()), attr='evidence', ctx=Load())), keyword(arg='file_ids', value=Name(id='files', ctx=Load())), keyword(arg='sinks', value=Name(id='sinks', ctx=Load())), keyword(arg='entry_points', value=ListComp(elt=Name(id='e', ctx=Load()), generators=[comprehension(target=Name(id='e', ctx=Store()), iter=Attribute(value=Name(id='ctx', ctx=Load()), attr='entry_points', ctx=Load()), ifs=[Compare(left=Attribute(value=Name(id='e', ctx=Load()), attr='file', ctx=Load()), ops=[In()], comparators=[Name(id='fset', ctx=Load())])], is_async=0)])), keyword(arg='related_cves', value=ListComp(elt=Attribute(value=Name(id='c', ctx=Load()), attr='id', ctx=Load()), generators=[comprehension(target=Name(id='c', ctx=Store()), iter=Attribute(value=Name(id='ctx', ctx=Load()), attr='known_cves', ctx=Load()), ifs=[BinOp(left=Call(func=Name(id='set', ctx=Load()), args=[Attribute(value=Name(id='c', ctx=Load()), attr='affected_files', ctx=Load())], keywords=[]), op=BitAnd(), right=Name(id='fset', ctx=Load()))], is_async=0)])), keyword(arg='communities', value=Call(func=Name(id='sorted', ctx=Load()), args=[SetComp(elt=Call(func=Attribute(value=Name(id='file_community', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='f', ctx=Load()), JoinedStr(values=[Constant(value='file:'), FormattedValue(value=Name(id='f', ctx=Load()), conversion=-1)])], keywords=[]), generators=[comprehension(target=Name(id='f', ctx=Store()), iter=Name(id='files', ctx=Load()), ifs=[], is_async=0)])], keywords=[])), keyword(arg='cwes', value=Call(func=Name(id='sorted', ctx=Load()), args=[SetComp(elt=Name(id='c', ctx=Load()), generators=[comprehension(target=Name(id='s', ctx=Store()), iter=Name(id='sinks', ctx=Load()), ifs=[], is_async=0), comprehension(target=Name(id='c', ctx=Store()), iter=Attribute(value=Name(id='s', ctx=Load()), attr='cwe', ctx=Load()), ifs=[], is_async=0)])], keywords=[])), keyword(arg='risk_rank', value=BinOp(left=Name(id='base_rank', ctx=Load()), op=Add(), right=Call(func=Name(id='_threat_risk_rank', ctx=Load()), args=[Name(id='t', ctx=Load())], keywords=[]))), keyword(arg='size', value=Call(func=Name(id='_size_for', ctx=Load()), args=[Name(id='loc', ctx=Load())], keywords=[]))])], keywords=[])",
+      "rendered": "manifest.units.append(InvestigationUnit(id=cid, threat=t.threat, surface=t.surface, actor=t.actor, asset=t.asset, impact=t.impact, likelihood=t.likelihood, controls=t.controls, evidence=t.evidence, file_ids=files, sinks=sinks, entry_points=[e for e in ctx.entry_points if e.file in fset], related_cves=[c.id for c in ctx.known_cves if set(c.affected_files) & fset], communities=sorted({file_community.get(f, source_template_140_54) for f in files}), cwes=sorted({c for s in sinks for c in s.cwe}), risk_rank=base_rank + _threat_risk_rank(t), size=_size_for(loc)))"
+    },
+    {
+      "line_start": 145,
+      "line_end": 145,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='added', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "added += 1"
+    },
+    {
+      "line_start": 147,
+      "line_end": 149,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='    [s3] threats: '), FormattedValue(value=Name(id='added', ctx=Load()), conversion=-1), Constant(value=' unit(s) from '), FormattedValue(value=Name(id='with_surface', ctx=Load()), conversion=-1), Constant(value='/'), FormattedValue(value=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='tm', ctx=Load()), attr='threats', ctx=Load())], keywords=[]), conversion=-1), Constant(value=' threat(s) with a validated surface')])], keywords=[])",
+      "rendered": "console.write(source_template_147_18)"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='added', ctx=Load())",
+      "rendered": "added"
+    },
+    {
+      "line_start": 154,
+      "line_end": 154,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='loc', ctx=Load()), ops=[Lt()], comparators=[Name(id='_SMALL_UNIT_LOC_MAX', ctx=Load())])",
+      "rendered": "loc < _SMALL_UNIT_LOC_MAX"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 15,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='UnitSize', ctx=Load()), attr='SMALL', ctx=Load())",
+      "rendered": "UnitSize.SMALL"
+    },
+    {
+      "line_start": 156,
+      "line_end": 156,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='loc', ctx=Load()), ops=[Lt()], comparators=[Name(id='_MEDIUM_UNIT_LOC_MAX', ctx=Load())])",
+      "rendered": "loc < _MEDIUM_UNIT_LOC_MAX"
+    },
+    {
+      "line_start": 157,
+      "line_end": 157,
+      "column": 15,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='UnitSize', ctx=Load()), attr='MEDIUM', ctx=Load())",
+      "rendered": "UnitSize.MEDIUM"
+    },
+    {
+      "line_start": 158,
+      "line_end": 158,
+      "column": 11,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='UnitSize', ctx=Load()), attr='LARGE', ctx=Load())",
+      "rendered": "UnitSize.LARGE"
+    },
+    {
+      "line_start": 163,
+      "line_end": 163,
+      "column": 24,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='manifest', ctx=Load()), attr='units', ctx=Load())",
+      "rendered": "manifest.units"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='covered', ctx=Load()), attr='update', ctx=Load()), args=[Attribute(value=Name(id='u', ctx=Load()), attr='files', ctx=Load())], keywords=[])",
+      "rendered": "covered.update(u.files)"
+    },
+    {
+      "line_start": 166,
+      "line_end": 166,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[BinOp(left=Call(func=Name(id='set', ctx=Load()), args=[Attribute(value=Name(id='ctx', ctx=Load()), attr='all_files', ctx=Load())], keywords=[]), op=Sub(), right=Name(id='covered', ctx=Load()))], keywords=[])",
+      "rendered": "sorted(set(ctx.all_files) - covered)"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='unreachable', ctx=Load())",
+      "rendered": "unreachable"
+    },
+    {
+      "line_start": 168,
+      "line_end": 169,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='    [s3] coverage: '), FormattedValue(value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='unreachable', ctx=Load())], keywords=[]), conversion=-1), Constant(value='/'), FormattedValue(value=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='ctx', ctx=Load()), attr='all_files', ctx=Load())], keywords=[]), conversion=-1), Constant(value=\" file(s) named by no threat's surface — never reviewed\")])], keywords=[])",
+      "rendered": "console.write(source_template_168_22)"
+    },
+    {
+      "line_start": 171,
+      "line_end": 171,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='unreachable', ctx=Load())",
+      "rendered": "unreachable"
+    },
+    {
+      "line_start": 175,
+      "line_end": 176,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[GeneratorExp(elt=Call(func=Name(id='sum', ctx=Load()), args=[GeneratorExp(elt=Call(func=Name(id='_count_loc', ctx=Load()), args=[BinOp(left=Name(id='repo_root', ctx=Load()), op=Div(), right=Name(id='f', ctx=Load()))], keywords=[]), generators=[comprehension(target=Name(id='f', ctx=Store()), iter=Attribute(value=Name(id='u', ctx=Load()), attr='files', ctx=Load()), ifs=[], is_async=0)])], keywords=[]), generators=[comprehension(target=Name(id='u', ctx=Store()), iter=Attribute(value=Name(id='manifest', ctx=Load()), attr='units', ctx=Load()), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "sorted((sum((_count_loc(repo_root / f) for f in u.files)) for u in manifest.units))"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='locs', ctx=Load()))",
+      "rendered": "not locs"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='len', ctx=Load()), args=[Name(id='locs', ctx=Load())], keywords=[])",
+      "rendered": "len(locs)"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 10,
+      "kind": "Lambda",
+      "original_ast": "Lambda(args=arguments(posonlyargs=[], args=[arg(arg='x')], kwonlyargs=[], kw_defaults=[], defaults=[]), body=IfExp(test=Compare(left=Name(id='x', ctx=Load()), ops=[GtE()], comparators=[Name(id='_LOC_KILO', ctx=Load())]), body=JoinedStr(values=[FormattedValue(value=BinOp(left=Name(id='x', ctx=Load()), op=Div(), right=Name(id='_LOC_KILO', ctx=Load())), conversion=-1, format_spec=JoinedStr(values=[Constant(value='.1f')])), Constant(value='k')]), orelse=Call(func=Name(id='str', ctx=Load()), args=[Name(id='x', ctx=Load())], keywords=[])))",
+      "rendered": "lambda x: source_template_180_20 if x >= _LOC_KILO else str(x)"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 10,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Name(id='locs', ctx=Load()), slice=Call(func=Name(id='min', ctx=Load()), args=[BinOp(left=Name(id='n', ctx=Load()), op=Sub(), right=Constant(value=1)), Call(func=Name(id='int', ctx=Load()), args=[BinOp(left=Name(id='n', ctx=Load()), op=Mult(), right=Name(id='_P90_FRACTION', ctx=Load()))], keywords=[])], keywords=[]), ctx=Load())",
+      "rendered": "locs[min(n - 1, int(n * _P90_FRACTION))]"
+    },
+    {
+      "line_start": 182,
+      "line_end": 183,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='    [s3] unit LOC: n='), FormattedValue(value=Name(id='n', ctx=Load()), conversion=-1), Constant(value=' min='), FormattedValue(value=Call(func=Name(id='fmt', ctx=Load()), args=[Subscript(value=Name(id='locs', ctx=Load()), slice=Constant(value=0), ctx=Load())], keywords=[]), conversion=-1), Constant(value=' p50='), FormattedValue(value=Call(func=Name(id='fmt', ctx=Load()), args=[Subscript(value=Name(id='locs', ctx=Load()), slice=BinOp(left=Name(id='n', ctx=Load()), op=FloorDiv(), right=Constant(value=2)), ctx=Load())], keywords=[]), conversion=-1), Constant(value=' p90='), FormattedValue(value=Call(func=Name(id='fmt', ctx=Load()), args=[Name(id='p90', ctx=Load())], keywords=[]), conversion=-1), Constant(value=' max='), FormattedValue(value=Call(func=Name(id='fmt', ctx=Load()), args=[Subscript(value=Name(id='locs', ctx=Load()), slice=UnaryOp(op=USub(), operand=Constant(value=1)), ctx=Load())], keywords=[]), conversion=-1)])], keywords=[])",
+      "rendered": "console.write(source_template_182_18)"
+    },
+    {
+      "line_start": 186,
+      "line_end": 186,
+      "column": 29,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='str', ctx=Load()), args=[Name(id='p', ctx=Load())], keywords=[])",
+      "rendered": "str(p)"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_LOC_CACHE', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='k', ctx=Load())], keywords=[])",
+      "rendered": "_LOC_CACHE.get(k)"
+    },
+    {
+      "line_start": 193,
+      "line_end": 193,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='v', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "v is not None"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='v', ctx=Load())",
+      "rendered": "v"
+    },
+    {
+      "line_start": 196,
+      "line_end": 196,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='p', ctx=Load()), attr='open', ctx=Load()), args=[Constant(value='r')], keywords=[keyword(arg='encoding', value=Constant(value='utf-8')), keyword(arg='errors', value=Constant(value='replace'))])",
+      "rendered": "p.open('r', encoding='utf-8', errors='replace')"
+    },
+    {
+      "line_start": 197,
+      "line_end": 197,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sum', ctx=Load()), args=[GeneratorExp(elt=Constant(value=1), generators=[comprehension(target=Name(id='_', ctx=Store()), iter=Name(id='fh', ctx=Load()), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "sum((1 for _ in fh))"
+    },
+    {
+      "line_start": 198,
+      "line_end": 198,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='OSError', ctx=Load())",
+      "rendered": "OSError"
+    },
+    {
+      "line_start": 199,
+      "line_end": 199,
+      "column": 12,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 200,
+      "line_end": 200,
+      "column": 20,
+      "kind": "Name",
+      "original_ast": "Name(id='v', ctx=Load())",
+      "rendered": "v"
+    },
+    {
+      "line_start": 201,
+      "line_end": 201,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='v', ctx=Load())",
+      "rendered": "v"
+    }
+  ],
+  "calls": [
+    {
+      "line": 22,
+      "end_line": 22,
+      "callee": "logs.get_logger",
+      "enclosing": "module initialization",
+      "expression": "logs.get_logger(__name__)"
+    },
+    {
+      "line": 41,
+      "end_line": 41,
+      "callee": "max",
+      "enclosing": "module initialization",
+      "expression": "max(_IMPACT_ORDINAL.values())"
+    },
+    {
+      "line": 41,
+      "end_line": 41,
+      "callee": "max",
+      "enclosing": "module initialization",
+      "expression": "max(_LIKELIHOOD_ORDINAL.values())"
+    },
+    {
+      "line": 45,
+      "end_line": 46,
+      "callee": "log.info",
+      "enclosing": "run",
+      "expression": "log.info(\"s3/decompose: starting task decomposition - threats=%d modules=%d\",\n             len(ctx.threat_model.threats) if ctx.threat_model else 0, len(ctx.modules))"
+    },
+    {
+      "line": 47,
+      "end_line": 47,
+      "callee": "TaskManifest",
+      "enclosing": "run",
+      "expression": "TaskManifest(units=[])"
+    },
+    {
+      "line": 49,
+      "end_line": 49,
+      "callee": "_investigation_units",
+      "enclosing": "run",
+      "expression": "_investigation_units(manifest, ctx)"
+    },
+    {
+      "line": 51,
+      "end_line": 51,
+      "callee": "Path",
+      "enclosing": "run",
+      "expression": "Path(ctx.repo_root)"
+    },
+    {
+      "line": 55,
+      "end_line": 55,
+      "callee": "_coverage_report",
+      "enclosing": "run",
+      "expression": "_coverage_report(manifest, ctx)"
+    },
+    {
+      "line": 56,
+      "end_line": 56,
+      "callee": "_report_unit_loc",
+      "enclosing": "run",
+      "expression": "_report_unit_loc(manifest, repo_root)"
+    },
+    {
+      "line": 58,
+      "end_line": 58,
+      "callee": "getattr",
+      "enclosing": "run",
+      "expression": "getattr(cfg, \"_scan_progress\", None)"
+    },
+    {
+      "line": 63,
+      "end_line": 66,
+      "callee": "console.write",
+      "enclosing": "run",
+      "expression": "console.write(\n        f\"  [s3] done: {len(manifest.units)} unit(s) ({n_threat} threat(s)), \"\n        f\"top risk = {manifest.sorted_units()[0].id if manifest.units else 'none'}\"\n    )"
+    },
+    {
+      "line": 67,
+      "end_line": 70,
+      "callee": "log.info",
+      "enclosing": "run",
+      "expression": "log.info(\n        \"s3/decompose: decomposition complete - units=%d (threat=%d)\",\n        len(manifest.units), n_threat,\n    )"
+    },
+    {
+      "line": 96,
+      "end_line": 96,
+      "callee": "set",
+      "enclosing": "_investigation_units",
+      "expression": "set(ctx.all_files)"
+    },
+    {
+      "line": 97,
+      "end_line": 97,
+      "callee": "_file_module_index",
+      "enclosing": "_investigation_units",
+      "expression": "_file_module_index(ctx)"
+    },
+    {
+      "line": 98,
+      "end_line": 98,
+      "callee": "Path",
+      "enclosing": "_investigation_units",
+      "expression": "Path(ctx.repo_root)"
+    },
+    {
+      "line": 99,
+      "end_line": 99,
+      "callee": "max",
+      "enclosing": "_investigation_units",
+      "expression": "max((u.risk_rank for u in manifest.units), default=0)"
+    },
+    {
+      "line": 104,
+      "end_line": 104,
+      "callee": "zip",
+      "enclosing": "_investigation_units",
+      "expression": "zip(tm.threat_ids(), tm.threats, strict=True)"
+    },
+    {
+      "line": 147,
+      "end_line": 149,
+      "callee": "console.write",
+      "enclosing": "_investigation_units",
+      "expression": "console.write(f\"    [s3] threats: {added} unit(s) from \"\n                  f\"{with_surface}/{len(tm.threats)} threat(s) with a validated \"\n                  \"surface\")"
+    },
+    {
+      "line": 163,
+      "end_line": 163,
+      "callee": "set",
+      "enclosing": "_coverage_report",
+      "expression": "set()"
+    },
+    {
+      "line": 166,
+      "end_line": 166,
+      "callee": "sorted",
+      "enclosing": "_coverage_report",
+      "expression": "sorted(set(ctx.all_files) - covered)"
+    },
+    {
+      "line": 175,
+      "end_line": 176,
+      "callee": "sorted",
+      "enclosing": "_report_unit_loc",
+      "expression": "sorted(sum(_count_loc(repo_root / f) for f in u.files)\n                  for u in manifest.units)"
+    },
+    {
+      "line": 179,
+      "end_line": 179,
+      "callee": "len",
+      "enclosing": "_report_unit_loc",
+      "expression": "len(locs)"
+    },
+    {
+      "line": 182,
+      "end_line": 183,
+      "callee": "console.write",
+      "enclosing": "_report_unit_loc",
+      "expression": "console.write(f\"    [s3] unit LOC: n={n} min={fmt(locs[0])} \"\n                  f\"p50={fmt(locs[n // 2])} p90={fmt(p90)} max={fmt(locs[-1])}\")"
+    },
+    {
+      "line": 191,
+      "end_line": 191,
+      "callee": "str",
+      "enclosing": "_count_loc",
+      "expression": "str(p)"
+    },
+    {
+      "line": 192,
+      "end_line": 192,
+      "callee": "_LOC_CACHE.get",
+      "enclosing": "_count_loc",
+      "expression": "_LOC_CACHE.get(k)"
+    },
+    {
+      "line": 41,
+      "end_line": 41,
+      "callee": "_IMPACT_ORDINAL.values",
+      "enclosing": "module initialization",
+      "expression": "_IMPACT_ORDINAL.values()"
+    },
+    {
+      "line": 41,
+      "end_line": 41,
+      "callee": "_LIKELIHOOD_ORDINAL.values",
+      "enclosing": "module initialization",
+      "expression": "_LIKELIHOOD_ORDINAL.values()"
+    },
+    {
+      "line": 46,
+      "end_line": 46,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(ctx.modules)"
+    },
+    {
+      "line": 53,
+      "end_line": 53,
+      "callee": "detect_languages",
+      "enclosing": "run",
+      "expression": "detect_languages(u.files, repo_root=repo_root)"
+    },
+    {
+      "line": 69,
+      "end_line": 69,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(manifest.units)"
+    },
+    {
+      "line": 76,
+      "end_line": 76,
+      "callee": "_IMPACT_ORDINAL.get",
+      "enclosing": "_threat_risk_rank",
+      "expression": "_IMPACT_ORDINAL.get(t.impact, _DEFAULT_IMPACT_ORDINAL)"
+    },
+    {
+      "line": 77,
+      "end_line": 77,
+      "callee": "_LIKELIHOOD_ORDINAL.get",
+      "enclosing": "_threat_risk_rank",
+      "expression": "_LIKELIHOOD_ORDINAL.get(t.likelihood, _DEFAULT_LIKELIHOOD_ORDINAL)"
+    },
+    {
+      "line": 104,
+      "end_line": 104,
+      "callee": "tm.threat_ids",
+      "enclosing": "_investigation_units",
+      "expression": "tm.threat_ids()"
+    },
+    {
+      "line": 113,
+      "end_line": 113,
+      "callee": "threat_unit_id",
+      "enclosing": "_investigation_units",
+      "expression": "threat_unit_id(threat_id)"
+    },
+    {
+      "line": 119,
+      "end_line": 119,
+      "callee": "used_ids.add",
+      "enclosing": "_investigation_units",
+      "expression": "used_ids.add(cid)"
+    },
+    {
+      "line": 121,
+      "end_line": 121,
+      "callee": "set",
+      "enclosing": "_investigation_units",
+      "expression": "set(files)"
+    },
+    {
+      "line": 123,
+      "end_line": 123,
+      "callee": "sum",
+      "enclosing": "_investigation_units",
+      "expression": "sum(_count_loc(repo_root / f) for f in files)"
+    },
+    {
+      "line": 125,
+      "end_line": 144,
+      "callee": "manifest.units.append",
+      "enclosing": "_investigation_units",
+      "expression": "manifest.units.append(InvestigationUnit(\n            id=cid,\n            threat=t.threat,\n            surface=t.surface,\n            actor=t.actor,\n            asset=t.asset,\n            impact=t.impact,\n            likelihood=t.likelihood,\n            controls=t.controls,\n            evidence=t.evidence,\n            file_ids=files,\n            sinks=sinks,\n            entry_points=[e for e in ctx.entry_points if e.file in fset],\n            related_cves=[c.id for c in ctx.known_cves\n                         if set(c.affected_files) & fset],\n            communities=sorted({file_community.get(f, f\"file:{f}\") for f in files}),\n            cwes=sorted({c for s in sinks for c in s.cwe}),\n            risk_rank=base_rank + _threat_risk_rank(t),\n            size=_size_for(loc),\n        ))"
+    },
+    {
+      "line": 165,
+      "end_line": 165,
+      "callee": "covered.update",
+      "enclosing": "_coverage_report",
+      "expression": "covered.update(u.files)"
+    },
+    {
+      "line": 168,
+      "end_line": 169,
+      "callee": "console.write",
+      "enclosing": "_coverage_report",
+      "expression": "console.write(f\"    [s3] coverage: {len(unreachable)}/{len(ctx.all_files)} \"\n                      \"file(s) named by no threat's surface — never reviewed\")"
+    },
+    {
+      "line": 181,
+      "end_line": 181,
+      "callee": "min",
+      "enclosing": "_report_unit_loc",
+      "expression": "min(n - 1, int(n * _P90_FRACTION))"
+    },
+    {
+      "line": 46,
+      "end_line": 46,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(ctx.threat_model.threats)"
+    },
+    {
+      "line": 61,
+      "end_line": 61,
+      "callee": "tracker.queued",
+      "enclosing": "run",
+      "expression": "tracker.queued(unit)"
+    },
+    {
+      "line": 86,
+      "end_line": 86,
+      "callee": "file_community.setdefault",
+      "enclosing": "_file_module_index",
+      "expression": "file_community.setdefault(f, m.name)"
+    },
+    {
+      "line": 107,
+      "end_line": 107,
+      "callee": "manifest.threats_without_unit.append",
+      "enclosing": "_investigation_units",
+      "expression": "manifest.threats_without_unit.append(threat_id)"
+    },
+    {
+      "line": 108,
+      "end_line": 109,
+      "callee": "console.write",
+      "enclosing": "_investigation_units",
+      "expression": "console.write(f\"    [s3] {threat_id}: no validated surface file — \"\n                          \"never reviewed\")"
+    },
+    {
+      "line": 125,
+      "end_line": 144,
+      "callee": "InvestigationUnit",
+      "enclosing": "_investigation_units",
+      "expression": "InvestigationUnit(\n            id=cid,\n            threat=t.threat,\n            surface=t.surface,\n            actor=t.actor,\n            asset=t.asset,\n            impact=t.impact,\n            likelihood=t.likelihood,\n            controls=t.controls,\n            evidence=t.evidence,\n            file_ids=files,\n            sinks=sinks,\n            entry_points=[e for e in ctx.entry_points if e.file in fset],\n            related_cves=[c.id for c in ctx.known_cves\n                         if set(c.affected_files) & fset],\n            communities=sorted({file_community.get(f, f\"file:{f}\") for f in files}),\n            cwes=sorted({c for s in sinks for c in s.cwe}),\n            risk_rank=base_rank + _threat_risk_rank(t),\n            size=_size_for(loc),\n        )"
+    },
+    {
+      "line": 166,
+      "end_line": 166,
+      "callee": "set",
+      "enclosing": "_coverage_report",
+      "expression": "set(ctx.all_files)"
+    },
+    {
+      "line": 175,
+      "end_line": 175,
+      "callee": "sum",
+      "enclosing": "_report_unit_loc",
+      "expression": "sum(_count_loc(repo_root / f) for f in u.files)"
+    },
+    {
+      "line": 180,
+      "end_line": 180,
+      "callee": "str",
+      "enclosing": "_report_unit_loc",
+      "expression": "str(x)"
+    },
+    {
+      "line": 181,
+      "end_line": 181,
+      "callee": "int",
+      "enclosing": "_report_unit_loc",
+      "expression": "int(n * _P90_FRACTION)"
+    },
+    {
+      "line": 196,
+      "end_line": 196,
+      "callee": "p.open",
+      "enclosing": "_count_loc",
+      "expression": "p.open(\"r\", encoding=\"utf-8\", errors=\"replace\")"
+    },
+    {
+      "line": 197,
+      "end_line": 197,
+      "callee": "sum",
+      "enclosing": "_count_loc",
+      "expression": "sum(1 for _ in fh)"
+    },
+    {
+      "line": 64,
+      "end_line": 64,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(manifest.units)"
+    },
+    {
+      "line": 105,
+      "end_line": 105,
+      "callee": "dict.fromkeys",
+      "enclosing": "_investigation_units",
+      "expression": "dict.fromkeys(t.surface_files)"
+    },
+    {
+      "line": 123,
+      "end_line": 123,
+      "callee": "_count_loc",
+      "enclosing": "_investigation_units",
+      "expression": "_count_loc(repo_root / f)"
+    },
+    {
+      "line": 148,
+      "end_line": 148,
+      "callee": "len",
+      "enclosing": "_investigation_units",
+      "expression": "len(tm.threats)"
+    },
+    {
+      "line": 182,
+      "end_line": 182,
+      "callee": "fmt",
+      "enclosing": "_report_unit_loc",
+      "expression": "fmt(locs[0])"
+    },
+    {
+      "line": 183,
+      "end_line": 183,
+      "callee": "fmt",
+      "enclosing": "_report_unit_loc",
+      "expression": "fmt(locs[n // 2])"
+    },
+    {
+      "line": 183,
+      "end_line": 183,
+      "callee": "fmt",
+      "enclosing": "_report_unit_loc",
+      "expression": "fmt(p90)"
+    },
+    {
+      "line": 183,
+      "end_line": 183,
+      "callee": "fmt",
+      "enclosing": "_report_unit_loc",
+      "expression": "fmt(locs[-1])"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "sorted",
+      "enclosing": "_investigation_units",
+      "expression": "sorted({file_community.get(f, f\"file:{f}\") for f in files})"
+    },
+    {
+      "line": 141,
+      "end_line": 141,
+      "callee": "sorted",
+      "enclosing": "_investigation_units",
+      "expression": "sorted({c for s in sinks for c in s.cwe})"
+    },
+    {
+      "line": 143,
+      "end_line": 143,
+      "callee": "_size_for",
+      "enclosing": "_investigation_units",
+      "expression": "_size_for(loc)"
+    },
+    {
+      "line": 168,
+      "end_line": 168,
+      "callee": "len",
+      "enclosing": "_coverage_report",
+      "expression": "len(unreachable)"
+    },
+    {
+      "line": 168,
+      "end_line": 168,
+      "callee": "len",
+      "enclosing": "_coverage_report",
+      "expression": "len(ctx.all_files)"
+    },
+    {
+      "line": 175,
+      "end_line": 175,
+      "callee": "_count_loc",
+      "enclosing": "_report_unit_loc",
+      "expression": "_count_loc(repo_root / f)"
+    },
+    {
+      "line": 142,
+      "end_line": 142,
+      "callee": "_threat_risk_rank",
+      "enclosing": "_investigation_units",
+      "expression": "_threat_risk_rank(t)"
+    },
+    {
+      "line": 65,
+      "end_line": 65,
+      "callee": "manifest.sorted_units",
+      "enclosing": "run",
+      "expression": "manifest.sorted_units()"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "file_community.get",
+      "enclosing": "_investigation_units",
+      "expression": "file_community.get(f, f\"file:{f}\")"
+    },
+    {
+      "line": 139,
+      "end_line": 139,
+      "callee": "set",
+      "enclosing": "_investigation_units",
+      "expression": "set(c.affected_files)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 16,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 18,
+      "source_expression": "from pathlib import Path",
+      "targets": [
+        "pathlib",
+        "pathlib.Path"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "from vvaharness.util import logs",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.logs"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/logs.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 24,
+      "source_expression": "from vvaharness.lang.detect import detect_languages",
+      "targets": [
+        "vvaharness.lang.detect",
+        "vvaharness.lang.detect.detect_languages"
+      ],
+      "local_source_paths": [
+        "vvaharness/lang/detect.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 25,
+      "source_expression": "from vvaharness.models import ContextPackage, InvestigationUnit, TaskManifest, UnitSize",
+      "targets": [
+        "vvaharness.models",
+        "vvaharness.models.ContextPackage",
+        "vvaharness.models.InvestigationUnit",
+        "vvaharness.models.TaskManifest",
+        "vvaharness.models.UnitSize"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 26,
+      "source_expression": "from vvaharness.models.scan.work import threat_unit_id",
+      "targets": [
+        "vvaharness.models.scan.work",
+        "vvaharness.models.scan.work.threat_unit_id"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/scan/work.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 27,
+      "source_expression": "from vvaharness.util import console",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.console"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/console.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

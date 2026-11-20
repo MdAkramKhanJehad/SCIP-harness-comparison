@@ -1,0 +1,348 @@
+# vvaharness/orchestrator/preflight.py
+
+Startup readiness checks before a scan spends tokens. `configure_backends` pushes the profile's credential, TLS and proxy settings into the backend clients. `check_backends` checks routing, credentials and the gateway, then `probe_backends` sends one small live request per unique model target plus a forced tool round trip for the agentic roles. A gap that only affects post-scan roles (Stage 10, Stage 11) warns; a gap that affects a detection role refuses the run. The file also holds the `doctor --cache-probe` diagnostic, which never runs during a scan.
+
+Source: `vvaharness/orchestrator/preflight.py` (lines 1-1268)
+Executor: mixed (code decides; the probes are small model calls whose replies are checked by code)
+Called from: `vvaharness/orchestrator/entry.py` main (`configure_backends`, `check_backends`); `vvaharness/cli/_commands.py` doctor (`run_cache_probe`)
+
+// ---------- Constants ----------
+// src: vvaharness/orchestrator/preflight.py:196-202
+_HARD_TURN_CAP_VIAS = ["sdk", "cli", "openai"]
+_TURN_CAPPED_STAGES = [["step2", "threatmodel"], ["step4", "deepdive"], ["step6_verify", "verify"]]
+_STARVED_TURN_CEILING = 20
+// src: vvaharness/orchestrator/preflight.py:407
+_AGENTIC_ROLES = ["preprocess", "verify", "threatmodel"]   // deepdive is not here: there is no step4.allowed_tools key
+// src: vvaharness/orchestrator/preflight.py:433-448
+_PROBE_PING_MIN_CHARS = 1          // VVAH-E003 floors for the probe; "NEVER lower to 0"
+_PROBE_PING_MIN_TOKENS = 1
+_PROBE_PING_MAX_TOKENS = 256
+_PROBE_PING_TIMEOUT_S = 120
+_PROBE_AGENTIC_TIMEOUT_S = 300
+_PROBE_ROUNDTRIP_TURNS = 2
+_PROBE_MARKER_FILENAME = "vva_preflight_probe_marker.txt"
+_PROBE_BRIDGE_TOOL_NAME = "PreflightProbeEcho"
+
+// src: vvaharness/orchestrator/preflight.py:99-155
+fn configure_backends(cfg, cfg_dir):executor=code {
+  vias = { resolve_model(m).via for each [_, m] in config_paths._iter_model_roles(cfg) }
+  sdk_sole = vias is a subset of ["sdk", "deepagents"]   // one credential serves sdk and deepagents; cli keeps its own
+  // pushed unconditionally so the cache marker kill switch is never hidden; cache_route forwarded raw (false is meaningful)
+  sdk.configure(cache_markers=knob("cache_markers", default=null), cache_min_block_tokens=knob("cache_min_block_tokens", default=null), cache_route=knob("cache_route", default=null))
+  openai.configure(cache_markers=knob("cache_markers", default=null))
+  if (cfg.sdk) sdk.configure(api_key, base_url, verify_ssl=_resolve_verify_path(cfg_dir, knob("sdk.verify_ssl", default=true)), ca_cert, client_cert=_resolve_cert_chain(...), no_proxy, allow_api_key_fallback=sdk_sole)
+  if (cfg.openai) openai.configure(api_key, base_url, verify_ssl=..., ca_cert, client_cert unresolved, organization, no_proxy)   // client_cert passed unresolved so the backend can warn; no mutual TLS on this route
+  if (cfg.cli) cli.configure(verify_ssl=..., ca_cert, client_cert, no_proxy, effort=knob("cli.effort", default=null), restricted=knob("cli.restricted", default=true))
+  // an omitted cli.restricted keeps the jail on
+  // relative certificate paths are anchored at the profile directory (config_paths._resolve_against); the third member of a client chain (key password) is never resolved
+}
+
+// src: vvaharness/orchestrator/preflight.py:227-403
+fn check_backends(cfg, skip_roles=[]):executor=code {
+  model_roles = config_paths._iter_model_roles(cfg) where role not in skip_roles
+  vias = { resolve_model(m).via for each model in model_roles }
+
+  // src: preflight.py:234-246 — Stage 4 tools must reach the model
+  if (cfg.models.deepdive) {
+    [carries, why] = deepagents.route_carries_tools(cfg, resolve_model(cfg.models.deepdive).via)
+    require carries => { log PREFLIGHT_DEEPDIVE_ROUTE_TOOLLESS; return false }   // refuses: otherwise Stage 4 sessions run with no tools
+  }
+  roles_by_via = roles grouped by resolved via
+
+  // src: preflight.py:252-259
+  unknown = every "models.<role>.<key>" where key in registry.unrecognized_model_keys(model)
+  if (unknown) warn MODEL_KEY_UNRECOGNIZED   // never fails
+
+  _warn_deepagents_tuned_max_turns(cfg)
+
+  // src: preflight.py:265-270
+  if (environment.langsmith_tracing_check().status == WARN) warn TRACING_UPLOADS_PROMPTS   // tracing uploads every prompt, which contains repository source
+
+  // abstracted: preflight.py:272-304 print credential presence only ("set" or "<unset>", never the value) for cli, sdk and openai
+
+  ok = true
+  // src: preflight.py:307-316
+  invalid_deepagents = roles routed via "deepagents" that are not in registry.DEEPAGENTS_ROLES
+  if (invalid_deepagents) { log PREFLIGHT_ROUTE_UNSUPPORTED; ok = false }   // refuses regardless of role kind
+
+  // src: preflight.py:317-325
+  if ("cli" in vias && neither "claude" nor "claude.cmd" is on PATH) {
+    if (_report_credential_gap("`claude` CLI not found on PATH (required by via:cli roles).", roles_by_via.cli)) ok = false
+  }
+  // src: preflight.py:327-351
+  if ("sdk" in vias) {
+    key = knob("sdk.api_key", default=null) || environment ANTHROPIC_SDK_API_KEY
+    sdk_sole = vias is a subset of ["sdk", "deepagents"]
+    if (!key && sdk_sole) key = environment ANTHROPIC_API_KEY || ANTHROPIC_AUTH_TOKEN   // fallback only when no cli role shares the run
+    if (!key && _report_credential_gap("ANTHROPIC_SDK_API_KEY not set (required by via:sdk roles).", roles_by_via.sdk)) ok = false
+  }
+  // src: preflight.py:353-362
+  if ("openai" in vias) {
+    key = knob("openai.api_key", default=null) || environment OPENAI_API_KEY
+    if (!key && _report_credential_gap("OPENAI_API_KEY not set (required by via:openai roles).", roles_by_via.openai)) ok = false
+  }
+  // src: preflight.py:364-383 — deepagents credentials are checked per (model_id, provider), in sorted order
+  if ("deepagents" in vias) {
+    for each [[model_id, provider], roles] in deepagents targets sorted by (model_id, provider || "") {
+      [ready, detail] = environment._backend_credential_ok("deepagents", model_id, provider, cfg=cfg)
+      if (!ready && _report_credential_gap("DeepAgents $model_id: $detail", roles)) ok = false
+    }
+  }
+
+  // src: preflight.py:385-388
+  if (!ok) return false   // "[probe] skipped — fix credential errors above first"
+
+  // src: preflight.py:389-402 — a JWT ANTHROPIC_API_KEY with no base URL would hang 60+ seconds at a proxy
+  anthropic_route = (vias intersection ["sdk", "cli"]) || any deepagents role where provider_routing.routes_to_anthropic(model_id, provider)
+  if (anthropic_route) {
+    require environment._gateway_check().status != FAIL => { log PREFLIGHT_GATEWAY_UNUSABLE; return false }
+  }
+  return probe_backends(cfg, skip_roles)
+}
+
+// src: vvaharness/orchestrator/preflight.py:182-193
+fn _report_credential_gap(message, roles, ...remedies):executor=code {
+  // returns true when the gap must abort the run
+  if (_post_scan_only(roles)) {
+    warn PREFLIGHT_CREDENTIAL_GAP   // "required only by <roles> — that stage will be skipped"
+    return false
+  }
+  log error PREFLIGHT_CREDENTIAL_GAP; print remedies
+  return true
+}
+
+// src: vvaharness/orchestrator/preflight.py:176-179
+fn _post_scan_only(roles):executor=code {
+  return roles is non-empty && roles is a subset of registry.POST_SCAN_ROLES   // empty is false: an unattributed gap is never assumed harmless
+}
+
+// src: vvaharness/orchestrator/preflight.py:205-224
+fn _warn_deepagents_tuned_max_turns(cfg):executor=code {
+  for each [stage_key, role] in _TURN_CAPPED_STAGES {
+    turns = knob("$stage_key.max_turns", default=null); model = cfg.models[role]
+    if (stage block or model missing || turns is not a positive integer) continue
+    via = resolve_model(model).via
+    if (via in _HARD_TURN_CAP_VIAS && turns <= _STARVED_TURN_CEILING) {
+      warn PREFLIGHT_MAX_TURNS_HARD_CAPPED   // "Values at or below 20 starved S2 on repos of real size; ... leave the scan reporting success with near-zero findings."; remedy: raise to for example 60, or route via deepagents
+    }
+  }
+}
+
+// src: vvaharness/orchestrator/preflight.py:740-820
+fn probe_backends(cfg, skip_roles=[]):executor=mixed {
+  invalid = roles not in skip_roles routed via "deepagents" and not in DEEPAGENTS_ROLES
+  require invalid is empty => { console: "ERROR: refusing DeepAgents probe for unsupported role(s) ..."; return false }
+  targets = _probe_targets(cfg, skip_roles)   // unique (model_id, via, provider) -> (node, roles)
+  ok = true; skipped = {}
+  // src: preflight.py:764-807 — one probe per target, sequentially
+  for each [[mid, via, provider], [mcfg, roles]] in targets {
+    effort = config_paths.highest_effort(config_paths.role_effort(cfg, r) for each r in roles)
+    try {
+      if (via == "deepagents") {
+        _probe_deepagents_harness(cfg, mid, provider, include_tls=!_post_scan_only(roles), use_responses_api=use_responses_api_of(mcfg), effort)
+      } else {
+        // response-quality floors lowered to 1 character / 1 token for this tag only (stage_floors("preflight", ...))
+        callModel({ role: roles, route: via, system: null, prompt: PROBE_PING_PROMPT, tools: [], limits: { max_tokens: _PROBE_PING_MAX_TOKENS, timeout: _PROBE_PING_TIMEOUT_S, effort: if (via != "cli") effort else omitted }, output: "any text" })
+      }
+    }
+    catch error => {
+      if (_reachable_despite_token_cap(error) || error is DegenerateResponseError || error is TruncatedResponseError) continue   // reachable; terse or token-capped reply counts as success
+      if (_post_scan_only(roles)) { warn PREFLIGHT_PROBE_FAILED; skipped += roles; continue }   // "unreachable — that stage will be skipped"
+      log PREFLIGHT_PROBE_FAILED with cause=_upstream_message(error); ok = false
+    }
+  }
+  // src: preflight.py:809-810 — runs even when a ping already failed, for complete diagnostics in one pass
+  ok = _probe_agentic_roles(cfg) && ok
+  if (!ok) log PREFLIGHT_BACKENDS_UNREACHABLE
+  return ok
+  // preserved: _probe_agentic_roles does not receive skip_roles; entry.py only ever skips exploit verification roles, remediate and validate, none of which is an agentic role, so this has no effect in the shipped call path
+}
+
+// prompt-src: vvaharness/orchestrator/preflight.py:781
+PROBE_PING_PROMPT {
+  prompt: "ping"
+}
+
+// src: vvaharness/orchestrator/preflight.py:680-737
+fn _probe_deepagents_harness(cfg, model_id, provider, include_tls=true, use_responses_api?, effort?):executor=mixed {
+  env = if (include_tls) deepagents.build_harness_env(model_id, provider, sdk_cfg, openai_cfg, cfg_dir) else (process environment + provider_routing.credential_env_overrides(...))
+  constraint OnEveryExit { delete the temporary working directory }
+  result = callModel({ role: "preflight", route: "deepagents", prompt: DEEPAGENTS_PROBE_PROMPT, tools: [], limits: { max_turns: 2, timeout: effort_scaled_seconds(_PROBE_PING_TIMEOUT_S, effort, kind=REQUEST) }, output: "any text" })
+  // cache_markers=deepagents.markers_on(sdk_cfg); think_in_prompt=think_in_prompt_enabled(cfg); runs on the scan's persistent loop so the model cache is primed
+  require !result.is_error => throw RuntimeError("DeepAgents preflight failed: <subtype or unknown error>")
+}
+
+// prompt-src: vvaharness/orchestrator/preflight.py:716
+DEEPAGENTS_PROBE_PROMPT {
+  prompt: "reply with the single word ok"
+}
+
+// src: vvaharness/orchestrator/preflight.py:512-617
+fn _probe_agentic_roles(cfg):executor=mixed {
+  targets = {}; ok = true
+  for each [role, m] in config_paths._iter_model_roles(cfg) where role in _AGENTIC_ROLES {
+    [mid, via] = resolve_model(m)
+    try tools = _agentic_role_tools(cfg, role, via);
+    catch ValueError => { if (_report_credential_gap(error, {role})) ok = false; continue }   // a doomed tool configuration fails here, not after Stages 1-5 spend
+    if (!tools) continue   // "no tools configured — skipping the agentic round-trip probe"
+    targets[(mid, via, provider, tools)] += role
+  }
+  if (!targets) return ok
+  // src: preflight.py:547-616 — one forced tool round trip per target, sequentially
+  for each [[mid, via], [mcfg, tools, roles]] in targets {
+    effort = highest_effort over roles
+    workdir = new temporary directory "vva-preflight-*"
+    constraint OnEveryExit { delete workdir (ignore errors) }   // src: preflight.py:615-616
+    try {
+      nonce = 16 random hex characters
+      write nonce to "$workdir/$_PROBE_MARKER_FILENAME"
+      // response-quality floors lowered to 1 / 1 for tag "preflight-agentic"
+      reply = callModel({ role: roles, route: via, system: null, prompt: _native_roundtrip_prompt, tools: tools, limits: { max_turns: _PROBE_ROUNDTRIP_TURNS, timeout: _PROBE_AGENTIC_TIMEOUT_S, effort: if (via != "cli") effort else omitted }, output: "the marker contents" })
+      if (via == "cli" && _cli_bridge_enabled(cfg)) _probe_agentic_via_cli_bridge(prompt, nonce, mid, tools, workdir)   // additionally, not instead
+      confirmed = nonce in reply
+      if (!confirmed) console warn "round-trip unconfirmed (reply never echoed the marker) — tool state was reachable but not proven round-tripped"   // a warning only; ok is unchanged
+    }
+    catch error => match (error) {
+      case ToolStateNotRoundTrippedError => { if (_report_credential_gap(error, roles)) ok = false }   // deterministic: the real session would fail the same way
+      case _reachable_despite_token_cap || DegenerateResponseError || TruncatedResponseError || HarnessJSONDecodeError || HarnessMessageParseError => continue   // reachable
+      default => { log PREFLIGHT_PROBE_FAILED with cause; ok = false }
+      // preserved: an ordinary agentic probe failure sets ok = false even for post-scan-only roles; none of _AGENTIC_ROLES is post-scan, so this does not arise in practice
+    }
+  }
+  return ok
+}
+
+// prompt-src: vvaharness/orchestrator/preflight.py:464-469
+_native_roundtrip_prompt {
+  $marker_name = _PROBE_MARKER_FILENAME
+  Constraints {
+    "Use your file-reading tool to read the file '$marker_name' in the current directory, then reply with exactly its contents and nothing else."
+  }
+}
+
+// src: vvaharness/orchestrator/preflight.py:415-429
+fn _agentic_role_tools(cfg, role, via?):executor=code {
+  match (role) {
+    case "preprocess" => return validate_detection_tools(knob("step1.allowed_tools", default=null), config_key="step1.allowed_tools", via)
+    case "verify" => return validate_detection_tools(knob("step6_verify.allowed_tools", default=null), config_key="step6_verify.allowed_tools", via)
+    case "threatmodel" => return validate_detection_tools(knob("step2.allowed_tools", default=null), config_key="step2.allowed_tools", via)
+    default => return []
+  }
+  // the same validator the stages use; it raises ValueError for a tool list the route cannot honour
+}
+
+// src: vvaharness/orchestrator/preflight.py:620-661
+fn _probe_agentic_via_cli_bridge(prompt, nonce, model, allowed_tools, cwd):executor=mixed {
+  echo_tool = tool "PreflightProbeEcho"(marker) returning marker unchanged
+  future = start_daemon(() => callModel({ role: "preflight", route: "cli", prompt: CLI_BRIDGE_PROMPT, tools: allowed_tools + [echo_tool], limits: { max_turns: _PROBE_ROUNDTRIP_TURNS }, output: "the echoed marker" }))   // through cli_mcp.agentic_with_tools, fact_tools=["PreflightProbeEcho"]
+  try return future.result(timeout=_PROBE_AGENTIC_TIMEOUT_S);
+  catch TimeoutError => { if (future done) return future.result(); cancel future; throw TimeoutError("cli MCP bridge probe ... did not respond within 300s") }
+  // preserved: the bridge reply is returned but the caller does not check it for the nonce
+}
+
+// prompt-src: vvaharness/orchestrator/preflight.py:641-642
+CLI_BRIDGE_PROMPT {
+  Constraints {
+    "Call the PreflightProbeEcho tool with marker='$nonce', then reply with exactly what it returns and nothing else."
+  }
+}
+
+// src: vvaharness/orchestrator/preflight.py:158-173 — reachability predicates used by both probes
+fn _reachable_despite_degenerate_reply(e):executor=code { return e is DegenerateResponseError }   // a terse reply proves reachability
+fn _reachable_despite_truncated_reply(e):executor=code { return e is TruncatedResponseError }    // a reply cut off by the probe's own output budget proves reachability
+fn _reachable_despite_token_cap(err_msg):executor=code { return lowercase(err_msg) contains "exceeded" && contains "output token" }   // legacy backstop
+// src: vvaharness/orchestrator/preflight.py:479-482 — agentic probe only
+fn _reachable_despite_tool_dispatch_error(e):executor=code { return e is HarnessJSONDecodeError || e is HarnessMessageParseError }   // NotImplementedError stays fatal
+
+// src: vvaharness/orchestrator/preflight.py:664-677
+fn _probe_targets(cfg, skip_roles=[]):executor=code { return roles not in skip_roles grouped by (model_id, via, provider) }
+
+// ---------- doctor --cache-probe (never part of a scan) ----------
+
+// src: vvaharness/orchestrator/preflight.py:826-837
+_PROMPT_VIAS = ["sdk", "openai", "cli"]
+_FILLER_MIN_TOKENS = 8192; _FILLER_CHARS_PER_TOKEN = 4; _FILLER_MARGIN = 1.25
+_PROBE_MAX_TOKENS = 256; _PROBE_TIMEOUT_S = 120
+_CALL_B_DEADLINE_S = 5.0
+_PROBE_THINKING_BUDGET = 1024
+
+// src: vvaharness/orchestrator/preflight.py:1144-1268
+fn run_cache_probe(cfg):executor=mixed {
+  targets = unique (model_id, via) where via in _PROMPT_VIAS
+  deepagents_targets = unique (model_id, "deepagents")
+  shapes = [["synthetic", cache_probe_filler()], ["deepdive-system", s4.prompts.build_system_prompt()]]
+  n_calls = length(targets) * 2 * 2 * 2 + length(deepagents_targets) * 2
+  if (n_calls == 0) return true
+  ok = true
+  // src: preflight.py:1170-1218 — per prompt-route target: 2 shapes x 2 thinking arms x (call A, then call B), sequentially
+  for each [[model_id, via], node] in sorted(targets) {
+    for each [shape_name, system_prompt] in shapes {
+      for each [think_label, budget] in [["on", _PROBE_THINKING_BUDGET], ["off", null]] {
+        try {
+          write = _observe_call(callModel({ route: via, system: system_prompt, prompt: _USER_MSG_A, limits: { thinking_budget: budget, max_tokens: _PROBE_MAX_TOKENS, timeout: _PROBE_TIMEOUT_S }, output: "PONG" }))
+          read = _observe_call(callModel({ route: via, system: system_prompt, prompt: _USER_MSG_B, limits: same }))
+        }
+        catch error => { ok = false; continue }   // reported as a FAILED row; probing continues
+        if (elapsed > _CALL_B_DEADLINE_S) warn PREFLIGHT_CACHE_PROBE_SLOW
+        verdict = classify_cache_verdict(usage_dict_for_classifier(write.cache_write, read.cache_read, write.cache_write_present, read.cache_read_present))
+        if (verdict == V_ANTHROPIC_NOT_HONOURED && _marker_would_be_placed(via, system_prompt, model_id) == false) verdict = V_MARKER_WITHHELD   // only a definite false, never null
+      }
+    }
+  }
+  // src: preflight.py:1220-1258 — per deepagents target: synthetic shape, thinking off, call A then call B through deepagents.dispatch_prompt
+  for each [[model_id, via], node] in sorted(deepagents_targets) {
+    try [write, read] = _probe_deepagents_cache(cfg, node); catch error => { ok = false; continue }
+    if (elapsed > _CALL_B_DEADLINE_S) warn PREFLIGHT_CACHE_PROBE_SLOW   // expected on this route: graph build dominates the first call
+    verdict = classify_cache_verdict(...)
+    if (verdict == V_ANTHROPIC_NOT_HONOURED && !_deepagents_marker_would_be_placed(cfg, model_id, provider)) verdict = V_MARKER_WITHHELD
+  }
+  print each row with _VERDICT_TEXT[verdict]
+  return ok
+}
+
+// prompt-src: vvaharness/orchestrator/preflight.py:840-849
+_USER_MSG_A {
+  "Reply with the single word PONG. cache-probe call A deterministic marker sequence diagnostic token filler padding text alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar"
+}
+_USER_MSG_B {
+  "Reply with the single word PONG. cache-probe call B deterministic marker sequence diagnostic token filler padding text papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu alpha bravo charlie"
+  // the two messages differ so a cache hit on B can only come from the shared system prefix
+}
+
+// src: vvaharness/orchestrator/preflight.py:988-1006
+fn classify_cache_verdict(usage_a, usage_b):executor=code {
+  // field PRESENCE, not value, selects the row
+  creation_present = "cache_creation_input_tokens" in usage_a
+  read_present = "cache_read_input_tokens" in usage_b
+  if (!creation_present && !read_present) return V_NO_CACHE_FIELDS
+  read = usage_b.cache_read_input_tokens || 0
+  if (creation_present) {
+    creation = usage_a.cache_creation_input_tokens || 0
+    if (creation > 0 && read > 0) return V_ANTHROPIC_WORKS
+    if (creation > 0 && read == 0) return V_ANTHROPIC_ROUTING_GAP
+    if (creation == 0 && read > 0) return V_ANTHROPIC_ALREADY_WARM
+    return V_ANTHROPIC_NOT_HONOURED
+  }
+  return if (read > 0) V_OPENAI_WORKING else V_OPENAI_BELOW_MIN
+}
+
+// src: vvaharness/orchestrator/preflight.py:958-971
+fn _marker_would_be_placed(via, system_prompt, model_id):executor=code {
+  if (via != "sdk") return null
+  try {
+    if (!sdk._cache_markers_enabled()) return false
+    if (sdk._cache_route(client) not in sdk._CACHE_CONTROL_ROUTES) return false
+    return sdk._cache_prefix_meets_minimum(system_prompt, model_id)
+  } catch => return null
+}
+
+// src: vvaharness/orchestrator/preflight.py:1090-1096
+fn _deepagents_marker_would_be_placed(cfg, model_id, provider):executor=code { return deepagents.markers_on(cfg.sdk) && routes_to_anthropic(model_id, provider) }
+
+// src: vvaharness/orchestrator/preflight.py:898-911
+fn cache_probe_filler(min_tokens=_FILLER_MIN_TOKENS):executor=code {
+  target_chars = min_tokens * 4 * 1.25
+  return numbered lines "CACHE-PROBE-FILLER-LINE-<i> alpha bravo ... zulu <i>" until total length >= target_chars
+}
+
+// abstracted: preflight.py:71-96 (_resolve_verify_path, _resolve_cert_chain, _mask), 451-461 (nonce and marker helpers), 472-476 (_cli_bridge_enabled asks route_carries_tools(cfg, "cli")), 485-509 (_upstream_message unwraps the gateway rejection text for logging), 852-896 (verdict codes and their explanatory text), 914-956 (_scheme_host, _resolved_base_url_scheme_host, _thinking_actually_sent: display only), 974-985 (usage_dict_for_classifier keeps a field only when observed present), 1009-1141 (_observe_call wraps TOKENS.add to observe usage presence per phase; target listing; _deepagents_base_url; _probe_deepagents_cache issues calls A then B with the filler system prompt). Diagnostics and bookkeeping; none changes whether a scan runs.

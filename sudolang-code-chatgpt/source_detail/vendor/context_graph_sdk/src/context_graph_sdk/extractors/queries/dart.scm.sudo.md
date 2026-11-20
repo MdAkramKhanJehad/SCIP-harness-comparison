@@ -1,0 +1,70 @@
+# vendor/context_graph_sdk/src/context_graph_sdk/extractors/queries/dart.scm
+
+Role: Tree-sitter matching query, data for vendored extractor.
+
+Exact source asset: `assets/original/vendor/context_graph_sdk/src/context_graph_sdk/extractors/queries/dart.scm`. SHA-256 `8c1cf6724c34586b795b83603e52357cc714f2cfb302b34bf2e746a7cd6905c5`.
+
+```sudo
+// Source: vendor/context_graph_sdk/src/context_graph_sdk/extractors/queries/dart.scm:1-52
+Preserve this resource's exact nested keys, list order, scalar values and text from its source asset.
+Interpretation belongs to its linked source loader; this record does not add an execution stage.
+For queries, preserve the original query grammar as data rather than inventing SudoLang query syntax.
+For examples, no loaded/active status is assumed.
+```
+
+``````text
+; Production extraction query set for dart
+; Copyright 2026 Visa, Inc.
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+; http://www.apache.org/licenses/LICENSE-2.0
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+(class_definition name: (identifier) @name) @definition.class
+(mixin_declaration (identifier) @name) @definition.trait
+(extension_declaration name: (identifier) @name) @definition.class
+(enum_declaration name: (identifier) @name) @definition.enum
+(type_alias (type_identifier) @name) @definition.type
+(function_signature name: (identifier) @name) @definition.function
+(getter_signature name: (identifier) @name) @definition.method
+(setter_signature name: (identifier) @name) @definition.method
+(constructor_signature name: (identifier) @name) @definition.constructor
+(constant_constructor_signature (identifier) @name) @definition.constructor
+(factory_constructor_signature (identifier) @name) @definition.constructor
+(factory_constructor_signature (identifier) (identifier) @name) @definition.constructor
+(redirecting_factory_constructor_signature (identifier) @name) @definition.constructor
+(declaration (initialized_identifier_list (initialized_identifier (identifier) @name))) @definition.property
+(declaration (static_final_declaration_list (static_final_declaration (identifier) @name))) @definition.constant
+(enum_constant name: (identifier) @name) @definition.const
+(import_or_export (library_import (import_specification (configurable_uri (uri (string_literal) @import.source))))) @import
+(import_or_export (library_import (import_specification (configurable_uri (uri (string_literal) @import.source)) (identifier) @import.alias))) @import
+(import_or_export (library_export (configurable_uri (uri (string_literal) @import.source)))) @import
+(part_directive (uri (string_literal) @import.source)) @import
+(_ (identifier) @call.name (selector (argument_part))) @call
+(_ (type_identifier) @call.name (selector (argument_part))) @call
+(_ (identifier) @call.receiver (selector (unconditional_assignable_selector (identifier) @call.name)) (selector (argument_part))) @call
+(_ (type_identifier) @call.receiver (selector (unconditional_assignable_selector (identifier) @call.name)) (selector (argument_part))) @call
+(assignment_expression left: (assignable_expression (identifier) @assignment.property) right: (_)) @assignment
+(assignment_expression left: (assignable_expression (this) @assignment.receiver (unconditional_assignable_selector (identifier) @assignment.property)) right: (_)) @assignment
+(assignment_expression left: (assignable_expression (identifier) @assignment.receiver (unconditional_assignable_selector (identifier) @assignment.property)) right: (_)) @assignment
+(class_definition name: (identifier) @heritage.class superclass: (superclass (type_identifier) @heritage.extends)) @heritage
+(class_definition name: (identifier) @heritage.class superclass: (superclass (type_identifier) (mixins (type_identifier) @heritage.trait))) @heritage
+(class_definition name: (identifier) @heritage.class interfaces: (interfaces (_) @heritage.implements)) @heritage.impl
+(mixin_declaration (identifier) @heritage.class superclass: (superclass (_) @heritage.extends)) @heritage
+(mixin_declaration (identifier) @heritage.class interfaces: (interfaces (_) @heritage.implements)) @heritage.impl
+(extension_declaration name: (identifier) @heritage.class class: (_) @heritage.extends) @heritage
+(_ (identifier) @_async (selector (argument_part (arguments (argument (identifier) @spawn.name)))) (#match? @_async "^(Future|Timer|scheduleMicrotask)$")) @spawn
+(_ (identifier) @_async (selector (argument_part (arguments (argument (_)) (argument (identifier) @spawn.name)))) (#match? @_async "^Timer$")) @spawn
+(_ (identifier) @spawn.receiver (selector (unconditional_assignable_selector (identifier) @_async)) (selector (argument_part (arguments (argument (identifier) @spawn.name)))) (#match? @_async "^(Future|Timer|scheduleMicrotask)$")) @spawn
+(_ (identifier) @spawn.receiver (selector (unconditional_assignable_selector (identifier) @_async)) (selector (argument_part (arguments (argument (_)) (argument (identifier) @spawn.name)))) (#match? @_async "^Timer$")) @spawn
+(_ (identifier) (selector (argument_part (arguments (argument (identifier) @delegate.target))))) @delegate
+(_ (identifier) (selector (argument_part (arguments (argument (identifier) @delegate.receiver (selector (unconditional_assignable_selector (identifier) @delegate.target))))))) @delegate
+(_ (identifier) (selector (unconditional_assignable_selector (identifier))) (selector (argument_part (arguments (argument (identifier) @delegate.target))))) @delegate
+(_ (identifier) (selector (unconditional_assignable_selector (identifier))) (selector (argument_part (arguments (argument (identifier) @delegate.receiver (selector (unconditional_assignable_selector (identifier) @delegate.target))))))) @delegate
+
+``````
+

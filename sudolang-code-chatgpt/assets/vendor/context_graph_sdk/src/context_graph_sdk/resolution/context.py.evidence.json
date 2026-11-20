@@ -1,0 +1,2445 @@
+{
+  "source": "vendor/context_graph_sdk/src/context_graph_sdk/resolution/context.py",
+  "sha256": "d9f4b909ca2d02aac567e557beca9738c96812ca9a99995039e6eb16e83eb9de",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Immutable indexed resolution context and result contracts.\n\nBuilt once per analysis from discovery/extraction records; resolvers never\nre-scan the graph or query a backend. All lookup structures are sorted so\nresolution output is independent of record arrival order.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport posixpath\nfrom collections.abc import Mapping, Sequence\nfrom dataclasses import dataclass, field\n\nfrom context_graph_sdk.errors import ResolutionLimitError\nfrom context_graph_sdk.extractors.records import ExtractionResult, Symbol\nfrom context_graph_sdk.models import LocalRelationshipType\nfrom context_graph_sdk.project.config import ProjectConfig, ResolutionSettings\n\nMAX_RESOLUTION_EDGES = 500_000\nMAX_CANDIDATES_PER_NAME = 200\n\n\n@dataclass(frozen=True)\nclass ResolvedEdge:\n    source_local_id: str\n    relationship: LocalRelationshipType\n    target_local_id: str\n    properties: tuple[tuple[str, object], ...] = ()\n\n\n@dataclass\nclass ResolutionResult:\n    \"\"\"Edges and symbol property updates emitted by the resolution stages.\"\"\"\n\n    edges: list[ResolvedEdge] = field(default_factory=list[ResolvedEdge])\n    property_updates: dict[str, dict[str, object]] = field(\n        default_factory=dict[str, dict[str, object]]\n    )\n    _seen: set[tuple[str, str, str]] = field(default_factory=set[tuple[str, str, str]], repr=False)\n\n    def add_edge(\n        self,\n        source_local_id: str,\n        relationship: LocalRelationshipType,\n        target_local_id: str,\n        properties: Mapping[str, object] | None = None,\n    ) -> bool:\n        \"\"\"Deduplicated add; the first edge for one (source, type, target)\n        wins so properties stay deterministic under the fixed stage order.\"\"\"\n        if not source_local_id or not target_local_id or source_local_id == target_local_id:\n            return False\n        key = (source_local_id, relationship.value, target_local_id)\n        if key in self._seen:\n            return False\n        if len(self.edges) >= MAX_RESOLUTION_EDGES:\n            raise ResolutionLimitError(\n                f\"resolution edge count exceeds {MAX_RESOLUTION_EDGES} bound\"\n            )\n            return False\n        self._seen.add(key)\n        self.edges.append(\n            ResolvedEdge(\n                source_local_id,\n                relationship,\n                target_local_id,\n                tuple(sorted((properties or {}).items())),\n            )\n        )\n        return True\n\n    def update_property(self, symbol_id: str, key: str, value: object) -> None:\n        self.property_updates.setdefault(symbol_id, {}).setdefault(key, value)\n\n\ndef file_local_id(relative_path: str) -> str:\n    return f\"file:{relative_path}\"\n\n\ndef folder_local_id(relative_path: str) -> str:\n    return f\"folder:{relative_path}\"\n\n\n@dataclass(frozen=True)\nclass _SymbolRange:\n    local_id: str\n    start: int\n    end: int\n\n\nclass ResolutionContext:\n    \"\"\"Sorted indexes over files and symbols for one project analysis.\"\"\"\n\n    def __init__(\n        self,\n        files: Sequence[tuple[str, str]],\n        folder_paths: Sequence[str],\n        extraction: ExtractionResult,\n        config: ProjectConfig,\n    ) -> None:\n        \"\"\"`files` carries the walker's authoritative (path, language) pairs so\n        symbol-less files (barrel re-exports, header-only imports) still\n        resolve with their real language.\"\"\"\n        self.settings: ResolutionSettings = config.resolution\n        self.file_language: dict[str, str] = {path: language for path, language in sorted(files)}\n        self.file_paths: tuple[str, ...] = tuple(sorted(self.file_language))\n        self.folders: frozenset[str] = frozenset(folder_paths)\n        self.files: frozenset[str] = frozenset(self.file_paths)\n        self.files_by_dir: dict[str, list[str]] = {}\n        for path in self.file_paths:\n            self.files_by_dir.setdefault(posixpath.dirname(path), []).append(\n                posixpath.basename(path)\n            )\n        self.files_by_base: dict[str, list[str]] = {}\n        for path in self.file_paths:\n            self.files_by_base.setdefault(posixpath.basename(path), []).append(path)\n\n        self.extraction = extraction\n        self.symbols: tuple[Symbol, ...] = tuple(\n            sorted(\n                (s for _, fr in extraction.files for s in fr.symbols),\n                key=lambda s: (s.file_path, s.start_line, s.id),\n            )\n        )\n        self.symbols_by_id: dict[str, Symbol] = {s.id: s for s in self.symbols}\n        self.symbols_by_name: dict[str, list[Symbol]] = {}\n        for symbol in self.symbols:\n            bucket = self.symbols_by_name.setdefault(symbol.name, [])\n            if len(bucket) < MAX_CANDIDATES_PER_NAME:\n                bucket.append(symbol)\n        for bucket in self.symbols_by_name.values():\n            bucket.sort(key=lambda s: s.id)\n        self._ranges: dict[str, list[_SymbolRange]] = {}\n        for symbol in self.symbols:\n            self._ranges.setdefault(symbol.file_path, []).append(\n                _SymbolRange(symbol.id, symbol.start_line, symbol.end_line)\n            )\n\n        self.import_aliases = _build_import_alias_map(extraction)\n        self.receiver_types = _build_receiver_type_map(extraction)\n\n    def has_file(self, path: str) -> bool:\n        return path in self.files\n\n    def lookup_with_extensions(self, base_path: str, extensions: tuple[str, ...]) -> str | None:\n        if base_path in self.files:\n            return base_path\n        for extension in extensions:\n            candidate = base_path + extension\n            if candidate in self.files:\n                return candidate\n        return None\n\n    def lookup_suffix(self, suffix: str) -> str | None:\n        base = posixpath.basename(suffix)\n        for path in self.files_by_base.get(base, []):\n            if path.endswith(suffix):\n                return path\n        return None\n\n    def files_in_dir(self, directory: str) -> list[str]:\n        return self.files_by_dir.get(directory.rstrip(\"/\"), [])\n\n    def enclosing_symbol(self, relative_path: str, line: int) -> str:\n        \"\"\"Tightest symbol containing the line, else the file node id.\"\"\"\n        best_id = \"\"\n        best_span = 1 << 31\n        for candidate in self._ranges.get(relative_path, []):\n            if candidate.start <= line <= candidate.end:\n                span = candidate.end - candidate.start\n                if span < best_span or (span == best_span and candidate.local_id < best_id):\n                    best_span = span\n                    best_id = candidate.local_id\n        return best_id or file_local_id(relative_path)\n\n    def receiver_type(self, relative_path: str, receiver_name: str) -> str:\n        # self/this/cls require enclosing-class inference, which is not available here.\n        if receiver_name in (\"self\", \"this\", \"cls\"):\n            return \"\"\n        return self.receiver_types.get(relative_path, {}).get(receiver_name, \"\")\n\n\ndef _build_import_alias_map(extraction: ExtractionResult) -> dict[str, dict[str, str]]:\n    result: dict[str, dict[str, str]] = {}\n    for path, file_result in extraction.files:\n        for imported in file_result.imports:\n            for binding in imported.bindings:\n                if (\n                    binding.alias\n                    and binding.original\n                    and binding.alias != binding.original\n                    and binding.original != \"*\"\n                ):\n                    result.setdefault(path, {}).setdefault(binding.alias, binding.original)\n    return result\n\n\ndef _build_receiver_type_map(extraction: ExtractionResult) -> dict[str, dict[str, str]]:\n    result: dict[str, dict[str, str]] = {}\n    for path, file_result in extraction.files:\n        for binding in file_result.type_bindings:\n            if not binding.variable_name or not binding.type_name:\n                continue\n            if binding.variable_name.startswith(\"@\"):\n                continue\n            result.setdefault(path, {}).setdefault(binding.variable_name, binding.type_name)\n    return result\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/resolution/context.py",
+      "line_start": 15,
+      "line_end": 20,
+      "value": "Immutable indexed resolution context and result contracts.\n\nBuilt once per analysis from discovery/extraction records; resolvers never\nre-scan the graph or query a backend. All lookup structures are sorted so\nresolution output is independent of record arrival order.\n",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_47_4": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/resolution/context.py",
+      "line_start": 47,
+      "line_end": 47,
+      "value": "Edges and symbol property updates emitted by the resolution stages.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_62_8": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/resolution/context.py",
+      "line_start": 62,
+      "line_end": 63,
+      "value": "Deduplicated add; the first edge for one (source, type, target)\n        wins so properties stay deterministic under the fixed stage order.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_71_16": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/resolution/context.py",
+      "line_start": 71,
+      "line_end": 71,
+      "source_expression": "f\"resolution edge count exceeds {MAX_RESOLUTION_EDGES} bound\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_90_11": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/resolution/context.py",
+      "line_start": 90,
+      "line_end": 90,
+      "source_expression": "f\"file:{relative_path}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_94_11": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/resolution/context.py",
+      "line_start": 94,
+      "line_end": 94,
+      "source_expression": "f\"folder:{relative_path}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_105_4": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/resolution/context.py",
+      "line_start": 105,
+      "line_end": 105,
+      "value": "Sorted indexes over files and symbols for one project analysis.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_114_8": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/resolution/context.py",
+      "line_start": 114,
+      "line_end": 116,
+      "value": "`files` carries the walker's authoritative (path, language) pairs so\n        symbol-less files (barrel re-exports, header-only imports) still\n        resolve with their real language.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_178_8": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/resolution/context.py",
+      "line_start": 178,
+      "line_end": 178,
+      "value": "Tightest symbol containing the line, else the file node id.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 20,
+      "column": 0,
+      "value": "Immutable indexed resolution context and result contracts.\n\nBuilt once per analysis from discovery/extraction records; resolvers never\nre-scan the graph or query a backend. All lookup structures are sorted so\nresolution output is independent of record arrival order.\n",
+      "context": "literal"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 4,
+      "value": "Edges and symbol property updates emitted by the resolution stages.",
+      "context": "literal"
+    },
+    {
+      "line_start": 105,
+      "line_end": 105,
+      "column": 4,
+      "value": "Sorted indexes over files and symbols for one project analysis.",
+      "context": "literal"
+    },
+    {
+      "line_start": 62,
+      "line_end": 63,
+      "column": 8,
+      "value": "Deduplicated add; the first edge for one (source, type, target)\n        wins so properties stay deterministic under the fixed stage order.",
+      "context": "literal"
+    },
+    {
+      "line_start": 90,
+      "line_end": 90,
+      "column": 13,
+      "value": "file:",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 13,
+      "value": "folder:",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 114,
+      "line_end": 116,
+      "column": 8,
+      "value": "`files` carries the walker's authoritative (path, language) pairs so\n        symbol-less files (barrel re-exports, header-only imports) still\n        resolve with their real language.",
+      "context": "literal"
+    },
+    {
+      "line_start": 178,
+      "line_end": 178,
+      "column": 8,
+      "value": "Tightest symbol containing the line, else the file node id.",
+      "context": "literal"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 18,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 19,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 193,
+      "line_end": 193,
+      "column": 77,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 54,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 29,
+      "value": "self",
+      "context": "literal"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 37,
+      "value": "this",
+      "context": "literal"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 45,
+      "value": "cls",
+      "context": "literal"
+    },
+    {
+      "line_start": 217,
+      "line_end": 217,
+      "column": 48,
+      "value": "@",
+      "context": "literal"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 18,
+      "value": "resolution edge count exceeds ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 70,
+      "value": " bound",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 44,
+      "value": "*",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 190,
+      "text": "# self/this/cls require enclosing-class inference, which is not available here."
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 26,
+      "line_end": 26,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 28,
+      "line_end": 28,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 29,
+      "line_end": 29,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 30,
+      "line_end": 30,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 31,
+      "line_end": 31,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "Assign",
+      "line_start": 33,
+      "line_end": 33,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "Assign",
+      "line_start": 34,
+      "line_end": 34,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 38,
+      "line_end": 42,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 7
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 39,
+      "line_end": 39,
+      "column": 4,
+      "owner": "ResolvedEdge",
+      "representation_line": 15
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 40,
+      "line_end": 40,
+      "column": 4,
+      "owner": "ResolvedEdge",
+      "representation_line": 15
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 41,
+      "line_end": 41,
+      "column": 4,
+      "owner": "ResolvedEdge",
+      "representation_line": 15
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 42,
+      "line_end": 42,
+      "column": 4,
+      "owner": "ResolvedEdge",
+      "representation_line": 15
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 46,
+      "line_end": 86,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 18
+    },
+    {
+      "kind": "Expr",
+      "line_start": 47,
+      "line_end": 47,
+      "column": 4,
+      "owner": "ResolutionResult",
+      "representation_line": 26
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 49,
+      "line_end": 49,
+      "column": 4,
+      "owner": "ResolutionResult",
+      "representation_line": 26
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 50,
+      "line_end": 52,
+      "column": 4,
+      "owner": "ResolutionResult",
+      "representation_line": 26
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 53,
+      "line_end": 53,
+      "column": 4,
+      "owner": "ResolutionResult",
+      "representation_line": 26
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 55,
+      "line_end": 83,
+      "column": 4,
+      "owner": "ResolutionResult",
+      "representation_line": 27
+    },
+    {
+      "kind": "Expr",
+      "line_start": 62,
+      "line_end": 63,
+      "column": 8,
+      "owner": "ResolutionResult.add_edge",
+      "representation_line": 33
+    },
+    {
+      "kind": "If",
+      "line_start": 64,
+      "line_end": 65,
+      "column": 8,
+      "owner": "ResolutionResult.add_edge",
+      "representation_line": 34
+    },
+    {
+      "kind": "Return",
+      "line_start": 65,
+      "line_end": 65,
+      "column": 12,
+      "owner": "ResolutionResult.add_edge",
+      "representation_line": 36
+    },
+    {
+      "kind": "Assign",
+      "line_start": 66,
+      "line_end": 66,
+      "column": 8,
+      "owner": "ResolutionResult.add_edge",
+      "representation_line": 40
+    },
+    {
+      "kind": "If",
+      "line_start": 67,
+      "line_end": 68,
+      "column": 8,
+      "owner": "ResolutionResult.add_edge",
+      "representation_line": 41
+    },
+    {
+      "kind": "Return",
+      "line_start": 68,
+      "line_end": 68,
+      "column": 12,
+      "owner": "ResolutionResult.add_edge",
+      "representation_line": 43
+    },
+    {
+      "kind": "If",
+      "line_start": 69,
+      "line_end": 73,
+      "column": 8,
+      "owner": "ResolutionResult.add_edge",
+      "representation_line": 46
+    },
+    {
+      "kind": "Raise",
+      "line_start": 70,
+      "line_end": 72,
+      "column": 12,
+      "owner": "ResolutionResult.add_edge",
+      "representation_line": 48
+    },
+    {
+      "kind": "Return",
+      "line_start": 73,
+      "line_end": 73,
+      "column": 12,
+      "owner": "ResolutionResult.add_edge",
+      "representation_line": 50
+    },
+    {
+      "kind": "Expr",
+      "line_start": 74,
+      "line_end": 74,
+      "column": 8,
+      "owner": "ResolutionResult.add_edge",
+      "representation_line": 54
+    },
+    {
+      "kind": "Expr",
+      "line_start": 75,
+      "line_end": 82,
+      "column": 8,
+      "owner": "ResolutionResult.add_edge",
+      "representation_line": 54
+    },
+    {
+      "kind": "Return",
+      "line_start": 83,
+      "line_end": 83,
+      "column": 8,
+      "owner": "ResolutionResult.add_edge",
+      "representation_line": 55
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 85,
+      "line_end": 86,
+      "column": 4,
+      "owner": "ResolutionResult",
+      "representation_line": 59
+    },
+    {
+      "kind": "Expr",
+      "line_start": 86,
+      "line_end": 86,
+      "column": 8,
+      "owner": "ResolutionResult.update_property",
+      "representation_line": 65
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 89,
+      "line_end": 90,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 70
+    },
+    {
+      "kind": "Return",
+      "line_start": 90,
+      "line_end": 90,
+      "column": 4,
+      "owner": "file_local_id",
+      "representation_line": 75
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 93,
+      "line_end": 94,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 79
+    },
+    {
+      "kind": "Return",
+      "line_start": 94,
+      "line_end": 94,
+      "column": 4,
+      "owner": "folder_local_id",
+      "representation_line": 84
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 98,
+      "line_end": 101,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 88
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 99,
+      "line_end": 99,
+      "column": 4,
+      "owner": "_SymbolRange",
+      "representation_line": 96
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 100,
+      "line_end": 100,
+      "column": 4,
+      "owner": "_SymbolRange",
+      "representation_line": 96
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 101,
+      "line_end": 101,
+      "column": 4,
+      "owner": "_SymbolRange",
+      "representation_line": 96
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 104,
+      "line_end": 193,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 99
+    },
+    {
+      "kind": "Expr",
+      "line_start": 105,
+      "line_end": 105,
+      "column": 4,
+      "owner": "ResolutionContext",
+      "representation_line": 104
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 107,
+      "line_end": 153,
+      "column": 4,
+      "owner": "ResolutionContext",
+      "representation_line": 105
+    },
+    {
+      "kind": "Expr",
+      "line_start": 114,
+      "line_end": 116,
+      "column": 8,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 111
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 117,
+      "line_end": 117,
+      "column": 8,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 111
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 118,
+      "line_end": 118,
+      "column": 8,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 111
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 119,
+      "line_end": 119,
+      "column": 8,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 111
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 120,
+      "line_end": 120,
+      "column": 8,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 111
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 121,
+      "line_end": 121,
+      "column": 8,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 113
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 122,
+      "line_end": 122,
+      "column": 8,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 113
+    },
+    {
+      "kind": "For",
+      "line_start": 123,
+      "line_end": 126,
+      "column": 8,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 114
+    },
+    {
+      "kind": "Expr",
+      "line_start": 124,
+      "line_end": 126,
+      "column": 12,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 117
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 127,
+      "line_end": 127,
+      "column": 8,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 120
+    },
+    {
+      "kind": "For",
+      "line_start": 128,
+      "line_end": 129,
+      "column": 8,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 121
+    },
+    {
+      "kind": "Expr",
+      "line_start": 129,
+      "line_end": 129,
+      "column": 12,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 124
+    },
+    {
+      "kind": "Assign",
+      "line_start": 131,
+      "line_end": 131,
+      "column": 8,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 127
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 132,
+      "line_end": 137,
+      "column": 8,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 127
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 138,
+      "line_end": 138,
+      "column": 8,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 127
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 139,
+      "line_end": 139,
+      "column": 8,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 127
+    },
+    {
+      "kind": "For",
+      "line_start": 140,
+      "line_end": 143,
+      "column": 8,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 128
+    },
+    {
+      "kind": "Assign",
+      "line_start": 141,
+      "line_end": 141,
+      "column": 12,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 131
+    },
+    {
+      "kind": "If",
+      "line_start": 142,
+      "line_end": 143,
+      "column": 12,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 132
+    },
+    {
+      "kind": "Expr",
+      "line_start": 143,
+      "line_end": 143,
+      "column": 16,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 135
+    },
+    {
+      "kind": "For",
+      "line_start": 144,
+      "line_end": 145,
+      "column": 8,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 138
+    },
+    {
+      "kind": "Expr",
+      "line_start": 145,
+      "line_end": 145,
+      "column": 12,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 141
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 146,
+      "line_end": 146,
+      "column": 8,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 144
+    },
+    {
+      "kind": "For",
+      "line_start": 147,
+      "line_end": 150,
+      "column": 8,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 145
+    },
+    {
+      "kind": "Expr",
+      "line_start": 148,
+      "line_end": 150,
+      "column": 12,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 148
+    },
+    {
+      "kind": "Assign",
+      "line_start": 152,
+      "line_end": 152,
+      "column": 8,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 151
+    },
+    {
+      "kind": "Assign",
+      "line_start": 153,
+      "line_end": 153,
+      "column": 8,
+      "owner": "ResolutionContext.__init__",
+      "representation_line": 151
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 155,
+      "line_end": 156,
+      "column": 4,
+      "owner": "ResolutionContext",
+      "representation_line": 154
+    },
+    {
+      "kind": "Return",
+      "line_start": 156,
+      "line_end": 156,
+      "column": 8,
+      "owner": "ResolutionContext.has_file",
+      "representation_line": 159
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 158,
+      "line_end": 165,
+      "column": 4,
+      "owner": "ResolutionContext",
+      "representation_line": 163
+    },
+    {
+      "kind": "If",
+      "line_start": 159,
+      "line_end": 160,
+      "column": 8,
+      "owner": "ResolutionContext.lookup_with_extensions",
+      "representation_line": 168
+    },
+    {
+      "kind": "Return",
+      "line_start": 160,
+      "line_end": 160,
+      "column": 12,
+      "owner": "ResolutionContext.lookup_with_extensions",
+      "representation_line": 170
+    },
+    {
+      "kind": "For",
+      "line_start": 161,
+      "line_end": 164,
+      "column": 8,
+      "owner": "ResolutionContext.lookup_with_extensions",
+      "representation_line": 173
+    },
+    {
+      "kind": "Assign",
+      "line_start": 162,
+      "line_end": 162,
+      "column": 12,
+      "owner": "ResolutionContext.lookup_with_extensions",
+      "representation_line": 176
+    },
+    {
+      "kind": "If",
+      "line_start": 163,
+      "line_end": 164,
+      "column": 12,
+      "owner": "ResolutionContext.lookup_with_extensions",
+      "representation_line": 177
+    },
+    {
+      "kind": "Return",
+      "line_start": 164,
+      "line_end": 164,
+      "column": 16,
+      "owner": "ResolutionContext.lookup_with_extensions",
+      "representation_line": 179
+    },
+    {
+      "kind": "Return",
+      "line_start": 165,
+      "line_end": 165,
+      "column": 8,
+      "owner": "ResolutionContext.lookup_with_extensions",
+      "representation_line": 183
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 167,
+      "line_end": 172,
+      "column": 4,
+      "owner": "ResolutionContext",
+      "representation_line": 187
+    },
+    {
+      "kind": "Assign",
+      "line_start": 168,
+      "line_end": 168,
+      "column": 8,
+      "owner": "ResolutionContext.lookup_suffix",
+      "representation_line": 193
+    },
+    {
+      "kind": "For",
+      "line_start": 169,
+      "line_end": 171,
+      "column": 8,
+      "owner": "ResolutionContext.lookup_suffix",
+      "representation_line": 194
+    },
+    {
+      "kind": "If",
+      "line_start": 170,
+      "line_end": 171,
+      "column": 12,
+      "owner": "ResolutionContext.lookup_suffix",
+      "representation_line": 196
+    },
+    {
+      "kind": "Return",
+      "line_start": 171,
+      "line_end": 171,
+      "column": 16,
+      "owner": "ResolutionContext.lookup_suffix",
+      "representation_line": 198
+    },
+    {
+      "kind": "Return",
+      "line_start": 172,
+      "line_end": 172,
+      "column": 8,
+      "owner": "ResolutionContext.lookup_suffix",
+      "representation_line": 202
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 174,
+      "line_end": 175,
+      "column": 4,
+      "owner": "ResolutionContext",
+      "representation_line": 206
+    },
+    {
+      "kind": "Return",
+      "line_start": 175,
+      "line_end": 175,
+      "column": 8,
+      "owner": "ResolutionContext.files_in_dir",
+      "representation_line": 211
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 177,
+      "line_end": 187,
+      "column": 4,
+      "owner": "ResolutionContext",
+      "representation_line": 215
+    },
+    {
+      "kind": "Expr",
+      "line_start": 178,
+      "line_end": 178,
+      "column": 8,
+      "owner": "ResolutionContext.enclosing_symbol",
+      "representation_line": 221
+    },
+    {
+      "kind": "Assign",
+      "line_start": 179,
+      "line_end": 179,
+      "column": 8,
+      "owner": "ResolutionContext.enclosing_symbol",
+      "representation_line": 221
+    },
+    {
+      "kind": "Assign",
+      "line_start": 180,
+      "line_end": 180,
+      "column": 8,
+      "owner": "ResolutionContext.enclosing_symbol",
+      "representation_line": 221
+    },
+    {
+      "kind": "For",
+      "line_start": 181,
+      "line_end": 186,
+      "column": 8,
+      "owner": "ResolutionContext.enclosing_symbol",
+      "representation_line": 222
+    },
+    {
+      "kind": "If",
+      "line_start": 182,
+      "line_end": 186,
+      "column": 12,
+      "owner": "ResolutionContext.enclosing_symbol",
+      "representation_line": 224
+    },
+    {
+      "kind": "Assign",
+      "line_start": 183,
+      "line_end": 183,
+      "column": 16,
+      "owner": "ResolutionContext.enclosing_symbol",
+      "representation_line": 227
+    },
+    {
+      "kind": "If",
+      "line_start": 184,
+      "line_end": 186,
+      "column": 16,
+      "owner": "ResolutionContext.enclosing_symbol",
+      "representation_line": 228
+    },
+    {
+      "kind": "Assign",
+      "line_start": 185,
+      "line_end": 185,
+      "column": 20,
+      "owner": "ResolutionContext.enclosing_symbol",
+      "representation_line": 231
+    },
+    {
+      "kind": "Assign",
+      "line_start": 186,
+      "line_end": 186,
+      "column": 20,
+      "owner": "ResolutionContext.enclosing_symbol",
+      "representation_line": 231
+    },
+    {
+      "kind": "Return",
+      "line_start": 187,
+      "line_end": 187,
+      "column": 8,
+      "owner": "ResolutionContext.enclosing_symbol",
+      "representation_line": 235
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 189,
+      "line_end": 193,
+      "column": 4,
+      "owner": "ResolutionContext",
+      "representation_line": 239
+    },
+    {
+      "kind": "If",
+      "line_start": 191,
+      "line_end": 192,
+      "column": 8,
+      "owner": "ResolutionContext.receiver_type",
+      "representation_line": 244
+    },
+    {
+      "kind": "Return",
+      "line_start": 192,
+      "line_end": 192,
+      "column": 12,
+      "owner": "ResolutionContext.receiver_type",
+      "representation_line": 246
+    },
+    {
+      "kind": "Return",
+      "line_start": 193,
+      "line_end": 193,
+      "column": 8,
+      "owner": "ResolutionContext.receiver_type",
+      "representation_line": 249
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 196,
+      "line_end": 208,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 254
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 197,
+      "line_end": 197,
+      "column": 4,
+      "owner": "_build_import_alias_map",
+      "representation_line": 260
+    },
+    {
+      "kind": "For",
+      "line_start": 198,
+      "line_end": 207,
+      "column": 4,
+      "owner": "_build_import_alias_map",
+      "representation_line": 261
+    },
+    {
+      "kind": "For",
+      "line_start": 199,
+      "line_end": 207,
+      "column": 8,
+      "owner": "_build_import_alias_map",
+      "representation_line": 263
+    },
+    {
+      "kind": "For",
+      "line_start": 200,
+      "line_end": 207,
+      "column": 12,
+      "owner": "_build_import_alias_map",
+      "representation_line": 265
+    },
+    {
+      "kind": "If",
+      "line_start": 201,
+      "line_end": 207,
+      "column": 16,
+      "owner": "_build_import_alias_map",
+      "representation_line": 267
+    },
+    {
+      "kind": "Expr",
+      "line_start": 207,
+      "line_end": 207,
+      "column": 20,
+      "owner": "_build_import_alias_map",
+      "representation_line": 270
+    },
+    {
+      "kind": "Return",
+      "line_start": 208,
+      "line_end": 208,
+      "column": 4,
+      "owner": "_build_import_alias_map",
+      "representation_line": 275
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 211,
+      "line_end": 220,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 279
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 212,
+      "line_end": 212,
+      "column": 4,
+      "owner": "_build_receiver_type_map",
+      "representation_line": 285
+    },
+    {
+      "kind": "For",
+      "line_start": 213,
+      "line_end": 219,
+      "column": 4,
+      "owner": "_build_receiver_type_map",
+      "representation_line": 286
+    },
+    {
+      "kind": "For",
+      "line_start": 214,
+      "line_end": 219,
+      "column": 8,
+      "owner": "_build_receiver_type_map",
+      "representation_line": 288
+    },
+    {
+      "kind": "If",
+      "line_start": 215,
+      "line_end": 216,
+      "column": 12,
+      "owner": "_build_receiver_type_map",
+      "representation_line": 290
+    },
+    {
+      "kind": "Continue",
+      "line_start": 216,
+      "line_end": 216,
+      "column": 16,
+      "owner": "_build_receiver_type_map",
+      "representation_line": 292
+    },
+    {
+      "kind": "If",
+      "line_start": 217,
+      "line_end": 218,
+      "column": 12,
+      "owner": "_build_receiver_type_map",
+      "representation_line": 295
+    },
+    {
+      "kind": "Continue",
+      "line_start": 218,
+      "line_end": 218,
+      "column": 16,
+      "owner": "_build_receiver_type_map",
+      "representation_line": 297
+    },
+    {
+      "kind": "Expr",
+      "line_start": 219,
+      "line_end": 219,
+      "column": 12,
+      "owner": "_build_receiver_type_map",
+      "representation_line": 301
+    },
+    {
+      "kind": "Return",
+      "line_start": 220,
+      "line_end": 220,
+      "column": 4,
+      "owner": "_build_receiver_type_map",
+      "representation_line": 304
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 33,
+      "line_end": 33,
+      "column": 23,
+      "kind": "Constant",
+      "original_ast": "Constant(value=500000)",
+      "rendered": "500000"
+    },
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 26,
+      "kind": "Constant",
+      "original_ast": "Constant(value=200)",
+      "rendered": "200"
+    },
+    {
+      "line_start": 37,
+      "line_end": 37,
+      "column": 1,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dataclass', ctx=Load()), args=[], keywords=[keyword(arg='frozen', value=Constant(value=True))])",
+      "rendered": "dataclass(frozen=True)"
+    },
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 49,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[], ctx=Load())",
+      "rendered": "()"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 1,
+      "kind": "Name",
+      "original_ast": "Name(id='dataclass', ctx=Load())",
+      "rendered": "dataclass"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 32,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='field', ctx=Load()), args=[], keywords=[keyword(arg='default_factory', value=Subscript(value=Name(id='list', ctx=Load()), slice=Name(id='ResolvedEdge', ctx=Load()), ctx=Load()))])",
+      "rendered": "field(default_factory=list[ResolvedEdge])"
+    },
+    {
+      "line_start": 50,
+      "line_end": 52,
+      "column": 53,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='field', ctx=Load()), args=[], keywords=[keyword(arg='default_factory', value=Subscript(value=Name(id='dict', ctx=Load()), slice=Tuple(elts=[Name(id='str', ctx=Load()), Subscript(value=Name(id='dict', ctx=Load()), slice=Tuple(elts=[Name(id='str', ctx=Load()), Name(id='object', ctx=Load())], ctx=Load()), ctx=Load())], ctx=Load()), ctx=Load()))])",
+      "rendered": "field(default_factory=dict[str, dict[str, object]])"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 39,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='field', ctx=Load()), args=[], keywords=[keyword(arg='default_factory', value=Subscript(value=Name(id='set', ctx=Load()), slice=Subscript(value=Name(id='tuple', ctx=Load()), slice=Tuple(elts=[Name(id='str', ctx=Load()), Name(id='str', ctx=Load()), Name(id='str', ctx=Load())], ctx=Load()), ctx=Load()), ctx=Load())), keyword(arg='repr', value=Constant(value=False))])",
+      "rendered": "field(default_factory=set[tuple[str, str, str]], repr=False)"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[UnaryOp(op=Not(), operand=Name(id='source_local_id', ctx=Load())), UnaryOp(op=Not(), operand=Name(id='target_local_id', ctx=Load())), Compare(left=Name(id='source_local_id', ctx=Load()), ops=[Eq()], comparators=[Name(id='target_local_id', ctx=Load())])])",
+      "rendered": "not source_local_id or not target_local_id or source_local_id == target_local_id"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 14,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='source_local_id', ctx=Load()), Attribute(value=Name(id='relationship', ctx=Load()), attr='value', ctx=Load()), Name(id='target_local_id', ctx=Load())], ctx=Load())",
+      "rendered": "(source_local_id, relationship.value, target_local_id)"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='key', ctx=Load()), ops=[In()], comparators=[Attribute(value=Name(id='self', ctx=Load()), attr='_seen', ctx=Load())])",
+      "rendered": "key in self._seen"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='edges', ctx=Load())], keywords=[]), ops=[GtE()], comparators=[Name(id='MAX_RESOLUTION_EDGES', ctx=Load())])",
+      "rendered": "len(self.edges) >= MAX_RESOLUTION_EDGES"
+    },
+    {
+      "line_start": 70,
+      "line_end": 72,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ResolutionLimitError', ctx=Load()), args=[JoinedStr(values=[Constant(value='resolution edge count exceeds '), FormattedValue(value=Name(id='MAX_RESOLUTION_EDGES', ctx=Load()), conversion=-1), Constant(value=' bound')])], keywords=[])",
+      "rendered": "ResolutionLimitError(source_template_71_16)"
+    },
+    {
+      "line_start": 73,
+      "line_end": 73,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 74,
+      "line_end": 74,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_seen', ctx=Load()), attr='add', ctx=Load()), args=[Name(id='key', ctx=Load())], keywords=[])",
+      "rendered": "self._seen.add(key)"
+    },
+    {
+      "line_start": 75,
+      "line_end": 82,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='edges', ctx=Load()), attr='append', ctx=Load()), args=[Call(func=Name(id='ResolvedEdge', ctx=Load()), args=[Name(id='source_local_id', ctx=Load()), Name(id='relationship', ctx=Load()), Name(id='target_local_id', ctx=Load()), Call(func=Name(id='tuple', ctx=Load()), args=[Call(func=Name(id='sorted', ctx=Load()), args=[Call(func=Attribute(value=BoolOp(op=Or(), values=[Name(id='properties', ctx=Load()), Dict(keys=[], values=[])]), attr='items', ctx=Load()), args=[], keywords=[])], keywords=[])], keywords=[])], keywords=[])], keywords=[])",
+      "rendered": "self.edges.append(ResolvedEdge(source_local_id, relationship, target_local_id, tuple(sorted((properties or {}).items()))))"
+    },
+    {
+      "line_start": 83,
+      "line_end": 83,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='property_updates', ctx=Load()), attr='setdefault', ctx=Load()), args=[Name(id='symbol_id', ctx=Load()), Dict(keys=[], values=[])], keywords=[]), attr='setdefault', ctx=Load()), args=[Name(id='key', ctx=Load()), Name(id='value', ctx=Load())], keywords=[])",
+      "rendered": "self.property_updates.setdefault(symbol_id, {}).setdefault(key, value)"
+    },
+    {
+      "line_start": 90,
+      "line_end": 90,
+      "column": 11,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[Constant(value='file:'), FormattedValue(value=Name(id='relative_path', ctx=Load()), conversion=-1)])",
+      "rendered": "source_template_90_11"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 11,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[Constant(value='folder:'), FormattedValue(value=Name(id='relative_path', ctx=Load()), conversion=-1)])",
+      "rendered": "source_template_94_11"
+    },
+    {
+      "line_start": 97,
+      "line_end": 97,
+      "column": 1,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dataclass', ctx=Load()), args=[], keywords=[keyword(arg='frozen', value=Constant(value=True))])",
+      "rendered": "dataclass(frozen=True)"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 44,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='config', ctx=Load()), attr='resolution', ctx=Load())",
+      "rendered": "config.resolution"
+    },
+    {
+      "line_start": 118,
+      "line_end": 118,
+      "column": 45,
+      "kind": "DictComp",
+      "original_ast": "DictComp(key=Name(id='path', ctx=Load()), value=Name(id='language', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='path', ctx=Store()), Name(id='language', ctx=Store())], ctx=Store()), iter=Call(func=Name(id='sorted', ctx=Load()), args=[Name(id='files', ctx=Load())], keywords=[]), ifs=[], is_async=0)])",
+      "rendered": "{path: language for path, language in sorted(files)}"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 43,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='tuple', ctx=Load()), args=[Call(func=Name(id='sorted', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='file_language', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "tuple(sorted(self.file_language))"
+    },
+    {
+      "line_start": 120,
+      "line_end": 120,
+      "column": 39,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='frozenset', ctx=Load()), args=[Name(id='folder_paths', ctx=Load())], keywords=[])",
+      "rendered": "frozenset(folder_paths)"
+    },
+    {
+      "line_start": 121,
+      "line_end": 121,
+      "column": 37,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='frozenset', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='file_paths', ctx=Load())], keywords=[])",
+      "rendered": "frozenset(self.file_paths)"
+    },
+    {
+      "line_start": 122,
+      "line_end": 122,
+      "column": 50,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 20,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='file_paths', ctx=Load())",
+      "rendered": "self.file_paths"
+    },
+    {
+      "line_start": 124,
+      "line_end": 126,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='files_by_dir', ctx=Load()), attr='setdefault', ctx=Load()), args=[Call(func=Attribute(value=Name(id='posixpath', ctx=Load()), attr='dirname', ctx=Load()), args=[Name(id='path', ctx=Load())], keywords=[]), List(elts=[], ctx=Load())], keywords=[]), attr='append', ctx=Load()), args=[Call(func=Attribute(value=Name(id='posixpath', ctx=Load()), attr='basename', ctx=Load()), args=[Name(id='path', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "self.files_by_dir.setdefault(posixpath.dirname(path), []).append(posixpath.basename(path))"
+    },
+    {
+      "line_start": 127,
+      "line_end": 127,
+      "column": 51,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 128,
+      "line_end": 128,
+      "column": 20,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='file_paths', ctx=Load())",
+      "rendered": "self.file_paths"
+    },
+    {
+      "line_start": 129,
+      "line_end": 129,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='files_by_base', ctx=Load()), attr='setdefault', ctx=Load()), args=[Call(func=Attribute(value=Name(id='posixpath', ctx=Load()), attr='basename', ctx=Load()), args=[Name(id='path', ctx=Load())], keywords=[]), List(elts=[], ctx=Load())], keywords=[]), attr='append', ctx=Load()), args=[Name(id='path', ctx=Load())], keywords=[])",
+      "rendered": "self.files_by_base.setdefault(posixpath.basename(path), []).append(path)"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 26,
+      "kind": "Name",
+      "original_ast": "Name(id='extraction', ctx=Load())",
+      "rendered": "extraction"
+    },
+    {
+      "line_start": 132,
+      "line_end": 137,
+      "column": 43,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='tuple', ctx=Load()), args=[Call(func=Name(id='sorted', ctx=Load()), args=[GeneratorExp(elt=Name(id='s', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='_', ctx=Store()), Name(id='fr', ctx=Store())], ctx=Store()), iter=Attribute(value=Name(id='extraction', ctx=Load()), attr='files', ctx=Load()), ifs=[], is_async=0), comprehension(target=Name(id='s', ctx=Store()), iter=Attribute(value=Name(id='fr', ctx=Load()), attr='symbols', ctx=Load()), ifs=[], is_async=0)])], keywords=[keyword(arg='key', value=Lambda(args=arguments(posonlyargs=[], args=[arg(arg='s')], kwonlyargs=[], kw_defaults=[], defaults=[]), body=Tuple(elts=[Attribute(value=Name(id='s', ctx=Load()), attr='file_path', ctx=Load()), Attribute(value=Name(id='s', ctx=Load()), attr='start_line', ctx=Load()), Attribute(value=Name(id='s', ctx=Load()), attr='id', ctx=Load())], ctx=Load())))])], keywords=[])",
+      "rendered": "tuple(sorted((s for _, fr in extraction.files for s in fr.symbols), key=lambda s: (s.file_path, s.start_line, s.id)))"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 48,
+      "kind": "DictComp",
+      "original_ast": "DictComp(key=Attribute(value=Name(id='s', ctx=Load()), attr='id', ctx=Load()), value=Name(id='s', ctx=Load()), generators=[comprehension(target=Name(id='s', ctx=Store()), iter=Attribute(value=Name(id='self', ctx=Load()), attr='symbols', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "{s.id: s for s in self.symbols}"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 56,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 22,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='symbols', ctx=Load())",
+      "rendered": "self.symbols"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='symbols_by_name', ctx=Load()), attr='setdefault', ctx=Load()), args=[Attribute(value=Name(id='symbol', ctx=Load()), attr='name', ctx=Load()), List(elts=[], ctx=Load())], keywords=[])",
+      "rendered": "self.symbols_by_name.setdefault(symbol.name, [])"
+    },
+    {
+      "line_start": 142,
+      "line_end": 142,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='bucket', ctx=Load())], keywords=[]), ops=[Lt()], comparators=[Name(id='MAX_CANDIDATES_PER_NAME', ctx=Load())])",
+      "rendered": "len(bucket) < MAX_CANDIDATES_PER_NAME"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='bucket', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='symbol', ctx=Load())], keywords=[])",
+      "rendered": "bucket.append(symbol)"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='symbols_by_name', ctx=Load()), attr='values', ctx=Load()), args=[], keywords=[])",
+      "rendered": "self.symbols_by_name.values()"
+    },
+    {
+      "line_start": 145,
+      "line_end": 145,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='bucket', ctx=Load()), attr='sort', ctx=Load()), args=[], keywords=[keyword(arg='key', value=Lambda(args=arguments(posonlyargs=[], args=[arg(arg='s')], kwonlyargs=[], kw_defaults=[], defaults=[]), body=Attribute(value=Name(id='s', ctx=Load()), attr='id', ctx=Load())))])",
+      "rendered": "bucket.sort(key=lambda s: s.id)"
+    },
+    {
+      "line_start": 146,
+      "line_end": 146,
+      "column": 54,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 22,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='symbols', ctx=Load())",
+      "rendered": "self.symbols"
+    },
+    {
+      "line_start": 148,
+      "line_end": 150,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_ranges', ctx=Load()), attr='setdefault', ctx=Load()), args=[Attribute(value=Name(id='symbol', ctx=Load()), attr='file_path', ctx=Load()), List(elts=[], ctx=Load())], keywords=[]), attr='append', ctx=Load()), args=[Call(func=Name(id='_SymbolRange', ctx=Load()), args=[Attribute(value=Name(id='symbol', ctx=Load()), attr='id', ctx=Load()), Attribute(value=Name(id='symbol', ctx=Load()), attr='start_line', ctx=Load()), Attribute(value=Name(id='symbol', ctx=Load()), attr='end_line', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "self._ranges.setdefault(symbol.file_path, []).append(_SymbolRange(symbol.id, symbol.start_line, symbol.end_line))"
+    },
+    {
+      "line_start": 152,
+      "line_end": 152,
+      "column": 30,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_build_import_alias_map', ctx=Load()), args=[Name(id='extraction', ctx=Load())], keywords=[])",
+      "rendered": "_build_import_alias_map(extraction)"
+    },
+    {
+      "line_start": 153,
+      "line_end": 153,
+      "column": 30,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_build_receiver_type_map', ctx=Load()), args=[Name(id='extraction', ctx=Load())], keywords=[])",
+      "rendered": "_build_receiver_type_map(extraction)"
+    },
+    {
+      "line_start": 156,
+      "line_end": 156,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='path', ctx=Load()), ops=[In()], comparators=[Attribute(value=Name(id='self', ctx=Load()), attr='files', ctx=Load())])",
+      "rendered": "path in self.files"
+    },
+    {
+      "line_start": 159,
+      "line_end": 159,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='base_path', ctx=Load()), ops=[In()], comparators=[Attribute(value=Name(id='self', ctx=Load()), attr='files', ctx=Load())])",
+      "rendered": "base_path in self.files"
+    },
+    {
+      "line_start": 160,
+      "line_end": 160,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='base_path', ctx=Load())",
+      "rendered": "base_path"
+    },
+    {
+      "line_start": 161,
+      "line_end": 161,
+      "column": 25,
+      "kind": "Name",
+      "original_ast": "Name(id='extensions', ctx=Load())",
+      "rendered": "extensions"
+    },
+    {
+      "line_start": 162,
+      "line_end": 162,
+      "column": 24,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Name(id='base_path', ctx=Load()), op=Add(), right=Name(id='extension', ctx=Load()))",
+      "rendered": "base_path + extension"
+    },
+    {
+      "line_start": 163,
+      "line_end": 163,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='candidate', ctx=Load()), ops=[In()], comparators=[Attribute(value=Name(id='self', ctx=Load()), attr='files', ctx=Load())])",
+      "rendered": "candidate in self.files"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='candidate', ctx=Load())",
+      "rendered": "candidate"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 168,
+      "line_end": 168,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='posixpath', ctx=Load()), attr='basename', ctx=Load()), args=[Name(id='suffix', ctx=Load())], keywords=[])",
+      "rendered": "posixpath.basename(suffix)"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='files_by_base', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='base', ctx=Load()), List(elts=[], ctx=Load())], keywords=[])",
+      "rendered": "self.files_by_base.get(base, [])"
+    },
+    {
+      "line_start": 170,
+      "line_end": 170,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='path', ctx=Load()), attr='endswith', ctx=Load()), args=[Name(id='suffix', ctx=Load())], keywords=[])",
+      "rendered": "path.endswith(suffix)"
+    },
+    {
+      "line_start": 171,
+      "line_end": 171,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='path', ctx=Load())",
+      "rendered": "path"
+    },
+    {
+      "line_start": 172,
+      "line_end": 172,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='files_by_dir', ctx=Load()), attr='get', ctx=Load()), args=[Call(func=Attribute(value=Name(id='directory', ctx=Load()), attr='rstrip', ctx=Load()), args=[Constant(value='/')], keywords=[]), List(elts=[], ctx=Load())], keywords=[])",
+      "rendered": "self.files_by_dir.get(directory.rstrip('/'), [])"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 18,
+      "kind": "Constant",
+      "original_ast": "Constant(value='')",
+      "rendered": "''"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 20,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Constant(value=1), op=LShift(), right=Constant(value=31))",
+      "rendered": "1 << 31"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 25,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_ranges', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='relative_path', ctx=Load()), List(elts=[], ctx=Load())], keywords=[])",
+      "rendered": "self._ranges.get(relative_path, [])"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='candidate', ctx=Load()), attr='start', ctx=Load()), ops=[LtE(), LtE()], comparators=[Name(id='line', ctx=Load()), Attribute(value=Name(id='candidate', ctx=Load()), attr='end', ctx=Load())])",
+      "rendered": "candidate.start <= line <= candidate.end"
+    },
+    {
+      "line_start": 183,
+      "line_end": 183,
+      "column": 23,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Attribute(value=Name(id='candidate', ctx=Load()), attr='end', ctx=Load()), op=Sub(), right=Attribute(value=Name(id='candidate', ctx=Load()), attr='start', ctx=Load()))",
+      "rendered": "candidate.end - candidate.start"
+    },
+    {
+      "line_start": 184,
+      "line_end": 184,
+      "column": 19,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Compare(left=Name(id='span', ctx=Load()), ops=[Lt()], comparators=[Name(id='best_span', ctx=Load())]), BoolOp(op=And(), values=[Compare(left=Name(id='span', ctx=Load()), ops=[Eq()], comparators=[Name(id='best_span', ctx=Load())]), Compare(left=Attribute(value=Name(id='candidate', ctx=Load()), attr='local_id', ctx=Load()), ops=[Lt()], comparators=[Name(id='best_id', ctx=Load())])])])",
+      "rendered": "span < best_span or (span == best_span and candidate.local_id < best_id)"
+    },
+    {
+      "line_start": 185,
+      "line_end": 185,
+      "column": 32,
+      "kind": "Name",
+      "original_ast": "Name(id='span', ctx=Load())",
+      "rendered": "span"
+    },
+    {
+      "line_start": 186,
+      "line_end": 186,
+      "column": 30,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='candidate', ctx=Load()), attr='local_id', ctx=Load())",
+      "rendered": "candidate.local_id"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 15,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Name(id='best_id', ctx=Load()), Call(func=Name(id='file_local_id', ctx=Load()), args=[Name(id='relative_path', ctx=Load())], keywords=[])])",
+      "rendered": "best_id or file_local_id(relative_path)"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='receiver_name', ctx=Load()), ops=[In()], comparators=[Tuple(elts=[Constant(value='self'), Constant(value='this'), Constant(value='cls')], ctx=Load())])",
+      "rendered": "receiver_name in ('self', 'this', 'cls')"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value='')",
+      "rendered": "''"
+    },
+    {
+      "line_start": 193,
+      "line_end": 193,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='receiver_types', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='relative_path', ctx=Load()), Dict(keys=[], values=[])], keywords=[]), attr='get', ctx=Load()), args=[Name(id='receiver_name', ctx=Load()), Constant(value='')], keywords=[])",
+      "rendered": "self.receiver_types.get(relative_path, {}).get(receiver_name, '')"
+    },
+    {
+      "line_start": 197,
+      "line_end": 197,
+      "column": 40,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 198,
+      "line_end": 198,
+      "column": 29,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='extraction', ctx=Load()), attr='files', ctx=Load())",
+      "rendered": "extraction.files"
+    },
+    {
+      "line_start": 199,
+      "line_end": 199,
+      "column": 24,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='file_result', ctx=Load()), attr='imports', ctx=Load())",
+      "rendered": "file_result.imports"
+    },
+    {
+      "line_start": 200,
+      "line_end": 200,
+      "column": 27,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='imported', ctx=Load()), attr='bindings', ctx=Load())",
+      "rendered": "imported.bindings"
+    },
+    {
+      "line_start": 202,
+      "line_end": 205,
+      "column": 20,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Attribute(value=Name(id='binding', ctx=Load()), attr='alias', ctx=Load()), Attribute(value=Name(id='binding', ctx=Load()), attr='original', ctx=Load()), Compare(left=Attribute(value=Name(id='binding', ctx=Load()), attr='alias', ctx=Load()), ops=[NotEq()], comparators=[Attribute(value=Name(id='binding', ctx=Load()), attr='original', ctx=Load())]), Compare(left=Attribute(value=Name(id='binding', ctx=Load()), attr='original', ctx=Load()), ops=[NotEq()], comparators=[Constant(value='*')])])",
+      "rendered": "binding.alias and binding.original and (binding.alias != binding.original) and (binding.original != '*')"
+    },
+    {
+      "line_start": 207,
+      "line_end": 207,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Name(id='result', ctx=Load()), attr='setdefault', ctx=Load()), args=[Name(id='path', ctx=Load()), Dict(keys=[], values=[])], keywords=[]), attr='setdefault', ctx=Load()), args=[Attribute(value=Name(id='binding', ctx=Load()), attr='alias', ctx=Load()), Attribute(value=Name(id='binding', ctx=Load()), attr='original', ctx=Load())], keywords=[])",
+      "rendered": "result.setdefault(path, {}).setdefault(binding.alias, binding.original)"
+    },
+    {
+      "line_start": 208,
+      "line_end": 208,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='result', ctx=Load())",
+      "rendered": "result"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 40,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 213,
+      "line_end": 213,
+      "column": 29,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='extraction', ctx=Load()), attr='files', ctx=Load())",
+      "rendered": "extraction.files"
+    },
+    {
+      "line_start": 214,
+      "line_end": 214,
+      "column": 23,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='file_result', ctx=Load()), attr='type_bindings', ctx=Load())",
+      "rendered": "file_result.type_bindings"
+    },
+    {
+      "line_start": 215,
+      "line_end": 215,
+      "column": 15,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[UnaryOp(op=Not(), operand=Attribute(value=Name(id='binding', ctx=Load()), attr='variable_name', ctx=Load())), UnaryOp(op=Not(), operand=Attribute(value=Name(id='binding', ctx=Load()), attr='type_name', ctx=Load()))])",
+      "rendered": "not binding.variable_name or not binding.type_name"
+    },
+    {
+      "line_start": 217,
+      "line_end": 217,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='binding', ctx=Load()), attr='variable_name', ctx=Load()), attr='startswith', ctx=Load()), args=[Constant(value='@')], keywords=[])",
+      "rendered": "binding.variable_name.startswith('@')"
+    },
+    {
+      "line_start": 219,
+      "line_end": 219,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Name(id='result', ctx=Load()), attr='setdefault', ctx=Load()), args=[Name(id='path', ctx=Load()), Dict(keys=[], values=[])], keywords=[]), attr='setdefault', ctx=Load()), args=[Attribute(value=Name(id='binding', ctx=Load()), attr='variable_name', ctx=Load()), Attribute(value=Name(id='binding', ctx=Load()), attr='type_name', ctx=Load())], keywords=[])",
+      "rendered": "result.setdefault(path, {}).setdefault(binding.variable_name, binding.type_name)"
+    },
+    {
+      "line_start": 220,
+      "line_end": 220,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='result', ctx=Load())",
+      "rendered": "result"
+    }
+  ],
+  "calls": [
+    {
+      "line": 37,
+      "end_line": 37,
+      "callee": "dataclass",
+      "enclosing": "ResolvedEdge",
+      "expression": "dataclass(frozen=True)"
+    },
+    {
+      "line": 97,
+      "end_line": 97,
+      "callee": "dataclass",
+      "enclosing": "_SymbolRange",
+      "expression": "dataclass(frozen=True)"
+    },
+    {
+      "line": 49,
+      "end_line": 49,
+      "callee": "field",
+      "enclosing": "ResolutionResult",
+      "expression": "field(default_factory=list[ResolvedEdge])"
+    },
+    {
+      "line": 50,
+      "end_line": 52,
+      "callee": "field",
+      "enclosing": "ResolutionResult",
+      "expression": "field(\n        default_factory=dict[str, dict[str, object]]\n    )"
+    },
+    {
+      "line": 53,
+      "end_line": 53,
+      "callee": "field",
+      "enclosing": "ResolutionResult",
+      "expression": "field(default_factory=set[tuple[str, str, str]], repr=False)"
+    },
+    {
+      "line": 74,
+      "end_line": 74,
+      "callee": "self._seen.add",
+      "enclosing": "ResolutionResult.add_edge",
+      "expression": "self._seen.add(key)"
+    },
+    {
+      "line": 75,
+      "end_line": 82,
+      "callee": "self.edges.append",
+      "enclosing": "ResolutionResult.add_edge",
+      "expression": "self.edges.append(\n            ResolvedEdge(\n                source_local_id,\n                relationship,\n                target_local_id,\n                tuple(sorted((properties or {}).items())),\n            )\n        )"
+    },
+    {
+      "line": 86,
+      "end_line": 86,
+      "callee": "self.property_updates.setdefault(symbol_id, {}).setdefault",
+      "enclosing": "ResolutionResult.update_property",
+      "expression": "self.property_updates.setdefault(symbol_id, {}).setdefault(key, value)"
+    },
+    {
+      "line": 119,
+      "end_line": 119,
+      "callee": "tuple",
+      "enclosing": "ResolutionContext.__init__",
+      "expression": "tuple(sorted(self.file_language))"
+    },
+    {
+      "line": 120,
+      "end_line": 120,
+      "callee": "frozenset",
+      "enclosing": "ResolutionContext.__init__",
+      "expression": "frozenset(folder_paths)"
+    },
+    {
+      "line": 121,
+      "end_line": 121,
+      "callee": "frozenset",
+      "enclosing": "ResolutionContext.__init__",
+      "expression": "frozenset(self.file_paths)"
+    },
+    {
+      "line": 132,
+      "end_line": 137,
+      "callee": "tuple",
+      "enclosing": "ResolutionContext.__init__",
+      "expression": "tuple(\n            sorted(\n                (s for _, fr in extraction.files for s in fr.symbols),\n                key=lambda s: (s.file_path, s.start_line, s.id),\n            )\n        )"
+    },
+    {
+      "line": 144,
+      "end_line": 144,
+      "callee": "self.symbols_by_name.values",
+      "enclosing": "ResolutionContext.__init__",
+      "expression": "self.symbols_by_name.values()"
+    },
+    {
+      "line": 152,
+      "end_line": 152,
+      "callee": "_build_import_alias_map",
+      "enclosing": "ResolutionContext.__init__",
+      "expression": "_build_import_alias_map(extraction)"
+    },
+    {
+      "line": 153,
+      "end_line": 153,
+      "callee": "_build_receiver_type_map",
+      "enclosing": "ResolutionContext.__init__",
+      "expression": "_build_receiver_type_map(extraction)"
+    },
+    {
+      "line": 168,
+      "end_line": 168,
+      "callee": "posixpath.basename",
+      "enclosing": "ResolutionContext.lookup_suffix",
+      "expression": "posixpath.basename(suffix)"
+    },
+    {
+      "line": 169,
+      "end_line": 169,
+      "callee": "self.files_by_base.get",
+      "enclosing": "ResolutionContext.lookup_suffix",
+      "expression": "self.files_by_base.get(base, [])"
+    },
+    {
+      "line": 175,
+      "end_line": 175,
+      "callee": "self.files_by_dir.get",
+      "enclosing": "ResolutionContext.files_in_dir",
+      "expression": "self.files_by_dir.get(directory.rstrip(\"/\"), [])"
+    },
+    {
+      "line": 181,
+      "end_line": 181,
+      "callee": "self._ranges.get",
+      "enclosing": "ResolutionContext.enclosing_symbol",
+      "expression": "self._ranges.get(relative_path, [])"
+    },
+    {
+      "line": 193,
+      "end_line": 193,
+      "callee": "self.receiver_types.get(relative_path, {}).get",
+      "enclosing": "ResolutionContext.receiver_type",
+      "expression": "self.receiver_types.get(relative_path, {}).get(receiver_name, \"\")"
+    },
+    {
+      "line": 69,
+      "end_line": 69,
+      "callee": "len",
+      "enclosing": "ResolutionResult.add_edge",
+      "expression": "len(self.edges)"
+    },
+    {
+      "line": 70,
+      "end_line": 72,
+      "callee": "ResolutionLimitError",
+      "enclosing": "ResolutionResult.add_edge",
+      "expression": "ResolutionLimitError(\n                f\"resolution edge count exceeds {MAX_RESOLUTION_EDGES} bound\"\n            )"
+    },
+    {
+      "line": 76,
+      "end_line": 81,
+      "callee": "ResolvedEdge",
+      "enclosing": "ResolutionResult.add_edge",
+      "expression": "ResolvedEdge(\n                source_local_id,\n                relationship,\n                target_local_id,\n                tuple(sorted((properties or {}).items())),\n            )"
+    },
+    {
+      "line": 119,
+      "end_line": 119,
+      "callee": "sorted",
+      "enclosing": "ResolutionContext.__init__",
+      "expression": "sorted(self.file_language)"
+    },
+    {
+      "line": 124,
+      "end_line": 126,
+      "callee": "self.files_by_dir.setdefault(posixpath.dirname(path), []).append",
+      "enclosing": "ResolutionContext.__init__",
+      "expression": "self.files_by_dir.setdefault(posixpath.dirname(path), []).append(\n                posixpath.basename(path)\n            )"
+    },
+    {
+      "line": 129,
+      "end_line": 129,
+      "callee": "self.files_by_base.setdefault(posixpath.basename(path), []).append",
+      "enclosing": "ResolutionContext.__init__",
+      "expression": "self.files_by_base.setdefault(posixpath.basename(path), []).append(path)"
+    },
+    {
+      "line": 133,
+      "end_line": 136,
+      "callee": "sorted",
+      "enclosing": "ResolutionContext.__init__",
+      "expression": "sorted(\n                (s for _, fr in extraction.files for s in fr.symbols),\n                key=lambda s: (s.file_path, s.start_line, s.id),\n            )"
+    },
+    {
+      "line": 141,
+      "end_line": 141,
+      "callee": "self.symbols_by_name.setdefault",
+      "enclosing": "ResolutionContext.__init__",
+      "expression": "self.symbols_by_name.setdefault(symbol.name, [])"
+    },
+    {
+      "line": 145,
+      "end_line": 145,
+      "callee": "bucket.sort",
+      "enclosing": "ResolutionContext.__init__",
+      "expression": "bucket.sort(key=lambda s: s.id)"
+    },
+    {
+      "line": 148,
+      "end_line": 150,
+      "callee": "self._ranges.setdefault(symbol.file_path, []).append",
+      "enclosing": "ResolutionContext.__init__",
+      "expression": "self._ranges.setdefault(symbol.file_path, []).append(\n                _SymbolRange(symbol.id, symbol.start_line, symbol.end_line)\n            )"
+    },
+    {
+      "line": 170,
+      "end_line": 170,
+      "callee": "path.endswith",
+      "enclosing": "ResolutionContext.lookup_suffix",
+      "expression": "path.endswith(suffix)"
+    },
+    {
+      "line": 175,
+      "end_line": 175,
+      "callee": "directory.rstrip",
+      "enclosing": "ResolutionContext.files_in_dir",
+      "expression": "directory.rstrip(\"/\")"
+    },
+    {
+      "line": 187,
+      "end_line": 187,
+      "callee": "file_local_id",
+      "enclosing": "ResolutionContext.enclosing_symbol",
+      "expression": "file_local_id(relative_path)"
+    },
+    {
+      "line": 217,
+      "end_line": 217,
+      "callee": "binding.variable_name.startswith",
+      "enclosing": "_build_receiver_type_map",
+      "expression": "binding.variable_name.startswith(\"@\")"
+    },
+    {
+      "line": 219,
+      "end_line": 219,
+      "callee": "result.setdefault(path, {}).setdefault",
+      "enclosing": "_build_receiver_type_map",
+      "expression": "result.setdefault(path, {}).setdefault(binding.variable_name, binding.type_name)"
+    },
+    {
+      "line": 80,
+      "end_line": 80,
+      "callee": "tuple",
+      "enclosing": "ResolutionResult.add_edge",
+      "expression": "tuple(sorted((properties or {}).items()))"
+    },
+    {
+      "line": 86,
+      "end_line": 86,
+      "callee": "self.property_updates.setdefault",
+      "enclosing": "ResolutionResult.update_property",
+      "expression": "self.property_updates.setdefault(symbol_id, {})"
+    },
+    {
+      "line": 118,
+      "end_line": 118,
+      "callee": "sorted",
+      "enclosing": "ResolutionContext.__init__",
+      "expression": "sorted(files)"
+    },
+    {
+      "line": 125,
+      "end_line": 125,
+      "callee": "posixpath.basename",
+      "enclosing": "ResolutionContext.__init__",
+      "expression": "posixpath.basename(path)"
+    },
+    {
+      "line": 142,
+      "end_line": 142,
+      "callee": "len",
+      "enclosing": "ResolutionContext.__init__",
+      "expression": "len(bucket)"
+    },
+    {
+      "line": 143,
+      "end_line": 143,
+      "callee": "bucket.append",
+      "enclosing": "ResolutionContext.__init__",
+      "expression": "bucket.append(symbol)"
+    },
+    {
+      "line": 149,
+      "end_line": 149,
+      "callee": "_SymbolRange",
+      "enclosing": "ResolutionContext.__init__",
+      "expression": "_SymbolRange(symbol.id, symbol.start_line, symbol.end_line)"
+    },
+    {
+      "line": 193,
+      "end_line": 193,
+      "callee": "self.receiver_types.get",
+      "enclosing": "ResolutionContext.receiver_type",
+      "expression": "self.receiver_types.get(relative_path, {})"
+    },
+    {
+      "line": 80,
+      "end_line": 80,
+      "callee": "sorted",
+      "enclosing": "ResolutionResult.add_edge",
+      "expression": "sorted((properties or {}).items())"
+    },
+    {
+      "line": 124,
+      "end_line": 124,
+      "callee": "self.files_by_dir.setdefault",
+      "enclosing": "ResolutionContext.__init__",
+      "expression": "self.files_by_dir.setdefault(posixpath.dirname(path), [])"
+    },
+    {
+      "line": 129,
+      "end_line": 129,
+      "callee": "self.files_by_base.setdefault",
+      "enclosing": "ResolutionContext.__init__",
+      "expression": "self.files_by_base.setdefault(posixpath.basename(path), [])"
+    },
+    {
+      "line": 148,
+      "end_line": 148,
+      "callee": "self._ranges.setdefault",
+      "enclosing": "ResolutionContext.__init__",
+      "expression": "self._ranges.setdefault(symbol.file_path, [])"
+    },
+    {
+      "line": 207,
+      "end_line": 207,
+      "callee": "result.setdefault(path, {}).setdefault",
+      "enclosing": "_build_import_alias_map",
+      "expression": "result.setdefault(path, {}).setdefault(binding.alias, binding.original)"
+    },
+    {
+      "line": 219,
+      "end_line": 219,
+      "callee": "result.setdefault",
+      "enclosing": "_build_receiver_type_map",
+      "expression": "result.setdefault(path, {})"
+    },
+    {
+      "line": 80,
+      "end_line": 80,
+      "callee": "(properties or {}).items",
+      "enclosing": "ResolutionResult.add_edge",
+      "expression": "(properties or {}).items()"
+    },
+    {
+      "line": 124,
+      "end_line": 124,
+      "callee": "posixpath.dirname",
+      "enclosing": "ResolutionContext.__init__",
+      "expression": "posixpath.dirname(path)"
+    },
+    {
+      "line": 129,
+      "end_line": 129,
+      "callee": "posixpath.basename",
+      "enclosing": "ResolutionContext.__init__",
+      "expression": "posixpath.basename(path)"
+    },
+    {
+      "line": 207,
+      "end_line": 207,
+      "callee": "result.setdefault",
+      "enclosing": "_build_import_alias_map",
+      "expression": "result.setdefault(path, {})"
+    }
+  ],
+  "imports": [
+    {
+      "line": 22,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 24,
+      "source_expression": "import posixpath",
+      "targets": [
+        "posixpath"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 25,
+      "source_expression": "from collections.abc import Mapping, Sequence",
+      "targets": [
+        "collections.abc",
+        "collections.abc.Mapping",
+        "collections.abc.Sequence"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 26,
+      "source_expression": "from dataclasses import dataclass, field",
+      "targets": [
+        "dataclasses",
+        "dataclasses.dataclass",
+        "dataclasses.field"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 28,
+      "source_expression": "from context_graph_sdk.errors import ResolutionLimitError",
+      "targets": [
+        "context_graph_sdk.errors",
+        "context_graph_sdk.errors.ResolutionLimitError"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/errors.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 29,
+      "source_expression": "from context_graph_sdk.extractors.records import ExtractionResult, Symbol",
+      "targets": [
+        "context_graph_sdk.extractors.records",
+        "context_graph_sdk.extractors.records.ExtractionResult",
+        "context_graph_sdk.extractors.records.Symbol"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/extractors/records.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 30,
+      "source_expression": "from context_graph_sdk.models import LocalRelationshipType",
+      "targets": [
+        "context_graph_sdk.models",
+        "context_graph_sdk.models.LocalRelationshipType"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/models.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 31,
+      "source_expression": "from context_graph_sdk.project.config import ProjectConfig, ResolutionSettings",
+      "targets": [
+        "context_graph_sdk.project.config",
+        "context_graph_sdk.project.config.ProjectConfig",
+        "context_graph_sdk.project.config.ResolutionSettings"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/project/config.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

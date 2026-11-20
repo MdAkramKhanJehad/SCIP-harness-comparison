@@ -1,0 +1,3792 @@
+{
+  "source": "vendor/context_graph_sdk/src/context_graph_sdk/resolution/mro.py",
+  "sha256": "1144983182705fcace30e172537dc9fa600eeb8ca69d59aa9270ba5e2c19eee0",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"C3 linearization, language-aware method resolution, and OVERRIDES edges.\"\"\"\n\nfrom __future__ import annotations\n\nfrom dataclasses import dataclass, field\n\nfrom context_graph_sdk.errors import ModelValidationError\nfrom context_graph_sdk.extractors.records import Symbol\nfrom context_graph_sdk.models import LocalRelationshipType\nfrom context_graph_sdk.resolution.context import ResolutionContext, ResolutionResult\nfrom context_graph_sdk.resolution.heritage import CLASS_LIKE_LABELS\n\n_MAX_LINEARIZE_STEPS = 10_000\n_MAX_HIERARCHY_DEPTH = 1_000\n\n\ndef c3_linearize(hierarchy: dict[str, list[str]]) -> dict[str, list[str]]:\n    \"\"\"Iterative C3 MRO; raises on cycles, depth, or unmergeable input.\"\"\"\n    result: dict[str, list[str]] = {}\n    all_classes = sorted(\n        set(hierarchy).union({parent for parents in hierarchy.values() for parent in parents})\n    )\n    for root in all_classes:\n        if root in result:\n            continue\n        stack: list[tuple[str, bool]] = [(root, False)]\n        in_progress: set[str] = set()\n        while stack:\n            if len(stack) > _MAX_HIERARCHY_DEPTH:\n                raise ModelValidationError(\"hierarchy linearization exceeded the depth bound\")\n            cls, expanded = stack.pop()\n            if cls in result:\n                continue\n            parents = hierarchy.get(cls, [])\n            if expanded:\n                sequences = [list(result[parent]) for parent in parents]\n                sequences.append(list(parents))\n                result[cls] = [cls, *_c3_merge(sequences)]\n                in_progress.discard(cls)\n                continue\n            if cls in in_progress:\n                raise ModelValidationError(f\"inconsistent hierarchy: cycle involving {cls!r}\")\n            in_progress.add(cls)\n            stack.append((cls, True))\n            for parent in reversed(parents):\n                if parent in in_progress:\n                    raise ModelValidationError(\n                        f\"inconsistent hierarchy: cycle involving {parent!r}\"\n                    )\n                if parent not in result:\n                    stack.append((parent, False))\n    return result\n\n\ndef _c3_merge(sequences: list[list[str]]) -> list[str]:\n    merged: list[str] = []\n    for _ in range(_MAX_LINEARIZE_STEPS):\n        sequences = [sequence for sequence in sequences if sequence]\n        if not sequences:\n            return merged\n        found = \"\"\n        for sequence in sequences:\n            candidate = sequence[0]\n            if not any(candidate in other[1:] for other in sequences):\n                found = candidate\n                break\n        if not found:\n            raise ModelValidationError(\"inconsistent hierarchy: cannot resolve merge order\")\n        merged.append(found)\n        for sequence in sequences:\n            if sequence and sequence[0] == found:\n                del sequence[0]\n    raise ModelValidationError(\"hierarchy linearization exceeded the step bound\")\n\n\n@dataclass(frozen=True)\nclass MROAmbiguity:\n    method_name: str\n    defined_in: tuple[str, ...]\n    resolved_to: str\n    reason: str\n\n\n@dataclass(frozen=True)\nclass MROEntry:\n    class_name: str\n    language: str\n    ambiguities: tuple[MROAmbiguity, ...] = ()\n\n\n@dataclass\nclass MROComputation:\n    entries: list[MROEntry] = field(default_factory=list[MROEntry])\n    override_edges: int = 0\n    ambiguity_count: int = 0\n\n\n@dataclass(frozen=True)\nclass _AncestorMethod:\n    symbol: Symbol\n    parent: Symbol\n    is_class: bool\n\n\ndef _linearize_all(\n    hierarchy: dict[str, list[str]],\n) -> tuple[dict[str, list[str]], dict[str, str]]:\n    \"\"\"Per-class C3 with memoization; a cycle or merge failure isolates to\n    the affected classes, which deterministically fall back to themselves\n    plus their direct parents.\"\"\"\n    orders: dict[str, list[str]] = {}\n    failures: dict[str, str] = {}\n    for cls in sorted(hierarchy):\n        subset_seen: set[str] = set()\n        pending = [cls]\n        subset: dict[str, list[str]] = {}\n        while pending:\n            current = pending.pop()\n            if current in subset_seen:\n                continue\n            subset_seen.add(current)\n            parents = hierarchy.get(current, [])\n            subset[current] = list(parents)\n            pending.extend(parents)\n        try:\n            orders.update(c3_linearize(subset))\n        except ModelValidationError as error:\n            failures[cls] = str(error)\n            orders[cls] = [cls, *hierarchy.get(cls, [])]\n    return orders, failures\n\n\ndef compute_mro(context: ResolutionContext, result: ResolutionResult) -> MROComputation:\n    \"\"\"Apply full-hierarchy C3 linearization with language-aware ambiguity rules.\n\n    Ancestors along the complete linearization contribute shadowing OVERRIDES\n    relationships and ambiguity resolution.\n    \"\"\"\n    computation = MROComputation()\n\n    parents_by_child: dict[str, list[str]] = {}\n    for edge in result.edges:\n        if edge.relationship in (\n            LocalRelationshipType.INHERITS,\n            LocalRelationshipType.IMPLEMENTS,\n        ):\n            if edge.target_local_id not in context.symbols_by_id:\n                continue\n            bucket = parents_by_child.setdefault(edge.source_local_id, [])\n            if edge.target_local_id not in bucket:\n                bucket.append(edge.target_local_id)\n\n    orders, failures = _linearize_all(parents_by_child)\n\n    methods_by_owner: dict[str, list[Symbol]] = {}\n    for symbol in context.symbols:\n        if symbol.label == \"Method\" and symbol.owner_name:\n            methods_by_owner.setdefault(f\"{symbol.file_path}\\x00{symbol.owner_name}\", []).append(\n                symbol\n            )\n\n    def own_methods(owner: Symbol) -> list[Symbol]:\n        return methods_by_owner.get(f\"{owner.file_path}\\x00{owner.name}\", [])\n\n    for symbol in context.symbols:\n        if symbol.label not in CLASS_LIKE_LABELS:\n            continue\n        if symbol.id not in parents_by_child:\n            continue\n        ancestors = [\n            context.symbols_by_id[ancestor_id]\n            for ancestor_id in orders.get(symbol.id, [])[1:]\n            if ancestor_id in context.symbols_by_id\n        ]\n        if not ancestors:\n            continue\n\n        own_names = {method.name for method in own_methods(symbol)}\n\n        # Shadowing: a child method overrides same-name methods in every\n        # ancestor along the linearization (grandparents included).\n        for child_method in own_methods(symbol):\n            for ancestor in ancestors:\n                for ancestor_method in own_methods(ancestor):\n                    if ancestor_method.name == child_method.name and result.add_edge(\n                        child_method.id,\n                        LocalRelationshipType.OVERRIDES,\n                        ancestor_method.id,\n                    ):\n                        computation.override_edges += 1\n\n        sources_by_name: dict[str, list[_AncestorMethod]] = {}\n        for ancestor in ancestors:\n            is_class = ancestor.label in (\"Class\", \"Struct\")\n            for method in own_methods(ancestor):\n                sources_by_name.setdefault(method.name, []).append(\n                    _AncestorMethod(method, ancestor, is_class)\n                )\n\n        ambiguities: list[MROAmbiguity] = []\n        if symbol.id in failures:\n            ambiguities.append(\n                MROAmbiguity(\"\", (), \"\", f\"linearization fallback: {failures[symbol.id]}\")\n            )\n        for method_name in sorted(sources_by_name):\n            if method_name in own_names:\n                continue\n            unique: list[_AncestorMethod] = []\n            seen: set[str] = set()\n            for source in sources_by_name[method_name]:\n                if source.symbol.id not in seen:\n                    seen.add(source.symbol.id)\n                    unique.append(source)\n            if len(unique) < 2:\n                continue\n            resolved_to, reason = _resolve_ambiguity(symbol.language, unique, ancestors)\n            ambiguities.append(\n                MROAmbiguity(\n                    method_name,\n                    tuple(source.symbol.id for source in unique),\n                    resolved_to,\n                    reason,\n                )\n            )\n            if resolved_to:\n                if result.add_edge(symbol.id, LocalRelationshipType.OVERRIDES, resolved_to):\n                    computation.override_edges += 1\n            else:\n                computation.ambiguity_count += 1\n\n        computation.entries.append(MROEntry(symbol.name, symbol.language, tuple(ambiguities)))\n    return computation\n\n\ndef _resolve_ambiguity(\n    language: str, sources: list[_AncestorMethod], parent_order: list[Symbol]\n) -> tuple[str, str]:\n    if language == \"cpp\":\n        return _resolve_leftmost(sources, parent_order, \"C++ leftmost\")\n    if language == \"python\":\n        return _resolve_leftmost(sources, parent_order, \"Python C3\")\n    if language in (\"csharp\", \"java\"):\n        return _resolve_class_beats_interface(sources)\n    if language == \"rust\":\n        return \"\", \"ambiguous: Rust requires qualified syntax (<Type as Trait>::method)\"\n    return _resolve_leftmost(sources, parent_order, \"leftmost base\")\n\n\ndef _resolve_leftmost(\n    sources: list[_AncestorMethod], parent_order: list[Symbol], prefix: str\n) -> tuple[str, str]:\n    # parent_order is the C3 linearization tail, so \"leftmost\" means the\n    # earliest ancestor in true MRO order.\n    order_index = {parent.id: index for index, parent in enumerate(parent_order)}\n    best: _AncestorMethod | None = None\n    best_index = len(parent_order) + 1\n    for source in sources:\n        index = order_index.get(source.parent.id)\n        if index is not None and index < best_index:\n            best_index = index\n            best = source\n    if best is not None:\n        return best.symbol.id, f\"{prefix} base {best.parent.name} wins\"\n    return sources[0].symbol.id, f\"{prefix} (fallback)\"\n\n\ndef _resolve_class_beats_interface(sources: list[_AncestorMethod]) -> tuple[str, str]:\n    class_sources = [source for source in sources if source.is_class]\n    interface_sources = [source for source in sources if not source.is_class]\n    if len(class_sources) == 1:\n        return class_sources[0].symbol.id, \"class method wins over interface default\"\n    if len(class_sources) > 1:\n        return \"\", \"ambiguous: multiple class methods\"\n    if len(interface_sources) == 1:\n        return interface_sources[0].symbol.id, \"single interface method\"\n    return \"\", \"ambiguous: multiple interface defaults\"\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/resolution/mro.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "C3 linearization, language-aware method resolution, and OVERRIDES edges.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_32_4": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/resolution/mro.py",
+      "line_start": 32,
+      "line_end": 32,
+      "value": "Iterative C3 MRO; raises on cycles, depth, or unmergeable input.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_56_43": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/resolution/mro.py",
+      "line_start": 56,
+      "line_end": 56,
+      "source_expression": "f\"inconsistent hierarchy: cycle involving {cls!r}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_62_24": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/resolution/mro.py",
+      "line_start": 62,
+      "line_end": 62,
+      "source_expression": "f\"inconsistent hierarchy: cycle involving {parent!r}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_122_4": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/resolution/mro.py",
+      "line_start": 122,
+      "line_end": 124,
+      "value": "Per-class C3 with memoization; a cycle or merge failure isolates to\n    the affected classes, which deterministically fall back to themselves\n    plus their direct parents.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_148_4": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/resolution/mro.py",
+      "line_start": 148,
+      "line_end": 152,
+      "value": "Apply full-hierarchy C3 linearization with language-aware ambiguity rules.\n\n    Ancestors along the complete linearization contribute shadowing OVERRIDES\n    relationships and ambiguity resolution.\n    ",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_172_40": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/resolution/mro.py",
+      "line_start": 172,
+      "line_end": 172,
+      "source_expression": "f\"{symbol.file_path}\\x00{symbol.owner_name}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_177_36": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/resolution/mro.py",
+      "line_start": 177,
+      "line_end": 177,
+      "source_expression": "f\"{owner.file_path}\\x00{owner.name}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_217_41": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/resolution/mro.py",
+      "line_start": 217,
+      "line_end": 217,
+      "source_expression": "f\"linearization fallback: {failures[symbol.id]}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_277_31": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/resolution/mro.py",
+      "line_start": 277,
+      "line_end": 277,
+      "source_expression": "f\"{prefix} base {best.parent.name} wins\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_278_33": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/resolution/mro.py",
+      "line_start": 278,
+      "line_end": 278,
+      "source_expression": "f\"{prefix} (fallback)\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "C3 linearization, language-aware method resolution, and OVERRIDES edges.",
+      "context": "literal"
+    },
+    {
+      "line_start": 32,
+      "line_end": 32,
+      "column": 4,
+      "value": "Iterative C3 MRO; raises on cycles, depth, or unmergeable input.",
+      "context": "literal"
+    },
+    {
+      "line_start": 122,
+      "line_end": 124,
+      "column": 4,
+      "value": "Per-class C3 with memoization; a cycle or merge failure isolates to\n    the affected classes, which deterministically fall back to themselves\n    plus their direct parents.",
+      "context": "literal"
+    },
+    {
+      "line_start": 148,
+      "line_end": 152,
+      "column": 4,
+      "value": "Apply full-hierarchy C3 linearization with language-aware ambiguity rules.\n\n    Ancestors along the complete linearization contribute shadowing OVERRIDES\n    relationships and ambiguity resolution.\n    ",
+      "context": "literal"
+    },
+    {
+      "line_start": 75,
+      "line_end": 75,
+      "column": 16,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 87,
+      "line_end": 87,
+      "column": 31,
+      "value": "hierarchy linearization exceeded the step bound",
+      "context": "literal"
+    },
+    {
+      "line_start": 252,
+      "line_end": 252,
+      "column": 19,
+      "value": "cpp",
+      "context": "literal"
+    },
+    {
+      "line_start": 254,
+      "line_end": 254,
+      "column": 19,
+      "value": "python",
+      "context": "literal"
+    },
+    {
+      "line_start": 258,
+      "line_end": 258,
+      "column": 19,
+      "value": "rust",
+      "context": "literal"
+    },
+    {
+      "line_start": 260,
+      "line_end": 260,
+      "column": 52,
+      "value": "leftmost base",
+      "context": "literal"
+    },
+    {
+      "line_start": 290,
+      "line_end": 290,
+      "column": 11,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 290,
+      "line_end": 290,
+      "column": 15,
+      "value": "ambiguous: multiple interface defaults",
+      "context": "literal"
+    },
+    {
+      "line_start": 253,
+      "line_end": 253,
+      "column": 56,
+      "value": "C++ leftmost",
+      "context": "literal"
+    },
+    {
+      "line_start": 255,
+      "line_end": 255,
+      "column": 56,
+      "value": "Python C3",
+      "context": "literal"
+    },
+    {
+      "line_start": 256,
+      "line_end": 256,
+      "column": 20,
+      "value": "csharp",
+      "context": "literal"
+    },
+    {
+      "line_start": 256,
+      "line_end": 256,
+      "column": 30,
+      "value": "java",
+      "context": "literal"
+    },
+    {
+      "line_start": 259,
+      "line_end": 259,
+      "column": 15,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 259,
+      "line_end": 259,
+      "column": 19,
+      "value": "ambiguous: Rust requires qualified syntax (<Type as Trait>::method)",
+      "context": "literal"
+    },
+    {
+      "line_start": 278,
+      "line_end": 278,
+      "column": 43,
+      "value": " (fallback)",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 285,
+      "line_end": 285,
+      "column": 43,
+      "value": "class method wins over interface default",
+      "context": "literal"
+    },
+    {
+      "line_start": 287,
+      "line_end": 287,
+      "column": 15,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 287,
+      "line_end": 287,
+      "column": 19,
+      "value": "ambiguous: multiple class methods",
+      "context": "literal"
+    },
+    {
+      "line_start": 289,
+      "line_end": 289,
+      "column": 47,
+      "value": "single interface method",
+      "context": "literal"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 39,
+      "value": "inconsistent hierarchy: cannot resolve merge order",
+      "context": "literal"
+    },
+    {
+      "line_start": 171,
+      "line_end": 171,
+      "column": 27,
+      "value": "Method",
+      "context": "literal"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 55,
+      "value": "\u0000",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 277,
+      "line_end": 277,
+      "column": 41,
+      "value": " base ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 277,
+      "line_end": 277,
+      "column": 65,
+      "value": " wins",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 44,
+      "line_end": 44,
+      "column": 43,
+      "value": "hierarchy linearization exceeded the depth bound",
+      "context": "literal"
+    },
+    {
+      "line_start": 208,
+      "line_end": 208,
+      "column": 42,
+      "value": "Class",
+      "context": "literal"
+    },
+    {
+      "line_start": 208,
+      "line_end": 208,
+      "column": 51,
+      "value": "Struct",
+      "context": "literal"
+    },
+    {
+      "line_start": 217,
+      "line_end": 217,
+      "column": 29,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 217,
+      "line_end": 217,
+      "column": 37,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 56,
+      "line_end": 56,
+      "column": 45,
+      "value": "inconsistent hierarchy: cycle involving ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 217,
+      "line_end": 217,
+      "column": 43,
+      "value": "linearization fallback: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 62,
+      "line_end": 62,
+      "column": 26,
+      "value": "inconsistent hierarchy: cycle involving ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 172,
+      "line_end": 172,
+      "column": 60,
+      "value": "\u0000",
+      "context": "f-string segment"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 194,
+      "text": "# Shadowing: a child method overrides same-name methods in every"
+    },
+    {
+      "line": 195,
+      "text": "# ancestor along the linearization (grandparents included)."
+    },
+    {
+      "line": 266,
+      "text": "# parent_order is the C3 linearization tail, so \"leftmost\" means the"
+    },
+    {
+      "line": 267,
+      "text": "# earliest ancestor in true MRO order."
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 23,
+      "line_end": 23,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "Assign",
+      "line_start": 27,
+      "line_end": 27,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "Assign",
+      "line_start": 28,
+      "line_end": 28,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 31,
+      "line_end": 66,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 5
+    },
+    {
+      "kind": "Expr",
+      "line_start": 32,
+      "line_end": 32,
+      "column": 4,
+      "owner": "c3_linearize",
+      "representation_line": 11
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 33,
+      "line_end": 33,
+      "column": 4,
+      "owner": "c3_linearize",
+      "representation_line": 11
+    },
+    {
+      "kind": "Assign",
+      "line_start": 34,
+      "line_end": 36,
+      "column": 4,
+      "owner": "c3_linearize",
+      "representation_line": 11
+    },
+    {
+      "kind": "For",
+      "line_start": 37,
+      "line_end": 65,
+      "column": 4,
+      "owner": "c3_linearize",
+      "representation_line": 12
+    },
+    {
+      "kind": "If",
+      "line_start": 38,
+      "line_end": 39,
+      "column": 8,
+      "owner": "c3_linearize",
+      "representation_line": 14
+    },
+    {
+      "kind": "Continue",
+      "line_start": 39,
+      "line_end": 39,
+      "column": 12,
+      "owner": "c3_linearize",
+      "representation_line": 16
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 40,
+      "line_end": 40,
+      "column": 8,
+      "owner": "c3_linearize",
+      "representation_line": 20
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 41,
+      "line_end": 41,
+      "column": 8,
+      "owner": "c3_linearize",
+      "representation_line": 20
+    },
+    {
+      "kind": "While",
+      "line_start": 42,
+      "line_end": 65,
+      "column": 8,
+      "owner": "c3_linearize",
+      "representation_line": 21
+    },
+    {
+      "kind": "If",
+      "line_start": 43,
+      "line_end": 44,
+      "column": 12,
+      "owner": "c3_linearize",
+      "representation_line": 23
+    },
+    {
+      "kind": "Raise",
+      "line_start": 44,
+      "line_end": 44,
+      "column": 16,
+      "owner": "c3_linearize",
+      "representation_line": 25
+    },
+    {
+      "kind": "Assign",
+      "line_start": 45,
+      "line_end": 45,
+      "column": 12,
+      "owner": "c3_linearize",
+      "representation_line": 29
+    },
+    {
+      "kind": "If",
+      "line_start": 46,
+      "line_end": 47,
+      "column": 12,
+      "owner": "c3_linearize",
+      "representation_line": 30
+    },
+    {
+      "kind": "Continue",
+      "line_start": 47,
+      "line_end": 47,
+      "column": 16,
+      "owner": "c3_linearize",
+      "representation_line": 32
+    },
+    {
+      "kind": "Assign",
+      "line_start": 48,
+      "line_end": 48,
+      "column": 12,
+      "owner": "c3_linearize",
+      "representation_line": 36
+    },
+    {
+      "kind": "If",
+      "line_start": 49,
+      "line_end": 54,
+      "column": 12,
+      "owner": "c3_linearize",
+      "representation_line": 37
+    },
+    {
+      "kind": "Assign",
+      "line_start": 50,
+      "line_end": 50,
+      "column": 16,
+      "owner": "c3_linearize",
+      "representation_line": 40
+    },
+    {
+      "kind": "Expr",
+      "line_start": 51,
+      "line_end": 51,
+      "column": 16,
+      "owner": "c3_linearize",
+      "representation_line": 40
+    },
+    {
+      "kind": "Assign",
+      "line_start": 52,
+      "line_end": 52,
+      "column": 16,
+      "owner": "c3_linearize",
+      "representation_line": 40
+    },
+    {
+      "kind": "Expr",
+      "line_start": 53,
+      "line_end": 53,
+      "column": 16,
+      "owner": "c3_linearize",
+      "representation_line": 40
+    },
+    {
+      "kind": "Continue",
+      "line_start": 54,
+      "line_end": 54,
+      "column": 16,
+      "owner": "c3_linearize",
+      "representation_line": 41
+    },
+    {
+      "kind": "If",
+      "line_start": 55,
+      "line_end": 56,
+      "column": 12,
+      "owner": "c3_linearize",
+      "representation_line": 44
+    },
+    {
+      "kind": "Raise",
+      "line_start": 56,
+      "line_end": 56,
+      "column": 16,
+      "owner": "c3_linearize",
+      "representation_line": 46
+    },
+    {
+      "kind": "Expr",
+      "line_start": 57,
+      "line_end": 57,
+      "column": 12,
+      "owner": "c3_linearize",
+      "representation_line": 50
+    },
+    {
+      "kind": "Expr",
+      "line_start": 58,
+      "line_end": 58,
+      "column": 12,
+      "owner": "c3_linearize",
+      "representation_line": 50
+    },
+    {
+      "kind": "For",
+      "line_start": 59,
+      "line_end": 65,
+      "column": 12,
+      "owner": "c3_linearize",
+      "representation_line": 51
+    },
+    {
+      "kind": "If",
+      "line_start": 60,
+      "line_end": 63,
+      "column": 16,
+      "owner": "c3_linearize",
+      "representation_line": 53
+    },
+    {
+      "kind": "Raise",
+      "line_start": 61,
+      "line_end": 63,
+      "column": 20,
+      "owner": "c3_linearize",
+      "representation_line": 55
+    },
+    {
+      "kind": "If",
+      "line_start": 64,
+      "line_end": 65,
+      "column": 16,
+      "owner": "c3_linearize",
+      "representation_line": 58
+    },
+    {
+      "kind": "Expr",
+      "line_start": 65,
+      "line_end": 65,
+      "column": 20,
+      "owner": "c3_linearize",
+      "representation_line": 61
+    },
+    {
+      "kind": "Return",
+      "line_start": 66,
+      "line_end": 66,
+      "column": 4,
+      "owner": "c3_linearize",
+      "representation_line": 66
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 69,
+      "line_end": 87,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 70
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 70,
+      "line_end": 70,
+      "column": 4,
+      "owner": "_c3_merge",
+      "representation_line": 76
+    },
+    {
+      "kind": "For",
+      "line_start": 71,
+      "line_end": 86,
+      "column": 4,
+      "owner": "_c3_merge",
+      "representation_line": 77
+    },
+    {
+      "kind": "Assign",
+      "line_start": 72,
+      "line_end": 72,
+      "column": 8,
+      "owner": "_c3_merge",
+      "representation_line": 80
+    },
+    {
+      "kind": "If",
+      "line_start": 73,
+      "line_end": 74,
+      "column": 8,
+      "owner": "_c3_merge",
+      "representation_line": 81
+    },
+    {
+      "kind": "Return",
+      "line_start": 74,
+      "line_end": 74,
+      "column": 12,
+      "owner": "_c3_merge",
+      "representation_line": 83
+    },
+    {
+      "kind": "Assign",
+      "line_start": 75,
+      "line_end": 75,
+      "column": 8,
+      "owner": "_c3_merge",
+      "representation_line": 87
+    },
+    {
+      "kind": "For",
+      "line_start": 76,
+      "line_end": 80,
+      "column": 8,
+      "owner": "_c3_merge",
+      "representation_line": 88
+    },
+    {
+      "kind": "Assign",
+      "line_start": 77,
+      "line_end": 77,
+      "column": 12,
+      "owner": "_c3_merge",
+      "representation_line": 91
+    },
+    {
+      "kind": "If",
+      "line_start": 78,
+      "line_end": 80,
+      "column": 12,
+      "owner": "_c3_merge",
+      "representation_line": 92
+    },
+    {
+      "kind": "Assign",
+      "line_start": 79,
+      "line_end": 79,
+      "column": 16,
+      "owner": "_c3_merge",
+      "representation_line": 95
+    },
+    {
+      "kind": "Break",
+      "line_start": 80,
+      "line_end": 80,
+      "column": 16,
+      "owner": "_c3_merge",
+      "representation_line": 96
+    },
+    {
+      "kind": "If",
+      "line_start": 81,
+      "line_end": 82,
+      "column": 8,
+      "owner": "_c3_merge",
+      "representation_line": 100
+    },
+    {
+      "kind": "Raise",
+      "line_start": 82,
+      "line_end": 82,
+      "column": 12,
+      "owner": "_c3_merge",
+      "representation_line": 102
+    },
+    {
+      "kind": "Expr",
+      "line_start": 83,
+      "line_end": 83,
+      "column": 8,
+      "owner": "_c3_merge",
+      "representation_line": 106
+    },
+    {
+      "kind": "For",
+      "line_start": 84,
+      "line_end": 86,
+      "column": 8,
+      "owner": "_c3_merge",
+      "representation_line": 107
+    },
+    {
+      "kind": "If",
+      "line_start": 85,
+      "line_end": 86,
+      "column": 12,
+      "owner": "_c3_merge",
+      "representation_line": 109
+    },
+    {
+      "kind": "Delete",
+      "line_start": 86,
+      "line_end": 86,
+      "column": 16,
+      "owner": "_c3_merge",
+      "representation_line": 112
+    },
+    {
+      "kind": "Raise",
+      "line_start": 87,
+      "line_end": 87,
+      "column": 4,
+      "owner": "_c3_merge",
+      "representation_line": 116
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 91,
+      "line_end": 95,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 120
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 92,
+      "line_end": 92,
+      "column": 4,
+      "owner": "MROAmbiguity",
+      "representation_line": 128
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 93,
+      "line_end": 93,
+      "column": 4,
+      "owner": "MROAmbiguity",
+      "representation_line": 128
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 94,
+      "line_end": 94,
+      "column": 4,
+      "owner": "MROAmbiguity",
+      "representation_line": 128
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 95,
+      "line_end": 95,
+      "column": 4,
+      "owner": "MROAmbiguity",
+      "representation_line": 128
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 99,
+      "line_end": 102,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 131
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 100,
+      "line_end": 100,
+      "column": 4,
+      "owner": "MROEntry",
+      "representation_line": 139
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 101,
+      "line_end": 101,
+      "column": 4,
+      "owner": "MROEntry",
+      "representation_line": 139
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 102,
+      "line_end": 102,
+      "column": 4,
+      "owner": "MROEntry",
+      "representation_line": 139
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 106,
+      "line_end": 109,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 142
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 107,
+      "line_end": 107,
+      "column": 4,
+      "owner": "MROComputation",
+      "representation_line": 150
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 108,
+      "line_end": 108,
+      "column": 4,
+      "owner": "MROComputation",
+      "representation_line": 150
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 109,
+      "line_end": 109,
+      "column": 4,
+      "owner": "MROComputation",
+      "representation_line": 150
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 113,
+      "line_end": 116,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 153
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 114,
+      "line_end": 114,
+      "column": 4,
+      "owner": "_AncestorMethod",
+      "representation_line": 161
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 115,
+      "line_end": 115,
+      "column": 4,
+      "owner": "_AncestorMethod",
+      "representation_line": 161
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 116,
+      "line_end": 116,
+      "column": 4,
+      "owner": "_AncestorMethod",
+      "representation_line": 161
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 119,
+      "line_end": 144,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 164
+    },
+    {
+      "kind": "Expr",
+      "line_start": 122,
+      "line_end": 124,
+      "column": 4,
+      "owner": "_linearize_all",
+      "representation_line": 170
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 125,
+      "line_end": 125,
+      "column": 4,
+      "owner": "_linearize_all",
+      "representation_line": 170
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 126,
+      "line_end": 126,
+      "column": 4,
+      "owner": "_linearize_all",
+      "representation_line": 170
+    },
+    {
+      "kind": "For",
+      "line_start": 127,
+      "line_end": 143,
+      "column": 4,
+      "owner": "_linearize_all",
+      "representation_line": 171
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 128,
+      "line_end": 128,
+      "column": 8,
+      "owner": "_linearize_all",
+      "representation_line": 174
+    },
+    {
+      "kind": "Assign",
+      "line_start": 129,
+      "line_end": 129,
+      "column": 8,
+      "owner": "_linearize_all",
+      "representation_line": 174
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 130,
+      "line_end": 130,
+      "column": 8,
+      "owner": "_linearize_all",
+      "representation_line": 174
+    },
+    {
+      "kind": "While",
+      "line_start": 131,
+      "line_end": 138,
+      "column": 8,
+      "owner": "_linearize_all",
+      "representation_line": 175
+    },
+    {
+      "kind": "Assign",
+      "line_start": 132,
+      "line_end": 132,
+      "column": 12,
+      "owner": "_linearize_all",
+      "representation_line": 178
+    },
+    {
+      "kind": "If",
+      "line_start": 133,
+      "line_end": 134,
+      "column": 12,
+      "owner": "_linearize_all",
+      "representation_line": 179
+    },
+    {
+      "kind": "Continue",
+      "line_start": 134,
+      "line_end": 134,
+      "column": 16,
+      "owner": "_linearize_all",
+      "representation_line": 181
+    },
+    {
+      "kind": "Expr",
+      "line_start": 135,
+      "line_end": 135,
+      "column": 12,
+      "owner": "_linearize_all",
+      "representation_line": 185
+    },
+    {
+      "kind": "Assign",
+      "line_start": 136,
+      "line_end": 136,
+      "column": 12,
+      "owner": "_linearize_all",
+      "representation_line": 185
+    },
+    {
+      "kind": "Assign",
+      "line_start": 137,
+      "line_end": 137,
+      "column": 12,
+      "owner": "_linearize_all",
+      "representation_line": 185
+    },
+    {
+      "kind": "Expr",
+      "line_start": 138,
+      "line_end": 138,
+      "column": 12,
+      "owner": "_linearize_all",
+      "representation_line": 185
+    },
+    {
+      "kind": "Try",
+      "line_start": 139,
+      "line_end": 143,
+      "column": 8,
+      "owner": "_linearize_all",
+      "representation_line": 187
+    },
+    {
+      "kind": "Expr",
+      "line_start": 140,
+      "line_end": 140,
+      "column": 12,
+      "owner": "_linearize_all",
+      "representation_line": 190
+    },
+    {
+      "kind": "Assign",
+      "line_start": 142,
+      "line_end": 142,
+      "column": 12,
+      "owner": "_linearize_all",
+      "representation_line": 195
+    },
+    {
+      "kind": "Assign",
+      "line_start": 143,
+      "line_end": 143,
+      "column": 12,
+      "owner": "_linearize_all",
+      "representation_line": 195
+    },
+    {
+      "kind": "Return",
+      "line_start": 144,
+      "line_end": 144,
+      "column": 4,
+      "owner": "_linearize_all",
+      "representation_line": 198
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 147,
+      "line_end": 246,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 202
+    },
+    {
+      "kind": "Expr",
+      "line_start": 148,
+      "line_end": 152,
+      "column": 4,
+      "owner": "compute_mro",
+      "representation_line": 208
+    },
+    {
+      "kind": "Assign",
+      "line_start": 153,
+      "line_end": 153,
+      "column": 4,
+      "owner": "compute_mro",
+      "representation_line": 208
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 155,
+      "line_end": 155,
+      "column": 4,
+      "owner": "compute_mro",
+      "representation_line": 208
+    },
+    {
+      "kind": "For",
+      "line_start": 156,
+      "line_end": 165,
+      "column": 4,
+      "owner": "compute_mro",
+      "representation_line": 209
+    },
+    {
+      "kind": "If",
+      "line_start": 157,
+      "line_end": 165,
+      "column": 8,
+      "owner": "compute_mro",
+      "representation_line": 211
+    },
+    {
+      "kind": "If",
+      "line_start": 161,
+      "line_end": 162,
+      "column": 12,
+      "owner": "compute_mro",
+      "representation_line": 213
+    },
+    {
+      "kind": "Continue",
+      "line_start": 162,
+      "line_end": 162,
+      "column": 16,
+      "owner": "compute_mro",
+      "representation_line": 215
+    },
+    {
+      "kind": "Assign",
+      "line_start": 163,
+      "line_end": 163,
+      "column": 12,
+      "owner": "compute_mro",
+      "representation_line": 219
+    },
+    {
+      "kind": "If",
+      "line_start": 164,
+      "line_end": 165,
+      "column": 12,
+      "owner": "compute_mro",
+      "representation_line": 220
+    },
+    {
+      "kind": "Expr",
+      "line_start": 165,
+      "line_end": 165,
+      "column": 16,
+      "owner": "compute_mro",
+      "representation_line": 223
+    },
+    {
+      "kind": "Assign",
+      "line_start": 167,
+      "line_end": 167,
+      "column": 4,
+      "owner": "compute_mro",
+      "representation_line": 228
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 169,
+      "line_end": 169,
+      "column": 4,
+      "owner": "compute_mro",
+      "representation_line": 228
+    },
+    {
+      "kind": "For",
+      "line_start": 170,
+      "line_end": 174,
+      "column": 4,
+      "owner": "compute_mro",
+      "representation_line": 229
+    },
+    {
+      "kind": "If",
+      "line_start": 171,
+      "line_end": 174,
+      "column": 8,
+      "owner": "compute_mro",
+      "representation_line": 231
+    },
+    {
+      "kind": "Expr",
+      "line_start": 172,
+      "line_end": 174,
+      "column": 12,
+      "owner": "compute_mro",
+      "representation_line": 234
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 176,
+      "line_end": 177,
+      "column": 4,
+      "owner": "compute_mro",
+      "representation_line": 237
+    },
+    {
+      "kind": "Return",
+      "line_start": 177,
+      "line_end": 177,
+      "column": 8,
+      "owner": "compute_mro.own_methods",
+      "representation_line": 242
+    },
+    {
+      "kind": "For",
+      "line_start": 179,
+      "line_end": 245,
+      "column": 4,
+      "owner": "compute_mro",
+      "representation_line": 246
+    },
+    {
+      "kind": "If",
+      "line_start": 180,
+      "line_end": 181,
+      "column": 8,
+      "owner": "compute_mro",
+      "representation_line": 248
+    },
+    {
+      "kind": "Continue",
+      "line_start": 181,
+      "line_end": 181,
+      "column": 12,
+      "owner": "compute_mro",
+      "representation_line": 250
+    },
+    {
+      "kind": "If",
+      "line_start": 182,
+      "line_end": 183,
+      "column": 8,
+      "owner": "compute_mro",
+      "representation_line": 253
+    },
+    {
+      "kind": "Continue",
+      "line_start": 183,
+      "line_end": 183,
+      "column": 12,
+      "owner": "compute_mro",
+      "representation_line": 255
+    },
+    {
+      "kind": "Assign",
+      "line_start": 184,
+      "line_end": 188,
+      "column": 8,
+      "owner": "compute_mro",
+      "representation_line": 259
+    },
+    {
+      "kind": "If",
+      "line_start": 189,
+      "line_end": 190,
+      "column": 8,
+      "owner": "compute_mro",
+      "representation_line": 260
+    },
+    {
+      "kind": "Continue",
+      "line_start": 190,
+      "line_end": 190,
+      "column": 12,
+      "owner": "compute_mro",
+      "representation_line": 262
+    },
+    {
+      "kind": "Assign",
+      "line_start": 192,
+      "line_end": 192,
+      "column": 8,
+      "owner": "compute_mro",
+      "representation_line": 266
+    },
+    {
+      "kind": "For",
+      "line_start": 196,
+      "line_end": 204,
+      "column": 8,
+      "owner": "compute_mro",
+      "representation_line": 267
+    },
+    {
+      "kind": "For",
+      "line_start": 197,
+      "line_end": 204,
+      "column": 12,
+      "owner": "compute_mro",
+      "representation_line": 269
+    },
+    {
+      "kind": "For",
+      "line_start": 198,
+      "line_end": 204,
+      "column": 16,
+      "owner": "compute_mro",
+      "representation_line": 271
+    },
+    {
+      "kind": "If",
+      "line_start": 199,
+      "line_end": 204,
+      "column": 20,
+      "owner": "compute_mro",
+      "representation_line": 273
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 204,
+      "line_end": 204,
+      "column": 24,
+      "owner": "compute_mro",
+      "representation_line": 276
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 206,
+      "line_end": 206,
+      "column": 8,
+      "owner": "compute_mro",
+      "representation_line": 282
+    },
+    {
+      "kind": "For",
+      "line_start": 207,
+      "line_end": 212,
+      "column": 8,
+      "owner": "compute_mro",
+      "representation_line": 283
+    },
+    {
+      "kind": "Assign",
+      "line_start": 208,
+      "line_end": 208,
+      "column": 12,
+      "owner": "compute_mro",
+      "representation_line": 286
+    },
+    {
+      "kind": "For",
+      "line_start": 209,
+      "line_end": 212,
+      "column": 12,
+      "owner": "compute_mro",
+      "representation_line": 287
+    },
+    {
+      "kind": "Expr",
+      "line_start": 210,
+      "line_end": 212,
+      "column": 16,
+      "owner": "compute_mro",
+      "representation_line": 290
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 214,
+      "line_end": 214,
+      "column": 8,
+      "owner": "compute_mro",
+      "representation_line": 294
+    },
+    {
+      "kind": "If",
+      "line_start": 215,
+      "line_end": 218,
+      "column": 8,
+      "owner": "compute_mro",
+      "representation_line": 295
+    },
+    {
+      "kind": "Expr",
+      "line_start": 216,
+      "line_end": 218,
+      "column": 12,
+      "owner": "compute_mro",
+      "representation_line": 298
+    },
+    {
+      "kind": "For",
+      "line_start": 219,
+      "line_end": 243,
+      "column": 8,
+      "owner": "compute_mro",
+      "representation_line": 300
+    },
+    {
+      "kind": "If",
+      "line_start": 220,
+      "line_end": 221,
+      "column": 12,
+      "owner": "compute_mro",
+      "representation_line": 302
+    },
+    {
+      "kind": "Continue",
+      "line_start": 221,
+      "line_end": 221,
+      "column": 16,
+      "owner": "compute_mro",
+      "representation_line": 304
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 222,
+      "line_end": 222,
+      "column": 12,
+      "owner": "compute_mro",
+      "representation_line": 308
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 223,
+      "line_end": 223,
+      "column": 12,
+      "owner": "compute_mro",
+      "representation_line": 308
+    },
+    {
+      "kind": "For",
+      "line_start": 224,
+      "line_end": 227,
+      "column": 12,
+      "owner": "compute_mro",
+      "representation_line": 309
+    },
+    {
+      "kind": "If",
+      "line_start": 225,
+      "line_end": 227,
+      "column": 16,
+      "owner": "compute_mro",
+      "representation_line": 311
+    },
+    {
+      "kind": "Expr",
+      "line_start": 226,
+      "line_end": 226,
+      "column": 20,
+      "owner": "compute_mro",
+      "representation_line": 314
+    },
+    {
+      "kind": "Expr",
+      "line_start": 227,
+      "line_end": 227,
+      "column": 20,
+      "owner": "compute_mro",
+      "representation_line": 314
+    },
+    {
+      "kind": "If",
+      "line_start": 228,
+      "line_end": 229,
+      "column": 12,
+      "owner": "compute_mro",
+      "representation_line": 317
+    },
+    {
+      "kind": "Continue",
+      "line_start": 229,
+      "line_end": 229,
+      "column": 16,
+      "owner": "compute_mro",
+      "representation_line": 319
+    },
+    {
+      "kind": "Assign",
+      "line_start": 230,
+      "line_end": 230,
+      "column": 12,
+      "owner": "compute_mro",
+      "representation_line": 323
+    },
+    {
+      "kind": "Expr",
+      "line_start": 231,
+      "line_end": 238,
+      "column": 12,
+      "owner": "compute_mro",
+      "representation_line": 323
+    },
+    {
+      "kind": "If",
+      "line_start": 239,
+      "line_end": 243,
+      "column": 12,
+      "owner": "compute_mro",
+      "representation_line": 324
+    },
+    {
+      "kind": "If",
+      "line_start": 240,
+      "line_end": 241,
+      "column": 16,
+      "owner": "compute_mro",
+      "representation_line": 326
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 241,
+      "line_end": 241,
+      "column": 20,
+      "owner": "compute_mro",
+      "representation_line": 329
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 243,
+      "line_end": 243,
+      "column": 16,
+      "owner": "compute_mro",
+      "representation_line": 334
+    },
+    {
+      "kind": "Expr",
+      "line_start": 245,
+      "line_end": 245,
+      "column": 8,
+      "owner": "compute_mro",
+      "representation_line": 338
+    },
+    {
+      "kind": "Return",
+      "line_start": 246,
+      "line_end": 246,
+      "column": 4,
+      "owner": "compute_mro",
+      "representation_line": 340
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 249,
+      "line_end": 260,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 344
+    },
+    {
+      "kind": "If",
+      "line_start": 252,
+      "line_end": 253,
+      "column": 4,
+      "owner": "_resolve_ambiguity",
+      "representation_line": 349
+    },
+    {
+      "kind": "Return",
+      "line_start": 253,
+      "line_end": 253,
+      "column": 8,
+      "owner": "_resolve_ambiguity",
+      "representation_line": 351
+    },
+    {
+      "kind": "If",
+      "line_start": 254,
+      "line_end": 255,
+      "column": 4,
+      "owner": "_resolve_ambiguity",
+      "representation_line": 354
+    },
+    {
+      "kind": "Return",
+      "line_start": 255,
+      "line_end": 255,
+      "column": 8,
+      "owner": "_resolve_ambiguity",
+      "representation_line": 356
+    },
+    {
+      "kind": "If",
+      "line_start": 256,
+      "line_end": 257,
+      "column": 4,
+      "owner": "_resolve_ambiguity",
+      "representation_line": 359
+    },
+    {
+      "kind": "Return",
+      "line_start": 257,
+      "line_end": 257,
+      "column": 8,
+      "owner": "_resolve_ambiguity",
+      "representation_line": 361
+    },
+    {
+      "kind": "If",
+      "line_start": 258,
+      "line_end": 259,
+      "column": 4,
+      "owner": "_resolve_ambiguity",
+      "representation_line": 364
+    },
+    {
+      "kind": "Return",
+      "line_start": 259,
+      "line_end": 259,
+      "column": 8,
+      "owner": "_resolve_ambiguity",
+      "representation_line": 366
+    },
+    {
+      "kind": "Return",
+      "line_start": 260,
+      "line_end": 260,
+      "column": 4,
+      "owner": "_resolve_ambiguity",
+      "representation_line": 369
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 263,
+      "line_end": 278,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 373
+    },
+    {
+      "kind": "Assign",
+      "line_start": 268,
+      "line_end": 268,
+      "column": 4,
+      "owner": "_resolve_leftmost",
+      "representation_line": 379
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 269,
+      "line_end": 269,
+      "column": 4,
+      "owner": "_resolve_leftmost",
+      "representation_line": 379
+    },
+    {
+      "kind": "Assign",
+      "line_start": 270,
+      "line_end": 270,
+      "column": 4,
+      "owner": "_resolve_leftmost",
+      "representation_line": 379
+    },
+    {
+      "kind": "For",
+      "line_start": 271,
+      "line_end": 275,
+      "column": 4,
+      "owner": "_resolve_leftmost",
+      "representation_line": 380
+    },
+    {
+      "kind": "Assign",
+      "line_start": 272,
+      "line_end": 272,
+      "column": 8,
+      "owner": "_resolve_leftmost",
+      "representation_line": 383
+    },
+    {
+      "kind": "If",
+      "line_start": 273,
+      "line_end": 275,
+      "column": 8,
+      "owner": "_resolve_leftmost",
+      "representation_line": 384
+    },
+    {
+      "kind": "Assign",
+      "line_start": 274,
+      "line_end": 274,
+      "column": 12,
+      "owner": "_resolve_leftmost",
+      "representation_line": 387
+    },
+    {
+      "kind": "Assign",
+      "line_start": 275,
+      "line_end": 275,
+      "column": 12,
+      "owner": "_resolve_leftmost",
+      "representation_line": 387
+    },
+    {
+      "kind": "If",
+      "line_start": 276,
+      "line_end": 277,
+      "column": 4,
+      "owner": "_resolve_leftmost",
+      "representation_line": 390
+    },
+    {
+      "kind": "Return",
+      "line_start": 277,
+      "line_end": 277,
+      "column": 8,
+      "owner": "_resolve_leftmost",
+      "representation_line": 392
+    },
+    {
+      "kind": "Return",
+      "line_start": 278,
+      "line_end": 278,
+      "column": 4,
+      "owner": "_resolve_leftmost",
+      "representation_line": 395
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 281,
+      "line_end": 290,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 399
+    },
+    {
+      "kind": "Assign",
+      "line_start": 282,
+      "line_end": 282,
+      "column": 4,
+      "owner": "_resolve_class_beats_interface",
+      "representation_line": 405
+    },
+    {
+      "kind": "Assign",
+      "line_start": 283,
+      "line_end": 283,
+      "column": 4,
+      "owner": "_resolve_class_beats_interface",
+      "representation_line": 405
+    },
+    {
+      "kind": "If",
+      "line_start": 284,
+      "line_end": 285,
+      "column": 4,
+      "owner": "_resolve_class_beats_interface",
+      "representation_line": 406
+    },
+    {
+      "kind": "Return",
+      "line_start": 285,
+      "line_end": 285,
+      "column": 8,
+      "owner": "_resolve_class_beats_interface",
+      "representation_line": 408
+    },
+    {
+      "kind": "If",
+      "line_start": 286,
+      "line_end": 287,
+      "column": 4,
+      "owner": "_resolve_class_beats_interface",
+      "representation_line": 411
+    },
+    {
+      "kind": "Return",
+      "line_start": 287,
+      "line_end": 287,
+      "column": 8,
+      "owner": "_resolve_class_beats_interface",
+      "representation_line": 413
+    },
+    {
+      "kind": "If",
+      "line_start": 288,
+      "line_end": 289,
+      "column": 4,
+      "owner": "_resolve_class_beats_interface",
+      "representation_line": 416
+    },
+    {
+      "kind": "Return",
+      "line_start": 289,
+      "line_end": 289,
+      "column": 8,
+      "owner": "_resolve_class_beats_interface",
+      "representation_line": 418
+    },
+    {
+      "kind": "Return",
+      "line_start": 290,
+      "line_end": 290,
+      "column": 4,
+      "owner": "_resolve_class_beats_interface",
+      "representation_line": 421
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 27,
+      "line_end": 27,
+      "column": 23,
+      "kind": "Constant",
+      "original_ast": "Constant(value=10000)",
+      "rendered": "10000"
+    },
+    {
+      "line_start": 28,
+      "line_end": 28,
+      "column": 23,
+      "kind": "Constant",
+      "original_ast": "Constant(value=1000)",
+      "rendered": "1000"
+    },
+    {
+      "line_start": 33,
+      "line_end": 33,
+      "column": 35,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 34,
+      "line_end": 36,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[Call(func=Attribute(value=Call(func=Name(id='set', ctx=Load()), args=[Name(id='hierarchy', ctx=Load())], keywords=[]), attr='union', ctx=Load()), args=[SetComp(elt=Name(id='parent', ctx=Load()), generators=[comprehension(target=Name(id='parents', ctx=Store()), iter=Call(func=Attribute(value=Name(id='hierarchy', ctx=Load()), attr='values', ctx=Load()), args=[], keywords=[]), ifs=[], is_async=0), comprehension(target=Name(id='parent', ctx=Store()), iter=Name(id='parents', ctx=Load()), ifs=[], is_async=0)])], keywords=[])], keywords=[])",
+      "rendered": "sorted(set(hierarchy).union({parent for parents in hierarchy.values() for parent in parents}))"
+    },
+    {
+      "line_start": 37,
+      "line_end": 37,
+      "column": 16,
+      "kind": "Name",
+      "original_ast": "Name(id='all_classes', ctx=Load())",
+      "rendered": "all_classes"
+    },
+    {
+      "line_start": 38,
+      "line_end": 38,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='root', ctx=Load()), ops=[In()], comparators=[Name(id='result', ctx=Load())])",
+      "rendered": "root in result"
+    },
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 40,
+      "kind": "List",
+      "original_ast": "List(elts=[Tuple(elts=[Name(id='root', ctx=Load()), Constant(value=False)], ctx=Load())], ctx=Load())",
+      "rendered": "[(root, False)]"
+    },
+    {
+      "line_start": 41,
+      "line_end": 41,
+      "column": 32,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 14,
+      "kind": "Name",
+      "original_ast": "Name(id='stack', ctx=Load())",
+      "rendered": "stack"
+    },
+    {
+      "line_start": 43,
+      "line_end": 43,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='stack', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Name(id='_MAX_HIERARCHY_DEPTH', ctx=Load())])",
+      "rendered": "len(stack) > _MAX_HIERARCHY_DEPTH"
+    },
+    {
+      "line_start": 44,
+      "line_end": 44,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='hierarchy linearization exceeded the depth bound')], keywords=[])",
+      "rendered": "ModelValidationError('hierarchy linearization exceeded the depth bound')"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 28,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='stack', ctx=Load()), attr='pop', ctx=Load()), args=[], keywords=[])",
+      "rendered": "stack.pop()"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='cls', ctx=Load()), ops=[In()], comparators=[Name(id='result', ctx=Load())])",
+      "rendered": "cls in result"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='hierarchy', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='cls', ctx=Load()), List(elts=[], ctx=Load())], keywords=[])",
+      "rendered": "hierarchy.get(cls, [])"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='expanded', ctx=Load())",
+      "rendered": "expanded"
+    },
+    {
+      "line_start": 50,
+      "line_end": 50,
+      "column": 28,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Call(func=Name(id='list', ctx=Load()), args=[Subscript(value=Name(id='result', ctx=Load()), slice=Name(id='parent', ctx=Load()), ctx=Load())], keywords=[]), generators=[comprehension(target=Name(id='parent', ctx=Store()), iter=Name(id='parents', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "[list(result[parent]) for parent in parents]"
+    },
+    {
+      "line_start": 51,
+      "line_end": 51,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='sequences', ctx=Load()), attr='append', ctx=Load()), args=[Call(func=Name(id='list', ctx=Load()), args=[Name(id='parents', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "sequences.append(list(parents))"
+    },
+    {
+      "line_start": 52,
+      "line_end": 52,
+      "column": 30,
+      "kind": "List",
+      "original_ast": "List(elts=[Name(id='cls', ctx=Load()), Starred(value=Call(func=Name(id='_c3_merge', ctx=Load()), args=[Name(id='sequences', ctx=Load())], keywords=[]), ctx=Load())], ctx=Load())",
+      "rendered": "[cls, *_c3_merge(sequences)]"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='in_progress', ctx=Load()), attr='discard', ctx=Load()), args=[Name(id='cls', ctx=Load())], keywords=[])",
+      "rendered": "in_progress.discard(cls)"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='cls', ctx=Load()), ops=[In()], comparators=[Name(id='in_progress', ctx=Load())])",
+      "rendered": "cls in in_progress"
+    },
+    {
+      "line_start": 56,
+      "line_end": 56,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[JoinedStr(values=[Constant(value='inconsistent hierarchy: cycle involving '), FormattedValue(value=Name(id='cls', ctx=Load()), conversion=114)])], keywords=[])",
+      "rendered": "ModelValidationError(source_template_56_43)"
+    },
+    {
+      "line_start": 57,
+      "line_end": 57,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='in_progress', ctx=Load()), attr='add', ctx=Load()), args=[Name(id='cls', ctx=Load())], keywords=[])",
+      "rendered": "in_progress.add(cls)"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='stack', ctx=Load()), attr='append', ctx=Load()), args=[Tuple(elts=[Name(id='cls', ctx=Load()), Constant(value=True)], ctx=Load())], keywords=[])",
+      "rendered": "stack.append((cls, True))"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='reversed', ctx=Load()), args=[Name(id='parents', ctx=Load())], keywords=[])",
+      "rendered": "reversed(parents)"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 19,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='parent', ctx=Load()), ops=[In()], comparators=[Name(id='in_progress', ctx=Load())])",
+      "rendered": "parent in in_progress"
+    },
+    {
+      "line_start": 61,
+      "line_end": 63,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[JoinedStr(values=[Constant(value='inconsistent hierarchy: cycle involving '), FormattedValue(value=Name(id='parent', ctx=Load()), conversion=114)])], keywords=[])",
+      "rendered": "ModelValidationError(source_template_62_24)"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 19,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='parent', ctx=Load()), ops=[NotIn()], comparators=[Name(id='result', ctx=Load())])",
+      "rendered": "parent not in result"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='stack', ctx=Load()), attr='append', ctx=Load()), args=[Tuple(elts=[Name(id='parent', ctx=Load()), Constant(value=False)], ctx=Load())], keywords=[])",
+      "rendered": "stack.append((parent, False))"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='result', ctx=Load())",
+      "rendered": "result"
+    },
+    {
+      "line_start": 70,
+      "line_end": 70,
+      "column": 24,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='range', ctx=Load()), args=[Name(id='_MAX_LINEARIZE_STEPS', ctx=Load())], keywords=[])",
+      "rendered": "range(_MAX_LINEARIZE_STEPS)"
+    },
+    {
+      "line_start": 72,
+      "line_end": 72,
+      "column": 20,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='sequence', ctx=Load()), generators=[comprehension(target=Name(id='sequence', ctx=Store()), iter=Name(id='sequences', ctx=Load()), ifs=[Name(id='sequence', ctx=Load())], is_async=0)])",
+      "rendered": "[sequence for sequence in sequences if sequence]"
+    },
+    {
+      "line_start": 73,
+      "line_end": 73,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='sequences', ctx=Load()))",
+      "rendered": "not sequences"
+    },
+    {
+      "line_start": 74,
+      "line_end": 74,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='merged', ctx=Load())",
+      "rendered": "merged"
+    },
+    {
+      "line_start": 75,
+      "line_end": 75,
+      "column": 16,
+      "kind": "Constant",
+      "original_ast": "Constant(value='')",
+      "rendered": "''"
+    },
+    {
+      "line_start": 76,
+      "line_end": 76,
+      "column": 24,
+      "kind": "Name",
+      "original_ast": "Name(id='sequences', ctx=Load())",
+      "rendered": "sequences"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 24,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Name(id='sequence', ctx=Load()), slice=Constant(value=0), ctx=Load())",
+      "rendered": "sequence[0]"
+    },
+    {
+      "line_start": 78,
+      "line_end": 78,
+      "column": 15,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='any', ctx=Load()), args=[GeneratorExp(elt=Compare(left=Name(id='candidate', ctx=Load()), ops=[In()], comparators=[Subscript(value=Name(id='other', ctx=Load()), slice=Slice(lower=Constant(value=1)), ctx=Load())]), generators=[comprehension(target=Name(id='other', ctx=Store()), iter=Name(id='sequences', ctx=Load()), ifs=[], is_async=0)])], keywords=[]))",
+      "rendered": "not any((candidate in other[1:] for other in sequences))"
+    },
+    {
+      "line_start": 79,
+      "line_end": 79,
+      "column": 24,
+      "kind": "Name",
+      "original_ast": "Name(id='candidate', ctx=Load())",
+      "rendered": "candidate"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='found', ctx=Load()))",
+      "rendered": "not found"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='inconsistent hierarchy: cannot resolve merge order')], keywords=[])",
+      "rendered": "ModelValidationError('inconsistent hierarchy: cannot resolve merge order')"
+    },
+    {
+      "line_start": 83,
+      "line_end": 83,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='merged', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='found', ctx=Load())], keywords=[])",
+      "rendered": "merged.append(found)"
+    },
+    {
+      "line_start": 84,
+      "line_end": 84,
+      "column": 24,
+      "kind": "Name",
+      "original_ast": "Name(id='sequences', ctx=Load())",
+      "rendered": "sequences"
+    },
+    {
+      "line_start": 85,
+      "line_end": 85,
+      "column": 15,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Name(id='sequence', ctx=Load()), Compare(left=Subscript(value=Name(id='sequence', ctx=Load()), slice=Constant(value=0), ctx=Load()), ops=[Eq()], comparators=[Name(id='found', ctx=Load())])])",
+      "rendered": "sequence and sequence[0] == found"
+    },
+    {
+      "line_start": 87,
+      "line_end": 87,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[Constant(value='hierarchy linearization exceeded the step bound')], keywords=[])",
+      "rendered": "ModelValidationError('hierarchy linearization exceeded the step bound')"
+    },
+    {
+      "line_start": 90,
+      "line_end": 90,
+      "column": 1,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dataclass', ctx=Load()), args=[], keywords=[keyword(arg='frozen', value=Constant(value=True))])",
+      "rendered": "dataclass(frozen=True)"
+    },
+    {
+      "line_start": 98,
+      "line_end": 98,
+      "column": 1,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dataclass', ctx=Load()), args=[], keywords=[keyword(arg='frozen', value=Constant(value=True))])",
+      "rendered": "dataclass(frozen=True)"
+    },
+    {
+      "line_start": 102,
+      "line_end": 102,
+      "column": 44,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[], ctx=Load())",
+      "rendered": "()"
+    },
+    {
+      "line_start": 105,
+      "line_end": 105,
+      "column": 1,
+      "kind": "Name",
+      "original_ast": "Name(id='dataclass', ctx=Load())",
+      "rendered": "dataclass"
+    },
+    {
+      "line_start": 107,
+      "line_end": 107,
+      "column": 30,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='field', ctx=Load()), args=[], keywords=[keyword(arg='default_factory', value=Subscript(value=Name(id='list', ctx=Load()), slice=Name(id='MROEntry', ctx=Load()), ctx=Load()))])",
+      "rendered": "field(default_factory=list[MROEntry])"
+    },
+    {
+      "line_start": 108,
+      "line_end": 108,
+      "column": 26,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 27,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 112,
+      "line_end": 112,
+      "column": 1,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dataclass', ctx=Load()), args=[], keywords=[keyword(arg='frozen', value=Constant(value=True))])",
+      "rendered": "dataclass(frozen=True)"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 35,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 31,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 127,
+      "line_end": 127,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[Name(id='hierarchy', ctx=Load())], keywords=[])",
+      "rendered": "sorted(hierarchy)"
+    },
+    {
+      "line_start": 128,
+      "line_end": 128,
+      "column": 32,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 129,
+      "line_end": 129,
+      "column": 18,
+      "kind": "List",
+      "original_ast": "List(elts=[Name(id='cls', ctx=Load())], ctx=Load())",
+      "rendered": "[cls]"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 39,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 14,
+      "kind": "Name",
+      "original_ast": "Name(id='pending', ctx=Load())",
+      "rendered": "pending"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='pending', ctx=Load()), attr='pop', ctx=Load()), args=[], keywords=[])",
+      "rendered": "pending.pop()"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='current', ctx=Load()), ops=[In()], comparators=[Name(id='subset_seen', ctx=Load())])",
+      "rendered": "current in subset_seen"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='subset_seen', ctx=Load()), attr='add', ctx=Load()), args=[Name(id='current', ctx=Load())], keywords=[])",
+      "rendered": "subset_seen.add(current)"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='hierarchy', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='current', ctx=Load()), List(elts=[], ctx=Load())], keywords=[])",
+      "rendered": "hierarchy.get(current, [])"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 30,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='list', ctx=Load()), args=[Name(id='parents', ctx=Load())], keywords=[])",
+      "rendered": "list(parents)"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='pending', ctx=Load()), attr='extend', ctx=Load()), args=[Name(id='parents', ctx=Load())], keywords=[])",
+      "rendered": "pending.extend(parents)"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='orders', ctx=Load()), attr='update', ctx=Load()), args=[Call(func=Name(id='c3_linearize', ctx=Load()), args=[Name(id='subset', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "orders.update(c3_linearize(subset))"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='ModelValidationError', ctx=Load())",
+      "rendered": "ModelValidationError"
+    },
+    {
+      "line_start": 142,
+      "line_end": 142,
+      "column": 28,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='str', ctx=Load()), args=[Name(id='error', ctx=Load())], keywords=[])",
+      "rendered": "str(error)"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 26,
+      "kind": "List",
+      "original_ast": "List(elts=[Name(id='cls', ctx=Load()), Starred(value=Call(func=Attribute(value=Name(id='hierarchy', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='cls', ctx=Load()), List(elts=[], ctx=Load())], keywords=[]), ctx=Load())], ctx=Load())",
+      "rendered": "[cls, *hierarchy.get(cls, [])]"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='orders', ctx=Load()), Name(id='failures', ctx=Load())], ctx=Load())",
+      "rendered": "(orders, failures)"
+    },
+    {
+      "line_start": 153,
+      "line_end": 153,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='MROComputation', ctx=Load()), args=[], keywords=[])",
+      "rendered": "MROComputation()"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 45,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 156,
+      "line_end": 156,
+      "column": 16,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='result', ctx=Load()), attr='edges', ctx=Load())",
+      "rendered": "result.edges"
+    },
+    {
+      "line_start": 157,
+      "line_end": 160,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='edge', ctx=Load()), attr='relationship', ctx=Load()), ops=[In()], comparators=[Tuple(elts=[Attribute(value=Name(id='LocalRelationshipType', ctx=Load()), attr='INHERITS', ctx=Load()), Attribute(value=Name(id='LocalRelationshipType', ctx=Load()), attr='IMPLEMENTS', ctx=Load())], ctx=Load())])",
+      "rendered": "edge.relationship in (LocalRelationshipType.INHERITS, LocalRelationshipType.IMPLEMENTS)"
+    },
+    {
+      "line_start": 161,
+      "line_end": 161,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='edge', ctx=Load()), attr='target_local_id', ctx=Load()), ops=[NotIn()], comparators=[Attribute(value=Name(id='context', ctx=Load()), attr='symbols_by_id', ctx=Load())])",
+      "rendered": "edge.target_local_id not in context.symbols_by_id"
+    },
+    {
+      "line_start": 163,
+      "line_end": 163,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='parents_by_child', ctx=Load()), attr='setdefault', ctx=Load()), args=[Attribute(value=Name(id='edge', ctx=Load()), attr='source_local_id', ctx=Load()), List(elts=[], ctx=Load())], keywords=[])",
+      "rendered": "parents_by_child.setdefault(edge.source_local_id, [])"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='edge', ctx=Load()), attr='target_local_id', ctx=Load()), ops=[NotIn()], comparators=[Name(id='bucket', ctx=Load())])",
+      "rendered": "edge.target_local_id not in bucket"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='bucket', ctx=Load()), attr='append', ctx=Load()), args=[Attribute(value=Name(id='edge', ctx=Load()), attr='target_local_id', ctx=Load())], keywords=[])",
+      "rendered": "bucket.append(edge.target_local_id)"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_linearize_all', ctx=Load()), args=[Name(id='parents_by_child', ctx=Load())], keywords=[])",
+      "rendered": "_linearize_all(parents_by_child)"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 48,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 170,
+      "line_end": 170,
+      "column": 18,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='context', ctx=Load()), attr='symbols', ctx=Load())",
+      "rendered": "context.symbols"
+    },
+    {
+      "line_start": 171,
+      "line_end": 171,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Attribute(value=Name(id='symbol', ctx=Load()), attr='label', ctx=Load()), ops=[Eq()], comparators=[Constant(value='Method')]), Attribute(value=Name(id='symbol', ctx=Load()), attr='owner_name', ctx=Load())])",
+      "rendered": "symbol.label == 'Method' and symbol.owner_name"
+    },
+    {
+      "line_start": 172,
+      "line_end": 174,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Name(id='methods_by_owner', ctx=Load()), attr='setdefault', ctx=Load()), args=[JoinedStr(values=[FormattedValue(value=Attribute(value=Name(id='symbol', ctx=Load()), attr='file_path', ctx=Load()), conversion=-1), Constant(value='\\x00'), FormattedValue(value=Attribute(value=Name(id='symbol', ctx=Load()), attr='owner_name', ctx=Load()), conversion=-1)]), List(elts=[], ctx=Load())], keywords=[]), attr='append', ctx=Load()), args=[Name(id='symbol', ctx=Load())], keywords=[])",
+      "rendered": "methods_by_owner.setdefault(source_template_172_40, []).append(symbol)"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='methods_by_owner', ctx=Load()), attr='get', ctx=Load()), args=[JoinedStr(values=[FormattedValue(value=Attribute(value=Name(id='owner', ctx=Load()), attr='file_path', ctx=Load()), conversion=-1), Constant(value='\\x00'), FormattedValue(value=Attribute(value=Name(id='owner', ctx=Load()), attr='name', ctx=Load()), conversion=-1)]), List(elts=[], ctx=Load())], keywords=[])",
+      "rendered": "methods_by_owner.get(source_template_177_36, [])"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 18,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='context', ctx=Load()), attr='symbols', ctx=Load())",
+      "rendered": "context.symbols"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='symbol', ctx=Load()), attr='label', ctx=Load()), ops=[NotIn()], comparators=[Name(id='CLASS_LIKE_LABELS', ctx=Load())])",
+      "rendered": "symbol.label not in CLASS_LIKE_LABELS"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='symbol', ctx=Load()), attr='id', ctx=Load()), ops=[NotIn()], comparators=[Name(id='parents_by_child', ctx=Load())])",
+      "rendered": "symbol.id not in parents_by_child"
+    },
+    {
+      "line_start": 184,
+      "line_end": 188,
+      "column": 20,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Subscript(value=Attribute(value=Name(id='context', ctx=Load()), attr='symbols_by_id', ctx=Load()), slice=Name(id='ancestor_id', ctx=Load()), ctx=Load()), generators=[comprehension(target=Name(id='ancestor_id', ctx=Store()), iter=Subscript(value=Call(func=Attribute(value=Name(id='orders', ctx=Load()), attr='get', ctx=Load()), args=[Attribute(value=Name(id='symbol', ctx=Load()), attr='id', ctx=Load()), List(elts=[], ctx=Load())], keywords=[]), slice=Slice(lower=Constant(value=1)), ctx=Load()), ifs=[Compare(left=Name(id='ancestor_id', ctx=Load()), ops=[In()], comparators=[Attribute(value=Name(id='context', ctx=Load()), attr='symbols_by_id', ctx=Load())])], is_async=0)])",
+      "rendered": "[context.symbols_by_id[ancestor_id] for ancestor_id in orders.get(symbol.id, [])[1:] if ancestor_id in context.symbols_by_id]"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='ancestors', ctx=Load()))",
+      "rendered": "not ancestors"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 20,
+      "kind": "SetComp",
+      "original_ast": "SetComp(elt=Attribute(value=Name(id='method', ctx=Load()), attr='name', ctx=Load()), generators=[comprehension(target=Name(id='method', ctx=Store()), iter=Call(func=Name(id='own_methods', ctx=Load()), args=[Name(id='symbol', ctx=Load())], keywords=[]), ifs=[], is_async=0)])",
+      "rendered": "{method.name for method in own_methods(symbol)}"
+    },
+    {
+      "line_start": 196,
+      "line_end": 196,
+      "column": 28,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='own_methods', ctx=Load()), args=[Name(id='symbol', ctx=Load())], keywords=[])",
+      "rendered": "own_methods(symbol)"
+    },
+    {
+      "line_start": 197,
+      "line_end": 197,
+      "column": 28,
+      "kind": "Name",
+      "original_ast": "Name(id='ancestors', ctx=Load())",
+      "rendered": "ancestors"
+    },
+    {
+      "line_start": 198,
+      "line_end": 198,
+      "column": 39,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='own_methods', ctx=Load()), args=[Name(id='ancestor', ctx=Load())], keywords=[])",
+      "rendered": "own_methods(ancestor)"
+    },
+    {
+      "line_start": 199,
+      "line_end": 203,
+      "column": 23,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Attribute(value=Name(id='ancestor_method', ctx=Load()), attr='name', ctx=Load()), ops=[Eq()], comparators=[Attribute(value=Name(id='child_method', ctx=Load()), attr='name', ctx=Load())]), Call(func=Attribute(value=Name(id='result', ctx=Load()), attr='add_edge', ctx=Load()), args=[Attribute(value=Name(id='child_method', ctx=Load()), attr='id', ctx=Load()), Attribute(value=Name(id='LocalRelationshipType', ctx=Load()), attr='OVERRIDES', ctx=Load()), Attribute(value=Name(id='ancestor_method', ctx=Load()), attr='id', ctx=Load())], keywords=[])])",
+      "rendered": "ancestor_method.name == child_method.name and result.add_edge(child_method.id, LocalRelationshipType.OVERRIDES, ancestor_method.id)"
+    },
+    {
+      "line_start": 204,
+      "line_end": 204,
+      "column": 24,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Attribute(value=Name(id='computation', ctx=Load()), attr='override_edges', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "computation.override_edges += 1"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 60,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 207,
+      "line_end": 207,
+      "column": 24,
+      "kind": "Name",
+      "original_ast": "Name(id='ancestors', ctx=Load())",
+      "rendered": "ancestors"
+    },
+    {
+      "line_start": 208,
+      "line_end": 208,
+      "column": 23,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='ancestor', ctx=Load()), attr='label', ctx=Load()), ops=[In()], comparators=[Tuple(elts=[Constant(value='Class'), Constant(value='Struct')], ctx=Load())])",
+      "rendered": "ancestor.label in ('Class', 'Struct')"
+    },
+    {
+      "line_start": 209,
+      "line_end": 209,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='own_methods', ctx=Load()), args=[Name(id='ancestor', ctx=Load())], keywords=[])",
+      "rendered": "own_methods(ancestor)"
+    },
+    {
+      "line_start": 210,
+      "line_end": 212,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Name(id='sources_by_name', ctx=Load()), attr='setdefault', ctx=Load()), args=[Attribute(value=Name(id='method', ctx=Load()), attr='name', ctx=Load()), List(elts=[], ctx=Load())], keywords=[]), attr='append', ctx=Load()), args=[Call(func=Name(id='_AncestorMethod', ctx=Load()), args=[Name(id='method', ctx=Load()), Name(id='ancestor', ctx=Load()), Name(id='is_class', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "sources_by_name.setdefault(method.name, []).append(_AncestorMethod(method, ancestor, is_class))"
+    },
+    {
+      "line_start": 214,
+      "line_end": 214,
+      "column": 42,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 215,
+      "line_end": 215,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='symbol', ctx=Load()), attr='id', ctx=Load()), ops=[In()], comparators=[Name(id='failures', ctx=Load())])",
+      "rendered": "symbol.id in failures"
+    },
+    {
+      "line_start": 216,
+      "line_end": 218,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='ambiguities', ctx=Load()), attr='append', ctx=Load()), args=[Call(func=Name(id='MROAmbiguity', ctx=Load()), args=[Constant(value=''), Tuple(elts=[], ctx=Load()), Constant(value=''), JoinedStr(values=[Constant(value='linearization fallback: '), FormattedValue(value=Subscript(value=Name(id='failures', ctx=Load()), slice=Attribute(value=Name(id='symbol', ctx=Load()), attr='id', ctx=Load()), ctx=Load()), conversion=-1)])], keywords=[])], keywords=[])",
+      "rendered": "ambiguities.append(MROAmbiguity('', (), '', source_template_217_41))"
+    },
+    {
+      "line_start": 219,
+      "line_end": 219,
+      "column": 27,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[Name(id='sources_by_name', ctx=Load())], keywords=[])",
+      "rendered": "sorted(sources_by_name)"
+    },
+    {
+      "line_start": 220,
+      "line_end": 220,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='method_name', ctx=Load()), ops=[In()], comparators=[Name(id='own_names', ctx=Load())])",
+      "rendered": "method_name in own_names"
+    },
+    {
+      "line_start": 222,
+      "line_end": 222,
+      "column": 44,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 223,
+      "line_end": 223,
+      "column": 29,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 224,
+      "line_end": 224,
+      "column": 26,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Name(id='sources_by_name', ctx=Load()), slice=Name(id='method_name', ctx=Load()), ctx=Load())",
+      "rendered": "sources_by_name[method_name]"
+    },
+    {
+      "line_start": 225,
+      "line_end": 225,
+      "column": 19,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Attribute(value=Name(id='source', ctx=Load()), attr='symbol', ctx=Load()), attr='id', ctx=Load()), ops=[NotIn()], comparators=[Name(id='seen', ctx=Load())])",
+      "rendered": "source.symbol.id not in seen"
+    },
+    {
+      "line_start": 226,
+      "line_end": 226,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='seen', ctx=Load()), attr='add', ctx=Load()), args=[Attribute(value=Attribute(value=Name(id='source', ctx=Load()), attr='symbol', ctx=Load()), attr='id', ctx=Load())], keywords=[])",
+      "rendered": "seen.add(source.symbol.id)"
+    },
+    {
+      "line_start": 227,
+      "line_end": 227,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='unique', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='source', ctx=Load())], keywords=[])",
+      "rendered": "unique.append(source)"
+    },
+    {
+      "line_start": 228,
+      "line_end": 228,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='unique', ctx=Load())], keywords=[]), ops=[Lt()], comparators=[Constant(value=2)])",
+      "rendered": "len(unique) < 2"
+    },
+    {
+      "line_start": 230,
+      "line_end": 230,
+      "column": 34,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_resolve_ambiguity', ctx=Load()), args=[Attribute(value=Name(id='symbol', ctx=Load()), attr='language', ctx=Load()), Name(id='unique', ctx=Load()), Name(id='ancestors', ctx=Load())], keywords=[])",
+      "rendered": "_resolve_ambiguity(symbol.language, unique, ancestors)"
+    },
+    {
+      "line_start": 231,
+      "line_end": 238,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='ambiguities', ctx=Load()), attr='append', ctx=Load()), args=[Call(func=Name(id='MROAmbiguity', ctx=Load()), args=[Name(id='method_name', ctx=Load()), Call(func=Name(id='tuple', ctx=Load()), args=[GeneratorExp(elt=Attribute(value=Attribute(value=Name(id='source', ctx=Load()), attr='symbol', ctx=Load()), attr='id', ctx=Load()), generators=[comprehension(target=Name(id='source', ctx=Store()), iter=Name(id='unique', ctx=Load()), ifs=[], is_async=0)])], keywords=[]), Name(id='resolved_to', ctx=Load()), Name(id='reason', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "ambiguities.append(MROAmbiguity(method_name, tuple((source.symbol.id for source in unique)), resolved_to, reason))"
+    },
+    {
+      "line_start": 239,
+      "line_end": 239,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='resolved_to', ctx=Load())",
+      "rendered": "resolved_to"
+    },
+    {
+      "line_start": 240,
+      "line_end": 240,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='result', ctx=Load()), attr='add_edge', ctx=Load()), args=[Attribute(value=Name(id='symbol', ctx=Load()), attr='id', ctx=Load()), Attribute(value=Name(id='LocalRelationshipType', ctx=Load()), attr='OVERRIDES', ctx=Load()), Name(id='resolved_to', ctx=Load())], keywords=[])",
+      "rendered": "result.add_edge(symbol.id, LocalRelationshipType.OVERRIDES, resolved_to)"
+    },
+    {
+      "line_start": 241,
+      "line_end": 241,
+      "column": 20,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Attribute(value=Name(id='computation', ctx=Load()), attr='override_edges', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "computation.override_edges += 1"
+    },
+    {
+      "line_start": 243,
+      "line_end": 243,
+      "column": 16,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Attribute(value=Name(id='computation', ctx=Load()), attr='ambiguity_count', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "computation.ambiguity_count += 1"
+    },
+    {
+      "line_start": 245,
+      "line_end": 245,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='computation', ctx=Load()), attr='entries', ctx=Load()), attr='append', ctx=Load()), args=[Call(func=Name(id='MROEntry', ctx=Load()), args=[Attribute(value=Name(id='symbol', ctx=Load()), attr='name', ctx=Load()), Attribute(value=Name(id='symbol', ctx=Load()), attr='language', ctx=Load()), Call(func=Name(id='tuple', ctx=Load()), args=[Name(id='ambiguities', ctx=Load())], keywords=[])], keywords=[])], keywords=[])",
+      "rendered": "computation.entries.append(MROEntry(symbol.name, symbol.language, tuple(ambiguities)))"
+    },
+    {
+      "line_start": 246,
+      "line_end": 246,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='computation', ctx=Load())",
+      "rendered": "computation"
+    },
+    {
+      "line_start": 252,
+      "line_end": 252,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='language', ctx=Load()), ops=[Eq()], comparators=[Constant(value='cpp')])",
+      "rendered": "language == 'cpp'"
+    },
+    {
+      "line_start": 253,
+      "line_end": 253,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_resolve_leftmost', ctx=Load()), args=[Name(id='sources', ctx=Load()), Name(id='parent_order', ctx=Load()), Constant(value='C++ leftmost')], keywords=[])",
+      "rendered": "_resolve_leftmost(sources, parent_order, 'C++ leftmost')"
+    },
+    {
+      "line_start": 254,
+      "line_end": 254,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='language', ctx=Load()), ops=[Eq()], comparators=[Constant(value='python')])",
+      "rendered": "language == 'python'"
+    },
+    {
+      "line_start": 255,
+      "line_end": 255,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_resolve_leftmost', ctx=Load()), args=[Name(id='sources', ctx=Load()), Name(id='parent_order', ctx=Load()), Constant(value='Python C3')], keywords=[])",
+      "rendered": "_resolve_leftmost(sources, parent_order, 'Python C3')"
+    },
+    {
+      "line_start": 256,
+      "line_end": 256,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='language', ctx=Load()), ops=[In()], comparators=[Tuple(elts=[Constant(value='csharp'), Constant(value='java')], ctx=Load())])",
+      "rendered": "language in ('csharp', 'java')"
+    },
+    {
+      "line_start": 257,
+      "line_end": 257,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_resolve_class_beats_interface', ctx=Load()), args=[Name(id='sources', ctx=Load())], keywords=[])",
+      "rendered": "_resolve_class_beats_interface(sources)"
+    },
+    {
+      "line_start": 258,
+      "line_end": 258,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='language', ctx=Load()), ops=[Eq()], comparators=[Constant(value='rust')])",
+      "rendered": "language == 'rust'"
+    },
+    {
+      "line_start": 259,
+      "line_end": 259,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value=''), Constant(value='ambiguous: Rust requires qualified syntax (<Type as Trait>::method)')], ctx=Load())",
+      "rendered": "('', 'ambiguous: Rust requires qualified syntax (<Type as Trait>::method)')"
+    },
+    {
+      "line_start": 260,
+      "line_end": 260,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_resolve_leftmost', ctx=Load()), args=[Name(id='sources', ctx=Load()), Name(id='parent_order', ctx=Load()), Constant(value='leftmost base')], keywords=[])",
+      "rendered": "_resolve_leftmost(sources, parent_order, 'leftmost base')"
+    },
+    {
+      "line_start": 268,
+      "line_end": 268,
+      "column": 18,
+      "kind": "DictComp",
+      "original_ast": "DictComp(key=Attribute(value=Name(id='parent', ctx=Load()), attr='id', ctx=Load()), value=Name(id='index', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='index', ctx=Store()), Name(id='parent', ctx=Store())], ctx=Store()), iter=Call(func=Name(id='enumerate', ctx=Load()), args=[Name(id='parent_order', ctx=Load())], keywords=[]), ifs=[], is_async=0)])",
+      "rendered": "{parent.id: index for index, parent in enumerate(parent_order)}"
+    },
+    {
+      "line_start": 269,
+      "line_end": 269,
+      "column": 35,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 270,
+      "line_end": 270,
+      "column": 17,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='parent_order', ctx=Load())], keywords=[]), op=Add(), right=Constant(value=1))",
+      "rendered": "len(parent_order) + 1"
+    },
+    {
+      "line_start": 271,
+      "line_end": 271,
+      "column": 18,
+      "kind": "Name",
+      "original_ast": "Name(id='sources', ctx=Load())",
+      "rendered": "sources"
+    },
+    {
+      "line_start": 272,
+      "line_end": 272,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='order_index', ctx=Load()), attr='get', ctx=Load()), args=[Attribute(value=Attribute(value=Name(id='source', ctx=Load()), attr='parent', ctx=Load()), attr='id', ctx=Load())], keywords=[])",
+      "rendered": "order_index.get(source.parent.id)"
+    },
+    {
+      "line_start": 273,
+      "line_end": 273,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='index', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), Compare(left=Name(id='index', ctx=Load()), ops=[Lt()], comparators=[Name(id='best_index', ctx=Load())])])",
+      "rendered": "index is not None and index < best_index"
+    },
+    {
+      "line_start": 274,
+      "line_end": 274,
+      "column": 25,
+      "kind": "Name",
+      "original_ast": "Name(id='index', ctx=Load())",
+      "rendered": "index"
+    },
+    {
+      "line_start": 275,
+      "line_end": 275,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='source', ctx=Load())",
+      "rendered": "source"
+    },
+    {
+      "line_start": 276,
+      "line_end": 276,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='best', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "best is not None"
+    },
+    {
+      "line_start": 277,
+      "line_end": 277,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Attribute(value=Attribute(value=Name(id='best', ctx=Load()), attr='symbol', ctx=Load()), attr='id', ctx=Load()), JoinedStr(values=[FormattedValue(value=Name(id='prefix', ctx=Load()), conversion=-1), Constant(value=' base '), FormattedValue(value=Attribute(value=Attribute(value=Name(id='best', ctx=Load()), attr='parent', ctx=Load()), attr='name', ctx=Load()), conversion=-1), Constant(value=' wins')])], ctx=Load())",
+      "rendered": "(best.symbol.id, source_template_277_31)"
+    },
+    {
+      "line_start": 278,
+      "line_end": 278,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Attribute(value=Attribute(value=Subscript(value=Name(id='sources', ctx=Load()), slice=Constant(value=0), ctx=Load()), attr='symbol', ctx=Load()), attr='id', ctx=Load()), JoinedStr(values=[FormattedValue(value=Name(id='prefix', ctx=Load()), conversion=-1), Constant(value=' (fallback)')])], ctx=Load())",
+      "rendered": "(sources[0].symbol.id, source_template_278_33)"
+    },
+    {
+      "line_start": 282,
+      "line_end": 282,
+      "column": 20,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='source', ctx=Load()), generators=[comprehension(target=Name(id='source', ctx=Store()), iter=Name(id='sources', ctx=Load()), ifs=[Attribute(value=Name(id='source', ctx=Load()), attr='is_class', ctx=Load())], is_async=0)])",
+      "rendered": "[source for source in sources if source.is_class]"
+    },
+    {
+      "line_start": 283,
+      "line_end": 283,
+      "column": 24,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='source', ctx=Load()), generators=[comprehension(target=Name(id='source', ctx=Store()), iter=Name(id='sources', ctx=Load()), ifs=[UnaryOp(op=Not(), operand=Attribute(value=Name(id='source', ctx=Load()), attr='is_class', ctx=Load()))], is_async=0)])",
+      "rendered": "[source for source in sources if not source.is_class]"
+    },
+    {
+      "line_start": 284,
+      "line_end": 284,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='class_sources', ctx=Load())], keywords=[]), ops=[Eq()], comparators=[Constant(value=1)])",
+      "rendered": "len(class_sources) == 1"
+    },
+    {
+      "line_start": 285,
+      "line_end": 285,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Attribute(value=Attribute(value=Subscript(value=Name(id='class_sources', ctx=Load()), slice=Constant(value=0), ctx=Load()), attr='symbol', ctx=Load()), attr='id', ctx=Load()), Constant(value='class method wins over interface default')], ctx=Load())",
+      "rendered": "(class_sources[0].symbol.id, 'class method wins over interface default')"
+    },
+    {
+      "line_start": 286,
+      "line_end": 286,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='class_sources', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Constant(value=1)])",
+      "rendered": "len(class_sources) > 1"
+    },
+    {
+      "line_start": 287,
+      "line_end": 287,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value=''), Constant(value='ambiguous: multiple class methods')], ctx=Load())",
+      "rendered": "('', 'ambiguous: multiple class methods')"
+    },
+    {
+      "line_start": 288,
+      "line_end": 288,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='interface_sources', ctx=Load())], keywords=[]), ops=[Eq()], comparators=[Constant(value=1)])",
+      "rendered": "len(interface_sources) == 1"
+    },
+    {
+      "line_start": 289,
+      "line_end": 289,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Attribute(value=Attribute(value=Subscript(value=Name(id='interface_sources', ctx=Load()), slice=Constant(value=0), ctx=Load()), attr='symbol', ctx=Load()), attr='id', ctx=Load()), Constant(value='single interface method')], ctx=Load())",
+      "rendered": "(interface_sources[0].symbol.id, 'single interface method')"
+    },
+    {
+      "line_start": 290,
+      "line_end": 290,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value=''), Constant(value='ambiguous: multiple interface defaults')], ctx=Load())",
+      "rendered": "('', 'ambiguous: multiple interface defaults')"
+    }
+  ],
+  "calls": [
+    {
+      "line": 90,
+      "end_line": 90,
+      "callee": "dataclass",
+      "enclosing": "MROAmbiguity",
+      "expression": "dataclass(frozen=True)"
+    },
+    {
+      "line": 98,
+      "end_line": 98,
+      "callee": "dataclass",
+      "enclosing": "MROEntry",
+      "expression": "dataclass(frozen=True)"
+    },
+    {
+      "line": 112,
+      "end_line": 112,
+      "callee": "dataclass",
+      "enclosing": "_AncestorMethod",
+      "expression": "dataclass(frozen=True)"
+    },
+    {
+      "line": 34,
+      "end_line": 36,
+      "callee": "sorted",
+      "enclosing": "c3_linearize",
+      "expression": "sorted(\n        set(hierarchy).union({parent for parents in hierarchy.values() for parent in parents})\n    )"
+    },
+    {
+      "line": 71,
+      "end_line": 71,
+      "callee": "range",
+      "enclosing": "_c3_merge",
+      "expression": "range(_MAX_LINEARIZE_STEPS)"
+    },
+    {
+      "line": 87,
+      "end_line": 87,
+      "callee": "ModelValidationError",
+      "enclosing": "_c3_merge",
+      "expression": "ModelValidationError(\"hierarchy linearization exceeded the step bound\")"
+    },
+    {
+      "line": 107,
+      "end_line": 107,
+      "callee": "field",
+      "enclosing": "MROComputation",
+      "expression": "field(default_factory=list[MROEntry])"
+    },
+    {
+      "line": 127,
+      "end_line": 127,
+      "callee": "sorted",
+      "enclosing": "_linearize_all",
+      "expression": "sorted(hierarchy)"
+    },
+    {
+      "line": 153,
+      "end_line": 153,
+      "callee": "MROComputation",
+      "enclosing": "compute_mro",
+      "expression": "MROComputation()"
+    },
+    {
+      "line": 167,
+      "end_line": 167,
+      "callee": "_linearize_all",
+      "enclosing": "compute_mro",
+      "expression": "_linearize_all(parents_by_child)"
+    },
+    {
+      "line": 260,
+      "end_line": 260,
+      "callee": "_resolve_leftmost",
+      "enclosing": "_resolve_ambiguity",
+      "expression": "_resolve_leftmost(sources, parent_order, \"leftmost base\")"
+    },
+    {
+      "line": 35,
+      "end_line": 35,
+      "callee": "set(hierarchy).union",
+      "enclosing": "c3_linearize",
+      "expression": "set(hierarchy).union({parent for parents in hierarchy.values() for parent in parents})"
+    },
+    {
+      "line": 41,
+      "end_line": 41,
+      "callee": "set",
+      "enclosing": "c3_linearize",
+      "expression": "set()"
+    },
+    {
+      "line": 83,
+      "end_line": 83,
+      "callee": "merged.append",
+      "enclosing": "_c3_merge",
+      "expression": "merged.append(found)"
+    },
+    {
+      "line": 128,
+      "end_line": 128,
+      "callee": "set",
+      "enclosing": "_linearize_all",
+      "expression": "set()"
+    },
+    {
+      "line": 177,
+      "end_line": 177,
+      "callee": "methods_by_owner.get",
+      "enclosing": "compute_mro.own_methods",
+      "expression": "methods_by_owner.get(f\"{owner.file_path}\\x00{owner.name}\", [])"
+    },
+    {
+      "line": 196,
+      "end_line": 196,
+      "callee": "own_methods",
+      "enclosing": "compute_mro",
+      "expression": "own_methods(symbol)"
+    },
+    {
+      "line": 219,
+      "end_line": 219,
+      "callee": "sorted",
+      "enclosing": "compute_mro",
+      "expression": "sorted(sources_by_name)"
+    },
+    {
+      "line": 245,
+      "end_line": 245,
+      "callee": "computation.entries.append",
+      "enclosing": "compute_mro",
+      "expression": "computation.entries.append(MROEntry(symbol.name, symbol.language, tuple(ambiguities)))"
+    },
+    {
+      "line": 253,
+      "end_line": 253,
+      "callee": "_resolve_leftmost",
+      "enclosing": "_resolve_ambiguity",
+      "expression": "_resolve_leftmost(sources, parent_order, \"C++ leftmost\")"
+    },
+    {
+      "line": 255,
+      "end_line": 255,
+      "callee": "_resolve_leftmost",
+      "enclosing": "_resolve_ambiguity",
+      "expression": "_resolve_leftmost(sources, parent_order, \"Python C3\")"
+    },
+    {
+      "line": 257,
+      "end_line": 257,
+      "callee": "_resolve_class_beats_interface",
+      "enclosing": "_resolve_ambiguity",
+      "expression": "_resolve_class_beats_interface(sources)"
+    },
+    {
+      "line": 270,
+      "end_line": 270,
+      "callee": "len",
+      "enclosing": "_resolve_leftmost",
+      "expression": "len(parent_order)"
+    },
+    {
+      "line": 272,
+      "end_line": 272,
+      "callee": "order_index.get",
+      "enclosing": "_resolve_leftmost",
+      "expression": "order_index.get(source.parent.id)"
+    },
+    {
+      "line": 284,
+      "end_line": 284,
+      "callee": "len",
+      "enclosing": "_resolve_class_beats_interface",
+      "expression": "len(class_sources)"
+    },
+    {
+      "line": 286,
+      "end_line": 286,
+      "callee": "len",
+      "enclosing": "_resolve_class_beats_interface",
+      "expression": "len(class_sources)"
+    },
+    {
+      "line": 288,
+      "end_line": 288,
+      "callee": "len",
+      "enclosing": "_resolve_class_beats_interface",
+      "expression": "len(interface_sources)"
+    },
+    {
+      "line": 45,
+      "end_line": 45,
+      "callee": "stack.pop",
+      "enclosing": "c3_linearize",
+      "expression": "stack.pop()"
+    },
+    {
+      "line": 48,
+      "end_line": 48,
+      "callee": "hierarchy.get",
+      "enclosing": "c3_linearize",
+      "expression": "hierarchy.get(cls, [])"
+    },
+    {
+      "line": 57,
+      "end_line": 57,
+      "callee": "in_progress.add",
+      "enclosing": "c3_linearize",
+      "expression": "in_progress.add(cls)"
+    },
+    {
+      "line": 58,
+      "end_line": 58,
+      "callee": "stack.append",
+      "enclosing": "c3_linearize",
+      "expression": "stack.append((cls, True))"
+    },
+    {
+      "line": 59,
+      "end_line": 59,
+      "callee": "reversed",
+      "enclosing": "c3_linearize",
+      "expression": "reversed(parents)"
+    },
+    {
+      "line": 82,
+      "end_line": 82,
+      "callee": "ModelValidationError",
+      "enclosing": "_c3_merge",
+      "expression": "ModelValidationError(\"inconsistent hierarchy: cannot resolve merge order\")"
+    },
+    {
+      "line": 132,
+      "end_line": 132,
+      "callee": "pending.pop",
+      "enclosing": "_linearize_all",
+      "expression": "pending.pop()"
+    },
+    {
+      "line": 135,
+      "end_line": 135,
+      "callee": "subset_seen.add",
+      "enclosing": "_linearize_all",
+      "expression": "subset_seen.add(current)"
+    },
+    {
+      "line": 136,
+      "end_line": 136,
+      "callee": "hierarchy.get",
+      "enclosing": "_linearize_all",
+      "expression": "hierarchy.get(current, [])"
+    },
+    {
+      "line": 137,
+      "end_line": 137,
+      "callee": "list",
+      "enclosing": "_linearize_all",
+      "expression": "list(parents)"
+    },
+    {
+      "line": 138,
+      "end_line": 138,
+      "callee": "pending.extend",
+      "enclosing": "_linearize_all",
+      "expression": "pending.extend(parents)"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "orders.update",
+      "enclosing": "_linearize_all",
+      "expression": "orders.update(c3_linearize(subset))"
+    },
+    {
+      "line": 163,
+      "end_line": 163,
+      "callee": "parents_by_child.setdefault",
+      "enclosing": "compute_mro",
+      "expression": "parents_by_child.setdefault(edge.source_local_id, [])"
+    },
+    {
+      "line": 172,
+      "end_line": 174,
+      "callee": "methods_by_owner.setdefault(f'{symbol.file_path}\\x00{symbol.owner_name}', []).append",
+      "enclosing": "compute_mro",
+      "expression": "methods_by_owner.setdefault(f\"{symbol.file_path}\\x00{symbol.owner_name}\", []).append(\n                symbol\n            )"
+    },
+    {
+      "line": 209,
+      "end_line": 209,
+      "callee": "own_methods",
+      "enclosing": "compute_mro",
+      "expression": "own_methods(ancestor)"
+    },
+    {
+      "line": 216,
+      "end_line": 218,
+      "callee": "ambiguities.append",
+      "enclosing": "compute_mro",
+      "expression": "ambiguities.append(\n                MROAmbiguity(\"\", (), \"\", f\"linearization fallback: {failures[symbol.id]}\")\n            )"
+    },
+    {
+      "line": 223,
+      "end_line": 223,
+      "callee": "set",
+      "enclosing": "compute_mro",
+      "expression": "set()"
+    },
+    {
+      "line": 230,
+      "end_line": 230,
+      "callee": "_resolve_ambiguity",
+      "enclosing": "compute_mro",
+      "expression": "_resolve_ambiguity(symbol.language, unique, ancestors)"
+    },
+    {
+      "line": 231,
+      "end_line": 238,
+      "callee": "ambiguities.append",
+      "enclosing": "compute_mro",
+      "expression": "ambiguities.append(\n                MROAmbiguity(\n                    method_name,\n                    tuple(source.symbol.id for source in unique),\n                    resolved_to,\n                    reason,\n                )\n            )"
+    },
+    {
+      "line": 245,
+      "end_line": 245,
+      "callee": "MROEntry",
+      "enclosing": "compute_mro",
+      "expression": "MROEntry(symbol.name, symbol.language, tuple(ambiguities))"
+    },
+    {
+      "line": 268,
+      "end_line": 268,
+      "callee": "enumerate",
+      "enclosing": "_resolve_leftmost",
+      "expression": "enumerate(parent_order)"
+    },
+    {
+      "line": 35,
+      "end_line": 35,
+      "callee": "set",
+      "enclosing": "c3_linearize",
+      "expression": "set(hierarchy)"
+    },
+    {
+      "line": 43,
+      "end_line": 43,
+      "callee": "len",
+      "enclosing": "c3_linearize",
+      "expression": "len(stack)"
+    },
+    {
+      "line": 44,
+      "end_line": 44,
+      "callee": "ModelValidationError",
+      "enclosing": "c3_linearize",
+      "expression": "ModelValidationError(\"hierarchy linearization exceeded the depth bound\")"
+    },
+    {
+      "line": 51,
+      "end_line": 51,
+      "callee": "sequences.append",
+      "enclosing": "c3_linearize",
+      "expression": "sequences.append(list(parents))"
+    },
+    {
+      "line": 53,
+      "end_line": 53,
+      "callee": "in_progress.discard",
+      "enclosing": "c3_linearize",
+      "expression": "in_progress.discard(cls)"
+    },
+    {
+      "line": 56,
+      "end_line": 56,
+      "callee": "ModelValidationError",
+      "enclosing": "c3_linearize",
+      "expression": "ModelValidationError(f\"inconsistent hierarchy: cycle involving {cls!r}\")"
+    },
+    {
+      "line": 78,
+      "end_line": 78,
+      "callee": "any",
+      "enclosing": "_c3_merge",
+      "expression": "any(candidate in other[1:] for other in sequences)"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "c3_linearize",
+      "enclosing": "_linearize_all",
+      "expression": "c3_linearize(subset)"
+    },
+    {
+      "line": 142,
+      "end_line": 142,
+      "callee": "str",
+      "enclosing": "_linearize_all",
+      "expression": "str(error)"
+    },
+    {
+      "line": 165,
+      "end_line": 165,
+      "callee": "bucket.append",
+      "enclosing": "compute_mro",
+      "expression": "bucket.append(edge.target_local_id)"
+    },
+    {
+      "line": 192,
+      "end_line": 192,
+      "callee": "own_methods",
+      "enclosing": "compute_mro",
+      "expression": "own_methods(symbol)"
+    },
+    {
+      "line": 198,
+      "end_line": 198,
+      "callee": "own_methods",
+      "enclosing": "compute_mro",
+      "expression": "own_methods(ancestor)"
+    },
+    {
+      "line": 210,
+      "end_line": 212,
+      "callee": "sources_by_name.setdefault(method.name, []).append",
+      "enclosing": "compute_mro",
+      "expression": "sources_by_name.setdefault(method.name, []).append(\n                    _AncestorMethod(method, ancestor, is_class)\n                )"
+    },
+    {
+      "line": 217,
+      "end_line": 217,
+      "callee": "MROAmbiguity",
+      "enclosing": "compute_mro",
+      "expression": "MROAmbiguity(\"\", (), \"\", f\"linearization fallback: {failures[symbol.id]}\")"
+    },
+    {
+      "line": 228,
+      "end_line": 228,
+      "callee": "len",
+      "enclosing": "compute_mro",
+      "expression": "len(unique)"
+    },
+    {
+      "line": 232,
+      "end_line": 237,
+      "callee": "MROAmbiguity",
+      "enclosing": "compute_mro",
+      "expression": "MROAmbiguity(\n                    method_name,\n                    tuple(source.symbol.id for source in unique),\n                    resolved_to,\n                    reason,\n                )"
+    },
+    {
+      "line": 240,
+      "end_line": 240,
+      "callee": "result.add_edge",
+      "enclosing": "compute_mro",
+      "expression": "result.add_edge(symbol.id, LocalRelationshipType.OVERRIDES, resolved_to)"
+    },
+    {
+      "line": 245,
+      "end_line": 245,
+      "callee": "tuple",
+      "enclosing": "compute_mro",
+      "expression": "tuple(ambiguities)"
+    },
+    {
+      "line": 35,
+      "end_line": 35,
+      "callee": "hierarchy.values",
+      "enclosing": "c3_linearize",
+      "expression": "hierarchy.values()"
+    },
+    {
+      "line": 50,
+      "end_line": 50,
+      "callee": "list",
+      "enclosing": "c3_linearize",
+      "expression": "list(result[parent])"
+    },
+    {
+      "line": 51,
+      "end_line": 51,
+      "callee": "list",
+      "enclosing": "c3_linearize",
+      "expression": "list(parents)"
+    },
+    {
+      "line": 61,
+      "end_line": 63,
+      "callee": "ModelValidationError",
+      "enclosing": "c3_linearize",
+      "expression": "ModelValidationError(\n                        f\"inconsistent hierarchy: cycle involving {parent!r}\"\n                    )"
+    },
+    {
+      "line": 65,
+      "end_line": 65,
+      "callee": "stack.append",
+      "enclosing": "c3_linearize",
+      "expression": "stack.append((parent, False))"
+    },
+    {
+      "line": 172,
+      "end_line": 172,
+      "callee": "methods_by_owner.setdefault",
+      "enclosing": "compute_mro",
+      "expression": "methods_by_owner.setdefault(f\"{symbol.file_path}\\x00{symbol.owner_name}\", [])"
+    },
+    {
+      "line": 186,
+      "end_line": 186,
+      "callee": "orders.get",
+      "enclosing": "compute_mro",
+      "expression": "orders.get(symbol.id, [])"
+    },
+    {
+      "line": 211,
+      "end_line": 211,
+      "callee": "_AncestorMethod",
+      "enclosing": "compute_mro",
+      "expression": "_AncestorMethod(method, ancestor, is_class)"
+    },
+    {
+      "line": 226,
+      "end_line": 226,
+      "callee": "seen.add",
+      "enclosing": "compute_mro",
+      "expression": "seen.add(source.symbol.id)"
+    },
+    {
+      "line": 227,
+      "end_line": 227,
+      "callee": "unique.append",
+      "enclosing": "compute_mro",
+      "expression": "unique.append(source)"
+    },
+    {
+      "line": 234,
+      "end_line": 234,
+      "callee": "tuple",
+      "enclosing": "compute_mro",
+      "expression": "tuple(source.symbol.id for source in unique)"
+    },
+    {
+      "line": 52,
+      "end_line": 52,
+      "callee": "_c3_merge",
+      "enclosing": "c3_linearize",
+      "expression": "_c3_merge(sequences)"
+    },
+    {
+      "line": 143,
+      "end_line": 143,
+      "callee": "hierarchy.get",
+      "enclosing": "_linearize_all",
+      "expression": "hierarchy.get(cls, [])"
+    },
+    {
+      "line": 199,
+      "end_line": 203,
+      "callee": "result.add_edge",
+      "enclosing": "compute_mro",
+      "expression": "result.add_edge(\n                        child_method.id,\n                        LocalRelationshipType.OVERRIDES,\n                        ancestor_method.id,\n                    )"
+    },
+    {
+      "line": 210,
+      "end_line": 210,
+      "callee": "sources_by_name.setdefault",
+      "enclosing": "compute_mro",
+      "expression": "sources_by_name.setdefault(method.name, [])"
+    }
+  ],
+  "imports": [
+    {
+      "line": 17,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "from dataclasses import dataclass, field",
+      "targets": [
+        "dataclasses",
+        "dataclasses.dataclass",
+        "dataclasses.field"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "from context_graph_sdk.errors import ModelValidationError",
+      "targets": [
+        "context_graph_sdk.errors",
+        "context_graph_sdk.errors.ModelValidationError"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/errors.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 22,
+      "source_expression": "from context_graph_sdk.extractors.records import Symbol",
+      "targets": [
+        "context_graph_sdk.extractors.records",
+        "context_graph_sdk.extractors.records.Symbol"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/extractors/records.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 23,
+      "source_expression": "from context_graph_sdk.models import LocalRelationshipType",
+      "targets": [
+        "context_graph_sdk.models",
+        "context_graph_sdk.models.LocalRelationshipType"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/models.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 24,
+      "source_expression": "from context_graph_sdk.resolution.context import ResolutionContext, ResolutionResult",
+      "targets": [
+        "context_graph_sdk.resolution.context",
+        "context_graph_sdk.resolution.context.ResolutionContext",
+        "context_graph_sdk.resolution.context.ResolutionResult"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/resolution/context.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 25,
+      "source_expression": "from context_graph_sdk.resolution.heritage import CLASS_LIKE_LABELS",
+      "targets": [
+        "context_graph_sdk.resolution.heritage",
+        "context_graph_sdk.resolution.heritage.CLASS_LIKE_LABELS"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/resolution/heritage.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

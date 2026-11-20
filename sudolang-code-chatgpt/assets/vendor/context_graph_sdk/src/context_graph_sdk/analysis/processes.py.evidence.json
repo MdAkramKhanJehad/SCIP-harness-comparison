@@ -1,0 +1,5682 @@
+{
+  "source": "vendor/context_graph_sdk/src/context_graph_sdk/analysis/processes.py",
+  "sha256": "945c98bb8950cdeb23a94afe743978f4d53818ac077770c2434f33fd6f5d11c9",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Bounded BFS process-flow discovery, importance scoring, and PageRank.\"\"\"\n\nfrom __future__ import annotations\n\nimport hashlib\nimport math\nimport posixpath\nfrom dataclasses import dataclass, field\n\nfrom context_graph_sdk.analysis.entry_points import (\n    ORCHESTRATOR_MAX_CALLERS,\n    ORCHESTRATOR_MIN_CALLEES,\n    entry_point_score,\n    heuristic_label,\n    is_command_dir,\n    is_test_file,\n)\nfrom context_graph_sdk.analysis.inputs import AnalysisInputs, AnalysisNode\nfrom context_graph_sdk.errors import ModelValidationError\n\n_PAGERANK_ITERATIONS = 10\n_PAGERANK_DAMPING = 0.85\nDEFAULT_MAX_PROCESSES = 10_000\nMAX_PROCESS_LIMIT = 100_000\n\n\n@dataclass(frozen=True)\nclass ProcessOptions:\n    max_depth: int = 10\n    max_branching: int = 4\n    min_steps: int = 3\n    max_processes: int = DEFAULT_MAX_PROCESSES\n    min_confidence: float = 0.5\n    exclude_tests: bool = True\n\n\n@dataclass(frozen=True)\nclass ProcessRecord:\n    local_id: str\n    name: str\n    entry_point_id: str\n    heuristic_label: str\n    step_count: int\n    caller_count: int\n    entry_point_score: float\n    importance: float\n    cross_community: bool\n    communities: tuple[str, ...]\n    steps: tuple[tuple[str, int], ...]  # (symbol local id, step number)\n\n\nclass FlowGraph:\n    \"\"\"Directed call-flow view over resolution edges, indexed both ways.\"\"\"\n\n    def __init__(\n        self,\n        inputs: AnalysisInputs,\n        community_of: dict[str, str],\n    ) -> None:\n        self.symbols: dict[str, AnalysisNode] = inputs.nodes\n        self.community_of = community_of\n        self.outgoing: dict[str, list[tuple[str, str, float]]] = {}\n        self.incoming: dict[str, list[tuple[str, str, float]]] = {}\n        for source_id, target_id, relationship, confidence in inputs.edges:\n            if source_id not in inputs.nodes or target_id not in inputs.nodes:\n                continue\n            self.outgoing.setdefault(source_id, []).append((target_id, relationship, confidence))\n            self.incoming.setdefault(target_id, []).append((source_id, relationship, confidence))\n        for bucket in self.outgoing.values():\n            bucket.sort(key=lambda item: (-item[2], item[0]))\n        for bucket in self.incoming.values():\n            bucket.sort()\n\n    def callable_ids(self) -> list[str]:\n        return sorted(\n            symbol_id\n            for symbol_id, symbol in self.symbols.items()\n            if symbol.label in (\"Function\", \"Method\")\n        )\n\n    def incoming_of(self, node: str, relationship: str) -> list[str]:\n        return [source for source, rel, _ in self.incoming.get(node, []) if rel == relationship]\n\n    def outgoing_count(self, node: str, *relationships: str) -> int:\n        return sum(1 for _, rel, _ in self.outgoing.get(node, []) if rel in relationships)\n\n    def production_callers(self, node: str, relationships: tuple[str, ...]) -> int:\n        count = 0\n        for source, rel, _ in self.incoming.get(node, []):\n            if rel not in relationships:\n                continue\n            symbol = self.symbols.get(source)\n            if symbol is not None and is_test_file(symbol.file_path):\n                continue\n            count += 1\n        return count\n\n\ndef _find_entry_points(graph: FlowGraph, exclude_tests: bool) -> list[str]:\n    entry_points: list[str] = []\n    for node in graph.callable_ids():\n        symbol = graph.symbols[node]\n        if exclude_tests and is_test_file(symbol.file_path):\n            continue\n        if not graph.incoming_of(node, \"CALLS\"):\n            entry_points.append(node)\n    return entry_points\n\n\ndef _find_orchestrators(graph: FlowGraph, existing: set[str], exclude_tests: bool) -> list[str]:\n    orchestrators: list[str] = []\n    all_relationships = (\"CALLS\", \"SPAWNS\", \"DELEGATES_TO\")\n    for node in graph.callable_ids():\n        if node in existing:\n            continue\n        symbol = graph.symbols[node]\n        if exclude_tests and is_test_file(symbol.file_path):\n            continue\n        production = graph.production_callers(node, all_relationships)\n        if production == 0 or production > ORCHESTRATOR_MAX_CALLERS:\n            continue\n        if graph.outgoing_count(node, *all_relationships) >= ORCHESTRATOR_MIN_CALLEES:\n            orchestrators.append(node)\n    return orchestrators\n\n\ndef _find_spawn_targets(graph: FlowGraph, existing: set[str], exclude_tests: bool) -> list[str]:\n    targets: list[str] = []\n    seen: set[str] = set()\n    for node in graph.callable_ids():\n        if node in existing or node in seen:\n            continue\n        if not graph.incoming_of(node, \"SPAWNS\"):\n            continue\n        seen.add(node)\n        symbol = graph.symbols[node]\n        if exclude_tests and is_test_file(symbol.file_path):\n            continue\n        targets.append(node)\n    return targets\n\n\ndef _find_delegate_targets(graph: FlowGraph, existing: set[str], exclude_tests: bool) -> list[str]:\n    targets: list[str] = []\n    for node in graph.callable_ids():\n        if node in existing:\n            continue\n        if not graph.incoming_of(node, \"DELEGATES_TO\"):\n            continue\n        symbol = graph.symbols[node]\n        if exclude_tests and is_test_file(symbol.file_path):\n            continue\n        if graph.incoming_of(node, \"CALLS\"):\n            continue\n        callees = graph.outgoing_count(node, \"CALLS\") + graph.outgoing_count(node, \"SPAWNS\")\n        if callees < 3:\n            continue\n        targets.append(node)\n    return targets\n\n\n@dataclass\nclass _RawProcess:\n    entry_point: str\n    steps: list[tuple[str, int, int]]  # (node, step number, depth)\n    visited: set[str]\n    communities: tuple[str, ...]\n    cross_community: bool\n    caller_count: int\n    importance: float = 0.0\n    steps_set: set[str] = field(default_factory=set[str])\n\n\ndef _spawn_sibling_counts(graph: FlowGraph) -> dict[str, int]:\n    fanout: dict[str, int] = {}\n    for source, edges in graph.outgoing.items():\n        fanout[source] = sum(1 for _, rel, _ in edges if rel == \"SPAWNS\")\n    siblings: dict[str, int] = {}\n    for target, edges in graph.incoming.items():\n        for source, rel, _ in edges:\n            if rel == \"SPAWNS\":\n                siblings[target] = max(siblings.get(target, 0), fanout.get(source, 0))\n    return siblings\n\n\ndef _external_callers(graph: FlowGraph, node: str, visited: set[str], seen: set[str]) -> list[str]:\n    callers: list[str] = []\n    for source, _, _ in graph.incoming.get(node, []):\n        if source not in visited and source not in seen:\n            seen.add(source)\n            callers.append(source)\n    return callers\n\n\ndef detect_processes(\n    inputs: AnalysisInputs,\n    community_of: dict[str, str],\n    options: ProcessOptions | None = None,\n) -> list[ProcessRecord]:\n    options = options or ProcessOptions()\n    if not 1 <= options.max_processes <= MAX_PROCESS_LIMIT:\n        raise ModelValidationError(f\"max_processes must be in [1, {MAX_PROCESS_LIMIT}]\")\n    graph = FlowGraph(inputs, community_of)\n\n    entry_points = _find_entry_points(graph, options.exclude_tests)\n    existing = set(entry_points)\n    orchestrators = _find_orchestrators(graph, existing, options.exclude_tests)\n    entry_points.extend(orchestrators)\n    existing.update(orchestrators)\n    spawn_targets = _find_spawn_targets(graph, existing, options.exclude_tests)\n    entry_points.extend(spawn_targets)\n    existing.update(spawn_targets)\n    delegate_targets = _find_delegate_targets(graph, existing, options.exclude_tests)\n    entry_points.extend(delegate_targets)\n    entry_points.sort()\n\n    orchestrator_set = set(orchestrators)\n    spawn_siblings = _spawn_sibling_counts(graph)\n\n    seen_fingerprints: set[str] = set()\n    raw_processes: list[_RawProcess] = []\n    for entry_point in entry_points:\n        if len(raw_processes) >= options.max_processes:\n            break\n        visited = {entry_point}\n        steps: list[tuple[str, int, int]] = []\n        queue: list[tuple[str, int]] = [(entry_point, 0)]\n        head = 0\n        step_number = 0\n        while head < len(queue):\n            node, depth = queue[head]\n            head += 1\n            step_number += 1\n            steps.append((node, step_number, depth))\n            if depth >= options.max_depth:\n                continue\n            branch_limit = options.max_branching * 2 if depth == 0 else options.max_branching\n            branch_count = 0\n            for target, _, confidence in graph.outgoing.get(node, []):\n                if branch_count >= branch_limit:\n                    break\n                # Zero or absent confidence means unspecified; only explicit\n                # low-confidence edges are pruned.\n                if 0 < confidence < options.min_confidence:\n                    continue\n                if target in visited:\n                    continue\n                visited.add(target)\n                queue.append((target, depth + 1))\n                branch_count += 1\n\n        if len(steps) < options.min_steps:\n            continue\n        fingerprint = hashlib.sha256(\n            \"\\x00\".join(sorted(node for node, _, _ in steps)).encode()\n        ).hexdigest()[:32]\n        if fingerprint in seen_fingerprints:\n            continue\n        seen_fingerprints.add(fingerprint)\n\n        community_set = {community_of[node] for node, _, _ in steps if node in community_of}\n        caller_seen: set[str] = set()\n        for node, _, _ in steps:\n            _external_callers(graph, node, visited, caller_seen)\n\n        raw_processes.append(\n            _RawProcess(\n                entry_point,\n                steps,\n                visited,\n                tuple(sorted(community_set)),\n                len(community_set) > 1,\n                len(caller_seen),\n                steps_set={node for node, _, _ in steps},\n            )\n        )\n\n    step_flow_count: dict[str, int] = {}\n    for raw in raw_processes:\n        for node, _, _ in raw.steps:\n            step_flow_count[node] = step_flow_count.get(node, 0) + 1\n\n    for raw in raw_processes:\n        effective_callers = 0.0\n        effective_steps = 0.0\n        caller_seen = set()\n        for node, _, depth in raw.steps:\n            share = max(step_flow_count.get(node, 1), 1)\n            step_weight = 1.0 / (share ** (1.0 / 3.0))\n            caller_weight = (1.0 / (depth + 1)) / math.sqrt(share)\n            effective_steps += step_weight\n            for caller in _external_callers(graph, node, raw.visited, caller_seen):\n                symbol = graph.symbols.get(caller)\n                if symbol is not None and is_test_file(symbol.file_path):\n                    continue\n                effective_callers += caller_weight\n\n        packages = {\n            posixpath.dirname(graph.symbols[node].file_path)\n            for node, _, _ in raw.steps\n            if graph.symbols[node].file_path\n        }\n        packages.discard(\"\")\n        entry_fanout = graph.outgoing_count(raw.entry_point, \"CALLS\")\n        entry_production_callers = graph.production_callers(raw.entry_point, (\"CALLS\", \"SPAWNS\"))\n        entry_symbol = graph.symbols[raw.entry_point]\n        entry_path = entry_symbol.file_path\n\n        raw_reach = float(len(raw.steps))\n        importance = (math.log1p(effective_callers) + 0.3 * math.log1p(raw_reach)) * math.log1p(\n            effective_steps\n        )\n        if raw.steps:\n            exclusivity = effective_steps / len(raw.steps)\n            importance *= 1.0 + 0.3 * math.sqrt(exclusivity)\n        if raw.cross_community:\n            importance *= 1.5\n        if len(packages) > 2:\n            importance *= 1.0 + 0.3 * math.log1p(len(packages) - 2)\n        if entry_fanout > 1:\n            importance *= 1.0 + 0.15 * math.log1p(entry_fanout)\n        if entry_production_callers > 1:\n            importance *= 1.0 + 0.2 * math.log1p(entry_production_callers)\n        siblings = spawn_siblings.get(raw.entry_point, 0)\n        if siblings > 0:\n            importance *= 1.0 + 0.5 / math.sqrt(max(siblings, 1))\n\n        entry_label = heuristic_label(entry_symbol.name)\n        if (\n            raw.entry_point in orchestrator_set\n            and entry_label not in (\"Create operation\", \"Initialization\")\n            and not is_command_dir(entry_path)\n        ):\n            importance *= 1.5\n        if entry_label in (\"Create operation\", \"Initialization\"):\n            importance *= 0.2\n        if is_command_dir(entry_path):\n            importance *= 0.5\n        if entry_path and is_test_file(entry_path):\n            importance *= 0.1\n        raw.importance = importance\n\n    # Flow-level PageRank: flows invoked by important flows gain rank.\n    entry_to_index = {raw.entry_point: index for index, raw in enumerate(raw_processes)}\n    invokers, out_degree = flow_rank_topology(\n        [[node for node, _, _ in raw.steps] for raw in raw_processes], entry_to_index\n    )\n    rank = [raw.importance for raw in raw_processes]\n    for _ in range(_PAGERANK_ITERATIONS):\n        new_rank = [0.0] * len(raw_processes)\n        for index, raw in enumerate(raw_processes):\n            new_rank[index] = (1 - _PAGERANK_DAMPING) * raw.importance\n            for invoker in invokers[index]:\n                if out_degree[invoker] > 0:\n                    new_rank[index] += _PAGERANK_DAMPING * rank[invoker] / out_degree[invoker]\n        rank = new_rank\n    for index, raw in enumerate(raw_processes):\n        if raw.importance > 0:\n            ratio = rank[index] / raw.importance\n            if ratio > 1.0:\n                raw.importance *= 1.0 + math.log1p(ratio - 1.0)\n\n    records: list[ProcessRecord] = []\n    for raw in raw_processes:\n        entry_symbol = graph.symbols[raw.entry_point]\n        # Expose the entry-point heuristic as metadata without letting it\n        # perturb the independently calculated importance ordering.\n        score = entry_point_score(\n            entry_symbol.name,\n            entry_symbol.language,\n            entry_symbol.is_exported,\n            len(graph.incoming_of(raw.entry_point, \"CALLS\")),\n            graph.outgoing_count(raw.entry_point, \"CALLS\"),\n            entry_symbol.file_path,\n        ).score\n        records.append(\n            ProcessRecord(\n                local_id=f\"process:{raw.entry_point}-flow\",\n                name=_qualified_flow_name(entry_symbol),\n                entry_point_id=raw.entry_point,\n                heuristic_label=heuristic_label(entry_symbol.name),\n                step_count=len(raw.steps),\n                # Expose the raw unique external caller count; importance\n                # applies production-only weighting separately.\n                caller_count=raw.caller_count,\n                entry_point_score=score,\n                importance=raw.importance,\n                cross_community=raw.cross_community,\n                communities=raw.communities,\n                steps=tuple((node, number) for node, number, _ in raw.steps),\n            )\n        )\n    return records\n\n\ndef flow_rank_topology(\n    flow_steps: list[list[str]], entry_to_index: dict[str, int]\n) -> tuple[list[list[int]], list[int]]:\n    \"\"\"Invoker lists and out-degrees for the flow PageRank.\n\n    A flow's own entry point is always among its steps; it is excluded from\n    both the invoker lists and the out-degree so a flow's rank share is\n    split only across the *other* flows it invokes (consistent semantics on\n    both sides of the propagation).\n    \"\"\"\n    invokers: list[list[int]] = [[] for _ in flow_steps]\n    out_degree: list[int] = [0] * len(flow_steps)\n    for index, steps in enumerate(flow_steps):\n        for node in steps:\n            target = entry_to_index.get(node)\n            if target is not None and target != index:\n                invokers[target].append(index)\n                out_degree[index] += 1\n    return invokers, out_degree\n\n\ndef _qualified_flow_name(entry: AnalysisNode) -> str:\n    package = \"\"\n    if entry.file_path:\n        directory = posixpath.dirname(entry.file_path)\n        if directory not in (\".\", \"/\", \"\"):\n            package = posixpath.basename(directory)\n    parts = [\n        part\n        for part in (package, entry.owner_name if entry.label == \"Method\" else \"\", entry.name)\n        if part\n    ]\n    return \".\".join(parts) + \"-flow\"\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/analysis/processes.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "Bounded BFS process-flow discovery, importance scoring, and PageRank.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_67_4": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/analysis/processes.py",
+      "line_start": 67,
+      "line_end": 67,
+      "value": "Directed call-flow view over resolution edges, indexed both ways.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_216_35": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/analysis/processes.py",
+      "line_start": 216,
+      "line_end": 216,
+      "source_expression": "f\"max_processes must be in [1, {MAX_PROCESS_LIMIT}]\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_392_25": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/analysis/processes.py",
+      "line_start": 392,
+      "line_end": 392,
+      "source_expression": "f\"process:{raw.entry_point}-flow\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_413_4": {
+      "source": "vendor/context_graph_sdk/src/context_graph_sdk/analysis/processes.py",
+      "line_start": 413,
+      "line_end": 419,
+      "value": "Invoker lists and out-degrees for the flow PageRank.\n\n    A flow's own entry point is always among its steps; it is excluded from\n    both the invoker lists and the out-degree so a flow's rank share is\n    split only across the *other* flows it invokes (consistent semantics on\n    both sides of the propagation).\n    ",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "Bounded BFS process-flow discovery, importance scoring, and PageRank.",
+      "context": "literal"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 4,
+      "value": "Directed call-flow view over resolution edges, indexed both ways.",
+      "context": "literal"
+    },
+    {
+      "line_start": 413,
+      "line_end": 419,
+      "column": 4,
+      "value": "Invoker lists and out-degrees for the flow PageRank.\n\n    A flow's own entry point is always among its steps; it is excluded from\n    both the invoker lists and the out-degree so a flow's rank share is\n    split only across the *other* flows it invokes (consistent semantics on\n    both sides of the propagation).\n    ",
+      "context": "literal"
+    },
+    {
+      "line_start": 432,
+      "line_end": 432,
+      "column": 14,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 25,
+      "value": "CALLS",
+      "context": "literal"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 34,
+      "value": "SPAWNS",
+      "context": "literal"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 44,
+      "value": "DELEGATES_TO",
+      "context": "literal"
+    },
+    {
+      "line_start": 442,
+      "line_end": 442,
+      "column": 29,
+      "value": "-flow",
+      "context": "literal"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 35,
+      "value": "CALLS",
+      "context": "literal"
+    },
+    {
+      "line_start": 317,
+      "line_end": 317,
+      "column": 25,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 318,
+      "line_end": 318,
+      "column": 61,
+      "value": "CALLS",
+      "context": "literal"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 39,
+      "value": "CALLS",
+      "context": "literal"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 39,
+      "value": "SPAWNS",
+      "context": "literal"
+    },
+    {
+      "line_start": 162,
+      "line_end": 162,
+      "column": 39,
+      "value": "DELEGATES_TO",
+      "context": "literal"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 45,
+      "value": "CALLS",
+      "context": "literal"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 83,
+      "value": "SPAWNS",
+      "context": "literal"
+    },
+    {
+      "line_start": 195,
+      "line_end": 195,
+      "column": 22,
+      "value": "SPAWNS",
+      "context": "literal"
+    },
+    {
+      "line_start": 216,
+      "line_end": 216,
+      "column": 37,
+      "value": "max_processes must be in [1, ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 216,
+      "line_end": 216,
+      "column": 85,
+      "value": "]",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 319,
+      "line_end": 319,
+      "column": 78,
+      "value": "CALLS",
+      "context": "literal"
+    },
+    {
+      "line_start": 319,
+      "line_end": 319,
+      "column": 87,
+      "value": "SPAWNS",
+      "context": "literal"
+    },
+    {
+      "line_start": 349,
+      "line_end": 349,
+      "column": 27,
+      "value": "Create operation",
+      "context": "literal"
+    },
+    {
+      "line_start": 349,
+      "line_end": 349,
+      "column": 47,
+      "value": "Initialization",
+      "context": "literal"
+    },
+    {
+      "line_start": 435,
+      "line_end": 435,
+      "column": 29,
+      "value": ".",
+      "context": "literal"
+    },
+    {
+      "line_start": 435,
+      "line_end": 435,
+      "column": 34,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 435,
+      "line_end": 435,
+      "column": 39,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 442,
+      "line_end": 442,
+      "column": 11,
+      "value": ".",
+      "context": "literal"
+    },
+    {
+      "line_start": 345,
+      "line_end": 345,
+      "column": 36,
+      "value": "Create operation",
+      "context": "literal"
+    },
+    {
+      "line_start": 345,
+      "line_end": 345,
+      "column": 56,
+      "value": "Initialization",
+      "context": "literal"
+    },
+    {
+      "line_start": 387,
+      "line_end": 387,
+      "column": 50,
+      "value": "CALLS",
+      "context": "literal"
+    },
+    {
+      "line_start": 439,
+      "line_end": 439,
+      "column": 79,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 64,
+      "value": "SPAWNS",
+      "context": "literal"
+    },
+    {
+      "line_start": 386,
+      "line_end": 386,
+      "column": 51,
+      "value": "CALLS",
+      "context": "literal"
+    },
+    {
+      "line_start": 392,
+      "line_end": 392,
+      "column": 27,
+      "value": "process:",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 392,
+      "line_end": 392,
+      "column": 52,
+      "value": "-flow",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 439,
+      "line_end": 439,
+      "column": 65,
+      "value": "Method",
+      "context": "literal"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 32,
+      "value": "Function",
+      "context": "literal"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 44,
+      "value": "Method",
+      "context": "literal"
+    },
+    {
+      "line_start": 269,
+      "line_end": 269,
+      "column": 12,
+      "value": "\u0000",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 63,
+      "text": "# (symbol local id, step number)"
+    },
+    {
+      "line": 179,
+      "text": "# (node, step number, depth)"
+    },
+    {
+      "line": 256,
+      "text": "# Zero or absent confidence means unspecified; only explicit"
+    },
+    {
+      "line": 257,
+      "text": "# low-confidence edges are pruned."
+    },
+    {
+      "line": 357,
+      "text": "# Flow-level PageRank: flows invoked by important flows gain rank."
+    },
+    {
+      "line": 380,
+      "text": "# Expose the entry-point heuristic as metadata without letting it"
+    },
+    {
+      "line": 381,
+      "text": "# perturb the independently calculated importance ordering."
+    },
+    {
+      "line": 397,
+      "text": "# Expose the raw unique external caller count; importance"
+    },
+    {
+      "line": 398,
+      "text": "# applies production-only weighting separately."
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 31,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 32,
+      "line_end": 32,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 33,
+      "line_end": 33,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "Assign",
+      "line_start": 35,
+      "line_end": 35,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "Assign",
+      "line_start": 36,
+      "line_end": 36,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 37,
+      "line_end": 37,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 38,
+      "line_end": 38,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 42,
+      "line_end": 48,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 7
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 43,
+      "line_end": 43,
+      "column": 4,
+      "owner": "ProcessOptions",
+      "representation_line": 15
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 44,
+      "line_end": 44,
+      "column": 4,
+      "owner": "ProcessOptions",
+      "representation_line": 15
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 45,
+      "line_end": 45,
+      "column": 4,
+      "owner": "ProcessOptions",
+      "representation_line": 15
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 46,
+      "line_end": 46,
+      "column": 4,
+      "owner": "ProcessOptions",
+      "representation_line": 15
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 47,
+      "line_end": 47,
+      "column": 4,
+      "owner": "ProcessOptions",
+      "representation_line": 15
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 48,
+      "line_end": 48,
+      "column": 4,
+      "owner": "ProcessOptions",
+      "representation_line": 17
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 52,
+      "line_end": 63,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 20
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 53,
+      "line_end": 53,
+      "column": 4,
+      "owner": "ProcessRecord",
+      "representation_line": 28
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 54,
+      "line_end": 54,
+      "column": 4,
+      "owner": "ProcessRecord",
+      "representation_line": 28
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 55,
+      "line_end": 55,
+      "column": 4,
+      "owner": "ProcessRecord",
+      "representation_line": 28
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 56,
+      "line_end": 56,
+      "column": 4,
+      "owner": "ProcessRecord",
+      "representation_line": 28
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 57,
+      "line_end": 57,
+      "column": 4,
+      "owner": "ProcessRecord",
+      "representation_line": 28
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 58,
+      "line_end": 58,
+      "column": 4,
+      "owner": "ProcessRecord",
+      "representation_line": 30
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 59,
+      "line_end": 59,
+      "column": 4,
+      "owner": "ProcessRecord",
+      "representation_line": 30
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 60,
+      "line_end": 60,
+      "column": 4,
+      "owner": "ProcessRecord",
+      "representation_line": 30
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 61,
+      "line_end": 61,
+      "column": 4,
+      "owner": "ProcessRecord",
+      "representation_line": 30
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 62,
+      "line_end": 62,
+      "column": 4,
+      "owner": "ProcessRecord",
+      "representation_line": 30
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 63,
+      "line_end": 63,
+      "column": 4,
+      "owner": "ProcessRecord",
+      "representation_line": 32
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 66,
+      "line_end": 110,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 35
+    },
+    {
+      "kind": "Expr",
+      "line_start": 67,
+      "line_end": 67,
+      "column": 4,
+      "owner": "FlowGraph",
+      "representation_line": 40
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 69,
+      "line_end": 86,
+      "column": 4,
+      "owner": "FlowGraph",
+      "representation_line": 41
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 74,
+      "line_end": 74,
+      "column": 8,
+      "owner": "FlowGraph.__init__",
+      "representation_line": 47
+    },
+    {
+      "kind": "Assign",
+      "line_start": 75,
+      "line_end": 75,
+      "column": 8,
+      "owner": "FlowGraph.__init__",
+      "representation_line": 47
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 76,
+      "line_end": 76,
+      "column": 8,
+      "owner": "FlowGraph.__init__",
+      "representation_line": 47
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 77,
+      "line_end": 77,
+      "column": 8,
+      "owner": "FlowGraph.__init__",
+      "representation_line": 47
+    },
+    {
+      "kind": "For",
+      "line_start": 78,
+      "line_end": 82,
+      "column": 8,
+      "owner": "FlowGraph.__init__",
+      "representation_line": 48
+    },
+    {
+      "kind": "If",
+      "line_start": 79,
+      "line_end": 80,
+      "column": 12,
+      "owner": "FlowGraph.__init__",
+      "representation_line": 50
+    },
+    {
+      "kind": "Continue",
+      "line_start": 80,
+      "line_end": 80,
+      "column": 16,
+      "owner": "FlowGraph.__init__",
+      "representation_line": 52
+    },
+    {
+      "kind": "Expr",
+      "line_start": 81,
+      "line_end": 81,
+      "column": 12,
+      "owner": "FlowGraph.__init__",
+      "representation_line": 56
+    },
+    {
+      "kind": "Expr",
+      "line_start": 82,
+      "line_end": 82,
+      "column": 12,
+      "owner": "FlowGraph.__init__",
+      "representation_line": 56
+    },
+    {
+      "kind": "For",
+      "line_start": 83,
+      "line_end": 84,
+      "column": 8,
+      "owner": "FlowGraph.__init__",
+      "representation_line": 58
+    },
+    {
+      "kind": "Expr",
+      "line_start": 84,
+      "line_end": 84,
+      "column": 12,
+      "owner": "FlowGraph.__init__",
+      "representation_line": 61
+    },
+    {
+      "kind": "For",
+      "line_start": 85,
+      "line_end": 86,
+      "column": 8,
+      "owner": "FlowGraph.__init__",
+      "representation_line": 63
+    },
+    {
+      "kind": "Expr",
+      "line_start": 86,
+      "line_end": 86,
+      "column": 12,
+      "owner": "FlowGraph.__init__",
+      "representation_line": 66
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 88,
+      "line_end": 93,
+      "column": 4,
+      "owner": "FlowGraph",
+      "representation_line": 70
+    },
+    {
+      "kind": "Return",
+      "line_start": 89,
+      "line_end": 93,
+      "column": 8,
+      "owner": "FlowGraph.callable_ids",
+      "representation_line": 75
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 95,
+      "line_end": 96,
+      "column": 4,
+      "owner": "FlowGraph",
+      "representation_line": 79
+    },
+    {
+      "kind": "Return",
+      "line_start": 96,
+      "line_end": 96,
+      "column": 8,
+      "owner": "FlowGraph.incoming_of",
+      "representation_line": 84
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 98,
+      "line_end": 99,
+      "column": 4,
+      "owner": "FlowGraph",
+      "representation_line": 88
+    },
+    {
+      "kind": "Return",
+      "line_start": 99,
+      "line_end": 99,
+      "column": 8,
+      "owner": "FlowGraph.outgoing_count",
+      "representation_line": 93
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 101,
+      "line_end": 110,
+      "column": 4,
+      "owner": "FlowGraph",
+      "representation_line": 97
+    },
+    {
+      "kind": "Assign",
+      "line_start": 102,
+      "line_end": 102,
+      "column": 8,
+      "owner": "FlowGraph.production_callers",
+      "representation_line": 103
+    },
+    {
+      "kind": "For",
+      "line_start": 103,
+      "line_end": 109,
+      "column": 8,
+      "owner": "FlowGraph.production_callers",
+      "representation_line": 104
+    },
+    {
+      "kind": "If",
+      "line_start": 104,
+      "line_end": 105,
+      "column": 12,
+      "owner": "FlowGraph.production_callers",
+      "representation_line": 106
+    },
+    {
+      "kind": "Continue",
+      "line_start": 105,
+      "line_end": 105,
+      "column": 16,
+      "owner": "FlowGraph.production_callers",
+      "representation_line": 108
+    },
+    {
+      "kind": "Assign",
+      "line_start": 106,
+      "line_end": 106,
+      "column": 12,
+      "owner": "FlowGraph.production_callers",
+      "representation_line": 112
+    },
+    {
+      "kind": "If",
+      "line_start": 107,
+      "line_end": 108,
+      "column": 12,
+      "owner": "FlowGraph.production_callers",
+      "representation_line": 113
+    },
+    {
+      "kind": "Continue",
+      "line_start": 108,
+      "line_end": 108,
+      "column": 16,
+      "owner": "FlowGraph.production_callers",
+      "representation_line": 115
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 109,
+      "line_end": 109,
+      "column": 12,
+      "owner": "FlowGraph.production_callers",
+      "representation_line": 119
+    },
+    {
+      "kind": "Return",
+      "line_start": 110,
+      "line_end": 110,
+      "column": 8,
+      "owner": "FlowGraph.production_callers",
+      "representation_line": 121
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 113,
+      "line_end": 121,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 126
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 114,
+      "line_end": 114,
+      "column": 4,
+      "owner": "_find_entry_points",
+      "representation_line": 132
+    },
+    {
+      "kind": "For",
+      "line_start": 115,
+      "line_end": 120,
+      "column": 4,
+      "owner": "_find_entry_points",
+      "representation_line": 133
+    },
+    {
+      "kind": "Assign",
+      "line_start": 116,
+      "line_end": 116,
+      "column": 8,
+      "owner": "_find_entry_points",
+      "representation_line": 136
+    },
+    {
+      "kind": "If",
+      "line_start": 117,
+      "line_end": 118,
+      "column": 8,
+      "owner": "_find_entry_points",
+      "representation_line": 137
+    },
+    {
+      "kind": "Continue",
+      "line_start": 118,
+      "line_end": 118,
+      "column": 12,
+      "owner": "_find_entry_points",
+      "representation_line": 139
+    },
+    {
+      "kind": "If",
+      "line_start": 119,
+      "line_end": 120,
+      "column": 8,
+      "owner": "_find_entry_points",
+      "representation_line": 142
+    },
+    {
+      "kind": "Expr",
+      "line_start": 120,
+      "line_end": 120,
+      "column": 12,
+      "owner": "_find_entry_points",
+      "representation_line": 145
+    },
+    {
+      "kind": "Return",
+      "line_start": 121,
+      "line_end": 121,
+      "column": 4,
+      "owner": "_find_entry_points",
+      "representation_line": 148
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 124,
+      "line_end": 138,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 152
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 125,
+      "line_end": 125,
+      "column": 4,
+      "owner": "_find_orchestrators",
+      "representation_line": 158
+    },
+    {
+      "kind": "Assign",
+      "line_start": 126,
+      "line_end": 126,
+      "column": 4,
+      "owner": "_find_orchestrators",
+      "representation_line": 158
+    },
+    {
+      "kind": "For",
+      "line_start": 127,
+      "line_end": 137,
+      "column": 4,
+      "owner": "_find_orchestrators",
+      "representation_line": 159
+    },
+    {
+      "kind": "If",
+      "line_start": 128,
+      "line_end": 129,
+      "column": 8,
+      "owner": "_find_orchestrators",
+      "representation_line": 161
+    },
+    {
+      "kind": "Continue",
+      "line_start": 129,
+      "line_end": 129,
+      "column": 12,
+      "owner": "_find_orchestrators",
+      "representation_line": 163
+    },
+    {
+      "kind": "Assign",
+      "line_start": 130,
+      "line_end": 130,
+      "column": 8,
+      "owner": "_find_orchestrators",
+      "representation_line": 167
+    },
+    {
+      "kind": "If",
+      "line_start": 131,
+      "line_end": 132,
+      "column": 8,
+      "owner": "_find_orchestrators",
+      "representation_line": 168
+    },
+    {
+      "kind": "Continue",
+      "line_start": 132,
+      "line_end": 132,
+      "column": 12,
+      "owner": "_find_orchestrators",
+      "representation_line": 170
+    },
+    {
+      "kind": "Assign",
+      "line_start": 133,
+      "line_end": 133,
+      "column": 8,
+      "owner": "_find_orchestrators",
+      "representation_line": 174
+    },
+    {
+      "kind": "If",
+      "line_start": 134,
+      "line_end": 135,
+      "column": 8,
+      "owner": "_find_orchestrators",
+      "representation_line": 175
+    },
+    {
+      "kind": "Continue",
+      "line_start": 135,
+      "line_end": 135,
+      "column": 12,
+      "owner": "_find_orchestrators",
+      "representation_line": 177
+    },
+    {
+      "kind": "If",
+      "line_start": 136,
+      "line_end": 137,
+      "column": 8,
+      "owner": "_find_orchestrators",
+      "representation_line": 180
+    },
+    {
+      "kind": "Expr",
+      "line_start": 137,
+      "line_end": 137,
+      "column": 12,
+      "owner": "_find_orchestrators",
+      "representation_line": 183
+    },
+    {
+      "kind": "Return",
+      "line_start": 138,
+      "line_end": 138,
+      "column": 4,
+      "owner": "_find_orchestrators",
+      "representation_line": 186
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 141,
+      "line_end": 154,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 190
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 142,
+      "line_end": 142,
+      "column": 4,
+      "owner": "_find_spawn_targets",
+      "representation_line": 196
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 143,
+      "line_end": 143,
+      "column": 4,
+      "owner": "_find_spawn_targets",
+      "representation_line": 196
+    },
+    {
+      "kind": "For",
+      "line_start": 144,
+      "line_end": 153,
+      "column": 4,
+      "owner": "_find_spawn_targets",
+      "representation_line": 197
+    },
+    {
+      "kind": "If",
+      "line_start": 145,
+      "line_end": 146,
+      "column": 8,
+      "owner": "_find_spawn_targets",
+      "representation_line": 199
+    },
+    {
+      "kind": "Continue",
+      "line_start": 146,
+      "line_end": 146,
+      "column": 12,
+      "owner": "_find_spawn_targets",
+      "representation_line": 201
+    },
+    {
+      "kind": "If",
+      "line_start": 147,
+      "line_end": 148,
+      "column": 8,
+      "owner": "_find_spawn_targets",
+      "representation_line": 204
+    },
+    {
+      "kind": "Continue",
+      "line_start": 148,
+      "line_end": 148,
+      "column": 12,
+      "owner": "_find_spawn_targets",
+      "representation_line": 206
+    },
+    {
+      "kind": "Expr",
+      "line_start": 149,
+      "line_end": 149,
+      "column": 8,
+      "owner": "_find_spawn_targets",
+      "representation_line": 210
+    },
+    {
+      "kind": "Assign",
+      "line_start": 150,
+      "line_end": 150,
+      "column": 8,
+      "owner": "_find_spawn_targets",
+      "representation_line": 210
+    },
+    {
+      "kind": "If",
+      "line_start": 151,
+      "line_end": 152,
+      "column": 8,
+      "owner": "_find_spawn_targets",
+      "representation_line": 211
+    },
+    {
+      "kind": "Continue",
+      "line_start": 152,
+      "line_end": 152,
+      "column": 12,
+      "owner": "_find_spawn_targets",
+      "representation_line": 213
+    },
+    {
+      "kind": "Expr",
+      "line_start": 153,
+      "line_end": 153,
+      "column": 8,
+      "owner": "_find_spawn_targets",
+      "representation_line": 217
+    },
+    {
+      "kind": "Return",
+      "line_start": 154,
+      "line_end": 154,
+      "column": 4,
+      "owner": "_find_spawn_targets",
+      "representation_line": 219
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 157,
+      "line_end": 173,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 223
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 158,
+      "line_end": 158,
+      "column": 4,
+      "owner": "_find_delegate_targets",
+      "representation_line": 229
+    },
+    {
+      "kind": "For",
+      "line_start": 159,
+      "line_end": 172,
+      "column": 4,
+      "owner": "_find_delegate_targets",
+      "representation_line": 230
+    },
+    {
+      "kind": "If",
+      "line_start": 160,
+      "line_end": 161,
+      "column": 8,
+      "owner": "_find_delegate_targets",
+      "representation_line": 232
+    },
+    {
+      "kind": "Continue",
+      "line_start": 161,
+      "line_end": 161,
+      "column": 12,
+      "owner": "_find_delegate_targets",
+      "representation_line": 234
+    },
+    {
+      "kind": "If",
+      "line_start": 162,
+      "line_end": 163,
+      "column": 8,
+      "owner": "_find_delegate_targets",
+      "representation_line": 237
+    },
+    {
+      "kind": "Continue",
+      "line_start": 163,
+      "line_end": 163,
+      "column": 12,
+      "owner": "_find_delegate_targets",
+      "representation_line": 239
+    },
+    {
+      "kind": "Assign",
+      "line_start": 164,
+      "line_end": 164,
+      "column": 8,
+      "owner": "_find_delegate_targets",
+      "representation_line": 243
+    },
+    {
+      "kind": "If",
+      "line_start": 165,
+      "line_end": 166,
+      "column": 8,
+      "owner": "_find_delegate_targets",
+      "representation_line": 244
+    },
+    {
+      "kind": "Continue",
+      "line_start": 166,
+      "line_end": 166,
+      "column": 12,
+      "owner": "_find_delegate_targets",
+      "representation_line": 246
+    },
+    {
+      "kind": "If",
+      "line_start": 167,
+      "line_end": 168,
+      "column": 8,
+      "owner": "_find_delegate_targets",
+      "representation_line": 249
+    },
+    {
+      "kind": "Continue",
+      "line_start": 168,
+      "line_end": 168,
+      "column": 12,
+      "owner": "_find_delegate_targets",
+      "representation_line": 251
+    },
+    {
+      "kind": "Assign",
+      "line_start": 169,
+      "line_end": 169,
+      "column": 8,
+      "owner": "_find_delegate_targets",
+      "representation_line": 255
+    },
+    {
+      "kind": "If",
+      "line_start": 170,
+      "line_end": 171,
+      "column": 8,
+      "owner": "_find_delegate_targets",
+      "representation_line": 256
+    },
+    {
+      "kind": "Continue",
+      "line_start": 171,
+      "line_end": 171,
+      "column": 12,
+      "owner": "_find_delegate_targets",
+      "representation_line": 258
+    },
+    {
+      "kind": "Expr",
+      "line_start": 172,
+      "line_end": 172,
+      "column": 8,
+      "owner": "_find_delegate_targets",
+      "representation_line": 262
+    },
+    {
+      "kind": "Return",
+      "line_start": 173,
+      "line_end": 173,
+      "column": 4,
+      "owner": "_find_delegate_targets",
+      "representation_line": 264
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 177,
+      "line_end": 185,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 268
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 178,
+      "line_end": 178,
+      "column": 4,
+      "owner": "_RawProcess",
+      "representation_line": 276
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 179,
+      "line_end": 179,
+      "column": 4,
+      "owner": "_RawProcess",
+      "representation_line": 276
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 180,
+      "line_end": 180,
+      "column": 4,
+      "owner": "_RawProcess",
+      "representation_line": 276
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 181,
+      "line_end": 181,
+      "column": 4,
+      "owner": "_RawProcess",
+      "representation_line": 276
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 182,
+      "line_end": 182,
+      "column": 4,
+      "owner": "_RawProcess",
+      "representation_line": 276
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 183,
+      "line_end": 183,
+      "column": 4,
+      "owner": "_RawProcess",
+      "representation_line": 278
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 184,
+      "line_end": 184,
+      "column": 4,
+      "owner": "_RawProcess",
+      "representation_line": 278
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 185,
+      "line_end": 185,
+      "column": 4,
+      "owner": "_RawProcess",
+      "representation_line": 278
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 188,
+      "line_end": 197,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 281
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 189,
+      "line_end": 189,
+      "column": 4,
+      "owner": "_spawn_sibling_counts",
+      "representation_line": 287
+    },
+    {
+      "kind": "For",
+      "line_start": 190,
+      "line_end": 191,
+      "column": 4,
+      "owner": "_spawn_sibling_counts",
+      "representation_line": 288
+    },
+    {
+      "kind": "Assign",
+      "line_start": 191,
+      "line_end": 191,
+      "column": 8,
+      "owner": "_spawn_sibling_counts",
+      "representation_line": 291
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 192,
+      "line_end": 192,
+      "column": 4,
+      "owner": "_spawn_sibling_counts",
+      "representation_line": 294
+    },
+    {
+      "kind": "For",
+      "line_start": 193,
+      "line_end": 196,
+      "column": 4,
+      "owner": "_spawn_sibling_counts",
+      "representation_line": 295
+    },
+    {
+      "kind": "For",
+      "line_start": 194,
+      "line_end": 196,
+      "column": 8,
+      "owner": "_spawn_sibling_counts",
+      "representation_line": 297
+    },
+    {
+      "kind": "If",
+      "line_start": 195,
+      "line_end": 196,
+      "column": 12,
+      "owner": "_spawn_sibling_counts",
+      "representation_line": 299
+    },
+    {
+      "kind": "Assign",
+      "line_start": 196,
+      "line_end": 196,
+      "column": 16,
+      "owner": "_spawn_sibling_counts",
+      "representation_line": 302
+    },
+    {
+      "kind": "Return",
+      "line_start": 197,
+      "line_end": 197,
+      "column": 4,
+      "owner": "_spawn_sibling_counts",
+      "representation_line": 306
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 200,
+      "line_end": 206,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 310
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 201,
+      "line_end": 201,
+      "column": 4,
+      "owner": "_external_callers",
+      "representation_line": 316
+    },
+    {
+      "kind": "For",
+      "line_start": 202,
+      "line_end": 205,
+      "column": 4,
+      "owner": "_external_callers",
+      "representation_line": 317
+    },
+    {
+      "kind": "If",
+      "line_start": 203,
+      "line_end": 205,
+      "column": 8,
+      "owner": "_external_callers",
+      "representation_line": 319
+    },
+    {
+      "kind": "Expr",
+      "line_start": 204,
+      "line_end": 204,
+      "column": 12,
+      "owner": "_external_callers",
+      "representation_line": 322
+    },
+    {
+      "kind": "Expr",
+      "line_start": 205,
+      "line_end": 205,
+      "column": 12,
+      "owner": "_external_callers",
+      "representation_line": 322
+    },
+    {
+      "kind": "Return",
+      "line_start": 206,
+      "line_end": 206,
+      "column": 4,
+      "owner": "_external_callers",
+      "representation_line": 325
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 209,
+      "line_end": 407,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 329
+    },
+    {
+      "kind": "Assign",
+      "line_start": 214,
+      "line_end": 214,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 335
+    },
+    {
+      "kind": "If",
+      "line_start": 215,
+      "line_end": 216,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 336
+    },
+    {
+      "kind": "Raise",
+      "line_start": 216,
+      "line_end": 216,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 338
+    },
+    {
+      "kind": "Assign",
+      "line_start": 217,
+      "line_end": 217,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 342
+    },
+    {
+      "kind": "Assign",
+      "line_start": 219,
+      "line_end": 219,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 342
+    },
+    {
+      "kind": "Assign",
+      "line_start": 220,
+      "line_end": 220,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 342
+    },
+    {
+      "kind": "Assign",
+      "line_start": 221,
+      "line_end": 221,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 342
+    },
+    {
+      "kind": "Expr",
+      "line_start": 222,
+      "line_end": 222,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 342
+    },
+    {
+      "kind": "Expr",
+      "line_start": 223,
+      "line_end": 223,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 344
+    },
+    {
+      "kind": "Assign",
+      "line_start": 224,
+      "line_end": 224,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 344
+    },
+    {
+      "kind": "Expr",
+      "line_start": 225,
+      "line_end": 225,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 344
+    },
+    {
+      "kind": "Expr",
+      "line_start": 226,
+      "line_end": 226,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 344
+    },
+    {
+      "kind": "Assign",
+      "line_start": 227,
+      "line_end": 227,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 344
+    },
+    {
+      "kind": "Expr",
+      "line_start": 228,
+      "line_end": 228,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 346
+    },
+    {
+      "kind": "Expr",
+      "line_start": 229,
+      "line_end": 229,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 346
+    },
+    {
+      "kind": "Assign",
+      "line_start": 231,
+      "line_end": 231,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 346
+    },
+    {
+      "kind": "Assign",
+      "line_start": 232,
+      "line_end": 232,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 346
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 234,
+      "line_end": 234,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 346
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 235,
+      "line_end": 235,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 348
+    },
+    {
+      "kind": "For",
+      "line_start": 236,
+      "line_end": 290,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 349
+    },
+    {
+      "kind": "If",
+      "line_start": 237,
+      "line_end": 238,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 351
+    },
+    {
+      "kind": "Break",
+      "line_start": 238,
+      "line_end": 238,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 353
+    },
+    {
+      "kind": "Assign",
+      "line_start": 239,
+      "line_end": 239,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 357
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 240,
+      "line_end": 240,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 357
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 241,
+      "line_end": 241,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 357
+    },
+    {
+      "kind": "Assign",
+      "line_start": 242,
+      "line_end": 242,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 357
+    },
+    {
+      "kind": "Assign",
+      "line_start": 243,
+      "line_end": 243,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 357
+    },
+    {
+      "kind": "While",
+      "line_start": 244,
+      "line_end": 264,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 358
+    },
+    {
+      "kind": "Assign",
+      "line_start": 245,
+      "line_end": 245,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 361
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 246,
+      "line_end": 246,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 361
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 247,
+      "line_end": 247,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 361
+    },
+    {
+      "kind": "Expr",
+      "line_start": 248,
+      "line_end": 248,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 361
+    },
+    {
+      "kind": "If",
+      "line_start": 249,
+      "line_end": 250,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 362
+    },
+    {
+      "kind": "Continue",
+      "line_start": 250,
+      "line_end": 250,
+      "column": 16,
+      "owner": "detect_processes",
+      "representation_line": 364
+    },
+    {
+      "kind": "Assign",
+      "line_start": 251,
+      "line_end": 251,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 368
+    },
+    {
+      "kind": "Assign",
+      "line_start": 252,
+      "line_end": 252,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 368
+    },
+    {
+      "kind": "For",
+      "line_start": 253,
+      "line_end": 264,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 369
+    },
+    {
+      "kind": "If",
+      "line_start": 254,
+      "line_end": 255,
+      "column": 16,
+      "owner": "detect_processes",
+      "representation_line": 371
+    },
+    {
+      "kind": "Break",
+      "line_start": 255,
+      "line_end": 255,
+      "column": 20,
+      "owner": "detect_processes",
+      "representation_line": 373
+    },
+    {
+      "kind": "If",
+      "line_start": 258,
+      "line_end": 259,
+      "column": 16,
+      "owner": "detect_processes",
+      "representation_line": 376
+    },
+    {
+      "kind": "Continue",
+      "line_start": 259,
+      "line_end": 259,
+      "column": 20,
+      "owner": "detect_processes",
+      "representation_line": 378
+    },
+    {
+      "kind": "If",
+      "line_start": 260,
+      "line_end": 261,
+      "column": 16,
+      "owner": "detect_processes",
+      "representation_line": 381
+    },
+    {
+      "kind": "Continue",
+      "line_start": 261,
+      "line_end": 261,
+      "column": 20,
+      "owner": "detect_processes",
+      "representation_line": 383
+    },
+    {
+      "kind": "Expr",
+      "line_start": 262,
+      "line_end": 262,
+      "column": 16,
+      "owner": "detect_processes",
+      "representation_line": 387
+    },
+    {
+      "kind": "Expr",
+      "line_start": 263,
+      "line_end": 263,
+      "column": 16,
+      "owner": "detect_processes",
+      "representation_line": 387
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 264,
+      "line_end": 264,
+      "column": 16,
+      "owner": "detect_processes",
+      "representation_line": 387
+    },
+    {
+      "kind": "If",
+      "line_start": 266,
+      "line_end": 267,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 390
+    },
+    {
+      "kind": "Continue",
+      "line_start": 267,
+      "line_end": 267,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 392
+    },
+    {
+      "kind": "Assign",
+      "line_start": 268,
+      "line_end": 270,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 396
+    },
+    {
+      "kind": "If",
+      "line_start": 271,
+      "line_end": 272,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 397
+    },
+    {
+      "kind": "Continue",
+      "line_start": 272,
+      "line_end": 272,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 399
+    },
+    {
+      "kind": "Expr",
+      "line_start": 273,
+      "line_end": 273,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 403
+    },
+    {
+      "kind": "Assign",
+      "line_start": 275,
+      "line_end": 275,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 403
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 276,
+      "line_end": 276,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 403
+    },
+    {
+      "kind": "For",
+      "line_start": 277,
+      "line_end": 278,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 404
+    },
+    {
+      "kind": "Expr",
+      "line_start": 278,
+      "line_end": 278,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 407
+    },
+    {
+      "kind": "Expr",
+      "line_start": 280,
+      "line_end": 290,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 410
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 292,
+      "line_end": 292,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 413
+    },
+    {
+      "kind": "For",
+      "line_start": 293,
+      "line_end": 295,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 414
+    },
+    {
+      "kind": "For",
+      "line_start": 294,
+      "line_end": 295,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 416
+    },
+    {
+      "kind": "Assign",
+      "line_start": 295,
+      "line_end": 295,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 419
+    },
+    {
+      "kind": "For",
+      "line_start": 297,
+      "line_end": 355,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 422
+    },
+    {
+      "kind": "Assign",
+      "line_start": 298,
+      "line_end": 298,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 425
+    },
+    {
+      "kind": "Assign",
+      "line_start": 299,
+      "line_end": 299,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 425
+    },
+    {
+      "kind": "Assign",
+      "line_start": 300,
+      "line_end": 300,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 425
+    },
+    {
+      "kind": "For",
+      "line_start": 301,
+      "line_end": 310,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 426
+    },
+    {
+      "kind": "Assign",
+      "line_start": 302,
+      "line_end": 302,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 429
+    },
+    {
+      "kind": "Assign",
+      "line_start": 303,
+      "line_end": 303,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 429
+    },
+    {
+      "kind": "Assign",
+      "line_start": 304,
+      "line_end": 304,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 429
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 305,
+      "line_end": 305,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 429
+    },
+    {
+      "kind": "For",
+      "line_start": 306,
+      "line_end": 310,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 430
+    },
+    {
+      "kind": "Assign",
+      "line_start": 307,
+      "line_end": 307,
+      "column": 16,
+      "owner": "detect_processes",
+      "representation_line": 433
+    },
+    {
+      "kind": "If",
+      "line_start": 308,
+      "line_end": 309,
+      "column": 16,
+      "owner": "detect_processes",
+      "representation_line": 434
+    },
+    {
+      "kind": "Continue",
+      "line_start": 309,
+      "line_end": 309,
+      "column": 20,
+      "owner": "detect_processes",
+      "representation_line": 436
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 310,
+      "line_end": 310,
+      "column": 16,
+      "owner": "detect_processes",
+      "representation_line": 440
+    },
+    {
+      "kind": "Assign",
+      "line_start": 312,
+      "line_end": 316,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 444
+    },
+    {
+      "kind": "Expr",
+      "line_start": 317,
+      "line_end": 317,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 444
+    },
+    {
+      "kind": "Assign",
+      "line_start": 318,
+      "line_end": 318,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 444
+    },
+    {
+      "kind": "Assign",
+      "line_start": 319,
+      "line_end": 319,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 444
+    },
+    {
+      "kind": "Assign",
+      "line_start": 320,
+      "line_end": 320,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 444
+    },
+    {
+      "kind": "Assign",
+      "line_start": 321,
+      "line_end": 321,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 446
+    },
+    {
+      "kind": "Assign",
+      "line_start": 323,
+      "line_end": 323,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 446
+    },
+    {
+      "kind": "Assign",
+      "line_start": 324,
+      "line_end": 326,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 446
+    },
+    {
+      "kind": "If",
+      "line_start": 327,
+      "line_end": 329,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 447
+    },
+    {
+      "kind": "Assign",
+      "line_start": 328,
+      "line_end": 328,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 450
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 329,
+      "line_end": 329,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 450
+    },
+    {
+      "kind": "If",
+      "line_start": 330,
+      "line_end": 331,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 452
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 331,
+      "line_end": 331,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 455
+    },
+    {
+      "kind": "If",
+      "line_start": 332,
+      "line_end": 333,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 457
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 333,
+      "line_end": 333,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 460
+    },
+    {
+      "kind": "If",
+      "line_start": 334,
+      "line_end": 335,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 462
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 335,
+      "line_end": 335,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 465
+    },
+    {
+      "kind": "If",
+      "line_start": 336,
+      "line_end": 337,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 467
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 337,
+      "line_end": 337,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 470
+    },
+    {
+      "kind": "Assign",
+      "line_start": 338,
+      "line_end": 338,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 473
+    },
+    {
+      "kind": "If",
+      "line_start": 339,
+      "line_end": 340,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 474
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 340,
+      "line_end": 340,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 477
+    },
+    {
+      "kind": "Assign",
+      "line_start": 342,
+      "line_end": 342,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 480
+    },
+    {
+      "kind": "If",
+      "line_start": 343,
+      "line_end": 348,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 481
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 348,
+      "line_end": 348,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 484
+    },
+    {
+      "kind": "If",
+      "line_start": 349,
+      "line_end": 350,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 486
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 350,
+      "line_end": 350,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 489
+    },
+    {
+      "kind": "If",
+      "line_start": 351,
+      "line_end": 352,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 491
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 352,
+      "line_end": 352,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 494
+    },
+    {
+      "kind": "If",
+      "line_start": 353,
+      "line_end": 354,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 496
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 354,
+      "line_end": 354,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 499
+    },
+    {
+      "kind": "Assign",
+      "line_start": 355,
+      "line_end": 355,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 502
+    },
+    {
+      "kind": "Assign",
+      "line_start": 358,
+      "line_end": 358,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 505
+    },
+    {
+      "kind": "Assign",
+      "line_start": 359,
+      "line_end": 361,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 505
+    },
+    {
+      "kind": "Assign",
+      "line_start": 362,
+      "line_end": 362,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 505
+    },
+    {
+      "kind": "For",
+      "line_start": 363,
+      "line_end": 370,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 506
+    },
+    {
+      "kind": "Assign",
+      "line_start": 364,
+      "line_end": 364,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 509
+    },
+    {
+      "kind": "For",
+      "line_start": 365,
+      "line_end": 369,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 510
+    },
+    {
+      "kind": "Assign",
+      "line_start": 366,
+      "line_end": 366,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 513
+    },
+    {
+      "kind": "For",
+      "line_start": 367,
+      "line_end": 369,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 514
+    },
+    {
+      "kind": "If",
+      "line_start": 368,
+      "line_end": 369,
+      "column": 16,
+      "owner": "detect_processes",
+      "representation_line": 516
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 369,
+      "line_end": 369,
+      "column": 20,
+      "owner": "detect_processes",
+      "representation_line": 519
+    },
+    {
+      "kind": "Assign",
+      "line_start": 370,
+      "line_end": 370,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 524
+    },
+    {
+      "kind": "For",
+      "line_start": 371,
+      "line_end": 375,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 526
+    },
+    {
+      "kind": "If",
+      "line_start": 372,
+      "line_end": 375,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 528
+    },
+    {
+      "kind": "Assign",
+      "line_start": 373,
+      "line_end": 373,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 531
+    },
+    {
+      "kind": "If",
+      "line_start": 374,
+      "line_end": 375,
+      "column": 12,
+      "owner": "detect_processes",
+      "representation_line": 532
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 375,
+      "line_end": 375,
+      "column": 16,
+      "owner": "detect_processes",
+      "representation_line": 535
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 377,
+      "line_end": 377,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 540
+    },
+    {
+      "kind": "For",
+      "line_start": 378,
+      "line_end": 406,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 541
+    },
+    {
+      "kind": "Assign",
+      "line_start": 379,
+      "line_end": 379,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 544
+    },
+    {
+      "kind": "Assign",
+      "line_start": 382,
+      "line_end": 389,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 544
+    },
+    {
+      "kind": "Expr",
+      "line_start": 390,
+      "line_end": 406,
+      "column": 8,
+      "owner": "detect_processes",
+      "representation_line": 544
+    },
+    {
+      "kind": "Return",
+      "line_start": 407,
+      "line_end": 407,
+      "column": 4,
+      "owner": "detect_processes",
+      "representation_line": 546
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 410,
+      "line_end": 428,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 550
+    },
+    {
+      "kind": "Expr",
+      "line_start": 413,
+      "line_end": 419,
+      "column": 4,
+      "owner": "flow_rank_topology",
+      "representation_line": 556
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 420,
+      "line_end": 420,
+      "column": 4,
+      "owner": "flow_rank_topology",
+      "representation_line": 556
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 421,
+      "line_end": 421,
+      "column": 4,
+      "owner": "flow_rank_topology",
+      "representation_line": 556
+    },
+    {
+      "kind": "For",
+      "line_start": 422,
+      "line_end": 427,
+      "column": 4,
+      "owner": "flow_rank_topology",
+      "representation_line": 557
+    },
+    {
+      "kind": "For",
+      "line_start": 423,
+      "line_end": 427,
+      "column": 8,
+      "owner": "flow_rank_topology",
+      "representation_line": 559
+    },
+    {
+      "kind": "Assign",
+      "line_start": 424,
+      "line_end": 424,
+      "column": 12,
+      "owner": "flow_rank_topology",
+      "representation_line": 562
+    },
+    {
+      "kind": "If",
+      "line_start": 425,
+      "line_end": 427,
+      "column": 12,
+      "owner": "flow_rank_topology",
+      "representation_line": 563
+    },
+    {
+      "kind": "Expr",
+      "line_start": 426,
+      "line_end": 426,
+      "column": 16,
+      "owner": "flow_rank_topology",
+      "representation_line": 566
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 427,
+      "line_end": 427,
+      "column": 16,
+      "owner": "flow_rank_topology",
+      "representation_line": 566
+    },
+    {
+      "kind": "Return",
+      "line_start": 428,
+      "line_end": 428,
+      "column": 4,
+      "owner": "flow_rank_topology",
+      "representation_line": 570
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 431,
+      "line_end": 442,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 574
+    },
+    {
+      "kind": "Assign",
+      "line_start": 432,
+      "line_end": 432,
+      "column": 4,
+      "owner": "_qualified_flow_name",
+      "representation_line": 580
+    },
+    {
+      "kind": "If",
+      "line_start": 433,
+      "line_end": 436,
+      "column": 4,
+      "owner": "_qualified_flow_name",
+      "representation_line": 581
+    },
+    {
+      "kind": "Assign",
+      "line_start": 434,
+      "line_end": 434,
+      "column": 8,
+      "owner": "_qualified_flow_name",
+      "representation_line": 584
+    },
+    {
+      "kind": "If",
+      "line_start": 435,
+      "line_end": 436,
+      "column": 8,
+      "owner": "_qualified_flow_name",
+      "representation_line": 585
+    },
+    {
+      "kind": "Assign",
+      "line_start": 436,
+      "line_end": 436,
+      "column": 12,
+      "owner": "_qualified_flow_name",
+      "representation_line": 588
+    },
+    {
+      "kind": "Assign",
+      "line_start": 437,
+      "line_end": 441,
+      "column": 4,
+      "owner": "_qualified_flow_name",
+      "representation_line": 592
+    },
+    {
+      "kind": "Return",
+      "line_start": 442,
+      "line_end": 442,
+      "column": 4,
+      "owner": "_qualified_flow_name",
+      "representation_line": 593
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 23,
+      "kind": "Constant",
+      "original_ast": "Constant(value=10)",
+      "rendered": "10"
+    },
+    {
+      "line_start": 36,
+      "line_end": 36,
+      "column": 20,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0.85)",
+      "rendered": "0.85"
+    },
+    {
+      "line_start": 37,
+      "line_end": 37,
+      "column": 24,
+      "kind": "Constant",
+      "original_ast": "Constant(value=10000)",
+      "rendered": "10000"
+    },
+    {
+      "line_start": 38,
+      "line_end": 38,
+      "column": 20,
+      "kind": "Constant",
+      "original_ast": "Constant(value=100000)",
+      "rendered": "100000"
+    },
+    {
+      "line_start": 41,
+      "line_end": 41,
+      "column": 1,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dataclass', ctx=Load()), args=[], keywords=[keyword(arg='frozen', value=Constant(value=True))])",
+      "rendered": "dataclass(frozen=True)"
+    },
+    {
+      "line_start": 43,
+      "line_end": 43,
+      "column": 21,
+      "kind": "Constant",
+      "original_ast": "Constant(value=10)",
+      "rendered": "10"
+    },
+    {
+      "line_start": 44,
+      "line_end": 44,
+      "column": 25,
+      "kind": "Constant",
+      "original_ast": "Constant(value=4)",
+      "rendered": "4"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 21,
+      "kind": "Constant",
+      "original_ast": "Constant(value=3)",
+      "rendered": "3"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 25,
+      "kind": "Name",
+      "original_ast": "Name(id='DEFAULT_MAX_PROCESSES', ctx=Load())",
+      "rendered": "DEFAULT_MAX_PROCESSES"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 28,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0.5)",
+      "rendered": "0.5"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 26,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 51,
+      "line_end": 51,
+      "column": 1,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dataclass', ctx=Load()), args=[], keywords=[keyword(arg='frozen', value=Constant(value=True))])",
+      "rendered": "dataclass(frozen=True)"
+    },
+    {
+      "line_start": 74,
+      "line_end": 74,
+      "column": 48,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='inputs', ctx=Load()), attr='nodes', ctx=Load())",
+      "rendered": "inputs.nodes"
+    },
+    {
+      "line_start": 75,
+      "line_end": 75,
+      "column": 28,
+      "kind": "Name",
+      "original_ast": "Name(id='community_of', ctx=Load())",
+      "rendered": "community_of"
+    },
+    {
+      "line_start": 76,
+      "line_end": 76,
+      "column": 65,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 65,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 78,
+      "line_end": 78,
+      "column": 62,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='inputs', ctx=Load()), attr='edges', ctx=Load())",
+      "rendered": "inputs.edges"
+    },
+    {
+      "line_start": 79,
+      "line_end": 79,
+      "column": 15,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Compare(left=Name(id='source_id', ctx=Load()), ops=[NotIn()], comparators=[Attribute(value=Name(id='inputs', ctx=Load()), attr='nodes', ctx=Load())]), Compare(left=Name(id='target_id', ctx=Load()), ops=[NotIn()], comparators=[Attribute(value=Name(id='inputs', ctx=Load()), attr='nodes', ctx=Load())])])",
+      "rendered": "source_id not in inputs.nodes or target_id not in inputs.nodes"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='outgoing', ctx=Load()), attr='setdefault', ctx=Load()), args=[Name(id='source_id', ctx=Load()), List(elts=[], ctx=Load())], keywords=[]), attr='append', ctx=Load()), args=[Tuple(elts=[Name(id='target_id', ctx=Load()), Name(id='relationship', ctx=Load()), Name(id='confidence', ctx=Load())], ctx=Load())], keywords=[])",
+      "rendered": "self.outgoing.setdefault(source_id, []).append((target_id, relationship, confidence))"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='incoming', ctx=Load()), attr='setdefault', ctx=Load()), args=[Name(id='target_id', ctx=Load()), List(elts=[], ctx=Load())], keywords=[]), attr='append', ctx=Load()), args=[Tuple(elts=[Name(id='source_id', ctx=Load()), Name(id='relationship', ctx=Load()), Name(id='confidence', ctx=Load())], ctx=Load())], keywords=[])",
+      "rendered": "self.incoming.setdefault(target_id, []).append((source_id, relationship, confidence))"
+    },
+    {
+      "line_start": 83,
+      "line_end": 83,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='outgoing', ctx=Load()), attr='values', ctx=Load()), args=[], keywords=[])",
+      "rendered": "self.outgoing.values()"
+    },
+    {
+      "line_start": 84,
+      "line_end": 84,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='bucket', ctx=Load()), attr='sort', ctx=Load()), args=[], keywords=[keyword(arg='key', value=Lambda(args=arguments(posonlyargs=[], args=[arg(arg='item')], kwonlyargs=[], kw_defaults=[], defaults=[]), body=Tuple(elts=[UnaryOp(op=USub(), operand=Subscript(value=Name(id='item', ctx=Load()), slice=Constant(value=2), ctx=Load())), Subscript(value=Name(id='item', ctx=Load()), slice=Constant(value=0), ctx=Load())], ctx=Load())))])",
+      "rendered": "bucket.sort(key=lambda item: (-item[2], item[0]))"
+    },
+    {
+      "line_start": 85,
+      "line_end": 85,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='incoming', ctx=Load()), attr='values', ctx=Load()), args=[], keywords=[])",
+      "rendered": "self.incoming.values()"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='bucket', ctx=Load()), attr='sort', ctx=Load()), args=[], keywords=[])",
+      "rendered": "bucket.sort()"
+    },
+    {
+      "line_start": 89,
+      "line_end": 93,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[GeneratorExp(elt=Name(id='symbol_id', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='symbol_id', ctx=Store()), Name(id='symbol', ctx=Store())], ctx=Store()), iter=Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='symbols', ctx=Load()), attr='items', ctx=Load()), args=[], keywords=[]), ifs=[Compare(left=Attribute(value=Name(id='symbol', ctx=Load()), attr='label', ctx=Load()), ops=[In()], comparators=[Tuple(elts=[Constant(value='Function'), Constant(value='Method')], ctx=Load())])], is_async=0)])], keywords=[])",
+      "rendered": "sorted((symbol_id for symbol_id, symbol in self.symbols.items() if symbol.label in ('Function', 'Method')))"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 15,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='source', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='source', ctx=Store()), Name(id='rel', ctx=Store()), Name(id='_', ctx=Store())], ctx=Store()), iter=Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='incoming', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='node', ctx=Load()), List(elts=[], ctx=Load())], keywords=[]), ifs=[Compare(left=Name(id='rel', ctx=Load()), ops=[Eq()], comparators=[Name(id='relationship', ctx=Load())])], is_async=0)])",
+      "rendered": "[source for source, rel, _ in self.incoming.get(node, []) if rel == relationship]"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sum', ctx=Load()), args=[GeneratorExp(elt=Constant(value=1), generators=[comprehension(target=Tuple(elts=[Name(id='_', ctx=Store()), Name(id='rel', ctx=Store()), Name(id='_', ctx=Store())], ctx=Store()), iter=Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='outgoing', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='node', ctx=Load()), List(elts=[], ctx=Load())], keywords=[]), ifs=[Compare(left=Name(id='rel', ctx=Load()), ops=[In()], comparators=[Name(id='relationships', ctx=Load())])], is_async=0)])], keywords=[])",
+      "rendered": "sum((1 for _, rel, _ in self.outgoing.get(node, []) if rel in relationships))"
+    },
+    {
+      "line_start": 102,
+      "line_end": 102,
+      "column": 16,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 103,
+      "line_end": 103,
+      "column": 30,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='incoming', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='node', ctx=Load()), List(elts=[], ctx=Load())], keywords=[])",
+      "rendered": "self.incoming.get(node, [])"
+    },
+    {
+      "line_start": 104,
+      "line_end": 104,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='rel', ctx=Load()), ops=[NotIn()], comparators=[Name(id='relationships', ctx=Load())])",
+      "rendered": "rel not in relationships"
+    },
+    {
+      "line_start": 106,
+      "line_end": 106,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='symbols', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='source', ctx=Load())], keywords=[])",
+      "rendered": "self.symbols.get(source)"
+    },
+    {
+      "line_start": 107,
+      "line_end": 107,
+      "column": 15,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='symbol', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), Call(func=Name(id='is_test_file', ctx=Load()), args=[Attribute(value=Name(id='symbol', ctx=Load()), attr='file_path', ctx=Load())], keywords=[])])",
+      "rendered": "symbol is not None and is_test_file(symbol.file_path)"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='count', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "count += 1"
+    },
+    {
+      "line_start": 110,
+      "line_end": 110,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='count', ctx=Load())",
+      "rendered": "count"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 30,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='graph', ctx=Load()), attr='callable_ids', ctx=Load()), args=[], keywords=[])",
+      "rendered": "graph.callable_ids()"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 17,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Attribute(value=Name(id='graph', ctx=Load()), attr='symbols', ctx=Load()), slice=Name(id='node', ctx=Load()), ctx=Load())",
+      "rendered": "graph.symbols[node]"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Name(id='exclude_tests', ctx=Load()), Call(func=Name(id='is_test_file', ctx=Load()), args=[Attribute(value=Name(id='symbol', ctx=Load()), attr='file_path', ctx=Load())], keywords=[])])",
+      "rendered": "exclude_tests and is_test_file(symbol.file_path)"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='graph', ctx=Load()), attr='incoming_of', ctx=Load()), args=[Name(id='node', ctx=Load()), Constant(value='CALLS')], keywords=[]))",
+      "rendered": "not graph.incoming_of(node, 'CALLS')"
+    },
+    {
+      "line_start": 120,
+      "line_end": 120,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='entry_points', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='node', ctx=Load())], keywords=[])",
+      "rendered": "entry_points.append(node)"
+    },
+    {
+      "line_start": 121,
+      "line_end": 121,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='entry_points', ctx=Load())",
+      "rendered": "entry_points"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 31,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 24,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value='CALLS'), Constant(value='SPAWNS'), Constant(value='DELEGATES_TO')], ctx=Load())",
+      "rendered": "('CALLS', 'SPAWNS', 'DELEGATES_TO')"
+    },
+    {
+      "line_start": 127,
+      "line_end": 127,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='graph', ctx=Load()), attr='callable_ids', ctx=Load()), args=[], keywords=[])",
+      "rendered": "graph.callable_ids()"
+    },
+    {
+      "line_start": 128,
+      "line_end": 128,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='node', ctx=Load()), ops=[In()], comparators=[Name(id='existing', ctx=Load())])",
+      "rendered": "node in existing"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 17,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Attribute(value=Name(id='graph', ctx=Load()), attr='symbols', ctx=Load()), slice=Name(id='node', ctx=Load()), ctx=Load())",
+      "rendered": "graph.symbols[node]"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Name(id='exclude_tests', ctx=Load()), Call(func=Name(id='is_test_file', ctx=Load()), args=[Attribute(value=Name(id='symbol', ctx=Load()), attr='file_path', ctx=Load())], keywords=[])])",
+      "rendered": "exclude_tests and is_test_file(symbol.file_path)"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='graph', ctx=Load()), attr='production_callers', ctx=Load()), args=[Name(id='node', ctx=Load()), Name(id='all_relationships', ctx=Load())], keywords=[])",
+      "rendered": "graph.production_callers(node, all_relationships)"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Compare(left=Name(id='production', ctx=Load()), ops=[Eq()], comparators=[Constant(value=0)]), Compare(left=Name(id='production', ctx=Load()), ops=[Gt()], comparators=[Name(id='ORCHESTRATOR_MAX_CALLERS', ctx=Load())])])",
+      "rendered": "production == 0 or production > ORCHESTRATOR_MAX_CALLERS"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Attribute(value=Name(id='graph', ctx=Load()), attr='outgoing_count', ctx=Load()), args=[Name(id='node', ctx=Load()), Starred(value=Name(id='all_relationships', ctx=Load()), ctx=Load())], keywords=[]), ops=[GtE()], comparators=[Name(id='ORCHESTRATOR_MIN_CALLEES', ctx=Load())])",
+      "rendered": "graph.outgoing_count(node, *all_relationships) >= ORCHESTRATOR_MIN_CALLEES"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='orchestrators', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='node', ctx=Load())], keywords=[])",
+      "rendered": "orchestrators.append(node)"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='orchestrators', ctx=Load())",
+      "rendered": "orchestrators"
+    },
+    {
+      "line_start": 142,
+      "line_end": 142,
+      "column": 25,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='graph', ctx=Load()), attr='callable_ids', ctx=Load()), args=[], keywords=[])",
+      "rendered": "graph.callable_ids()"
+    },
+    {
+      "line_start": 145,
+      "line_end": 145,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Compare(left=Name(id='node', ctx=Load()), ops=[In()], comparators=[Name(id='existing', ctx=Load())]), Compare(left=Name(id='node', ctx=Load()), ops=[In()], comparators=[Name(id='seen', ctx=Load())])])",
+      "rendered": "node in existing or node in seen"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='graph', ctx=Load()), attr='incoming_of', ctx=Load()), args=[Name(id='node', ctx=Load()), Constant(value='SPAWNS')], keywords=[]))",
+      "rendered": "not graph.incoming_of(node, 'SPAWNS')"
+    },
+    {
+      "line_start": 149,
+      "line_end": 149,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='seen', ctx=Load()), attr='add', ctx=Load()), args=[Name(id='node', ctx=Load())], keywords=[])",
+      "rendered": "seen.add(node)"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 17,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Attribute(value=Name(id='graph', ctx=Load()), attr='symbols', ctx=Load()), slice=Name(id='node', ctx=Load()), ctx=Load())",
+      "rendered": "graph.symbols[node]"
+    },
+    {
+      "line_start": 151,
+      "line_end": 151,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Name(id='exclude_tests', ctx=Load()), Call(func=Name(id='is_test_file', ctx=Load()), args=[Attribute(value=Name(id='symbol', ctx=Load()), attr='file_path', ctx=Load())], keywords=[])])",
+      "rendered": "exclude_tests and is_test_file(symbol.file_path)"
+    },
+    {
+      "line_start": 153,
+      "line_end": 153,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='targets', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='node', ctx=Load())], keywords=[])",
+      "rendered": "targets.append(node)"
+    },
+    {
+      "line_start": 154,
+      "line_end": 154,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='targets', ctx=Load())",
+      "rendered": "targets"
+    },
+    {
+      "line_start": 158,
+      "line_end": 158,
+      "column": 25,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 159,
+      "line_end": 159,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='graph', ctx=Load()), attr='callable_ids', ctx=Load()), args=[], keywords=[])",
+      "rendered": "graph.callable_ids()"
+    },
+    {
+      "line_start": 160,
+      "line_end": 160,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='node', ctx=Load()), ops=[In()], comparators=[Name(id='existing', ctx=Load())])",
+      "rendered": "node in existing"
+    },
+    {
+      "line_start": 162,
+      "line_end": 162,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='graph', ctx=Load()), attr='incoming_of', ctx=Load()), args=[Name(id='node', ctx=Load()), Constant(value='DELEGATES_TO')], keywords=[]))",
+      "rendered": "not graph.incoming_of(node, 'DELEGATES_TO')"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 17,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Attribute(value=Name(id='graph', ctx=Load()), attr='symbols', ctx=Load()), slice=Name(id='node', ctx=Load()), ctx=Load())",
+      "rendered": "graph.symbols[node]"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Name(id='exclude_tests', ctx=Load()), Call(func=Name(id='is_test_file', ctx=Load()), args=[Attribute(value=Name(id='symbol', ctx=Load()), attr='file_path', ctx=Load())], keywords=[])])",
+      "rendered": "exclude_tests and is_test_file(symbol.file_path)"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='graph', ctx=Load()), attr='incoming_of', ctx=Load()), args=[Name(id='node', ctx=Load()), Constant(value='CALLS')], keywords=[])",
+      "rendered": "graph.incoming_of(node, 'CALLS')"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 18,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Attribute(value=Name(id='graph', ctx=Load()), attr='outgoing_count', ctx=Load()), args=[Name(id='node', ctx=Load()), Constant(value='CALLS')], keywords=[]), op=Add(), right=Call(func=Attribute(value=Name(id='graph', ctx=Load()), attr='outgoing_count', ctx=Load()), args=[Name(id='node', ctx=Load()), Constant(value='SPAWNS')], keywords=[]))",
+      "rendered": "graph.outgoing_count(node, 'CALLS') + graph.outgoing_count(node, 'SPAWNS')"
+    },
+    {
+      "line_start": 170,
+      "line_end": 170,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='callees', ctx=Load()), ops=[Lt()], comparators=[Constant(value=3)])",
+      "rendered": "callees < 3"
+    },
+    {
+      "line_start": 172,
+      "line_end": 172,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='targets', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='node', ctx=Load())], keywords=[])",
+      "rendered": "targets.append(node)"
+    },
+    {
+      "line_start": 173,
+      "line_end": 173,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='targets', ctx=Load())",
+      "rendered": "targets"
+    },
+    {
+      "line_start": 176,
+      "line_end": 176,
+      "column": 1,
+      "kind": "Name",
+      "original_ast": "Name(id='dataclass', ctx=Load())",
+      "rendered": "dataclass"
+    },
+    {
+      "line_start": 184,
+      "line_end": 184,
+      "column": 24,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0.0)",
+      "rendered": "0.0"
+    },
+    {
+      "line_start": 185,
+      "line_end": 185,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='field', ctx=Load()), args=[], keywords=[keyword(arg='default_factory', value=Subscript(value=Name(id='set', ctx=Load()), slice=Name(id='str', ctx=Load()), ctx=Load()))])",
+      "rendered": "field(default_factory=set[str])"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 29,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 190,
+      "line_end": 190,
+      "column": 25,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='graph', ctx=Load()), attr='outgoing', ctx=Load()), attr='items', ctx=Load()), args=[], keywords=[])",
+      "rendered": "graph.outgoing.items()"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 25,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sum', ctx=Load()), args=[GeneratorExp(elt=Constant(value=1), generators=[comprehension(target=Tuple(elts=[Name(id='_', ctx=Store()), Name(id='rel', ctx=Store()), Name(id='_', ctx=Store())], ctx=Store()), iter=Name(id='edges', ctx=Load()), ifs=[Compare(left=Name(id='rel', ctx=Load()), ops=[Eq()], comparators=[Constant(value='SPAWNS')])], is_async=0)])], keywords=[])",
+      "rendered": "sum((1 for _, rel, _ in edges if rel == 'SPAWNS'))"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 31,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 193,
+      "line_end": 193,
+      "column": 25,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='graph', ctx=Load()), attr='incoming', ctx=Load()), attr='items', ctx=Load()), args=[], keywords=[])",
+      "rendered": "graph.incoming.items()"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 30,
+      "kind": "Name",
+      "original_ast": "Name(id='edges', ctx=Load())",
+      "rendered": "edges"
+    },
+    {
+      "line_start": 195,
+      "line_end": 195,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='rel', ctx=Load()), ops=[Eq()], comparators=[Constant(value='SPAWNS')])",
+      "rendered": "rel == 'SPAWNS'"
+    },
+    {
+      "line_start": 196,
+      "line_end": 196,
+      "column": 35,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='max', ctx=Load()), args=[Call(func=Attribute(value=Name(id='siblings', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='target', ctx=Load()), Constant(value=0)], keywords=[]), Call(func=Attribute(value=Name(id='fanout', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='source', ctx=Load()), Constant(value=0)], keywords=[])], keywords=[])",
+      "rendered": "max(siblings.get(target, 0), fanout.get(source, 0))"
+    },
+    {
+      "line_start": 197,
+      "line_end": 197,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='siblings', ctx=Load())",
+      "rendered": "siblings"
+    },
+    {
+      "line_start": 201,
+      "line_end": 201,
+      "column": 25,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 202,
+      "line_end": 202,
+      "column": 24,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='graph', ctx=Load()), attr='incoming', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='node', ctx=Load()), List(elts=[], ctx=Load())], keywords=[])",
+      "rendered": "graph.incoming.get(node, [])"
+    },
+    {
+      "line_start": 203,
+      "line_end": 203,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='source', ctx=Load()), ops=[NotIn()], comparators=[Name(id='visited', ctx=Load())]), Compare(left=Name(id='source', ctx=Load()), ops=[NotIn()], comparators=[Name(id='seen', ctx=Load())])])",
+      "rendered": "source not in visited and source not in seen"
+    },
+    {
+      "line_start": 204,
+      "line_end": 204,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='seen', ctx=Load()), attr='add', ctx=Load()), args=[Name(id='source', ctx=Load())], keywords=[])",
+      "rendered": "seen.add(source)"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='callers', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='source', ctx=Load())], keywords=[])",
+      "rendered": "callers.append(source)"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='callers', ctx=Load())",
+      "rendered": "callers"
+    },
+    {
+      "line_start": 214,
+      "line_end": 214,
+      "column": 14,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Name(id='options', ctx=Load()), Call(func=Name(id='ProcessOptions', ctx=Load()), args=[], keywords=[])])",
+      "rendered": "options or ProcessOptions()"
+    },
+    {
+      "line_start": 215,
+      "line_end": 215,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Compare(left=Constant(value=1), ops=[LtE(), LtE()], comparators=[Attribute(value=Name(id='options', ctx=Load()), attr='max_processes', ctx=Load()), Name(id='MAX_PROCESS_LIMIT', ctx=Load())]))",
+      "rendered": "not 1 <= options.max_processes <= MAX_PROCESS_LIMIT"
+    },
+    {
+      "line_start": 216,
+      "line_end": 216,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelValidationError', ctx=Load()), args=[JoinedStr(values=[Constant(value='max_processes must be in [1, '), FormattedValue(value=Name(id='MAX_PROCESS_LIMIT', ctx=Load()), conversion=-1), Constant(value=']')])], keywords=[])",
+      "rendered": "ModelValidationError(source_template_216_35)"
+    },
+    {
+      "line_start": 217,
+      "line_end": 217,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='FlowGraph', ctx=Load()), args=[Name(id='inputs', ctx=Load()), Name(id='community_of', ctx=Load())], keywords=[])",
+      "rendered": "FlowGraph(inputs, community_of)"
+    },
+    {
+      "line_start": 219,
+      "line_end": 219,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_find_entry_points', ctx=Load()), args=[Name(id='graph', ctx=Load()), Attribute(value=Name(id='options', ctx=Load()), attr='exclude_tests', ctx=Load())], keywords=[])",
+      "rendered": "_find_entry_points(graph, options.exclude_tests)"
+    },
+    {
+      "line_start": 220,
+      "line_end": 220,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[Name(id='entry_points', ctx=Load())], keywords=[])",
+      "rendered": "set(entry_points)"
+    },
+    {
+      "line_start": 221,
+      "line_end": 221,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_find_orchestrators', ctx=Load()), args=[Name(id='graph', ctx=Load()), Name(id='existing', ctx=Load()), Attribute(value=Name(id='options', ctx=Load()), attr='exclude_tests', ctx=Load())], keywords=[])",
+      "rendered": "_find_orchestrators(graph, existing, options.exclude_tests)"
+    },
+    {
+      "line_start": 222,
+      "line_end": 222,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='entry_points', ctx=Load()), attr='extend', ctx=Load()), args=[Name(id='orchestrators', ctx=Load())], keywords=[])",
+      "rendered": "entry_points.extend(orchestrators)"
+    },
+    {
+      "line_start": 223,
+      "line_end": 223,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='existing', ctx=Load()), attr='update', ctx=Load()), args=[Name(id='orchestrators', ctx=Load())], keywords=[])",
+      "rendered": "existing.update(orchestrators)"
+    },
+    {
+      "line_start": 224,
+      "line_end": 224,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_find_spawn_targets', ctx=Load()), args=[Name(id='graph', ctx=Load()), Name(id='existing', ctx=Load()), Attribute(value=Name(id='options', ctx=Load()), attr='exclude_tests', ctx=Load())], keywords=[])",
+      "rendered": "_find_spawn_targets(graph, existing, options.exclude_tests)"
+    },
+    {
+      "line_start": 225,
+      "line_end": 225,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='entry_points', ctx=Load()), attr='extend', ctx=Load()), args=[Name(id='spawn_targets', ctx=Load())], keywords=[])",
+      "rendered": "entry_points.extend(spawn_targets)"
+    },
+    {
+      "line_start": 226,
+      "line_end": 226,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='existing', ctx=Load()), attr='update', ctx=Load()), args=[Name(id='spawn_targets', ctx=Load())], keywords=[])",
+      "rendered": "existing.update(spawn_targets)"
+    },
+    {
+      "line_start": 227,
+      "line_end": 227,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_find_delegate_targets', ctx=Load()), args=[Name(id='graph', ctx=Load()), Name(id='existing', ctx=Load()), Attribute(value=Name(id='options', ctx=Load()), attr='exclude_tests', ctx=Load())], keywords=[])",
+      "rendered": "_find_delegate_targets(graph, existing, options.exclude_tests)"
+    },
+    {
+      "line_start": 228,
+      "line_end": 228,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='entry_points', ctx=Load()), attr='extend', ctx=Load()), args=[Name(id='delegate_targets', ctx=Load())], keywords=[])",
+      "rendered": "entry_points.extend(delegate_targets)"
+    },
+    {
+      "line_start": 229,
+      "line_end": 229,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='entry_points', ctx=Load()), attr='sort', ctx=Load()), args=[], keywords=[])",
+      "rendered": "entry_points.sort()"
+    },
+    {
+      "line_start": 231,
+      "line_end": 231,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[Name(id='orchestrators', ctx=Load())], keywords=[])",
+      "rendered": "set(orchestrators)"
+    },
+    {
+      "line_start": 232,
+      "line_end": 232,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_spawn_sibling_counts', ctx=Load()), args=[Name(id='graph', ctx=Load())], keywords=[])",
+      "rendered": "_spawn_sibling_counts(graph)"
+    },
+    {
+      "line_start": 234,
+      "line_end": 234,
+      "column": 34,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 235,
+      "line_end": 235,
+      "column": 39,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 236,
+      "line_end": 236,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='entry_points', ctx=Load())",
+      "rendered": "entry_points"
+    },
+    {
+      "line_start": 237,
+      "line_end": 237,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='raw_processes', ctx=Load())], keywords=[]), ops=[GtE()], comparators=[Attribute(value=Name(id='options', ctx=Load()), attr='max_processes', ctx=Load())])",
+      "rendered": "len(raw_processes) >= options.max_processes"
+    },
+    {
+      "line_start": 239,
+      "line_end": 239,
+      "column": 18,
+      "kind": "Set",
+      "original_ast": "Set(elts=[Name(id='entry_point', ctx=Load())])",
+      "rendered": "{entry_point}"
+    },
+    {
+      "line_start": 240,
+      "line_end": 240,
+      "column": 44,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 241,
+      "line_end": 241,
+      "column": 39,
+      "kind": "List",
+      "original_ast": "List(elts=[Tuple(elts=[Name(id='entry_point', ctx=Load()), Constant(value=0)], ctx=Load())], ctx=Load())",
+      "rendered": "[(entry_point, 0)]"
+    },
+    {
+      "line_start": 242,
+      "line_end": 242,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 243,
+      "line_end": 243,
+      "column": 22,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 244,
+      "line_end": 244,
+      "column": 14,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='head', ctx=Load()), ops=[Lt()], comparators=[Call(func=Name(id='len', ctx=Load()), args=[Name(id='queue', ctx=Load())], keywords=[])])",
+      "rendered": "head < len(queue)"
+    },
+    {
+      "line_start": 245,
+      "line_end": 245,
+      "column": 26,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Name(id='queue', ctx=Load()), slice=Name(id='head', ctx=Load()), ctx=Load())",
+      "rendered": "queue[head]"
+    },
+    {
+      "line_start": 246,
+      "line_end": 246,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='head', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "head += 1"
+    },
+    {
+      "line_start": 247,
+      "line_end": 247,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='step_number', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "step_number += 1"
+    },
+    {
+      "line_start": 248,
+      "line_end": 248,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='steps', ctx=Load()), attr='append', ctx=Load()), args=[Tuple(elts=[Name(id='node', ctx=Load()), Name(id='step_number', ctx=Load()), Name(id='depth', ctx=Load())], ctx=Load())], keywords=[])",
+      "rendered": "steps.append((node, step_number, depth))"
+    },
+    {
+      "line_start": 249,
+      "line_end": 249,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='depth', ctx=Load()), ops=[GtE()], comparators=[Attribute(value=Name(id='options', ctx=Load()), attr='max_depth', ctx=Load())])",
+      "rendered": "depth >= options.max_depth"
+    },
+    {
+      "line_start": 251,
+      "line_end": 251,
+      "column": 27,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=Name(id='depth', ctx=Load()), ops=[Eq()], comparators=[Constant(value=0)]), body=BinOp(left=Attribute(value=Name(id='options', ctx=Load()), attr='max_branching', ctx=Load()), op=Mult(), right=Constant(value=2)), orelse=Attribute(value=Name(id='options', ctx=Load()), attr='max_branching', ctx=Load()))",
+      "rendered": "options.max_branching * 2 if depth == 0 else options.max_branching"
+    },
+    {
+      "line_start": 252,
+      "line_end": 252,
+      "column": 27,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 253,
+      "line_end": 253,
+      "column": 41,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='graph', ctx=Load()), attr='outgoing', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='node', ctx=Load()), List(elts=[], ctx=Load())], keywords=[])",
+      "rendered": "graph.outgoing.get(node, [])"
+    },
+    {
+      "line_start": 254,
+      "line_end": 254,
+      "column": 19,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='branch_count', ctx=Load()), ops=[GtE()], comparators=[Name(id='branch_limit', ctx=Load())])",
+      "rendered": "branch_count >= branch_limit"
+    },
+    {
+      "line_start": 258,
+      "line_end": 258,
+      "column": 19,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Constant(value=0), ops=[Lt(), Lt()], comparators=[Name(id='confidence', ctx=Load()), Attribute(value=Name(id='options', ctx=Load()), attr='min_confidence', ctx=Load())])",
+      "rendered": "0 < confidence < options.min_confidence"
+    },
+    {
+      "line_start": 260,
+      "line_end": 260,
+      "column": 19,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='target', ctx=Load()), ops=[In()], comparators=[Name(id='visited', ctx=Load())])",
+      "rendered": "target in visited"
+    },
+    {
+      "line_start": 262,
+      "line_end": 262,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='visited', ctx=Load()), attr='add', ctx=Load()), args=[Name(id='target', ctx=Load())], keywords=[])",
+      "rendered": "visited.add(target)"
+    },
+    {
+      "line_start": 263,
+      "line_end": 263,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='queue', ctx=Load()), attr='append', ctx=Load()), args=[Tuple(elts=[Name(id='target', ctx=Load()), BinOp(left=Name(id='depth', ctx=Load()), op=Add(), right=Constant(value=1))], ctx=Load())], keywords=[])",
+      "rendered": "queue.append((target, depth + 1))"
+    },
+    {
+      "line_start": 264,
+      "line_end": 264,
+      "column": 16,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='branch_count', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "branch_count += 1"
+    },
+    {
+      "line_start": 266,
+      "line_end": 266,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='steps', ctx=Load())], keywords=[]), ops=[Lt()], comparators=[Attribute(value=Name(id='options', ctx=Load()), attr='min_steps', ctx=Load())])",
+      "rendered": "len(steps) < options.min_steps"
+    },
+    {
+      "line_start": 268,
+      "line_end": 270,
+      "column": 22,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Call(func=Attribute(value=Call(func=Attribute(value=Name(id='hashlib', ctx=Load()), attr='sha256', ctx=Load()), args=[Call(func=Attribute(value=Call(func=Attribute(value=Constant(value='\\x00'), attr='join', ctx=Load()), args=[Call(func=Name(id='sorted', ctx=Load()), args=[GeneratorExp(elt=Name(id='node', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='node', ctx=Store()), Name(id='_', ctx=Store()), Name(id='_', ctx=Store())], ctx=Store()), iter=Name(id='steps', ctx=Load()), ifs=[], is_async=0)])], keywords=[])], keywords=[]), attr='encode', ctx=Load()), args=[], keywords=[])], keywords=[]), attr='hexdigest', ctx=Load()), args=[], keywords=[]), slice=Slice(upper=Constant(value=32)), ctx=Load())",
+      "rendered": "hashlib.sha256('\\x00'.join(sorted((node for node, _, _ in steps))).encode()).hexdigest()[:32]"
+    },
+    {
+      "line_start": 271,
+      "line_end": 271,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='fingerprint', ctx=Load()), ops=[In()], comparators=[Name(id='seen_fingerprints', ctx=Load())])",
+      "rendered": "fingerprint in seen_fingerprints"
+    },
+    {
+      "line_start": 273,
+      "line_end": 273,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='seen_fingerprints', ctx=Load()), attr='add', ctx=Load()), args=[Name(id='fingerprint', ctx=Load())], keywords=[])",
+      "rendered": "seen_fingerprints.add(fingerprint)"
+    },
+    {
+      "line_start": 275,
+      "line_end": 275,
+      "column": 24,
+      "kind": "SetComp",
+      "original_ast": "SetComp(elt=Subscript(value=Name(id='community_of', ctx=Load()), slice=Name(id='node', ctx=Load()), ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='node', ctx=Store()), Name(id='_', ctx=Store()), Name(id='_', ctx=Store())], ctx=Store()), iter=Name(id='steps', ctx=Load()), ifs=[Compare(left=Name(id='node', ctx=Load()), ops=[In()], comparators=[Name(id='community_of', ctx=Load())])], is_async=0)])",
+      "rendered": "{community_of[node] for node, _, _ in steps if node in community_of}"
+    },
+    {
+      "line_start": 276,
+      "line_end": 276,
+      "column": 32,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 277,
+      "line_end": 277,
+      "column": 26,
+      "kind": "Name",
+      "original_ast": "Name(id='steps', ctx=Load())",
+      "rendered": "steps"
+    },
+    {
+      "line_start": 278,
+      "line_end": 278,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_external_callers', ctx=Load()), args=[Name(id='graph', ctx=Load()), Name(id='node', ctx=Load()), Name(id='visited', ctx=Load()), Name(id='caller_seen', ctx=Load())], keywords=[])",
+      "rendered": "_external_callers(graph, node, visited, caller_seen)"
+    },
+    {
+      "line_start": 280,
+      "line_end": 290,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='raw_processes', ctx=Load()), attr='append', ctx=Load()), args=[Call(func=Name(id='_RawProcess', ctx=Load()), args=[Name(id='entry_point', ctx=Load()), Name(id='steps', ctx=Load()), Name(id='visited', ctx=Load()), Call(func=Name(id='tuple', ctx=Load()), args=[Call(func=Name(id='sorted', ctx=Load()), args=[Name(id='community_set', ctx=Load())], keywords=[])], keywords=[]), Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='community_set', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Constant(value=1)]), Call(func=Name(id='len', ctx=Load()), args=[Name(id='caller_seen', ctx=Load())], keywords=[])], keywords=[keyword(arg='steps_set', value=SetComp(elt=Name(id='node', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='node', ctx=Store()), Name(id='_', ctx=Store()), Name(id='_', ctx=Store())], ctx=Store()), iter=Name(id='steps', ctx=Load()), ifs=[], is_async=0)]))])], keywords=[])",
+      "rendered": "raw_processes.append(_RawProcess(entry_point, steps, visited, tuple(sorted(community_set)), len(community_set) > 1, len(caller_seen), steps_set={node for node, _, _ in steps}))"
+    },
+    {
+      "line_start": 292,
+      "line_end": 292,
+      "column": 38,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 293,
+      "line_end": 293,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='raw_processes', ctx=Load())",
+      "rendered": "raw_processes"
+    },
+    {
+      "line_start": 294,
+      "line_end": 294,
+      "column": 26,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='raw', ctx=Load()), attr='steps', ctx=Load())",
+      "rendered": "raw.steps"
+    },
+    {
+      "line_start": 295,
+      "line_end": 295,
+      "column": 36,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Attribute(value=Name(id='step_flow_count', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='node', ctx=Load()), Constant(value=0)], keywords=[]), op=Add(), right=Constant(value=1))",
+      "rendered": "step_flow_count.get(node, 0) + 1"
+    },
+    {
+      "line_start": 297,
+      "line_end": 297,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='raw_processes', ctx=Load())",
+      "rendered": "raw_processes"
+    },
+    {
+      "line_start": 298,
+      "line_end": 298,
+      "column": 28,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0.0)",
+      "rendered": "0.0"
+    },
+    {
+      "line_start": 299,
+      "line_end": 299,
+      "column": 26,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0.0)",
+      "rendered": "0.0"
+    },
+    {
+      "line_start": 300,
+      "line_end": 300,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 301,
+      "line_end": 301,
+      "column": 30,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='raw', ctx=Load()), attr='steps', ctx=Load())",
+      "rendered": "raw.steps"
+    },
+    {
+      "line_start": 302,
+      "line_end": 302,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='max', ctx=Load()), args=[Call(func=Attribute(value=Name(id='step_flow_count', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='node', ctx=Load()), Constant(value=1)], keywords=[]), Constant(value=1)], keywords=[])",
+      "rendered": "max(step_flow_count.get(node, 1), 1)"
+    },
+    {
+      "line_start": 303,
+      "line_end": 303,
+      "column": 26,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Constant(value=1.0), op=Div(), right=BinOp(left=Name(id='share', ctx=Load()), op=Pow(), right=BinOp(left=Constant(value=1.0), op=Div(), right=Constant(value=3.0))))",
+      "rendered": "1.0 / share ** (1.0 / 3.0)"
+    },
+    {
+      "line_start": 304,
+      "line_end": 304,
+      "column": 28,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=BinOp(left=Constant(value=1.0), op=Div(), right=BinOp(left=Name(id='depth', ctx=Load()), op=Add(), right=Constant(value=1))), op=Div(), right=Call(func=Attribute(value=Name(id='math', ctx=Load()), attr='sqrt', ctx=Load()), args=[Name(id='share', ctx=Load())], keywords=[]))",
+      "rendered": "1.0 / (depth + 1) / math.sqrt(share)"
+    },
+    {
+      "line_start": 305,
+      "line_end": 305,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='effective_steps', ctx=Store()), op=Add(), value=Name(id='step_weight', ctx=Load()))",
+      "rendered": "effective_steps += step_weight"
+    },
+    {
+      "line_start": 306,
+      "line_end": 306,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_external_callers', ctx=Load()), args=[Name(id='graph', ctx=Load()), Name(id='node', ctx=Load()), Attribute(value=Name(id='raw', ctx=Load()), attr='visited', ctx=Load()), Name(id='caller_seen', ctx=Load())], keywords=[])",
+      "rendered": "_external_callers(graph, node, raw.visited, caller_seen)"
+    },
+    {
+      "line_start": 307,
+      "line_end": 307,
+      "column": 25,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='graph', ctx=Load()), attr='symbols', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='caller', ctx=Load())], keywords=[])",
+      "rendered": "graph.symbols.get(caller)"
+    },
+    {
+      "line_start": 308,
+      "line_end": 308,
+      "column": 19,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='symbol', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), Call(func=Name(id='is_test_file', ctx=Load()), args=[Attribute(value=Name(id='symbol', ctx=Load()), attr='file_path', ctx=Load())], keywords=[])])",
+      "rendered": "symbol is not None and is_test_file(symbol.file_path)"
+    },
+    {
+      "line_start": 310,
+      "line_end": 310,
+      "column": 16,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='effective_callers', ctx=Store()), op=Add(), value=Name(id='caller_weight', ctx=Load()))",
+      "rendered": "effective_callers += caller_weight"
+    },
+    {
+      "line_start": 312,
+      "line_end": 316,
+      "column": 19,
+      "kind": "SetComp",
+      "original_ast": "SetComp(elt=Call(func=Attribute(value=Name(id='posixpath', ctx=Load()), attr='dirname', ctx=Load()), args=[Attribute(value=Subscript(value=Attribute(value=Name(id='graph', ctx=Load()), attr='symbols', ctx=Load()), slice=Name(id='node', ctx=Load()), ctx=Load()), attr='file_path', ctx=Load())], keywords=[]), generators=[comprehension(target=Tuple(elts=[Name(id='node', ctx=Store()), Name(id='_', ctx=Store()), Name(id='_', ctx=Store())], ctx=Store()), iter=Attribute(value=Name(id='raw', ctx=Load()), attr='steps', ctx=Load()), ifs=[Attribute(value=Subscript(value=Attribute(value=Name(id='graph', ctx=Load()), attr='symbols', ctx=Load()), slice=Name(id='node', ctx=Load()), ctx=Load()), attr='file_path', ctx=Load())], is_async=0)])",
+      "rendered": "{posixpath.dirname(graph.symbols[node].file_path) for node, _, _ in raw.steps if graph.symbols[node].file_path}"
+    },
+    {
+      "line_start": 317,
+      "line_end": 317,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='packages', ctx=Load()), attr='discard', ctx=Load()), args=[Constant(value='')], keywords=[])",
+      "rendered": "packages.discard('')"
+    },
+    {
+      "line_start": 318,
+      "line_end": 318,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='graph', ctx=Load()), attr='outgoing_count', ctx=Load()), args=[Attribute(value=Name(id='raw', ctx=Load()), attr='entry_point', ctx=Load()), Constant(value='CALLS')], keywords=[])",
+      "rendered": "graph.outgoing_count(raw.entry_point, 'CALLS')"
+    },
+    {
+      "line_start": 319,
+      "line_end": 319,
+      "column": 35,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='graph', ctx=Load()), attr='production_callers', ctx=Load()), args=[Attribute(value=Name(id='raw', ctx=Load()), attr='entry_point', ctx=Load()), Tuple(elts=[Constant(value='CALLS'), Constant(value='SPAWNS')], ctx=Load())], keywords=[])",
+      "rendered": "graph.production_callers(raw.entry_point, ('CALLS', 'SPAWNS'))"
+    },
+    {
+      "line_start": 320,
+      "line_end": 320,
+      "column": 23,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Attribute(value=Name(id='graph', ctx=Load()), attr='symbols', ctx=Load()), slice=Attribute(value=Name(id='raw', ctx=Load()), attr='entry_point', ctx=Load()), ctx=Load())",
+      "rendered": "graph.symbols[raw.entry_point]"
+    },
+    {
+      "line_start": 321,
+      "line_end": 321,
+      "column": 21,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='entry_symbol', ctx=Load()), attr='file_path', ctx=Load())",
+      "rendered": "entry_symbol.file_path"
+    },
+    {
+      "line_start": 323,
+      "line_end": 323,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='float', ctx=Load()), args=[Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='raw', ctx=Load()), attr='steps', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "float(len(raw.steps))"
+    },
+    {
+      "line_start": 324,
+      "line_end": 326,
+      "column": 21,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=BinOp(left=Call(func=Attribute(value=Name(id='math', ctx=Load()), attr='log1p', ctx=Load()), args=[Name(id='effective_callers', ctx=Load())], keywords=[]), op=Add(), right=BinOp(left=Constant(value=0.3), op=Mult(), right=Call(func=Attribute(value=Name(id='math', ctx=Load()), attr='log1p', ctx=Load()), args=[Name(id='raw_reach', ctx=Load())], keywords=[]))), op=Mult(), right=Call(func=Attribute(value=Name(id='math', ctx=Load()), attr='log1p', ctx=Load()), args=[Name(id='effective_steps', ctx=Load())], keywords=[]))",
+      "rendered": "(math.log1p(effective_callers) + 0.3 * math.log1p(raw_reach)) * math.log1p(effective_steps)"
+    },
+    {
+      "line_start": 327,
+      "line_end": 327,
+      "column": 11,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='raw', ctx=Load()), attr='steps', ctx=Load())",
+      "rendered": "raw.steps"
+    },
+    {
+      "line_start": 328,
+      "line_end": 328,
+      "column": 26,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Name(id='effective_steps', ctx=Load()), op=Div(), right=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='raw', ctx=Load()), attr='steps', ctx=Load())], keywords=[]))",
+      "rendered": "effective_steps / len(raw.steps)"
+    },
+    {
+      "line_start": 329,
+      "line_end": 329,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='importance', ctx=Store()), op=Mult(), value=BinOp(left=Constant(value=1.0), op=Add(), right=BinOp(left=Constant(value=0.3), op=Mult(), right=Call(func=Attribute(value=Name(id='math', ctx=Load()), attr='sqrt', ctx=Load()), args=[Name(id='exclusivity', ctx=Load())], keywords=[]))))",
+      "rendered": "importance *= 1.0 + 0.3 * math.sqrt(exclusivity)"
+    },
+    {
+      "line_start": 330,
+      "line_end": 330,
+      "column": 11,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='raw', ctx=Load()), attr='cross_community', ctx=Load())",
+      "rendered": "raw.cross_community"
+    },
+    {
+      "line_start": 331,
+      "line_end": 331,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='importance', ctx=Store()), op=Mult(), value=Constant(value=1.5))",
+      "rendered": "importance *= 1.5"
+    },
+    {
+      "line_start": 332,
+      "line_end": 332,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='packages', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Constant(value=2)])",
+      "rendered": "len(packages) > 2"
+    },
+    {
+      "line_start": 333,
+      "line_end": 333,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='importance', ctx=Store()), op=Mult(), value=BinOp(left=Constant(value=1.0), op=Add(), right=BinOp(left=Constant(value=0.3), op=Mult(), right=Call(func=Attribute(value=Name(id='math', ctx=Load()), attr='log1p', ctx=Load()), args=[BinOp(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='packages', ctx=Load())], keywords=[]), op=Sub(), right=Constant(value=2))], keywords=[]))))",
+      "rendered": "importance *= 1.0 + 0.3 * math.log1p(len(packages) - 2)"
+    },
+    {
+      "line_start": 334,
+      "line_end": 334,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='entry_fanout', ctx=Load()), ops=[Gt()], comparators=[Constant(value=1)])",
+      "rendered": "entry_fanout > 1"
+    },
+    {
+      "line_start": 335,
+      "line_end": 335,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='importance', ctx=Store()), op=Mult(), value=BinOp(left=Constant(value=1.0), op=Add(), right=BinOp(left=Constant(value=0.15), op=Mult(), right=Call(func=Attribute(value=Name(id='math', ctx=Load()), attr='log1p', ctx=Load()), args=[Name(id='entry_fanout', ctx=Load())], keywords=[]))))",
+      "rendered": "importance *= 1.0 + 0.15 * math.log1p(entry_fanout)"
+    },
+    {
+      "line_start": 336,
+      "line_end": 336,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='entry_production_callers', ctx=Load()), ops=[Gt()], comparators=[Constant(value=1)])",
+      "rendered": "entry_production_callers > 1"
+    },
+    {
+      "line_start": 337,
+      "line_end": 337,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='importance', ctx=Store()), op=Mult(), value=BinOp(left=Constant(value=1.0), op=Add(), right=BinOp(left=Constant(value=0.2), op=Mult(), right=Call(func=Attribute(value=Name(id='math', ctx=Load()), attr='log1p', ctx=Load()), args=[Name(id='entry_production_callers', ctx=Load())], keywords=[]))))",
+      "rendered": "importance *= 1.0 + 0.2 * math.log1p(entry_production_callers)"
+    },
+    {
+      "line_start": 338,
+      "line_end": 338,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='spawn_siblings', ctx=Load()), attr='get', ctx=Load()), args=[Attribute(value=Name(id='raw', ctx=Load()), attr='entry_point', ctx=Load()), Constant(value=0)], keywords=[])",
+      "rendered": "spawn_siblings.get(raw.entry_point, 0)"
+    },
+    {
+      "line_start": 339,
+      "line_end": 339,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='siblings', ctx=Load()), ops=[Gt()], comparators=[Constant(value=0)])",
+      "rendered": "siblings > 0"
+    },
+    {
+      "line_start": 340,
+      "line_end": 340,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='importance', ctx=Store()), op=Mult(), value=BinOp(left=Constant(value=1.0), op=Add(), right=BinOp(left=Constant(value=0.5), op=Div(), right=Call(func=Attribute(value=Name(id='math', ctx=Load()), attr='sqrt', ctx=Load()), args=[Call(func=Name(id='max', ctx=Load()), args=[Name(id='siblings', ctx=Load()), Constant(value=1)], keywords=[])], keywords=[]))))",
+      "rendered": "importance *= 1.0 + 0.5 / math.sqrt(max(siblings, 1))"
+    },
+    {
+      "line_start": 342,
+      "line_end": 342,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='heuristic_label', ctx=Load()), args=[Attribute(value=Name(id='entry_symbol', ctx=Load()), attr='name', ctx=Load())], keywords=[])",
+      "rendered": "heuristic_label(entry_symbol.name)"
+    },
+    {
+      "line_start": 344,
+      "line_end": 346,
+      "column": 12,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Attribute(value=Name(id='raw', ctx=Load()), attr='entry_point', ctx=Load()), ops=[In()], comparators=[Name(id='orchestrator_set', ctx=Load())]), Compare(left=Name(id='entry_label', ctx=Load()), ops=[NotIn()], comparators=[Tuple(elts=[Constant(value='Create operation'), Constant(value='Initialization')], ctx=Load())]), UnaryOp(op=Not(), operand=Call(func=Name(id='is_command_dir', ctx=Load()), args=[Name(id='entry_path', ctx=Load())], keywords=[]))])",
+      "rendered": "raw.entry_point in orchestrator_set and entry_label not in ('Create operation', 'Initialization') and (not is_command_dir(entry_path))"
+    },
+    {
+      "line_start": 348,
+      "line_end": 348,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='importance', ctx=Store()), op=Mult(), value=Constant(value=1.5))",
+      "rendered": "importance *= 1.5"
+    },
+    {
+      "line_start": 349,
+      "line_end": 349,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='entry_label', ctx=Load()), ops=[In()], comparators=[Tuple(elts=[Constant(value='Create operation'), Constant(value='Initialization')], ctx=Load())])",
+      "rendered": "entry_label in ('Create operation', 'Initialization')"
+    },
+    {
+      "line_start": 350,
+      "line_end": 350,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='importance', ctx=Store()), op=Mult(), value=Constant(value=0.2))",
+      "rendered": "importance *= 0.2"
+    },
+    {
+      "line_start": 351,
+      "line_end": 351,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='is_command_dir', ctx=Load()), args=[Name(id='entry_path', ctx=Load())], keywords=[])",
+      "rendered": "is_command_dir(entry_path)"
+    },
+    {
+      "line_start": 352,
+      "line_end": 352,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='importance', ctx=Store()), op=Mult(), value=Constant(value=0.5))",
+      "rendered": "importance *= 0.5"
+    },
+    {
+      "line_start": 353,
+      "line_end": 353,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Name(id='entry_path', ctx=Load()), Call(func=Name(id='is_test_file', ctx=Load()), args=[Name(id='entry_path', ctx=Load())], keywords=[])])",
+      "rendered": "entry_path and is_test_file(entry_path)"
+    },
+    {
+      "line_start": 354,
+      "line_end": 354,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='importance', ctx=Store()), op=Mult(), value=Constant(value=0.1))",
+      "rendered": "importance *= 0.1"
+    },
+    {
+      "line_start": 355,
+      "line_end": 355,
+      "column": 25,
+      "kind": "Name",
+      "original_ast": "Name(id='importance', ctx=Load())",
+      "rendered": "importance"
+    },
+    {
+      "line_start": 358,
+      "line_end": 358,
+      "column": 21,
+      "kind": "DictComp",
+      "original_ast": "DictComp(key=Attribute(value=Name(id='raw', ctx=Load()), attr='entry_point', ctx=Load()), value=Name(id='index', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='index', ctx=Store()), Name(id='raw', ctx=Store())], ctx=Store()), iter=Call(func=Name(id='enumerate', ctx=Load()), args=[Name(id='raw_processes', ctx=Load())], keywords=[]), ifs=[], is_async=0)])",
+      "rendered": "{raw.entry_point: index for index, raw in enumerate(raw_processes)}"
+    },
+    {
+      "line_start": 359,
+      "line_end": 361,
+      "column": 27,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='flow_rank_topology', ctx=Load()), args=[ListComp(elt=ListComp(elt=Name(id='node', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='node', ctx=Store()), Name(id='_', ctx=Store()), Name(id='_', ctx=Store())], ctx=Store()), iter=Attribute(value=Name(id='raw', ctx=Load()), attr='steps', ctx=Load()), ifs=[], is_async=0)]), generators=[comprehension(target=Name(id='raw', ctx=Store()), iter=Name(id='raw_processes', ctx=Load()), ifs=[], is_async=0)]), Name(id='entry_to_index', ctx=Load())], keywords=[])",
+      "rendered": "flow_rank_topology([[node for node, _, _ in raw.steps] for raw in raw_processes], entry_to_index)"
+    },
+    {
+      "line_start": 362,
+      "line_end": 362,
+      "column": 11,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Attribute(value=Name(id='raw', ctx=Load()), attr='importance', ctx=Load()), generators=[comprehension(target=Name(id='raw', ctx=Store()), iter=Name(id='raw_processes', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "[raw.importance for raw in raw_processes]"
+    },
+    {
+      "line_start": 363,
+      "line_end": 363,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='range', ctx=Load()), args=[Name(id='_PAGERANK_ITERATIONS', ctx=Load())], keywords=[])",
+      "rendered": "range(_PAGERANK_ITERATIONS)"
+    },
+    {
+      "line_start": 364,
+      "line_end": 364,
+      "column": 19,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=List(elts=[Constant(value=0.0)], ctx=Load()), op=Mult(), right=Call(func=Name(id='len', ctx=Load()), args=[Name(id='raw_processes', ctx=Load())], keywords=[]))",
+      "rendered": "[0.0] * len(raw_processes)"
+    },
+    {
+      "line_start": 365,
+      "line_end": 365,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='enumerate', ctx=Load()), args=[Name(id='raw_processes', ctx=Load())], keywords=[])",
+      "rendered": "enumerate(raw_processes)"
+    },
+    {
+      "line_start": 366,
+      "line_end": 366,
+      "column": 30,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=BinOp(left=Constant(value=1), op=Sub(), right=Name(id='_PAGERANK_DAMPING', ctx=Load())), op=Mult(), right=Attribute(value=Name(id='raw', ctx=Load()), attr='importance', ctx=Load()))",
+      "rendered": "(1 - _PAGERANK_DAMPING) * raw.importance"
+    },
+    {
+      "line_start": 367,
+      "line_end": 367,
+      "column": 27,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Name(id='invokers', ctx=Load()), slice=Name(id='index', ctx=Load()), ctx=Load())",
+      "rendered": "invokers[index]"
+    },
+    {
+      "line_start": 368,
+      "line_end": 368,
+      "column": 19,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Subscript(value=Name(id='out_degree', ctx=Load()), slice=Name(id='invoker', ctx=Load()), ctx=Load()), ops=[Gt()], comparators=[Constant(value=0)])",
+      "rendered": "out_degree[invoker] > 0"
+    },
+    {
+      "line_start": 369,
+      "line_end": 369,
+      "column": 20,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Subscript(value=Name(id='new_rank', ctx=Load()), slice=Name(id='index', ctx=Load()), ctx=Store()), op=Add(), value=BinOp(left=BinOp(left=Name(id='_PAGERANK_DAMPING', ctx=Load()), op=Mult(), right=Subscript(value=Name(id='rank', ctx=Load()), slice=Name(id='invoker', ctx=Load()), ctx=Load())), op=Div(), right=Subscript(value=Name(id='out_degree', ctx=Load()), slice=Name(id='invoker', ctx=Load()), ctx=Load())))",
+      "rendered": "new_rank[index] += _PAGERANK_DAMPING * rank[invoker] / out_degree[invoker]"
+    },
+    {
+      "line_start": 370,
+      "line_end": 370,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='new_rank', ctx=Load())",
+      "rendered": "new_rank"
+    },
+    {
+      "line_start": 371,
+      "line_end": 371,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='enumerate', ctx=Load()), args=[Name(id='raw_processes', ctx=Load())], keywords=[])",
+      "rendered": "enumerate(raw_processes)"
+    },
+    {
+      "line_start": 372,
+      "line_end": 372,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='raw', ctx=Load()), attr='importance', ctx=Load()), ops=[Gt()], comparators=[Constant(value=0)])",
+      "rendered": "raw.importance > 0"
+    },
+    {
+      "line_start": 373,
+      "line_end": 373,
+      "column": 20,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Subscript(value=Name(id='rank', ctx=Load()), slice=Name(id='index', ctx=Load()), ctx=Load()), op=Div(), right=Attribute(value=Name(id='raw', ctx=Load()), attr='importance', ctx=Load()))",
+      "rendered": "rank[index] / raw.importance"
+    },
+    {
+      "line_start": 374,
+      "line_end": 374,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='ratio', ctx=Load()), ops=[Gt()], comparators=[Constant(value=1.0)])",
+      "rendered": "ratio > 1.0"
+    },
+    {
+      "line_start": 375,
+      "line_end": 375,
+      "column": 16,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Attribute(value=Name(id='raw', ctx=Load()), attr='importance', ctx=Store()), op=Mult(), value=BinOp(left=Constant(value=1.0), op=Add(), right=Call(func=Attribute(value=Name(id='math', ctx=Load()), attr='log1p', ctx=Load()), args=[BinOp(left=Name(id='ratio', ctx=Load()), op=Sub(), right=Constant(value=1.0))], keywords=[])))",
+      "rendered": "raw.importance *= 1.0 + math.log1p(ratio - 1.0)"
+    },
+    {
+      "line_start": 377,
+      "line_end": 377,
+      "column": 35,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 378,
+      "line_end": 378,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='raw_processes', ctx=Load())",
+      "rendered": "raw_processes"
+    },
+    {
+      "line_start": 379,
+      "line_end": 379,
+      "column": 23,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Attribute(value=Name(id='graph', ctx=Load()), attr='symbols', ctx=Load()), slice=Attribute(value=Name(id='raw', ctx=Load()), attr='entry_point', ctx=Load()), ctx=Load())",
+      "rendered": "graph.symbols[raw.entry_point]"
+    },
+    {
+      "line_start": 382,
+      "line_end": 389,
+      "column": 16,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Call(func=Name(id='entry_point_score', ctx=Load()), args=[Attribute(value=Name(id='entry_symbol', ctx=Load()), attr='name', ctx=Load()), Attribute(value=Name(id='entry_symbol', ctx=Load()), attr='language', ctx=Load()), Attribute(value=Name(id='entry_symbol', ctx=Load()), attr='is_exported', ctx=Load()), Call(func=Name(id='len', ctx=Load()), args=[Call(func=Attribute(value=Name(id='graph', ctx=Load()), attr='incoming_of', ctx=Load()), args=[Attribute(value=Name(id='raw', ctx=Load()), attr='entry_point', ctx=Load()), Constant(value='CALLS')], keywords=[])], keywords=[]), Call(func=Attribute(value=Name(id='graph', ctx=Load()), attr='outgoing_count', ctx=Load()), args=[Attribute(value=Name(id='raw', ctx=Load()), attr='entry_point', ctx=Load()), Constant(value='CALLS')], keywords=[]), Attribute(value=Name(id='entry_symbol', ctx=Load()), attr='file_path', ctx=Load())], keywords=[]), attr='score', ctx=Load())",
+      "rendered": "entry_point_score(entry_symbol.name, entry_symbol.language, entry_symbol.is_exported, len(graph.incoming_of(raw.entry_point, 'CALLS')), graph.outgoing_count(raw.entry_point, 'CALLS'), entry_symbol.file_path).score"
+    },
+    {
+      "line_start": 390,
+      "line_end": 406,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='records', ctx=Load()), attr='append', ctx=Load()), args=[Call(func=Name(id='ProcessRecord', ctx=Load()), args=[], keywords=[keyword(arg='local_id', value=JoinedStr(values=[Constant(value='process:'), FormattedValue(value=Attribute(value=Name(id='raw', ctx=Load()), attr='entry_point', ctx=Load()), conversion=-1), Constant(value='-flow')])), keyword(arg='name', value=Call(func=Name(id='_qualified_flow_name', ctx=Load()), args=[Name(id='entry_symbol', ctx=Load())], keywords=[])), keyword(arg='entry_point_id', value=Attribute(value=Name(id='raw', ctx=Load()), attr='entry_point', ctx=Load())), keyword(arg='heuristic_label', value=Call(func=Name(id='heuristic_label', ctx=Load()), args=[Attribute(value=Name(id='entry_symbol', ctx=Load()), attr='name', ctx=Load())], keywords=[])), keyword(arg='step_count', value=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='raw', ctx=Load()), attr='steps', ctx=Load())], keywords=[])), keyword(arg='caller_count', value=Attribute(value=Name(id='raw', ctx=Load()), attr='caller_count', ctx=Load())), keyword(arg='entry_point_score', value=Name(id='score', ctx=Load())), keyword(arg='importance', value=Attribute(value=Name(id='raw', ctx=Load()), attr='importance', ctx=Load())), keyword(arg='cross_community', value=Attribute(value=Name(id='raw', ctx=Load()), attr='cross_community', ctx=Load())), keyword(arg='communities', value=Attribute(value=Name(id='raw', ctx=Load()), attr='communities', ctx=Load())), keyword(arg='steps', value=Call(func=Name(id='tuple', ctx=Load()), args=[GeneratorExp(elt=Tuple(elts=[Name(id='node', ctx=Load()), Name(id='number', ctx=Load())], ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='node', ctx=Store()), Name(id='number', ctx=Store()), Name(id='_', ctx=Store())], ctx=Store()), iter=Attribute(value=Name(id='raw', ctx=Load()), attr='steps', ctx=Load()), ifs=[], is_async=0)])], keywords=[]))])], keywords=[])",
+      "rendered": "records.append(ProcessRecord(local_id=source_template_392_25, name=_qualified_flow_name(entry_symbol), entry_point_id=raw.entry_point, heuristic_label=heuristic_label(entry_symbol.name), step_count=len(raw.steps), caller_count=raw.caller_count, entry_point_score=score, importance=raw.importance, cross_community=raw.cross_community, communities=raw.communities, steps=tuple(((node, number) for node, number, _ in raw.steps))))"
+    },
+    {
+      "line_start": 407,
+      "line_end": 407,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='records', ctx=Load())",
+      "rendered": "records"
+    },
+    {
+      "line_start": 420,
+      "line_end": 420,
+      "column": 32,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=List(elts=[], ctx=Load()), generators=[comprehension(target=Name(id='_', ctx=Store()), iter=Name(id='flow_steps', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "[[] for _ in flow_steps]"
+    },
+    {
+      "line_start": 421,
+      "line_end": 421,
+      "column": 28,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=List(elts=[Constant(value=0)], ctx=Load()), op=Mult(), right=Call(func=Name(id='len', ctx=Load()), args=[Name(id='flow_steps', ctx=Load())], keywords=[]))",
+      "rendered": "[0] * len(flow_steps)"
+    },
+    {
+      "line_start": 422,
+      "line_end": 422,
+      "column": 24,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='enumerate', ctx=Load()), args=[Name(id='flow_steps', ctx=Load())], keywords=[])",
+      "rendered": "enumerate(flow_steps)"
+    },
+    {
+      "line_start": 423,
+      "line_end": 423,
+      "column": 20,
+      "kind": "Name",
+      "original_ast": "Name(id='steps', ctx=Load())",
+      "rendered": "steps"
+    },
+    {
+      "line_start": 424,
+      "line_end": 424,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='entry_to_index', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='node', ctx=Load())], keywords=[])",
+      "rendered": "entry_to_index.get(node)"
+    },
+    {
+      "line_start": 425,
+      "line_end": 425,
+      "column": 15,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='target', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), Compare(left=Name(id='target', ctx=Load()), ops=[NotEq()], comparators=[Name(id='index', ctx=Load())])])",
+      "rendered": "target is not None and target != index"
+    },
+    {
+      "line_start": 426,
+      "line_end": 426,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Subscript(value=Name(id='invokers', ctx=Load()), slice=Name(id='target', ctx=Load()), ctx=Load()), attr='append', ctx=Load()), args=[Name(id='index', ctx=Load())], keywords=[])",
+      "rendered": "invokers[target].append(index)"
+    },
+    {
+      "line_start": 427,
+      "line_end": 427,
+      "column": 16,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Subscript(value=Name(id='out_degree', ctx=Load()), slice=Name(id='index', ctx=Load()), ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "out_degree[index] += 1"
+    },
+    {
+      "line_start": 428,
+      "line_end": 428,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='invokers', ctx=Load()), Name(id='out_degree', ctx=Load())], ctx=Load())",
+      "rendered": "(invokers, out_degree)"
+    },
+    {
+      "line_start": 432,
+      "line_end": 432,
+      "column": 14,
+      "kind": "Constant",
+      "original_ast": "Constant(value='')",
+      "rendered": "''"
+    },
+    {
+      "line_start": 433,
+      "line_end": 433,
+      "column": 7,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='entry', ctx=Load()), attr='file_path', ctx=Load())",
+      "rendered": "entry.file_path"
+    },
+    {
+      "line_start": 434,
+      "line_end": 434,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='posixpath', ctx=Load()), attr='dirname', ctx=Load()), args=[Attribute(value=Name(id='entry', ctx=Load()), attr='file_path', ctx=Load())], keywords=[])",
+      "rendered": "posixpath.dirname(entry.file_path)"
+    },
+    {
+      "line_start": 435,
+      "line_end": 435,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='directory', ctx=Load()), ops=[NotIn()], comparators=[Tuple(elts=[Constant(value='.'), Constant(value='/'), Constant(value='')], ctx=Load())])",
+      "rendered": "directory not in ('.', '/', '')"
+    },
+    {
+      "line_start": 436,
+      "line_end": 436,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='posixpath', ctx=Load()), attr='basename', ctx=Load()), args=[Name(id='directory', ctx=Load())], keywords=[])",
+      "rendered": "posixpath.basename(directory)"
+    },
+    {
+      "line_start": 437,
+      "line_end": 441,
+      "column": 12,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='part', ctx=Load()), generators=[comprehension(target=Name(id='part', ctx=Store()), iter=Tuple(elts=[Name(id='package', ctx=Load()), IfExp(test=Compare(left=Attribute(value=Name(id='entry', ctx=Load()), attr='label', ctx=Load()), ops=[Eq()], comparators=[Constant(value='Method')]), body=Attribute(value=Name(id='entry', ctx=Load()), attr='owner_name', ctx=Load()), orelse=Constant(value='')), Attribute(value=Name(id='entry', ctx=Load()), attr='name', ctx=Load())], ctx=Load()), ifs=[Name(id='part', ctx=Load())], is_async=0)])",
+      "rendered": "[part for part in (package, entry.owner_name if entry.label == 'Method' else '', entry.name) if part]"
+    },
+    {
+      "line_start": 442,
+      "line_end": 442,
+      "column": 11,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Attribute(value=Constant(value='.'), attr='join', ctx=Load()), args=[Name(id='parts', ctx=Load())], keywords=[]), op=Add(), right=Constant(value='-flow'))",
+      "rendered": "'.'.join(parts) + '-flow'"
+    }
+  ],
+  "calls": [
+    {
+      "line": 41,
+      "end_line": 41,
+      "callee": "dataclass",
+      "enclosing": "ProcessOptions",
+      "expression": "dataclass(frozen=True)"
+    },
+    {
+      "line": 51,
+      "end_line": 51,
+      "callee": "dataclass",
+      "enclosing": "ProcessRecord",
+      "expression": "dataclass(frozen=True)"
+    },
+    {
+      "line": 115,
+      "end_line": 115,
+      "callee": "graph.callable_ids",
+      "enclosing": "_find_entry_points",
+      "expression": "graph.callable_ids()"
+    },
+    {
+      "line": 127,
+      "end_line": 127,
+      "callee": "graph.callable_ids",
+      "enclosing": "_find_orchestrators",
+      "expression": "graph.callable_ids()"
+    },
+    {
+      "line": 143,
+      "end_line": 143,
+      "callee": "set",
+      "enclosing": "_find_spawn_targets",
+      "expression": "set()"
+    },
+    {
+      "line": 144,
+      "end_line": 144,
+      "callee": "graph.callable_ids",
+      "enclosing": "_find_spawn_targets",
+      "expression": "graph.callable_ids()"
+    },
+    {
+      "line": 159,
+      "end_line": 159,
+      "callee": "graph.callable_ids",
+      "enclosing": "_find_delegate_targets",
+      "expression": "graph.callable_ids()"
+    },
+    {
+      "line": 185,
+      "end_line": 185,
+      "callee": "field",
+      "enclosing": "_RawProcess",
+      "expression": "field(default_factory=set[str])"
+    },
+    {
+      "line": 190,
+      "end_line": 190,
+      "callee": "graph.outgoing.items",
+      "enclosing": "_spawn_sibling_counts",
+      "expression": "graph.outgoing.items()"
+    },
+    {
+      "line": 193,
+      "end_line": 193,
+      "callee": "graph.incoming.items",
+      "enclosing": "_spawn_sibling_counts",
+      "expression": "graph.incoming.items()"
+    },
+    {
+      "line": 202,
+      "end_line": 202,
+      "callee": "graph.incoming.get",
+      "enclosing": "_external_callers",
+      "expression": "graph.incoming.get(node, [])"
+    },
+    {
+      "line": 217,
+      "end_line": 217,
+      "callee": "FlowGraph",
+      "enclosing": "detect_processes",
+      "expression": "FlowGraph(inputs, community_of)"
+    },
+    {
+      "line": 219,
+      "end_line": 219,
+      "callee": "_find_entry_points",
+      "enclosing": "detect_processes",
+      "expression": "_find_entry_points(graph, options.exclude_tests)"
+    },
+    {
+      "line": 220,
+      "end_line": 220,
+      "callee": "set",
+      "enclosing": "detect_processes",
+      "expression": "set(entry_points)"
+    },
+    {
+      "line": 221,
+      "end_line": 221,
+      "callee": "_find_orchestrators",
+      "enclosing": "detect_processes",
+      "expression": "_find_orchestrators(graph, existing, options.exclude_tests)"
+    },
+    {
+      "line": 222,
+      "end_line": 222,
+      "callee": "entry_points.extend",
+      "enclosing": "detect_processes",
+      "expression": "entry_points.extend(orchestrators)"
+    },
+    {
+      "line": 223,
+      "end_line": 223,
+      "callee": "existing.update",
+      "enclosing": "detect_processes",
+      "expression": "existing.update(orchestrators)"
+    },
+    {
+      "line": 224,
+      "end_line": 224,
+      "callee": "_find_spawn_targets",
+      "enclosing": "detect_processes",
+      "expression": "_find_spawn_targets(graph, existing, options.exclude_tests)"
+    },
+    {
+      "line": 225,
+      "end_line": 225,
+      "callee": "entry_points.extend",
+      "enclosing": "detect_processes",
+      "expression": "entry_points.extend(spawn_targets)"
+    },
+    {
+      "line": 226,
+      "end_line": 226,
+      "callee": "existing.update",
+      "enclosing": "detect_processes",
+      "expression": "existing.update(spawn_targets)"
+    },
+    {
+      "line": 227,
+      "end_line": 227,
+      "callee": "_find_delegate_targets",
+      "enclosing": "detect_processes",
+      "expression": "_find_delegate_targets(graph, existing, options.exclude_tests)"
+    },
+    {
+      "line": 228,
+      "end_line": 228,
+      "callee": "entry_points.extend",
+      "enclosing": "detect_processes",
+      "expression": "entry_points.extend(delegate_targets)"
+    },
+    {
+      "line": 229,
+      "end_line": 229,
+      "callee": "entry_points.sort",
+      "enclosing": "detect_processes",
+      "expression": "entry_points.sort()"
+    },
+    {
+      "line": 231,
+      "end_line": 231,
+      "callee": "set",
+      "enclosing": "detect_processes",
+      "expression": "set(orchestrators)"
+    },
+    {
+      "line": 232,
+      "end_line": 232,
+      "callee": "_spawn_sibling_counts",
+      "enclosing": "detect_processes",
+      "expression": "_spawn_sibling_counts(graph)"
+    },
+    {
+      "line": 234,
+      "end_line": 234,
+      "callee": "set",
+      "enclosing": "detect_processes",
+      "expression": "set()"
+    },
+    {
+      "line": 359,
+      "end_line": 361,
+      "callee": "flow_rank_topology",
+      "enclosing": "detect_processes",
+      "expression": "flow_rank_topology(\n        [[node for node, _, _ in raw.steps] for raw in raw_processes], entry_to_index\n    )"
+    },
+    {
+      "line": 363,
+      "end_line": 363,
+      "callee": "range",
+      "enclosing": "detect_processes",
+      "expression": "range(_PAGERANK_ITERATIONS)"
+    },
+    {
+      "line": 371,
+      "end_line": 371,
+      "callee": "enumerate",
+      "enclosing": "detect_processes",
+      "expression": "enumerate(raw_processes)"
+    },
+    {
+      "line": 422,
+      "end_line": 422,
+      "callee": "enumerate",
+      "enclosing": "flow_rank_topology",
+      "expression": "enumerate(flow_steps)"
+    },
+    {
+      "line": 83,
+      "end_line": 83,
+      "callee": "self.outgoing.values",
+      "enclosing": "FlowGraph.__init__",
+      "expression": "self.outgoing.values()"
+    },
+    {
+      "line": 85,
+      "end_line": 85,
+      "callee": "self.incoming.values",
+      "enclosing": "FlowGraph.__init__",
+      "expression": "self.incoming.values()"
+    },
+    {
+      "line": 89,
+      "end_line": 93,
+      "callee": "sorted",
+      "enclosing": "FlowGraph.callable_ids",
+      "expression": "sorted(\n            symbol_id\n            for symbol_id, symbol in self.symbols.items()\n            if symbol.label in (\"Function\", \"Method\")\n        )"
+    },
+    {
+      "line": 99,
+      "end_line": 99,
+      "callee": "sum",
+      "enclosing": "FlowGraph.outgoing_count",
+      "expression": "sum(1 for _, rel, _ in self.outgoing.get(node, []) if rel in relationships)"
+    },
+    {
+      "line": 103,
+      "end_line": 103,
+      "callee": "self.incoming.get",
+      "enclosing": "FlowGraph.production_callers",
+      "expression": "self.incoming.get(node, [])"
+    },
+    {
+      "line": 133,
+      "end_line": 133,
+      "callee": "graph.production_callers",
+      "enclosing": "_find_orchestrators",
+      "expression": "graph.production_callers(node, all_relationships)"
+    },
+    {
+      "line": 149,
+      "end_line": 149,
+      "callee": "seen.add",
+      "enclosing": "_find_spawn_targets",
+      "expression": "seen.add(node)"
+    },
+    {
+      "line": 153,
+      "end_line": 153,
+      "callee": "targets.append",
+      "enclosing": "_find_spawn_targets",
+      "expression": "targets.append(node)"
+    },
+    {
+      "line": 167,
+      "end_line": 167,
+      "callee": "graph.incoming_of",
+      "enclosing": "_find_delegate_targets",
+      "expression": "graph.incoming_of(node, \"CALLS\")"
+    },
+    {
+      "line": 172,
+      "end_line": 172,
+      "callee": "targets.append",
+      "enclosing": "_find_delegate_targets",
+      "expression": "targets.append(node)"
+    },
+    {
+      "line": 191,
+      "end_line": 191,
+      "callee": "sum",
+      "enclosing": "_spawn_sibling_counts",
+      "expression": "sum(1 for _, rel, _ in edges if rel == \"SPAWNS\")"
+    },
+    {
+      "line": 214,
+      "end_line": 214,
+      "callee": "ProcessOptions",
+      "enclosing": "detect_processes",
+      "expression": "ProcessOptions()"
+    },
+    {
+      "line": 216,
+      "end_line": 216,
+      "callee": "ModelValidationError",
+      "enclosing": "detect_processes",
+      "expression": "ModelValidationError(f\"max_processes must be in [1, {MAX_PROCESS_LIMIT}]\")"
+    },
+    {
+      "line": 273,
+      "end_line": 273,
+      "callee": "seen_fingerprints.add",
+      "enclosing": "detect_processes",
+      "expression": "seen_fingerprints.add(fingerprint)"
+    },
+    {
+      "line": 276,
+      "end_line": 276,
+      "callee": "set",
+      "enclosing": "detect_processes",
+      "expression": "set()"
+    },
+    {
+      "line": 280,
+      "end_line": 290,
+      "callee": "raw_processes.append",
+      "enclosing": "detect_processes",
+      "expression": "raw_processes.append(\n            _RawProcess(\n                entry_point,\n                steps,\n                visited,\n                tuple(sorted(community_set)),\n                len(community_set) > 1,\n                len(caller_seen),\n                steps_set={node for node, _, _ in steps},\n            )\n        )"
+    },
+    {
+      "line": 300,
+      "end_line": 300,
+      "callee": "set",
+      "enclosing": "detect_processes",
+      "expression": "set()"
+    },
+    {
+      "line": 317,
+      "end_line": 317,
+      "callee": "packages.discard",
+      "enclosing": "detect_processes",
+      "expression": "packages.discard(\"\")"
+    },
+    {
+      "line": 318,
+      "end_line": 318,
+      "callee": "graph.outgoing_count",
+      "enclosing": "detect_processes",
+      "expression": "graph.outgoing_count(raw.entry_point, \"CALLS\")"
+    },
+    {
+      "line": 319,
+      "end_line": 319,
+      "callee": "graph.production_callers",
+      "enclosing": "detect_processes",
+      "expression": "graph.production_callers(raw.entry_point, (\"CALLS\", \"SPAWNS\"))"
+    },
+    {
+      "line": 323,
+      "end_line": 323,
+      "callee": "float",
+      "enclosing": "detect_processes",
+      "expression": "float(len(raw.steps))"
+    },
+    {
+      "line": 338,
+      "end_line": 338,
+      "callee": "spawn_siblings.get",
+      "enclosing": "detect_processes",
+      "expression": "spawn_siblings.get(raw.entry_point, 0)"
+    },
+    {
+      "line": 342,
+      "end_line": 342,
+      "callee": "heuristic_label",
+      "enclosing": "detect_processes",
+      "expression": "heuristic_label(entry_symbol.name)"
+    },
+    {
+      "line": 351,
+      "end_line": 351,
+      "callee": "is_command_dir",
+      "enclosing": "detect_processes",
+      "expression": "is_command_dir(entry_path)"
+    },
+    {
+      "line": 365,
+      "end_line": 365,
+      "callee": "enumerate",
+      "enclosing": "detect_processes",
+      "expression": "enumerate(raw_processes)"
+    },
+    {
+      "line": 390,
+      "end_line": 406,
+      "callee": "records.append",
+      "enclosing": "detect_processes",
+      "expression": "records.append(\n            ProcessRecord(\n                local_id=f\"process:{raw.entry_point}-flow\",\n                name=_qualified_flow_name(entry_symbol),\n                entry_point_id=raw.entry_point,\n                heuristic_label=heuristic_label(entry_symbol.name),\n                step_count=len(raw.steps),\n                # Expose the raw unique external caller count; importance\n                # applies production-only weighting separately.\n                caller_count=raw.caller_count,\n                entry_point_score=score,\n                importance=raw.importance,\n                cross_community=raw.cross_community,\n                communities=raw.communities,\n                steps=tuple((node, number) for node, number, _ in raw.steps),\n            )\n        )"
+    },
+    {
+      "line": 421,
+      "end_line": 421,
+      "callee": "len",
+      "enclosing": "flow_rank_topology",
+      "expression": "len(flow_steps)"
+    },
+    {
+      "line": 434,
+      "end_line": 434,
+      "callee": "posixpath.dirname",
+      "enclosing": "_qualified_flow_name",
+      "expression": "posixpath.dirname(entry.file_path)"
+    },
+    {
+      "line": 442,
+      "end_line": 442,
+      "callee": "'.'.join",
+      "enclosing": "_qualified_flow_name",
+      "expression": "\".\".join(parts)"
+    },
+    {
+      "line": 81,
+      "end_line": 81,
+      "callee": "self.outgoing.setdefault(source_id, []).append",
+      "enclosing": "FlowGraph.__init__",
+      "expression": "self.outgoing.setdefault(source_id, []).append((target_id, relationship, confidence))"
+    },
+    {
+      "line": 82,
+      "end_line": 82,
+      "callee": "self.incoming.setdefault(target_id, []).append",
+      "enclosing": "FlowGraph.__init__",
+      "expression": "self.incoming.setdefault(target_id, []).append((source_id, relationship, confidence))"
+    },
+    {
+      "line": 84,
+      "end_line": 84,
+      "callee": "bucket.sort",
+      "enclosing": "FlowGraph.__init__",
+      "expression": "bucket.sort(key=lambda item: (-item[2], item[0]))"
+    },
+    {
+      "line": 86,
+      "end_line": 86,
+      "callee": "bucket.sort",
+      "enclosing": "FlowGraph.__init__",
+      "expression": "bucket.sort()"
+    },
+    {
+      "line": 106,
+      "end_line": 106,
+      "callee": "self.symbols.get",
+      "enclosing": "FlowGraph.production_callers",
+      "expression": "self.symbols.get(source)"
+    },
+    {
+      "line": 117,
+      "end_line": 117,
+      "callee": "is_test_file",
+      "enclosing": "_find_entry_points",
+      "expression": "is_test_file(symbol.file_path)"
+    },
+    {
+      "line": 119,
+      "end_line": 119,
+      "callee": "graph.incoming_of",
+      "enclosing": "_find_entry_points",
+      "expression": "graph.incoming_of(node, \"CALLS\")"
+    },
+    {
+      "line": 120,
+      "end_line": 120,
+      "callee": "entry_points.append",
+      "enclosing": "_find_entry_points",
+      "expression": "entry_points.append(node)"
+    },
+    {
+      "line": 131,
+      "end_line": 131,
+      "callee": "is_test_file",
+      "enclosing": "_find_orchestrators",
+      "expression": "is_test_file(symbol.file_path)"
+    },
+    {
+      "line": 136,
+      "end_line": 136,
+      "callee": "graph.outgoing_count",
+      "enclosing": "_find_orchestrators",
+      "expression": "graph.outgoing_count(node, *all_relationships)"
+    },
+    {
+      "line": 137,
+      "end_line": 137,
+      "callee": "orchestrators.append",
+      "enclosing": "_find_orchestrators",
+      "expression": "orchestrators.append(node)"
+    },
+    {
+      "line": 147,
+      "end_line": 147,
+      "callee": "graph.incoming_of",
+      "enclosing": "_find_spawn_targets",
+      "expression": "graph.incoming_of(node, \"SPAWNS\")"
+    },
+    {
+      "line": 151,
+      "end_line": 151,
+      "callee": "is_test_file",
+      "enclosing": "_find_spawn_targets",
+      "expression": "is_test_file(symbol.file_path)"
+    },
+    {
+      "line": 162,
+      "end_line": 162,
+      "callee": "graph.incoming_of",
+      "enclosing": "_find_delegate_targets",
+      "expression": "graph.incoming_of(node, \"DELEGATES_TO\")"
+    },
+    {
+      "line": 165,
+      "end_line": 165,
+      "callee": "is_test_file",
+      "enclosing": "_find_delegate_targets",
+      "expression": "is_test_file(symbol.file_path)"
+    },
+    {
+      "line": 169,
+      "end_line": 169,
+      "callee": "graph.outgoing_count",
+      "enclosing": "_find_delegate_targets",
+      "expression": "graph.outgoing_count(node, \"CALLS\")"
+    },
+    {
+      "line": 169,
+      "end_line": 169,
+      "callee": "graph.outgoing_count",
+      "enclosing": "_find_delegate_targets",
+      "expression": "graph.outgoing_count(node, \"SPAWNS\")"
+    },
+    {
+      "line": 204,
+      "end_line": 204,
+      "callee": "seen.add",
+      "enclosing": "_external_callers",
+      "expression": "seen.add(source)"
+    },
+    {
+      "line": 205,
+      "end_line": 205,
+      "callee": "callers.append",
+      "enclosing": "_external_callers",
+      "expression": "callers.append(source)"
+    },
+    {
+      "line": 237,
+      "end_line": 237,
+      "callee": "len",
+      "enclosing": "detect_processes",
+      "expression": "len(raw_processes)"
+    },
+    {
+      "line": 244,
+      "end_line": 244,
+      "callee": "len",
+      "enclosing": "detect_processes",
+      "expression": "len(queue)"
+    },
+    {
+      "line": 248,
+      "end_line": 248,
+      "callee": "steps.append",
+      "enclosing": "detect_processes",
+      "expression": "steps.append((node, step_number, depth))"
+    },
+    {
+      "line": 253,
+      "end_line": 253,
+      "callee": "graph.outgoing.get",
+      "enclosing": "detect_processes",
+      "expression": "graph.outgoing.get(node, [])"
+    },
+    {
+      "line": 266,
+      "end_line": 266,
+      "callee": "len",
+      "enclosing": "detect_processes",
+      "expression": "len(steps)"
+    },
+    {
+      "line": 268,
+      "end_line": 270,
+      "callee": "hashlib.sha256('\\x00'.join(sorted((node for node, _, _ in steps))).encode()).hexdigest",
+      "enclosing": "detect_processes",
+      "expression": "hashlib.sha256(\n            \"\\x00\".join(sorted(node for node, _, _ in steps)).encode()\n        ).hexdigest()"
+    },
+    {
+      "line": 278,
+      "end_line": 278,
+      "callee": "_external_callers",
+      "enclosing": "detect_processes",
+      "expression": "_external_callers(graph, node, visited, caller_seen)"
+    },
+    {
+      "line": 281,
+      "end_line": 289,
+      "callee": "_RawProcess",
+      "enclosing": "detect_processes",
+      "expression": "_RawProcess(\n                entry_point,\n                steps,\n                visited,\n                tuple(sorted(community_set)),\n                len(community_set) > 1,\n                len(caller_seen),\n                steps_set={node for node, _, _ in steps},\n            )"
+    },
+    {
+      "line": 302,
+      "end_line": 302,
+      "callee": "max",
+      "enclosing": "detect_processes",
+      "expression": "max(step_flow_count.get(node, 1), 1)"
+    },
+    {
+      "line": 306,
+      "end_line": 306,
+      "callee": "_external_callers",
+      "enclosing": "detect_processes",
+      "expression": "_external_callers(graph, node, raw.visited, caller_seen)"
+    },
+    {
+      "line": 313,
+      "end_line": 313,
+      "callee": "posixpath.dirname",
+      "enclosing": "detect_processes",
+      "expression": "posixpath.dirname(graph.symbols[node].file_path)"
+    },
+    {
+      "line": 323,
+      "end_line": 323,
+      "callee": "len",
+      "enclosing": "detect_processes",
+      "expression": "len(raw.steps)"
+    },
+    {
+      "line": 324,
+      "end_line": 326,
+      "callee": "math.log1p",
+      "enclosing": "detect_processes",
+      "expression": "math.log1p(\n            effective_steps\n        )"
+    },
+    {
+      "line": 332,
+      "end_line": 332,
+      "callee": "len",
+      "enclosing": "detect_processes",
+      "expression": "len(packages)"
+    },
+    {
+      "line": 353,
+      "end_line": 353,
+      "callee": "is_test_file",
+      "enclosing": "detect_processes",
+      "expression": "is_test_file(entry_path)"
+    },
+    {
+      "line": 358,
+      "end_line": 358,
+      "callee": "enumerate",
+      "enclosing": "detect_processes",
+      "expression": "enumerate(raw_processes)"
+    },
+    {
+      "line": 364,
+      "end_line": 364,
+      "callee": "len",
+      "enclosing": "detect_processes",
+      "expression": "len(raw_processes)"
+    },
+    {
+      "line": 382,
+      "end_line": 389,
+      "callee": "entry_point_score",
+      "enclosing": "detect_processes",
+      "expression": "entry_point_score(\n            entry_symbol.name,\n            entry_symbol.language,\n            entry_symbol.is_exported,\n            len(graph.incoming_of(raw.entry_point, \"CALLS\")),\n            graph.outgoing_count(raw.entry_point, \"CALLS\"),\n            entry_symbol.file_path,\n        )"
+    },
+    {
+      "line": 391,
+      "end_line": 405,
+      "callee": "ProcessRecord",
+      "enclosing": "detect_processes",
+      "expression": "ProcessRecord(\n                local_id=f\"process:{raw.entry_point}-flow\",\n                name=_qualified_flow_name(entry_symbol),\n                entry_point_id=raw.entry_point,\n                heuristic_label=heuristic_label(entry_symbol.name),\n                step_count=len(raw.steps),\n                # Expose the raw unique external caller count; importance\n                # applies production-only weighting separately.\n                caller_count=raw.caller_count,\n                entry_point_score=score,\n                importance=raw.importance,\n                cross_community=raw.cross_community,\n                communities=raw.communities,\n                steps=tuple((node, number) for node, number, _ in raw.steps),\n            )"
+    },
+    {
+      "line": 424,
+      "end_line": 424,
+      "callee": "entry_to_index.get",
+      "enclosing": "flow_rank_topology",
+      "expression": "entry_to_index.get(node)"
+    },
+    {
+      "line": 436,
+      "end_line": 436,
+      "callee": "posixpath.basename",
+      "enclosing": "_qualified_flow_name",
+      "expression": "posixpath.basename(directory)"
+    },
+    {
+      "line": 96,
+      "end_line": 96,
+      "callee": "self.incoming.get",
+      "enclosing": "FlowGraph.incoming_of",
+      "expression": "self.incoming.get(node, [])"
+    },
+    {
+      "line": 107,
+      "end_line": 107,
+      "callee": "is_test_file",
+      "enclosing": "FlowGraph.production_callers",
+      "expression": "is_test_file(symbol.file_path)"
+    },
+    {
+      "line": 196,
+      "end_line": 196,
+      "callee": "max",
+      "enclosing": "_spawn_sibling_counts",
+      "expression": "max(siblings.get(target, 0), fanout.get(source, 0))"
+    },
+    {
+      "line": 262,
+      "end_line": 262,
+      "callee": "visited.add",
+      "enclosing": "detect_processes",
+      "expression": "visited.add(target)"
+    },
+    {
+      "line": 263,
+      "end_line": 263,
+      "callee": "queue.append",
+      "enclosing": "detect_processes",
+      "expression": "queue.append((target, depth + 1))"
+    },
+    {
+      "line": 285,
+      "end_line": 285,
+      "callee": "tuple",
+      "enclosing": "detect_processes",
+      "expression": "tuple(sorted(community_set))"
+    },
+    {
+      "line": 287,
+      "end_line": 287,
+      "callee": "len",
+      "enclosing": "detect_processes",
+      "expression": "len(caller_seen)"
+    },
+    {
+      "line": 295,
+      "end_line": 295,
+      "callee": "step_flow_count.get",
+      "enclosing": "detect_processes",
+      "expression": "step_flow_count.get(node, 0)"
+    },
+    {
+      "line": 302,
+      "end_line": 302,
+      "callee": "step_flow_count.get",
+      "enclosing": "detect_processes",
+      "expression": "step_flow_count.get(node, 1)"
+    },
+    {
+      "line": 304,
+      "end_line": 304,
+      "callee": "math.sqrt",
+      "enclosing": "detect_processes",
+      "expression": "math.sqrt(share)"
+    },
+    {
+      "line": 307,
+      "end_line": 307,
+      "callee": "graph.symbols.get",
+      "enclosing": "detect_processes",
+      "expression": "graph.symbols.get(caller)"
+    },
+    {
+      "line": 324,
+      "end_line": 324,
+      "callee": "math.log1p",
+      "enclosing": "detect_processes",
+      "expression": "math.log1p(effective_callers)"
+    },
+    {
+      "line": 328,
+      "end_line": 328,
+      "callee": "len",
+      "enclosing": "detect_processes",
+      "expression": "len(raw.steps)"
+    },
+    {
+      "line": 346,
+      "end_line": 346,
+      "callee": "is_command_dir",
+      "enclosing": "detect_processes",
+      "expression": "is_command_dir(entry_path)"
+    },
+    {
+      "line": 386,
+      "end_line": 386,
+      "callee": "len",
+      "enclosing": "detect_processes",
+      "expression": "len(graph.incoming_of(raw.entry_point, \"CALLS\"))"
+    },
+    {
+      "line": 387,
+      "end_line": 387,
+      "callee": "graph.outgoing_count",
+      "enclosing": "detect_processes",
+      "expression": "graph.outgoing_count(raw.entry_point, \"CALLS\")"
+    },
+    {
+      "line": 426,
+      "end_line": 426,
+      "callee": "invokers[target].append",
+      "enclosing": "flow_rank_topology",
+      "expression": "invokers[target].append(index)"
+    },
+    {
+      "line": 81,
+      "end_line": 81,
+      "callee": "self.outgoing.setdefault",
+      "enclosing": "FlowGraph.__init__",
+      "expression": "self.outgoing.setdefault(source_id, [])"
+    },
+    {
+      "line": 82,
+      "end_line": 82,
+      "callee": "self.incoming.setdefault",
+      "enclosing": "FlowGraph.__init__",
+      "expression": "self.incoming.setdefault(target_id, [])"
+    },
+    {
+      "line": 91,
+      "end_line": 91,
+      "callee": "self.symbols.items",
+      "enclosing": "FlowGraph.callable_ids",
+      "expression": "self.symbols.items()"
+    },
+    {
+      "line": 99,
+      "end_line": 99,
+      "callee": "self.outgoing.get",
+      "enclosing": "FlowGraph.outgoing_count",
+      "expression": "self.outgoing.get(node, [])"
+    },
+    {
+      "line": 196,
+      "end_line": 196,
+      "callee": "siblings.get",
+      "enclosing": "_spawn_sibling_counts",
+      "expression": "siblings.get(target, 0)"
+    },
+    {
+      "line": 196,
+      "end_line": 196,
+      "callee": "fanout.get",
+      "enclosing": "_spawn_sibling_counts",
+      "expression": "fanout.get(source, 0)"
+    },
+    {
+      "line": 268,
+      "end_line": 270,
+      "callee": "hashlib.sha256",
+      "enclosing": "detect_processes",
+      "expression": "hashlib.sha256(\n            \"\\x00\".join(sorted(node for node, _, _ in steps)).encode()\n        )"
+    },
+    {
+      "line": 285,
+      "end_line": 285,
+      "callee": "sorted",
+      "enclosing": "detect_processes",
+      "expression": "sorted(community_set)"
+    },
+    {
+      "line": 286,
+      "end_line": 286,
+      "callee": "len",
+      "enclosing": "detect_processes",
+      "expression": "len(community_set)"
+    },
+    {
+      "line": 308,
+      "end_line": 308,
+      "callee": "is_test_file",
+      "enclosing": "detect_processes",
+      "expression": "is_test_file(symbol.file_path)"
+    },
+    {
+      "line": 324,
+      "end_line": 324,
+      "callee": "math.log1p",
+      "enclosing": "detect_processes",
+      "expression": "math.log1p(raw_reach)"
+    },
+    {
+      "line": 329,
+      "end_line": 329,
+      "callee": "math.sqrt",
+      "enclosing": "detect_processes",
+      "expression": "math.sqrt(exclusivity)"
+    },
+    {
+      "line": 333,
+      "end_line": 333,
+      "callee": "math.log1p",
+      "enclosing": "detect_processes",
+      "expression": "math.log1p(len(packages) - 2)"
+    },
+    {
+      "line": 335,
+      "end_line": 335,
+      "callee": "math.log1p",
+      "enclosing": "detect_processes",
+      "expression": "math.log1p(entry_fanout)"
+    },
+    {
+      "line": 337,
+      "end_line": 337,
+      "callee": "math.log1p",
+      "enclosing": "detect_processes",
+      "expression": "math.log1p(entry_production_callers)"
+    },
+    {
+      "line": 340,
+      "end_line": 340,
+      "callee": "math.sqrt",
+      "enclosing": "detect_processes",
+      "expression": "math.sqrt(max(siblings, 1))"
+    },
+    {
+      "line": 375,
+      "end_line": 375,
+      "callee": "math.log1p",
+      "enclosing": "detect_processes",
+      "expression": "math.log1p(ratio - 1.0)"
+    },
+    {
+      "line": 386,
+      "end_line": 386,
+      "callee": "graph.incoming_of",
+      "enclosing": "detect_processes",
+      "expression": "graph.incoming_of(raw.entry_point, \"CALLS\")"
+    },
+    {
+      "line": 393,
+      "end_line": 393,
+      "callee": "_qualified_flow_name",
+      "enclosing": "detect_processes",
+      "expression": "_qualified_flow_name(entry_symbol)"
+    },
+    {
+      "line": 395,
+      "end_line": 395,
+      "callee": "heuristic_label",
+      "enclosing": "detect_processes",
+      "expression": "heuristic_label(entry_symbol.name)"
+    },
+    {
+      "line": 396,
+      "end_line": 396,
+      "callee": "len",
+      "enclosing": "detect_processes",
+      "expression": "len(raw.steps)"
+    },
+    {
+      "line": 404,
+      "end_line": 404,
+      "callee": "tuple",
+      "enclosing": "detect_processes",
+      "expression": "tuple((node, number) for node, number, _ in raw.steps)"
+    },
+    {
+      "line": 269,
+      "end_line": 269,
+      "callee": "'\\x00'.join(sorted((node for node, _, _ in steps))).encode",
+      "enclosing": "detect_processes",
+      "expression": "\"\\x00\".join(sorted(node for node, _, _ in steps)).encode()"
+    },
+    {
+      "line": 340,
+      "end_line": 340,
+      "callee": "max",
+      "enclosing": "detect_processes",
+      "expression": "max(siblings, 1)"
+    },
+    {
+      "line": 333,
+      "end_line": 333,
+      "callee": "len",
+      "enclosing": "detect_processes",
+      "expression": "len(packages)"
+    },
+    {
+      "line": 269,
+      "end_line": 269,
+      "callee": "'\\x00'.join",
+      "enclosing": "detect_processes",
+      "expression": "\"\\x00\".join(sorted(node for node, _, _ in steps))"
+    },
+    {
+      "line": 269,
+      "end_line": 269,
+      "callee": "sorted",
+      "enclosing": "detect_processes",
+      "expression": "sorted(node for node, _, _ in steps)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 17,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "import hashlib",
+      "targets": [
+        "hashlib"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "import math",
+      "targets": [
+        "math"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "import posixpath",
+      "targets": [
+        "posixpath"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "from dataclasses import dataclass, field",
+      "targets": [
+        "dataclasses",
+        "dataclasses.dataclass",
+        "dataclasses.field"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 24,
+      "source_expression": "from context_graph_sdk.analysis.entry_points import ORCHESTRATOR_MAX_CALLERS, ORCHESTRATOR_MIN_CALLEES, entry_point_score, heuristic_label, is_command_dir, is_test_file",
+      "targets": [
+        "context_graph_sdk.analysis.entry_points",
+        "context_graph_sdk.analysis.entry_points.ORCHESTRATOR_MAX_CALLERS",
+        "context_graph_sdk.analysis.entry_points.ORCHESTRATOR_MIN_CALLEES",
+        "context_graph_sdk.analysis.entry_points.entry_point_score",
+        "context_graph_sdk.analysis.entry_points.heuristic_label",
+        "context_graph_sdk.analysis.entry_points.is_command_dir",
+        "context_graph_sdk.analysis.entry_points.is_test_file"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/analysis/entry_points.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 32,
+      "source_expression": "from context_graph_sdk.analysis.inputs import AnalysisInputs, AnalysisNode",
+      "targets": [
+        "context_graph_sdk.analysis.inputs",
+        "context_graph_sdk.analysis.inputs.AnalysisInputs",
+        "context_graph_sdk.analysis.inputs.AnalysisNode"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/analysis/inputs.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 33,
+      "source_expression": "from context_graph_sdk.errors import ModelValidationError",
+      "targets": [
+        "context_graph_sdk.errors",
+        "context_graph_sdk.errors.ModelValidationError"
+      ],
+      "local_source_paths": [
+        "vendor/context_graph_sdk/src/context_graph_sdk/errors.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

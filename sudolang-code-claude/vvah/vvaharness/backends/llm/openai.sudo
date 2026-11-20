@@ -1,0 +1,657 @@
+# vvaharness/backends/llm/openai.py
+
+The `openai` route: any OpenAI-compatible endpoint through the `openai` client library, with the same `prompt()` and `agentic()` surface as `cli` and `sdk`. `prompt()` is one streamed Chat Completions request with a retry ladder that drops or rewrites rejected parameters, steps a rejected reasoning-effort tier down, gives one doubled-budget truncation retry, retries transients, and turns a content filter or a cyber-policy block into a typed refusal. `agentic()` is a function-calling loop over the local read-only tools (Read, Glob, Grep plus caller tools), 25 turns by default, with a structured-output submit tool, a forced final answer when the turn cap is reached, and a learned move of a model's tool turns from Chat Completions to the Responses API when the gateway says tools and reasoning effort conflict.
+
+Source: `vvaharness/backends/llm/openai.py` (lines 1-2186)
+Executor: mixed (the code builds and checks each request; the model does the reasoning and chooses the tool calls)
+Called from: `vvaharness/backends/llm/registry.py` (dispatch for `via: openai`); stages reach it through `callModel({ route: "openai", ... })`
+
+// src: vvaharness/backends/llm/openai.py:17-32
+// Newer models (o-series, gpt-5+) need max_completion_tokens and reject temperature. Prompt caching relies on the provider's implicit cache only (a routing key, never an explicit breakpoint).
+// Transport: prompt() always uses Chat Completions. agentic() starts on Chat Completions and stays there UNTIL a model's own gateway says tools and reasoning_effort conflict there; from then on that model's tool turns use the Responses API (same loop, same tools, reasoning replayed through encrypted content with store=False). The move is learned from gateway wording or pinned by `use_responses_api:`, never guessed from a model name. One canonical transcript stays Chat-shaped; `openai_responses.py` translates it at send time.
+
+## Client and credentials
+
+// src: vvaharness/backends/llm/openai.py:138-150
+_AUTH_STATUS_RX_OAI = /unauthorized|invalid[_ ]api[_ ]key|invalid[^\n]{0,24}\btoken\b|\btoken\b[^\n]{0,24}(?:expired|invalid|revoked)|authentication[_ ]failed|incorrect[_ ]api[_ ]key/i
+_AUTH_MAX_RETRIES_OAI = 3
+_AUTH_BACKOFF_OAI = (2, 4, 8)   // seconds
+
+// abstracted: openai.py:152-231 — _summarise_status_error collapses a proxy or data-loss-prevention HTML block page into one line ("blocked by corporate proxy/DLP — <reason> ..."), otherwise the redacted body cut to 300 characters; _scrub_secrets masks sk- keys, bearer tokens and secret header lines; _cause_chain flattens the cause chain; _payload_shape appends one line describing the request to a terminal 400 (and a hint when the error names "image" but the request was text-only). These change only error text.
+
+// src: vvaharness/backends/llm/openai.py:240-318
+OpenAiConfig defaults { api_key: null; base_url: null; verify_ssl: true; ca_cert: null; organization: null; no_proxy: null; cache_markers: "on" }
+fn configure(...):executor=code {
+  // stores non-empty arguments under a lock and drops the cached client
+  if (client_cert) warn "client_cert/mTLS is configured but the `via: openai` backend cannot present a client certificate. Use a `via: sdk` or `via: deepagents` role for mTLS gateways."   // accepted only to diagnose it
+}
+fn _get_client():executor=code {
+  kw = { max_retries: 2 }   // library retries 2 times, wrapper ladder 3: worst case 3x3 = 9 sends per call; only the wrapper sees a transient inside an HTTP 200 body
+  key = config.api_key || environment OPENAI_API_KEY; if (key) kw.api_key = trim(key)
+  kw.base_url = config.base_url || environment OPENAI_BASE_URL || "https://api.openai.com/v1"
+  if (config.organization) kw.organization = config.organization
+  if (config.ca_cert path is missing) { warn TLS_CA_FALLBACK; ca = null }
+  verify = ca || config.verify_ssl; if (verify == false) tls.warn_verify_disabled(...)
+  // both constructions stay inside tls.scoped_no_proxy_env(config.no_proxy)
+  if (verify != true) kw.http_client = openai.DefaultHttpxClient(verify=verify)
+  return openai.OpenAI(...kw)   // external: openai client library; built once and cached under a lock
+  // no harness-side credential check here, unlike the `sdk` route; a missing key is left to the client library
+}
+
+## Prompt-cache routing key
+
+// src: vvaharness/backends/llm/openai.py:326-378
+_CACHE_MIN_PROMPT_TOKENS = 1024   // one flat floor, not a per-model table
+_CACHE_KEY_SHARDS = 8
+fn _prefix_meets_cache_minimum(text, preceding = ""):executor=code {
+  if (!text) return false
+  return (estimate_tokens(preceding) + estimate_tokens(text)) * cache.CACHE_EST_MARGIN >= 1024
+}
+fn _prompt_cache_key(tag, model, cache_prefix?, preceding = ""):executor=code {
+  stage = first word of tag; repo_name = active progress tracker repo name
+  bucket = ""
+  if (cache_prefix) {
+    bucket = if (_prefix_meets_cache_minimum(cache_prefix, preceding)) first 12 hex of sha256(cache_prefix) else "r" + (sha256(rest of tag) mod 8)
+  }
+  return first 32 hex of sha256("$stage:$repo_name:$model:$bucket")   // no credential or raw prompt content enters the key
+}
+
+## Parameter memories
+
+// src: vvaharness/backends/llm/openai.py:383-461
+_MAX_TOKENS_KEY = "max_tokens"; _MAX_COMPLETION_TOKENS_KEY = "max_completion_tokens"; _MAX_OUTPUT_TOKENS_KEY = "max_output_tokens"
+_ATTEMPTS_CEILING = 6   // ceiling on total prompt() attempts after bounded extra-send grants
+_AGENTIC_TRANSIENT_RETRIES = 4   // per turn and for the forced final; waits 10, 20, 30, 40 seconds before jitter
+_NO_TEMP_MODELS = set(); _USE_LEGACY_MAXTOK = set()
+_LEARNED_OUTPUT_CAP = {}   // per-model output cap learned once from a gateway's own 400 or 422 body
+_NO_CACHE_KEY_MODELS = set(); _NO_TOOL_CHOICE_MODELS = set()
+_NO_REASONING_EFFORT_MODELS = EFFORT_REJECTIONS.field   // the same set object shared with the `deepagents` client
+_NO_JSON_SCHEMA_MODELS = set(); _NO_STREAM_OPTIONS_MODELS = set()
+_OPENAI_FINISH_CONTENT_FILTER = "content_filter"   // a provider guardrail refusal: raises ModelRefusal, enters no ladder
+
+// src: vvaharness/backends/llm/openai.py:406-417
+_CAP_VALUE_RX = /\b(\d{4,7})\b/   // 4 to 7 digits so the HTTP status in "Error code: 400 - ..." is never read as the cap
+fn _learned_cap_from_body(body, requested):executor=code {
+  body = body without the leading "error code: NNN - "
+  candidates = distinct numbers matching _CAP_VALUE_RX with 0 < n < requested
+  return if (exactly one candidate) that number else null   // ambiguous means do not learn
+}
+
+// src: vvaharness/backends/llm/openai.py:430-455
+fn _reasoning_effort_kw(model, effort, transport = TRANSPORT_CHAT, with_tools = false):executor=code {
+  if (with_tools && transport == TRANSPORT_CHAT && model in EFFORT_REJECTIONS.tools_off) return { reasoning_effort: "none" }   // wins even when no effort is configured
+  if (effort == null || model in _NO_REASONING_EFFORT_MODELS) return {}
+  tier = effort_after_rejections(model, deepagents.options.model_building._to_openai_reasoning_effort(effort), transport)   // external to this batch: shared effort mapping
+  return if (tier == null) {} else { reasoning_effort: tier }
+}
+
+// src: vvaharness/backends/llm/openai.py:468-473
+fn _raise_if_refusal_rejection(e, tag):executor=code {
+  // called FIRST in every error arm: any other arm would re-send the flagged content
+  refusal = model_refusal_from(e, route="openai", stage=tag)
+  if (refusal) throw refusal
+}
+
+// src: vvaharness/backends/llm/openai.py:479-492
+fn _warn_max_budget_unenforced(fn, max_budget_usd):executor=code {
+  if (max_budget_usd != null) warn once "WARN [openai]: max_budget_usd=$max_budget_usd is accepted by $fn() but not enforced on this route -- no spend cap is applied here; max_turns is the bound that applies instead. Route this role via: cli for an enforced budget."
+}
+
+## Structured output by response_format (prompt only)
+
+// src: vvaharness/backends/llm/openai.py:499-517
+fn _strict_ready(node):executor=code {
+  // a predicate, never a transform: every object must carry additionalProperties false and list every property in required
+}
+
+// src: vvaharness/backends/llm/openai.py:520-541
+fn _response_format_for(json_schema, model, tag):executor=code {
+  if (!json_schema || model in _NO_JSON_SCHEMA_MODELS) return { type: "json_object" }
+  name = tag with characters outside [A-Za-z0-9_-] replaced by "_", or "vvaharness"
+  strict = _strict_ready(json_schema)
+  if (!strict) warn once "... sent with strict: false — the model receives the schema but the provider does not ENFORCE it, and the stage's own pydantic validation remains the guarantee ..."
+  return { type: "json_schema", json_schema: { name: first 64 characters of name, schema: json_schema, strict } }
+}
+
+## Transient and authentication classification
+
+// src: vvaharness/backends/llm/openai.py:544-568
+fn _is_transient_oai(error):executor=code {
+  if (error.status_code in RETRYABLE_STATUS) return true
+  if (error.status_code in [401, 403]) return false   // a proxy 403 block page saying "Service Unavailable" is not transient
+  body = rejection_text(error)
+  return RATE_LIMIT_TRANSIENT_RX matches body || SERVER_ERROR_TRANSIENT_RX matches body
+}
+fn _auth_failure_oai(error):executor=code {
+  return error.status_code == 401 || (_AUTH_STATUS_RX_OAI matches rejection_text(error) && error.status_code not in RETRYABLE_STATUS)
+}
+
+// src: vvaharness/backends/llm/openai.py:571-585
+fn _stream_within_deadline(stream, deadline, stage, effort, budget_s):executor=code {
+  for each chunk in stream {
+    if (now >= deadline) { close stream; throw call_timeout_error(stage, route="openai", budget_s, effort, cause_text="openai stream exceeded its ${budget_s}s wall-clock budget") }
+    yield chunk
+  }
+}
+
+## prompt(): one streamed Chat Completions request
+
+// src: vvaharness/backends/llm/openai.py:588-1102
+fn prompt(user_prompt, model, cache_prefix?, system_prompt?, max_tokens?, temperature?, thinking_budget?, betas?, json_schema?, output_format = "text", cwd?, max_budget_usd?, timeout?, tag?, output_cap?, effort?):executor=mixed {
+  // thinking_budget and betas are ignored on this route
+  _warn_max_budget_unenforced("prompt", max_budget_usd)
+  client = _get_client()
+
+  // src: openai.py:615-665 — request assembly
+  max_tok = max_tokens || 16000
+  if (output_cap != null) max_tok = min(max_tok, output_cap)   // the role's declared models.<role>.max_tokens
+  if (_LEARNED_OUTPUT_CAP[model]) max_tok = min(max_tok, _LEARNED_OUTPUT_CAP[model])
+  messages = [system message if system_prompt, user message]
+  // a block-list user prompt loses any cache_control; cache_prefix is folded in front (as a leading text block or by string concatenation)
+  kw = { model, messages, stream: true }
+  if (model not in _NO_STREAM_OPTIONS_MODELS) kw.stream_options = { include_usage: true }
+  if (cache markers enabled && model not in _NO_CACHE_KEY_MODELS) kw.prompt_cache_key = _prompt_cache_key(tag, model, cache_prefix, preceding=system_prompt)
+  if (model in _USE_LEGACY_MAXTOK) kw.max_tokens = max_tok else kw.max_completion_tokens = max_tok
+  if (temperature != null && model not in _NO_TEMP_MODELS) kw.temperature = temperature
+  if (json_schema || output_format == "json") kw.response_format = _response_format_for(json_schema, model, tag)
+  kw += _reasoning_effort_kw(model, effort)
+  request_timeout = effort_scaled_seconds(timeout || DEFAULT_REQUEST_TIMEOUT_SECONDS, effort, kind=REQUEST)
+  session_t0 = now; session_budget = request_timeout
+
+  // src: openai.py:686-1071 — retry ladder
+  attempts = 3; retry_wait = 60; text = null; usage = null; auth_attempt = 0
+  trunc_retried = false; trunc_retry_at = 0; attempt = 0
+  streamed_any = false   // separates a pre-flight proxy or TLS failure (terminal) from a drop mid-body (transient)
+  server_error_probe = null; server_error_exc = null
+  while (attempt < attempts) {
+    attempt += 1
+    try {
+      streamed_any = false
+      send = turn_options(session_t0, session_budget, request_timeout)
+      [parts, usage, finish, refusal] = callModel({ role: tag, route: "openai", system: system_prompt, prompt: messages, tools: [], limits: { budget_key: max_tok, timeout: send.timeout }, output: kw.response_format || "text" })
+        // streamed through _stream_within_deadline; the refusal delta is collected separately from content
+      note_budget_use(elapsed, request_timeout, effort)
+
+      // src: openai.py:736-745 — refusals
+      if (finish == "content_filter") { _bank_attempt_usage(usage); throw model_refusal(route="openai", stage=tag, category="content_filter", detail=refusal) }
+      if (refusal && joined parts are blank) { _bank_attempt_usage(usage); throw model_refusal(route="openai", stage=tag, category=null, detail=refusal) }
+
+      // src: openai.py:746-798 — truncation
+      if (finish == "length") {
+        budget_key = if ("max_tokens" in kw) "max_tokens" else "max_completion_tokens"
+        retry_at = if (trunc_retried) null else truncation_retry_max(kw[budget_key], cap=output_cap)   // unbounded when no declared cap
+        if (retry_at != null) {
+          if (attempt == attempts && attempts < _ATTEMPTS_CEILING) attempts += 1
+          if (attempt < attempts) {
+            trunc_retried = true; trunc_retry_at = retry_at; COUNTERS.bump(TRUNCATED_RETRY_ATTEMPTED_COUNTER)
+            _bank_attempt_usage(usage)   // real spend, banked before the retry overwrites usage
+            errlog "VVAH-E005 warning: reply truncated at $budget_key=...; retrying once at $retry_at" (recovered)
+            kw[budget_key] = retry_at; continue
+          }
+        }
+        norm = _bank_attempt_usage(usage); COUNTERS.bump(TRUNCATED_REPLIES_COUNTER)
+        if (truncated_below_budget(norm.output_tokens, max_tok)) COUNTERS.bump(LLM_TRUNCATED_BELOW_BUDGET_COUNTER)
+        throw TruncatedResponseError(if (trunc_retried) "reply still hit the output-token budget after the doubled retry" else "reply hit the output-token budget with no retry budget left", requested=max_tok, retried=trunc_retry_at, produced, reasoning_tokens)
+      }
+      if (trunc_retried) COUNTERS.bump(TRUNCATED_RETRY_RECOVERED_COUNTER)
+
+      // src: openai.py:801-811 — a server-error probe that succeeded at the lower tier
+      if (server_error_probe) {
+        if (EFFORT_REJECTIONS.recovered_twice(server_error_probe)) EFFORT_REJECTIONS.tiers.add(server_error_probe)   // the second recovery keeps the lower tier for the rest of the run
+        COUNTERS.bump("llm_effort_tier_stepped_down_on_server_error")
+      }
+      text = joined parts; break
+    }
+    catch openai.BadRequestError or openai.UnprocessableEntityError e => {
+      // src: openai.py:815-969 — 400 and 422
+      _raise_if_refusal_rejection(e, tag)
+      body = lowercase(rejection_text(e)); budget_key_now = current budget key
+      if (model not in _LEARNED_OUTPUT_CAP && body names a budget key) {
+        learned = _learned_cap_from_body(body, requested=kw[budget_key_now])
+        if (learned != null) {
+          _LEARNED_OUTPUT_CAP[model] = learned; kw[budget_key_now] = learned
+          if (attempt == attempts && attempts < _ATTEMPTS_CEILING) attempts += 1
+          continue
+        }
+      }
+      if (trunc_retried && body names a budget key) {
+        // this rejection IS the provider's cap, reached by the doubled retry; the first attempt's usage was already banked
+        COUNTERS.bump(TRUNCATED_REPLIES_COUNTER)
+        throw TruncatedResponseError("provider rejected the doubled output budget as over its cap: ...", requested=max_tok, retried=trunc_retry_at)
+      }
+      // parameter drops: the first matching arm applies, and each guarantees a resend
+      dropped = true
+      match (body) {
+        case contains "temperature" && "temperature" in kw => { _NO_TEMP_MODELS.add(model); remove kw.temperature }
+        case contains "max_completion_tokens" && "max_completion_tokens" in kw => { _USE_LEGACY_MAXTOK.add(model); rename to max_tokens }
+        case contains "max_completion_tokens" && "max_tokens" in kw => rename max_tokens to max_completion_tokens
+        case contains "prompt_cache_key" && "prompt_cache_key" in kw => { _NO_CACHE_KEY_MODELS.add(model); remove it }   // optimization only
+        case contains "json_schema" && kw.response_format.type == "json_schema" => {
+          _NO_JSON_SCHEMA_MODELS.add(model); kw.response_format = { type: "json_object" }
+          warn once "... falling back to json_object mode for the rest of this run. Replies are syntactically valid JSON but NOT schema-validated ..."
+        }
+        case "reasoning_effort" in kw && classify_effort_rejection(e) != null => {
+          // tools_conflict cannot occur here: prompt() carries no tools
+          if (class == "field") { EFFORT_REJECTIONS.field.add(model); remove kw.reasoning_effort; COUNTERS.bump("llm_effort_field_dropped") }
+          else { nxt = step_down(model, kw.reasoning_effort, e); if (nxt == null) remove kw.reasoning_effort else kw.reasoning_effort = nxt; COUNTERS.bump("llm_effort_tier_stepped_down") }
+        }
+        case contains "stream_options" && "stream_options" in kw => { _NO_STREAM_OPTIONS_MODELS.add(model); remove it }   // usage then reads zero on this endpoint
+        default => dropped = false
+      }
+      if (dropped) {
+        if (attempt == attempts && attempts < _ATTEMPTS_CEILING) attempts += 1
+        continue
+      }
+      if (_auth_failure_oai(e)) throw AuthenticationError(redacted first 400 characters, status_code, backend="openai")
+      if (_is_transient_oai(e) && attempt < attempts) {   // a gateway heuristic: 400 and 422 are documented as non-retryable
+        wait = jittered_delay(retry_wait); require wait_overrun(wait, ...) == null => throw CallTimeoutError
+        sleep(wait); continue
+      }
+      throw RuntimeError("OpenAI call failed (status=..., model=$model): <summary>\n  <payload shape>")
+    }
+    catch openai.APIStatusError e => {
+      // src: openai.py:970-1034 — other statuses
+      _raise_if_refusal_rejection(e, tag)
+      if (_auth_failure_oai(e)) {
+        if (auth_attempt < _AUTH_MAX_RETRIES_OAI && attempt < attempts) {
+          wait = _AUTH_BACKOFF_OAI[min(auth_attempt, 2)]; require wait_overrun(wait, ...) == null => throw CallTimeoutError
+          sleep(wait); auth_attempt += 1; continue
+        }
+        throw AuthenticationError(redacted first 400 characters, status_code, backend="openai")   // VVAH-E001
+      }
+      if (_is_transient_oai(e) && attempt < attempts) {
+        wait = jittered_delay(retry_wait); require wait_overrun(wait, ...) == null => throw CallTimeoutError
+        sleep(wait); continue
+      }
+      if (server_error_probe) throw RuntimeError(the FIRST error)   // the probe resend also failed: an outage, nothing recorded
+      sent = kw.reasoning_effort
+      can_probe = sent != null && sent != "none" && e.status_code in SERVER_ERROR_STATUS && (attempt < attempts || attempts < _ATTEMPTS_CEILING)
+      nxt = if (can_probe) next_effort_tier(sent) else null
+      if (nxt != null && EFFORT_REJECTIONS.probe_once((model, sent))) {
+        // one extra send at the next lower tier after a persistent 5xx
+        server_error_probe = (model, sent); server_error_exc = e; kw.reasoning_effort = nxt
+        if (attempt == attempts && attempts < _ATTEMPTS_CEILING) attempts += 1
+        continue
+      }
+      // preserved: a 5xx is retryable, so the transient arm wins while attempt < attempts; the probe is reached only on the last attempt
+      throw RuntimeError("OpenAI call failed (status=..., model=$model): <summary>")
+    }
+    catch openai.APIConnectionError e => {
+      if (is_timeout_failure(e)) throw call_timeout_error(stage=tag, route="openai", budget_s=request_timeout, effort, cause_text="OpenAI request exceeded ${request_timeout}s")   // the library already retried a timeout twice
+      if (!streamed_any && proxy_error(e, backend="openai")) throw that ProxyError   // VVAH-E002 only before anything streamed
+      if (attempt < attempts) { wait = jittered_delay(retry_wait); require wait_overrun(wait, ...) == null => throw CallTimeoutError; sleep(wait); continue }
+      throw RuntimeError("OpenAI <mid-stream|connection> error after $attempts attempts ... hint: CERTIFICATE_VERIFY_FAILED → set openai.ca_cert ...")
+    }
+    catch openai.APIError e => { _raise_if_refusal_rejection(e, tag); throw e }   // a mid-stream error event raises the base type
+  }
+  require text != null => throw RuntimeError("OpenAI call to $model exhausted all retries without a successful response (every attempt hit a parameter-drop retry) ...")
+
+  // src: openai.py:1081-1102
+  TOKENS.add(_normalise_usage(usage) or null)
+  check_response_quality(trim(text), stage=tag, output_tokens=output_tokens_for_gate(completion_tokens))   // external: vvaharness/util/response_quality.py
+  return trim(text)
+  // with output_format "json" or a json_schema the text is returned without schema validation here; the calling stage parses it
+}
+
+## Token accounting
+
+// src: vvaharness/backends/llm/openai.py:1113-1187
+fn _normalise_usage(u):executor=code {
+  cached = u.prompt_tokens_details.cached_tokens || 0
+  norm = { input_tokens: max(0, u.prompt_tokens - cached), output_tokens: u.completion_tokens /* absent stays null */, cache_read_input_tokens: cached }
+  if ("cache_write_tokens" in u.prompt_tokens_details) { norm.cache_creation_input_tokens = it; norm.input_tokens -= it (floor 0) }
+  if ("reasoning_tokens" in u.completion_tokens_details) norm.reasoning_tokens = it
+  return norm
+}
+fn _bank_attempt_usage(usage):executor=code { norm = normalised usage or null; TOKENS.add(norm); return norm }   // every discarded attempt still spent tokens
+// abstracted: _note_unparsed_cache_keys, _normalised_attempt_usage and _record_usage (lines 1119-1187) flag unknown cache keys and bank usage; no decision depends on them
+
+## agentic(): function-calling loop
+
+// src: vvaharness/backends/llm/openai.py:1107-1108
+_MAX_TURNS = 25   // default tool-loop cap; a step's max_turns overrides it
+_AGENTIC_MAX_TOK = AGENTIC_MAX_TOKENS   // 16000
+
+// src: vvaharness/backends/llm/openai.py:1193-1218
+_TOOL_RESULT_CAP = tools.TOOL_RESULT_CAP   // external value: vvaharness/backends/llm/tools.py
+_CTX_OVERFLOW_RX = /context.?length|context length|exceed.*(?:token|limit)|too long/i
+_EVICTED_MARK = "[evicted to fit context]"
+fn _shrink_history(messages):executor=code {
+  for each message m, oldest first {
+    if (m.role == "tool" && m.content is a string && length(m.content) > 1200 && !m.content ends with _EVICTED_MARK) {
+      m.content = first 800 characters + "\n…" + _EVICTED_MARK; return true
+    }
+  }
+  return false
+}
+
+// src: vvaharness/backends/llm/openai.py:1221-1229
+fn _first_choice(resp, model, tag, turn):executor=code {
+  require resp.choices is not empty => throw RuntimeError("OpenAI returned a reply with no choices ... the gateway answered 200 with an empty completion; nothing can be parsed from it.")
+  return resp.choices[0]
+}
+
+// src: vvaharness/backends/llm/openai.py:1370-1456 — transport selection
+fn _responses_allowed(model, override):executor=code {
+  if (model in TRANSPORT_MEMORY.chat_only) return false   // a learned Chat-only failure vetoes even an explicit pin
+  return deepagents.options.model_building.resolve_use_responses_api(model, null, override)   // external to this batch
+}
+fn _initial_transport(model, override):executor=code {
+  if (override == true && _responses_allowed(model, override)) return TRANSPORT_RESPONSES
+  if (model in EFFORT_REJECTIONS.tools_off && _responses_allowed(model, override)) return TRANSPORT_RESPONSES
+  return TRANSPORT_CHAT
+}
+fn _send_turn(client, transport, messages, kw):executor=code {
+  if (transport == TRANSPORT_CHAT) return client.chat.completions.create(messages=openai_responses.to_chat_messages(messages), ...kw)
+  request = openai_responses.to_responses_request(messages, kw, include_encrypted = kw.model not in TRANSPORT_MEMORY.no_include)
+  resp = openai_responses.from_response(client.responses.create(request))   // external to this batch: vvaharness/backends/llm/openai_responses.py
+  TRANSPORT_MEMORY.responses_proven.add(kw.model); COUNTERS.bump("openai_responses_api_calls")
+  return resp
+}
+fn _fall_back_to_chat(model, base_kw):executor=code {
+  TRANSPORT_MEMORY.chat_only.add(model); COUNTERS.bump("openai_responses_fallback")
+  warn once "WARN [openai]: $model's Responses API call failed with no effort-field explanation — falling back to Chat Completions for the rest of this run."
+  if (model in EFFORT_REJECTIONS.tools_off) base_kw.reasoning_effort = "none"
+}
+fn _responses_failure_falls_back(model, e):executor=code {
+  return is_responses_shape_rejection(e) || model not in TRANSPORT_MEMORY.responses_proven   // an unproven model falls back on any 400 or 422 reaching here
+}
+fn _handle_include_rejection(model, e, transport):executor=code {
+  if (transport != TRANSPORT_RESPONSES || !is_param_rejection(e, "include")) return false
+  TRANSPORT_MEMORY.no_include.add(model)   // resend without include; reasoning restarts fresh each tool turn; stays on Responses
+  return true
+}
+
+// src: vvaharness/backends/llm/openai.py:1458-1573 — reasoning-effort rejection on a tool-carrying call
+_EffortOutcome { transport; fail = false }
+fn _handle_effort_rejection(model, base_kw, e, transport, override):executor=code {
+  effort_cls = classify_effort_rejection(e); if (effort_cls == null) return null
+  sent = base_kw.reasoning_effort
+  if (transport == TRANSPORT_CHAT && model in EFFORT_REJECTIONS.tools_off && (effort_cls == "tools_conflict" || sent == "none")) {
+    EFFORT_REJECTIONS.tiers.add(_tiers_key(model, "none", transport))
+    return _EffortOutcome(transport, fail=true)   // the forced "none" remedy already failed; no resend can help
+  }
+  match (effort_cls) {
+    case "tools_conflict" if transport == TRANSPORT_CHAT && sent != "none" => {
+      EFFORT_REJECTIONS.tools_off.add(model); COUNTERS.bump("llm_effort_tools_off")
+      if (_responses_allowed(model, override)) return _EffortOutcome(TRANSPORT_RESPONSES)   // native reasoning kept
+      base_kw.reasoning_effort = "none"   // measurably lowers finding recall; warned once
+      return _EffortOutcome(TRANSPORT_CHAT)
+    }
+    case "field" => { EFFORT_REJECTIONS.field.add(model); remove base_kw.reasoning_effort; COUNTERS.bump("llm_effort_field_dropped"); return _EffortOutcome(transport) }
+    default => {
+      if (sent == null) return null   // nothing was sent to step down: not this route's to fix
+      nxt = step_down(model, sent, e, transport)
+      if (nxt == null) remove base_kw.reasoning_effort else base_kw.reasoning_effort = nxt
+      COUNTERS.bump("llm_effort_tier_stepped_down")
+      return _EffortOutcome(transport)
+    }
+  }
+}
+
+// src: vvaharness/backends/llm/openai.py:1576-1586
+fn _run_localtool(name, args, ok_tools, cwd, tag):executor=code {
+  if (name not in ok_tools) return tools.UNGRANTED_TOOL_ERROR with name   // same gate as sdk.agentic
+  return tools.cap_tool_result(tools.execute(name, args, cwd))   // external to this batch
+}
+
+// src: vvaharness/backends/llm/openai.py:1589-2185
+fn agentic(user_prompt, model, system_prompt?, allowed_tools?, cwd, max_budget_usd?, permission_mode = "auto", max_turns?, timeout?, tag?, extra_tools?, extra_dispatch?, max_output_tokens?, response_model?, output_cap?, submit_guard?, exhausted_tools?, effort?, use_responses_api?):executor=mixed {
+  _warn_max_budget_unenforced("agentic", max_budget_usd)   // permission_mode is accepted and unused
+  client = _get_client()
+  request_timeout = effort_scaled_seconds(DEFAULT_REQUEST_TIMEOUT_SECONDS, effort, kind=REQUEST)
+  session_budget = if (timeout) effort_scaled_seconds(timeout, effort, kind=SESSION) else null
+  session_t0 = now
+  transport = _initial_transport(model, use_responses_api)
+  turns_cap = if (max_turns) int(max_turns) else _MAX_TURNS   // 25
+  out_cap = if (max_output_tokens) int(max_output_tokens) else 16000
+  if (output_cap != null) out_cap = min(out_cap, output_cap)
+  if (_LEARNED_OUTPUT_CAP[model]) out_cap = min(out_cap, _LEARNED_OUTPUT_CAP[model])
+
+  // src: openai.py:1661-1674 — tool gate
+  allowed = if (allowed_tools == null) DEFAULT_READ_TOOLS else allowed_tools
+  [ok_tools, missing] = tools.supported(allowed)
+  require missing is empty => throw NotImplementedError("via:openai agentic() does not implement tools $missing. Supported: ... Keep this role on `via: cli` or drop the unsupported tool from allowed_tools.")
+    // unlike `sdk`, no delegation to the Agent SDK: a mutating tool is refused outright
+  tools = [...tools.schemas_for(ok_tools), ...extra_tools converted to function tools]
+  if (response_model) tools += response_model_tool(response_model) converted to a function tool   // a tool, not a response_format, so the read tools stay usable
+
+  messages = [system message if system_prompt, { role: "user", content: user_prompt }]
+  base_kw = { model, tools, (max_tokens if model in _USE_LEGACY_MAXTOK else max_completion_tokens): out_cap }
+  if (cache markers enabled && model not in _NO_CACHE_KEY_MODELS) base_kw.prompt_cache_key = _prompt_cache_key(tag, model, cache_prefix=system_prompt + user_prompt, preceding=JSON of tools)   // built once per session
+  base_kw += _reasoning_effort_kw(model, effort, transport, with_tools=true)
+  // preserved: no tool_choice is sent on loop turns, so the submit tool is never forced inside the loop on this route
+
+  final_text = ""; tool_calls_total = 0; schema_nudged = false; submit_rejects = 0; withdrawn = {}
+
+  // src: openai.py:1711-2051 — the turn loop
+  for each turn in 1..turns_cap {
+    require !(session_budget && now - session_t0 >= session_budget) => throw call_timeout_error(stage=tag, route="openai", budget_s=session_budget, effort, cause_text="session clock exceeded ${session_budget}s before turn $turn")
+    if (exhausted_tools) {
+      newly = exhausted_tools() - withdrawn
+      if (newly) { withdrawn = withdrawn union newly; base_kw.tools = base_kw.tools without functions named in withdrawn }
+    }
+
+    // src: openai.py:1727-1901 — one turn with its own retry ladder
+    resp = null; shrinks = 0; transients = 0; server_error_probe = null; server_error_exc = null
+    while (resp == null) {
+      try {
+        resp = callModel({ role: tag, route: "openai", system: system_prompt, prompt: messages, tools: base_kw.tools, limits: { budget_key: out_cap, turns: turns_cap, timeout: turn_options(session_t0, session_budget, request_timeout).timeout, session: session_budget }, output: "assistant message (content or tool_calls)" })
+          // sent by _send_turn on the current transport (Chat Completions or Responses)
+        note_budget_use(elapsed, request_timeout, effort)
+      }
+      catch openai.BadRequestError or openai.UnprocessableEntityError e => {
+        _raise_if_refusal_rejection(e, tag)
+        low = lowercase(rejection_text(e))
+        // the first matching arm applies
+        if (model not in _LEARNED_OUTPUT_CAP && low names max_tokens, max_completion_tokens or max_output_tokens) {
+          learned = _learned_cap_from_body(low, requested=current budget)
+          if (learned != null) { _LEARNED_OUTPUT_CAP[model] = learned; set the budget to learned; continue }
+        }
+        if ("max_completion_tokens" in base_kw && low contains "max_completion_tokens") { _USE_LEGACY_MAXTOK.add(model); rename to max_tokens; continue }
+        if ("prompt_cache_key" in base_kw && low contains "prompt_cache_key") { _NO_CACHE_KEY_MODELS.add(model); remove it; continue }
+        outcome = _handle_effort_rejection(model, base_kw, e, transport, override=use_responses_api)
+        if (outcome != null) {
+          require !outcome.fail => throw RuntimeError("OpenAI agentic call failed ... This model rejects reasoning_effort alongside function tools at every value, including 'none'. Set `use_responses_api: true` on this models entry, or route the role via: deepagents, to keep native reasoning with tools.")
+          transport = outcome.transport; continue
+        }
+        if (_handle_include_rejection(model, e, transport)) continue
+        if (transport == TRANSPORT_RESPONSES && _responses_failure_falls_back(model, e)) { _fall_back_to_chat(model, base_kw); transport = TRANSPORT_CHAT; continue }
+        if (_CTX_OVERFLOW_RX matches low && shrinks < 16 && _shrink_history(messages)) { shrinks += 1; continue }   // bounded at 16 evictions per turn
+        if (_auth_failure_oai(e)) throw AuthenticationError
+        if (_is_transient_oai(e) && transients < 4) {
+          transients += 1; wait = jittered_delay(min(60, 10 * transients))
+          require wait_overrun(wait, ...) == null => throw CallTimeoutError
+          sleep(wait); continue
+        }
+        throw RuntimeError("OpenAI agentic call failed (status=..., model=$model, turn=$turn): ...")
+      }
+      catch openai.APIStatusError e => {
+        _raise_if_refusal_rejection(e, tag)
+        if (_auth_failure_oai(e)) throw AuthenticationError   // no authentication retry inside the loop
+        if (_is_transient_oai(e) && transients < 4) {
+          transients += 1; wait = jittered_delay(min(60, 10 * transients))
+          require wait_overrun(wait, ...) == null => throw CallTimeoutError
+          sleep(wait); continue
+        }
+        if (transport == TRANSPORT_RESPONSES && model not in TRANSPORT_MEMORY.responses_proven) { _fall_back_to_chat(model, base_kw); transport = TRANSPORT_CHAT; continue }
+        if (server_error_probe) throw RuntimeError(the FIRST error)
+        sent = base_kw.reasoning_effort
+        nxt = if (sent != null && sent != "none" && e.status_code in SERVER_ERROR_STATUS) next_effort_tier(sent) else null
+        if (nxt != null && EFFORT_REJECTIONS.probe_once(_tiers_key(model, sent, transport))) {
+          server_error_probe = (model, sent, key); server_error_exc = e; base_kw.reasoning_effort = nxt; continue
+        }
+        throw RuntimeError("OpenAI agentic call failed ...")
+      }
+      catch openai.APIConnectionError e => {
+        if (is_timeout_failure(e)) throw call_timeout_error(stage=tag, route="openai", budget_s=request_timeout, effort, cause_text="OpenAI agentic call exceeded ${request_timeout}s (turn=$turn)")
+        if (proxy_error(e, backend="openai")) throw that ProxyError
+        if (transients < 4) { transients += 1; wait = jittered_delay(min(60, 10 * transients)); require wait_overrun(...) == null => throw CallTimeoutError; sleep(wait); continue }
+        throw RuntimeError("OpenAI agentic connection error ...")
+      }
+    }
+    if (server_error_probe) {
+      if (EFFORT_REJECTIONS.recovered_twice(key)) EFFORT_REJECTIONS.tiers.add(key)
+      COUNTERS.bump("llm_effort_tier_stepped_down_on_server_error")
+      // the lowered tier stays in base_kw for the rest of this session even after a first recovery
+    }
+    _record_usage(resp.usage)
+    choice = _first_choice(resp, model, tag, turn); msg = choice.message
+    calls = msg.tool_calls || []
+    assistant = { role: "assistant", content: msg.content, tool_calls: calls or null, _reasoning_items: msg.reasoning_items or [] }
+    messages.append(assistant)
+
+    // src: openai.py:1934-1970 — terminal reply, or a cut-off mid tool call
+    if (calls is empty || choice.finish_reason == "length") {
+      [choice, msg, override] = _check_terminal_finish(choice, msg, send=resend on the same transport, messages, call_kw=base_kw, appended=true, model, tag, requested=out_cap, response_model, dispatchable=true, output_cap, effort, request_timeout)
+      if (override != null) return override
+      calls = msg.tool_calls || []
+      if (calls is empty) {
+        final_text = trim(msg.content)
+        if (response_model && !schema_nudged) {   // allowed even on the last turn (the loop then ends and goes to the forced final)
+          schema_nudged = true; COUNTERS.bump("llm_structured_prose_reask")
+          messages.append({ role: "user", content: STRUCTURED_PROSE_REASK })
+          continue
+        }
+        return final_text
+        // preserved: with response_model set, prose after the one re-ask is returned as the final text, not raised
+      }
+    }
+
+    // src: openai.py:1972-2051 — dispatch every tool call of this turn, in order
+    for each [i, tc] in calls {
+      tool_calls_total += 1
+      try { args = JSON parse of tc.function.arguments || "{}"; args_valid = true }
+      catch => { args = {}; args_valid = false; assistant.tool_calls[i].function.arguments = "{}" }   // the gateway rejects a replayed invalid string
+      // preserved: after a doubled-budget retry, `assistant` still names the popped original turn, so this rewrite does not reach the replayed message (and fails if the original had no tool calls)
+      if (response_model && tc.function.name == "emit_structured_response") {
+        try validated = response_model.model_validate(args)
+        catch exc => {
+          submit_rejects += 1; COUNTERS.bump("llm_structured_submit_rejected")
+          if (submit_rejects >= STRUCTURED_REASK_MAX) {   // 2
+            errlog "emit_structured_response rejected $submit_rejects time(s); raw submit returned" (reason "llm_structured_reask_gave_up", recovered)
+            return JSON of args   // raw, unvalidated; the stage's own parser decides
+          }
+          messages.append(tool message(tc.id, "Rejected: <first 600 characters of the error>. Fix the named fields and call the tool again."))
+          continue
+        }
+        if (submit_guard) {
+          hold_text = submit_guard()   // out-of-loop EvidenceGate
+          if (hold_text != null) { messages.append(tool message(tc.id, hold_text)); continue }
+        }
+        return validated.model_dump_json()
+        // preserved: tool calls after an accepted submit in the same turn are never run and get no tool message
+      }
+      if (args_valid) {
+        result = if (extra_dispatch) extra_dispatch(name, args) else null
+        if (result == null) result = _run_localtool(name, args, ok_tools, cwd, tag)
+      } else {
+        COUNTERS.bump("openai_tool_args_invalid_json"); result = "ERROR: tool arguments were not valid JSON"   // runs nothing
+      }
+      messages.append(tool message(tc.id, result))
+    }
+  }
+
+  // src: openai.py:2053-2075 — turn cap reached: one forced final answer
+  warn LLM_TURN_CAP_EXHAUSTED; COUNTERS.bump("llm_turn_cap_exhausted")
+  forced_kw = base_kw without tools
+  if (response_model) {
+    forced_kw.tools = [the submit tool only]   // the read tools are dropped
+    if (model not in _NO_TOOL_CHOICE_MODELS) forced_kw.tool_choice = { type: "function", function: { name: "emit_structured_response" } }
+    messages.append(user text OPENAI_FORCED_FINAL_SUBMIT)
+  } else {
+    messages.append(user text OPENAI_FORCED_FINAL_TEXT)
+  }
+
+  // src: openai.py:2076-2157 — forced-final retry ladder
+  final_transients = 0
+  loop {
+    try { resp = callModel({ role: tag, route: "openai", prompt: messages, tools: forced_kw.tools, limits: { budget_key: out_cap, tool_choice: forced_kw.tool_choice }, output: if (response_model) response_model else "text" }); break }
+    catch openai.BadRequestError or openai.UnprocessableEntityError e => {
+      _raise_if_refusal_rejection(e, tag)
+      if ("tool_choice" in forced_kw && rejection names "tool_choice") { _NO_TOOL_CHOICE_MODELS.add(model); remove forced_kw.tool_choice; continue }
+      if (_auth_failure_oai(e)) throw AuthenticationError
+      if (_is_transient_oai(e) && final_transients < 4) { final_transients += 1; wait = jittered_delay(min(60, 10 * final_transients)); require wait_overrun(...) == null => throw CallTimeoutError; sleep(wait); continue }
+      throw RuntimeError("OpenAI agentic forced-final failed ...")
+      // preserved: the forced final has no effort-rejection, transport-fallback or context-eviction arms
+    }
+    catch openai.APIStatusError e => {
+      _raise_if_refusal_rejection(e, tag)
+      if (_auth_failure_oai(e)) throw AuthenticationError
+      if (_is_transient_oai(e) && final_transients < 4) { final_transients += 1; ...wait and retry as above; continue }
+      throw RuntimeError("OpenAI agentic forced-final failed ...")
+    }
+    catch openai.APIConnectionError e => {
+      if (is_timeout_failure(e)) throw call_timeout_error(...)
+      if (proxy_error(e, backend="openai")) throw that ProxyError
+      if (final_transients < 4) { final_transients += 1; ...wait and retry; continue }
+      throw RuntimeError("OpenAI agentic forced-final connection error ...")
+    }
+  }
+  _record_usage(resp.usage)
+  final_choice = _first_choice(resp, model, tag, turn=turns_cap)
+  [final_choice, final_msg, override] = _check_terminal_finish(final_choice, final_choice.message, ..., call_kw=forced_kw, appended=false, requested=out_cap, response_model, dispatchable=false, output_cap, ...)
+  if (override != null) return override
+  if (response_model) {
+    for each submit call tc in final_msg.tool_calls {
+      try return response_model.model_validate(JSON parse of tc.function.arguments).model_dump_json()
+      catch => warn RESPONSE_MODEL_FORCED_FINAL_INVALID   // falls through to the prose below; no raise
+    }
+  }
+  return trim(final_msg.content)
+}
+
+// prompt-src: vvaharness/backends/llm/openai.py:2069-2074
+OPENAI_FORCED_FINAL_SUBMIT {
+  Constraints {
+    "Tool budget exhausted. Call `emit_structured_response` now with what you have established so far; it is the only way to reply."
+  }
+}
+OPENAI_FORCED_FINAL_TEXT {
+  Constraints {
+    "Tool budget exhausted. Reply now with your final answer based on what you have read so far; do not call tools."
+  }
+}
+
+// prompt-src: vvaharness/backends/llm/openai.py:2015-2016
+OPENAI_SUBMIT_REJECTED_RESULT {
+  Constraints {
+    "Rejected: $error_first_600_characters. Fix the named fields and call the tool again."
+  }
+}
+
+// src: vvaharness/backends/llm/openai.py:1232-1367
+fn _check_terminal_finish(choice, msg, send, messages, call_kw, appended, model, tag, requested, response_model?, dispatchable = false, output_cap?, effort?, request_timeout?):executor=mixed {
+  finish = choice.finish_reason; refusal = msg.refusal
+  if (finish == "content_filter") throw model_refusal(route="openai", stage=tag, category="content_filter", detail=refusal)
+  if (finish == "length") {
+    budget_key = current budget key in call_kw
+    retry_at = truncation_retry_max(call_kw[budget_key], cap=output_cap)
+    if (retry_at == null) { COUNTERS.bump(TRUNCATED_REPLIES_COUNTER); throw TruncatedResponseError("output truncated at $budget_key=$requested with no useful doubling left (model cap $output_cap)", retried=0) }
+    COUNTERS.bump(TRUNCATED_RETRY_ATTEMPTED_COUNTER); errlog "VVAH-E005 warning: agentic reply truncated at $budget_key=$requested; retrying once at $retry_at" (recovered)
+    if (appended) messages.pop()   // the clipped assistant turn is replaced by the retried one
+    try resp = send(call_kw with budget_key = retry_at)   // exactly one resend, no transient retry
+    catch 400 or 422 e => {
+      _raise_if_refusal_rejection(e, tag)
+      if (body names a budget key) { COUNTERS.bump(TRUNCATED_REPLIES_COUNTER); throw TruncatedResponseError("provider rejected the doubled output budget as over its cap: ...", retried=retry_at) }
+      if (_auth_failure_oai(e)) throw AuthenticationError
+      throw RuntimeError("OpenAI agentic truncation-retry failed ...")
+    }
+    catch other status e => { _raise_if_refusal_rejection(e, tag); if (_auth_failure_oai(e)) throw AuthenticationError; throw RuntimeError }
+    catch connection error e => { timeout => throw call_timeout_error; proxy => throw ProxyError; otherwise throw RuntimeError }
+    _record_usage(resp.usage)
+    retried_choice = _first_choice(resp, ..., turn=-1); retried_msg = retried_choice.message
+    if (appended) messages.append(the retried assistant turn)
+    if (retried_choice.finish_reason == "length") { COUNTERS.bump(TRUNCATED_REPLIES_COUNTER); throw TruncatedResponseError("agentic reply still hit the output-token budget after the doubled retry", retried=retry_at) }
+    undispatched = if (dispatchable) [] else retried_msg.tool_calls
+    submit = first of undispatched named "emit_structured_response" when response_model is set
+    require !(undispatched && submit == null) => throw TruncatedResponseError("agentic reply's doubled-budget retry unexpectedly requested a tool call; refusing to guess ...")
+    COUNTERS.bump(TRUNCATED_RETRY_RECOVERED_COUNTER)
+    if (submit == null || response_model == null) return [retried_choice, retried_msg, null]
+    try return [retried_choice, retried_msg, response_model.model_validate(JSON of submit arguments).model_dump_json()]
+    catch => { warn RESPONSE_MODEL_RETRY_INVALID; return [retried_choice, retried_msg, null] }   // the forced-final site re-checks and falls back to prose
+    // preserved: the content-filter and refusal checks are not repeated on the retried reply
+  }
+  if (refusal && trim(msg.content) is empty) throw model_refusal(route="openai", stage=tag, category=null, detail=refusal)
+  return [choice, msg, null]
+}

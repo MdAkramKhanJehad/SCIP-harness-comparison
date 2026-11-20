@@ -1,0 +1,3713 @@
+{
+  "source": "vvaharness/backends/llm/cli/process.py",
+  "sha256": "97783ba9974d48b9784246aa534525730887d65c7ae7f6dfe8fda3ece9454a22",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Running the `claude` subprocess, buffered and streaming.\"\"\"\nfrom __future__ import annotations\n\nimport json\nimport os\nimport re\nimport subprocess\nimport sys\nimport threading\nimport time\n\nfrom vvaharness.backends.llm.cli import cancel as _cancel\nfrom vvaharness.backends.llm.cli import env as _env\nfrom vvaharness.backends.llm.models import (\n    TIMEOUT_STOP_GRACE_SECONDS,\n)\nfrom vvaharness.report.redact import redact\nfrom vvaharness.util import console, logs\n\nlog = logs.get_logger(__name__)\n\n\ndef _run(cmd: list[str], *, input: str | None = None,\n         cwd: str | None = None, timeout: int = 600,\n         env: dict | None = None,\n         heartbeat_label: str | None = None,\n         heartbeat_interval: int = 300,\n         stream_cb=None,\n         should_stop=None) -> subprocess.CompletedProcess:\n    \"\"\"Central subprocess runner with optional periodic progress heartbeat.\"\"\"\n    proc_env = {**os.environ, **_env._tls_extra, **(env or {})}\n\n    if stream_cb is not None or should_stop is not None:\n        # `should_stop` needs the line reader, so arming the watchdog alone still streams\n        return _run_streaming(cmd, input=input, cwd=cwd, timeout=timeout,\n                              proc_env=proc_env,\n                              stream_cb=stream_cb or (lambda _line: None),\n                              should_stop=should_stop)\n\n    start = time.monotonic()\n    deadline = start + timeout\n    pending_input = input\n\n    with subprocess.Popen(\n        cmd,\n        stdin=subprocess.PIPE if input is not None else None,\n        stdout=subprocess.PIPE,\n        stderr=subprocess.PIPE,\n        text=True,\n        encoding=\"utf-8\",\n        errors=\"replace\",\n        cwd=cwd,\n        env=proc_env,\n        **_cancel._NEW_GROUP_KW,\n    ) as proc:\n        with _cancel._LIVE_LOCK:\n            _cancel._LIVE.add(proc)\n        try:\n            while True:\n                if _cancel._ABORT.is_set():\n                    _cancel._kill_tree(proc)\n                    out, err = proc.communicate()\n                    raise RuntimeError(\"aborted by user (Ctrl-C)\")\n                remaining = deadline - time.monotonic()\n                if remaining <= 0:\n                    _cancel._stop_tree(proc, TIMEOUT_STOP_GRACE_SECONDS)\n                    out, err = proc.communicate()\n                    raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)\n\n                try:\n                    out, err = proc.communicate(\n                        input=pending_input,\n                        timeout=min(float(heartbeat_interval), remaining),\n                    )\n                    break\n                except subprocess.TimeoutExpired:\n                    if heartbeat_label:\n                        elapsed = int(time.monotonic() - start)\n                        console.write(\n                            f\"    [cli] {heartbeat_label} still running... {elapsed}s elapsed\")\n                    pending_input = None\n        except KeyboardInterrupt:\n            _cancel._ABORT.set()\n            _cancel._kill_tree(proc)\n            try:\n                proc.communicate(timeout=2)\n            except Exception:\n                pass\n            raise\n        finally:\n            with _cancel._LIVE_LOCK:\n                _cancel._LIVE.discard(proc)\n\n        return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)\n\n\ndef _run_streaming(cmd: list[str], *, input: str | None, cwd: str | None,\n                   timeout: int, proc_env: dict,\n                   stream_cb,\n                   should_stop=None) -> subprocess.CompletedProcess:\n    \"\"\"Run the CLI, forwarding each stdout line to *stream_cb* live, still capturing full output.\"\"\"\n    # Drain BOTH pipes in threads or the 64KB stderr buffer deadlocks; should_stop kills per line\n    chunks: list[str] = []\n    err_chunks: list[str] = []\n    stopped = threading.Event()\n\n    def _reader(pipe):\n        for line in iter(pipe.readline, \"\"):\n            chunks.append(line)\n            try:\n                stream_cb(line)\n            except Exception:\n                pass\n            if should_stop is not None and not stopped.is_set():\n                try:\n                    if should_stop(line):\n                        stopped.set()\n                        _cancel._kill_tree(proc)\n                except Exception:\n                    pass\n        try:\n            pipe.close()\n        except Exception:\n            pass\n\n    def _err_reader(pipe):\n        \"\"\"Drain stderr continuously so a full pipe buffer can never block the child.\"\"\"\n        try:\n            for line in iter(pipe.readline, \"\"):\n                err_chunks.append(line)\n        except Exception:\n            pass\n        try:\n            pipe.close()\n        except Exception:\n            pass\n\n    with subprocess.Popen(\n        cmd,\n        stdin=subprocess.PIPE if input is not None else None,\n        stdout=subprocess.PIPE,\n        stderr=subprocess.PIPE,\n        text=True,\n        encoding=\"utf-8\",\n        errors=\"replace\",\n        cwd=cwd,\n        env=proc_env,\n        bufsize=1,  # line-buffered\n        **_cancel._NEW_GROUP_KW,\n    ) as proc:\n        with _cancel._LIVE_LOCK:\n            _cancel._LIVE.add(proc)\n        reader = threading.Thread(target=_reader, args=(proc.stdout,), daemon=True)\n        err_thread = threading.Thread(target=_err_reader, args=(proc.stderr,),\n                                      daemon=True)\n        reader.start()\n        err_thread.start()\n        try:\n            if input is not None:\n                try:\n                    proc.stdin.write(input)\n                    proc.stdin.close()\n                except BrokenPipeError:\n                    pass\n            try:\n                proc.wait(timeout=timeout)\n            except subprocess.TimeoutExpired:\n                _cancel._stop_tree(proc, TIMEOUT_STOP_GRACE_SECONDS)\n                reader.join(timeout=2)\n                err_thread.join(timeout=2)\n                raise subprocess.TimeoutExpired(\n                    cmd, timeout, output=\"\".join(chunks),\n                    stderr=\"\".join(err_chunks))\n        except KeyboardInterrupt:\n            _cancel._ABORT.set()\n            _cancel._kill_tree(proc)\n            raise\n        finally:\n            with _cancel._LIVE_LOCK:\n                _cancel._LIVE.discard(proc)\n        reader.join(timeout=5)\n        err_thread.join(timeout=5)\n    result = subprocess.CompletedProcess(cmd, proc.returncode, \"\".join(chunks),\n                                         \"\".join(err_chunks))\n    if stopped.is_set():\n        # Mark before any returncode check: the kill is non-zero and reads as a CLI failure\n        _WATCHDOG_STOPPED.add(id(result))\n    return result\n\n\n#: An id set, not a field: CompletedProcess is not ours to subclass; _was_stopped consumes it\n_WATCHDOG_STOPPED: set[int] = set()\n\n\ndef _was_stopped(result: subprocess.CompletedProcess) -> bool:\n    \"\"\"Whether the turn watchdog killed *result*'s process, consuming the mark.\"\"\"\n    key = id(result)\n    if key in _WATCHDOG_STOPPED:\n        _WATCHDOG_STOPPED.discard(key)\n        return True\n    return False\n\n\n# C0 (incl. ESC, CR, LF, BEL), DEL and C1 (incl. 8-bit CSI \\x9b): any can drive or forge the terminal\n_TERMINAL_CONTROL_RX = re.compile(\"[\\x00-\\x1f\\x7f-\\x9f]\")\n\n\ndef _trace_print(text: str, out) -> None:\n    print(_TERMINAL_CONTROL_RX.sub(\" \", text), file=out, flush=True)\n\n\ndef stream_trace(line: str, *, out=None) -> None:\n    \"\"\"Render one `stream-json` event as a concise `--verbose` trace (tool calls, text, result).\"\"\"\n    out = out or sys.stderr\n    line = (line or \"\").strip()\n    if not line:\n        return\n    try:\n        evt = json.loads(line)\n    except (json.JSONDecodeError, TypeError):\n        return\n    etype = evt.get(\"type\")\n    if etype == \"assistant\":\n        for blk in (evt.get(\"message\", {}) or {}).get(\"content\", []) or []:\n            if not isinstance(blk, dict):\n                continue\n            if blk.get(\"type\") == \"text\" and blk.get(\"text\", \"\").strip():\n                _trace_print(f\"    [agent] 💬 {redact(blk['text'].strip())[:400]}\", out)\n            elif blk.get(\"type\") == \"tool_use\":\n                name = blk.get(\"name\", \"?\")\n                args = blk.get(\"input\", {}) or {}\n                summ = \", \".join(f\"{k}={v!r}\" for k, v in args.items())\n                summ = redact(summ)\n                if len(summ) > 160:\n                    summ = summ[:157] + \"...\"\n                _trace_print(f\"    [agent] 🔧 {name}({summ})\", out)\n    elif etype == \"user\":\n        # tool_result coming back to the model — show a short confirmation.\n        for blk in (evt.get(\"message\", {}) or {}).get(\"content\", []) or []:\n            if isinstance(blk, dict) and blk.get(\"type\") == \"tool_result\":\n                content = blk.get(\"content\")\n                if isinstance(content, list):\n                    content = \" \".join(\n                        c.get(\"text\", \"\") for c in content\n                        if isinstance(c, dict))\n                n = len(str(content or \"\"))\n                _trace_print(f\"    [agent] ↩ tool result ({n} chars)\", out)\n    elif etype == \"result\":\n        if evt.get(\"is_error\"):\n            _trace_print(\n                f\"    [agent] ✗ {redact(str(evt.get('result') or evt.get('error') or ''))[:200]}\",\n                out)\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/backends/llm/cli/process.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "Running the `claude` subprocess, buffered and streaming.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_44_4": {
+      "source": "vvaharness/backends/llm/cli/process.py",
+      "line_start": 44,
+      "line_end": 44,
+      "value": "Central subprocess runner with optional periodic progress heartbeat.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_94_28": {
+      "source": "vvaharness/backends/llm/cli/process.py",
+      "line_start": 94,
+      "line_end": 94,
+      "source_expression": "f\"    [cli] {heartbeat_label} still running... {elapsed}s elapsed\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_115_4": {
+      "source": "vvaharness/backends/llm/cli/process.py",
+      "line_start": 115,
+      "line_end": 115,
+      "value": "Run the CLI, forwarding each stdout line to *stream_cb* live, still capturing full output.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_141_8": {
+      "source": "vvaharness/backends/llm/cli/process.py",
+      "line_start": 141,
+      "line_end": 141,
+      "value": "Drain stderr continuously so a full pipe buffer can never block the child.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_210_4": {
+      "source": "vvaharness/backends/llm/cli/process.py",
+      "line_start": 210,
+      "line_end": 210,
+      "value": "Whether the turn watchdog killed *result*'s process, consuming the mark.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_227_4": {
+      "source": "vvaharness/backends/llm/cli/process.py",
+      "line_start": 227,
+      "line_end": 227,
+      "value": "Render one `stream-json` event as a concise `--verbose` trace (tool calls, text, result).",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_242_29": {
+      "source": "vvaharness/backends/llm/cli/process.py",
+      "line_start": 242,
+      "line_end": 242,
+      "source_expression": "f\"    [agent] 💬 {redact(blk['text'].strip())[:400]}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_246_33": {
+      "source": "vvaharness/backends/llm/cli/process.py",
+      "line_start": 246,
+      "line_end": 246,
+      "source_expression": "f\"{k}={v!r}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_250_29": {
+      "source": "vvaharness/backends/llm/cli/process.py",
+      "line_start": 250,
+      "line_end": 250,
+      "source_expression": "f\"    [agent] 🔧 {name}({summ})\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_261_29": {
+      "source": "vvaharness/backends/llm/cli/process.py",
+      "line_start": 261,
+      "line_end": 261,
+      "source_expression": "f\"    [agent] ↩ tool result ({n} chars)\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_265_16": {
+      "source": "vvaharness/backends/llm/cli/process.py",
+      "line_start": 265,
+      "line_end": 265,
+      "source_expression": "f\"    [agent] ✗ {redact(str(evt.get('result') or evt.get('error') or ''))[:200]}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "Running the `claude` subprocess, buffered and streaming.",
+      "context": "literal"
+    },
+    {
+      "line_start": 44,
+      "line_end": 44,
+      "column": 4,
+      "value": "Central subprocess runner with optional periodic progress heartbeat.",
+      "context": "literal"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 4,
+      "value": "Run the CLI, forwarding each stdout line to *stream_cb* live, still capturing full output.",
+      "context": "literal"
+    },
+    {
+      "line_start": 210,
+      "line_end": 210,
+      "column": 4,
+      "value": "Whether the turn watchdog killed *result*'s process, consuming the mark.",
+      "context": "literal"
+    },
+    {
+      "line_start": 219,
+      "line_end": 219,
+      "column": 34,
+      "value": "[\u0000-\u001f-]",
+      "context": "literal"
+    },
+    {
+      "line_start": 227,
+      "line_end": 227,
+      "column": 4,
+      "value": "Render one `stream-json` event as a concise `--verbose` trace (tool calls, text, result).",
+      "context": "literal"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 8,
+      "value": "Drain stderr continuously so a full pipe buffer can never block the child.",
+      "context": "literal"
+    },
+    {
+      "line_start": 236,
+      "line_end": 236,
+      "column": 20,
+      "value": "type",
+      "context": "literal"
+    },
+    {
+      "line_start": 237,
+      "line_end": 237,
+      "column": 16,
+      "value": "assistant",
+      "context": "literal"
+    },
+    {
+      "line_start": 122,
+      "line_end": 122,
+      "column": 40,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 223,
+      "line_end": 223,
+      "column": 35,
+      "value": " ",
+      "context": "literal"
+    },
+    {
+      "line_start": 251,
+      "line_end": 251,
+      "column": 18,
+      "value": "user",
+      "context": "literal"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 17,
+      "value": "utf-8",
+      "context": "literal"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 15,
+      "value": "replace",
+      "context": "literal"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 44,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 158,
+      "line_end": 158,
+      "column": 17,
+      "value": "utf-8",
+      "context": "literal"
+    },
+    {
+      "line_start": 159,
+      "line_end": 159,
+      "column": 15,
+      "value": "replace",
+      "context": "literal"
+    },
+    {
+      "line_start": 197,
+      "line_end": 197,
+      "column": 63,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 198,
+      "line_end": 198,
+      "column": 41,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 229,
+      "line_end": 229,
+      "column": 20,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 238,
+      "line_end": 238,
+      "column": 54,
+      "value": "content",
+      "context": "literal"
+    },
+    {
+      "line_start": 262,
+      "line_end": 262,
+      "column": 18,
+      "value": "result",
+      "context": "literal"
+    },
+    {
+      "line_start": 241,
+      "line_end": 241,
+      "column": 34,
+      "value": "text",
+      "context": "literal"
+    },
+    {
+      "line_start": 243,
+      "line_end": 243,
+      "column": 36,
+      "value": "tool_use",
+      "context": "literal"
+    },
+    {
+      "line_start": 253,
+      "line_end": 253,
+      "column": 54,
+      "value": "content",
+      "context": "literal"
+    },
+    {
+      "line_start": 263,
+      "line_end": 263,
+      "column": 19,
+      "value": "is_error",
+      "context": "literal"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 39,
+      "value": "aborted by user (Ctrl-C)",
+      "context": "literal"
+    },
+    {
+      "line_start": 241,
+      "line_end": 241,
+      "column": 23,
+      "value": "type",
+      "context": "literal"
+    },
+    {
+      "line_start": 242,
+      "line_end": 242,
+      "column": 31,
+      "value": "    [agent] 💬 ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 243,
+      "line_end": 243,
+      "column": 25,
+      "value": "type",
+      "context": "literal"
+    },
+    {
+      "line_start": 244,
+      "line_end": 244,
+      "column": 31,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 244,
+      "line_end": 244,
+      "column": 39,
+      "value": "?",
+      "context": "literal"
+    },
+    {
+      "line_start": 254,
+      "line_end": 254,
+      "column": 60,
+      "value": "tool_result",
+      "context": "literal"
+    },
+    {
+      "line_start": 255,
+      "line_end": 255,
+      "column": 34,
+      "value": "content",
+      "context": "literal"
+    },
+    {
+      "line_start": 238,
+      "line_end": 238,
+      "column": 28,
+      "value": "message",
+      "context": "literal"
+    },
+    {
+      "line_start": 241,
+      "line_end": 241,
+      "column": 53,
+      "value": "text",
+      "context": "literal"
+    },
+    {
+      "line_start": 241,
+      "line_end": 241,
+      "column": 61,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 245,
+      "line_end": 245,
+      "column": 31,
+      "value": "input",
+      "context": "literal"
+    },
+    {
+      "line_start": 246,
+      "line_end": 246,
+      "column": 23,
+      "value": ", ",
+      "context": "literal"
+    },
+    {
+      "line_start": 249,
+      "line_end": 249,
+      "column": 40,
+      "value": "...",
+      "context": "literal"
+    },
+    {
+      "line_start": 250,
+      "line_end": 250,
+      "column": 31,
+      "value": "    [agent] 🔧 ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 250,
+      "line_end": 250,
+      "column": 54,
+      "value": "(",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 250,
+      "line_end": 250,
+      "column": 61,
+      "value": ")",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 254,
+      "line_end": 254,
+      "column": 49,
+      "value": "type",
+      "context": "literal"
+    },
+    {
+      "line_start": 261,
+      "line_end": 261,
+      "column": 31,
+      "value": "    [agent] ↩ tool result (",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 261,
+      "line_end": 261,
+      "column": 63,
+      "value": " chars)",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 265,
+      "line_end": 265,
+      "column": 18,
+      "value": "    [agent] ✗ ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 246,
+      "line_end": 246,
+      "column": 38,
+      "value": "=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 253,
+      "line_end": 253,
+      "column": 28,
+      "value": "message",
+      "context": "literal"
+    },
+    {
+      "line_start": 257,
+      "line_end": 257,
+      "column": 30,
+      "value": " ",
+      "context": "literal"
+    },
+    {
+      "line_start": 260,
+      "line_end": 260,
+      "column": 39,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 30,
+      "value": "    [cli] ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 57,
+      "value": " still running... ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 84,
+      "value": "s elapsed",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 186,
+      "line_end": 186,
+      "column": 41,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 27,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 258,
+      "line_end": 258,
+      "column": 30,
+      "value": "text",
+      "context": "literal"
+    },
+    {
+      "line_start": 258,
+      "line_end": 258,
+      "column": 38,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 242,
+      "line_end": 242,
+      "column": 60,
+      "value": "text",
+      "context": "literal"
+    },
+    {
+      "line_start": 265,
+      "line_end": 265,
+      "column": 87,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 265,
+      "line_end": 265,
+      "column": 54,
+      "value": "result",
+      "context": "literal"
+    },
+    {
+      "line_start": 265,
+      "line_end": 265,
+      "column": 75,
+      "value": "error",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 48,
+      "text": "# `should_stop` needs the line reader, so arming the watchdog alone still streams"
+    },
+    {
+      "line": 116,
+      "text": "# Drain BOTH pipes in threads or the 64KB stderr buffer deadlocks; should_stop kills per line"
+    },
+    {
+      "line": 162,
+      "text": "# line-buffered"
+    },
+    {
+      "line": 200,
+      "text": "# Mark before any returncode check: the kill is non-zero and reads as a CLI failure"
+    },
+    {
+      "line": 205,
+      "text": "#: An id set, not a field: CompletedProcess is not ours to subclass; _was_stopped consumes it"
+    },
+    {
+      "line": 218,
+      "text": "# C0 (incl. ESC, CR, LF, BEL), DEL and C1 (incl. 8-bit CSI \\x9b): any can drive or forge the terminal"
+    },
+    {
+      "line": 252,
+      "text": "# tool_result coming back to the model — show a short confirmation."
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 18,
+      "line_end": 18,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "Import",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "Import",
+      "line_start": 23,
+      "line_end": 23,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "Import",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 26,
+      "line_end": 26,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 27,
+      "line_end": 27,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 28,
+      "line_end": 30,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 31,
+      "line_end": 31,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 32,
+      "line_end": 32,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 34,
+      "line_end": 34,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 37,
+      "line_end": 108,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 7
+    },
+    {
+      "kind": "Expr",
+      "line_start": 44,
+      "line_end": 44,
+      "column": 4,
+      "owner": "_run",
+      "representation_line": 13
+    },
+    {
+      "kind": "Assign",
+      "line_start": 45,
+      "line_end": 45,
+      "column": 4,
+      "owner": "_run",
+      "representation_line": 13
+    },
+    {
+      "kind": "If",
+      "line_start": 47,
+      "line_end": 52,
+      "column": 4,
+      "owner": "_run",
+      "representation_line": 14
+    },
+    {
+      "kind": "Return",
+      "line_start": 49,
+      "line_end": 52,
+      "column": 8,
+      "owner": "_run",
+      "representation_line": 16
+    },
+    {
+      "kind": "Assign",
+      "line_start": 54,
+      "line_end": 54,
+      "column": 4,
+      "owner": "_run",
+      "representation_line": 20
+    },
+    {
+      "kind": "Assign",
+      "line_start": 55,
+      "line_end": 55,
+      "column": 4,
+      "owner": "_run",
+      "representation_line": 20
+    },
+    {
+      "kind": "Assign",
+      "line_start": 56,
+      "line_end": 56,
+      "column": 4,
+      "owner": "_run",
+      "representation_line": 20
+    },
+    {
+      "kind": "With",
+      "line_start": 58,
+      "line_end": 108,
+      "column": 4,
+      "owner": "_run",
+      "representation_line": 21
+    },
+    {
+      "kind": "With",
+      "line_start": 70,
+      "line_end": 71,
+      "column": 8,
+      "owner": "_run",
+      "representation_line": 23
+    },
+    {
+      "kind": "Expr",
+      "line_start": 71,
+      "line_end": 71,
+      "column": 12,
+      "owner": "_run",
+      "representation_line": 26
+    },
+    {
+      "kind": "Try",
+      "line_start": 72,
+      "line_end": 106,
+      "column": 8,
+      "owner": "_run",
+      "representation_line": 29
+    },
+    {
+      "kind": "While",
+      "line_start": 73,
+      "line_end": 95,
+      "column": 12,
+      "owner": "_run",
+      "representation_line": 31
+    },
+    {
+      "kind": "If",
+      "line_start": 74,
+      "line_end": 77,
+      "column": 16,
+      "owner": "_run",
+      "representation_line": 33
+    },
+    {
+      "kind": "Expr",
+      "line_start": 75,
+      "line_end": 75,
+      "column": 20,
+      "owner": "_run",
+      "representation_line": 36
+    },
+    {
+      "kind": "Assign",
+      "line_start": 76,
+      "line_end": 76,
+      "column": 20,
+      "owner": "_run",
+      "representation_line": 36
+    },
+    {
+      "kind": "Raise",
+      "line_start": 77,
+      "line_end": 77,
+      "column": 20,
+      "owner": "_run",
+      "representation_line": 37
+    },
+    {
+      "kind": "Assign",
+      "line_start": 78,
+      "line_end": 78,
+      "column": 16,
+      "owner": "_run",
+      "representation_line": 41
+    },
+    {
+      "kind": "If",
+      "line_start": 79,
+      "line_end": 82,
+      "column": 16,
+      "owner": "_run",
+      "representation_line": 42
+    },
+    {
+      "kind": "Expr",
+      "line_start": 80,
+      "line_end": 80,
+      "column": 20,
+      "owner": "_run",
+      "representation_line": 45
+    },
+    {
+      "kind": "Assign",
+      "line_start": 81,
+      "line_end": 81,
+      "column": 20,
+      "owner": "_run",
+      "representation_line": 45
+    },
+    {
+      "kind": "Raise",
+      "line_start": 82,
+      "line_end": 82,
+      "column": 20,
+      "owner": "_run",
+      "representation_line": 46
+    },
+    {
+      "kind": "Try",
+      "line_start": 84,
+      "line_end": 95,
+      "column": 16,
+      "owner": "_run",
+      "representation_line": 49
+    },
+    {
+      "kind": "Assign",
+      "line_start": 85,
+      "line_end": 88,
+      "column": 20,
+      "owner": "_run",
+      "representation_line": 52
+    },
+    {
+      "kind": "Break",
+      "line_start": 89,
+      "line_end": 89,
+      "column": 20,
+      "owner": "_run",
+      "representation_line": 53
+    },
+    {
+      "kind": "If",
+      "line_start": 91,
+      "line_end": 94,
+      "column": 20,
+      "owner": "_run",
+      "representation_line": 58
+    },
+    {
+      "kind": "Assign",
+      "line_start": 92,
+      "line_end": 92,
+      "column": 24,
+      "owner": "_run",
+      "representation_line": 61
+    },
+    {
+      "kind": "Expr",
+      "line_start": 93,
+      "line_end": 94,
+      "column": 24,
+      "owner": "_run",
+      "representation_line": 61
+    },
+    {
+      "kind": "Assign",
+      "line_start": 95,
+      "line_end": 95,
+      "column": 20,
+      "owner": "_run",
+      "representation_line": 64
+    },
+    {
+      "kind": "Expr",
+      "line_start": 97,
+      "line_end": 97,
+      "column": 12,
+      "owner": "_run",
+      "representation_line": 71
+    },
+    {
+      "kind": "Expr",
+      "line_start": 98,
+      "line_end": 98,
+      "column": 12,
+      "owner": "_run",
+      "representation_line": 71
+    },
+    {
+      "kind": "Try",
+      "line_start": 99,
+      "line_end": 102,
+      "column": 12,
+      "owner": "_run",
+      "representation_line": 72
+    },
+    {
+      "kind": "Expr",
+      "line_start": 100,
+      "line_end": 100,
+      "column": 16,
+      "owner": "_run",
+      "representation_line": 75
+    },
+    {
+      "kind": "Pass",
+      "line_start": 102,
+      "line_end": 102,
+      "column": 16,
+      "owner": "_run",
+      "representation_line": 80
+    },
+    {
+      "kind": "Raise",
+      "line_start": 103,
+      "line_end": 103,
+      "column": 12,
+      "owner": "_run",
+      "representation_line": 82
+    },
+    {
+      "kind": "With",
+      "line_start": 105,
+      "line_end": 106,
+      "column": 12,
+      "owner": "_run",
+      "representation_line": 86
+    },
+    {
+      "kind": "Expr",
+      "line_start": 106,
+      "line_end": 106,
+      "column": 16,
+      "owner": "_run",
+      "representation_line": 89
+    },
+    {
+      "kind": "Return",
+      "line_start": 108,
+      "line_end": 108,
+      "column": 8,
+      "owner": "_run",
+      "representation_line": 93
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 111,
+      "line_end": 202,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 99
+    },
+    {
+      "kind": "Expr",
+      "line_start": 115,
+      "line_end": 115,
+      "column": 4,
+      "owner": "_run_streaming",
+      "representation_line": 105
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 117,
+      "line_end": 117,
+      "column": 4,
+      "owner": "_run_streaming",
+      "representation_line": 105
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 118,
+      "line_end": 118,
+      "column": 4,
+      "owner": "_run_streaming",
+      "representation_line": 105
+    },
+    {
+      "kind": "Assign",
+      "line_start": 119,
+      "line_end": 119,
+      "column": 4,
+      "owner": "_run_streaming",
+      "representation_line": 105
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 121,
+      "line_end": 138,
+      "column": 4,
+      "owner": "_run_streaming",
+      "representation_line": 106
+    },
+    {
+      "kind": "For",
+      "line_start": 122,
+      "line_end": 134,
+      "column": 8,
+      "owner": "_run_streaming._reader",
+      "representation_line": 111
+    },
+    {
+      "kind": "Expr",
+      "line_start": 123,
+      "line_end": 123,
+      "column": 12,
+      "owner": "_run_streaming._reader",
+      "representation_line": 114
+    },
+    {
+      "kind": "Try",
+      "line_start": 124,
+      "line_end": 127,
+      "column": 12,
+      "owner": "_run_streaming._reader",
+      "representation_line": 115
+    },
+    {
+      "kind": "Expr",
+      "line_start": 125,
+      "line_end": 125,
+      "column": 16,
+      "owner": "_run_streaming._reader",
+      "representation_line": 118
+    },
+    {
+      "kind": "Pass",
+      "line_start": 127,
+      "line_end": 127,
+      "column": 16,
+      "owner": "_run_streaming._reader",
+      "representation_line": 123
+    },
+    {
+      "kind": "If",
+      "line_start": 128,
+      "line_end": 134,
+      "column": 12,
+      "owner": "_run_streaming._reader",
+      "representation_line": 125
+    },
+    {
+      "kind": "Try",
+      "line_start": 129,
+      "line_end": 134,
+      "column": 16,
+      "owner": "_run_streaming._reader",
+      "representation_line": 127
+    },
+    {
+      "kind": "If",
+      "line_start": 130,
+      "line_end": 132,
+      "column": 20,
+      "owner": "_run_streaming._reader",
+      "representation_line": 129
+    },
+    {
+      "kind": "Expr",
+      "line_start": 131,
+      "line_end": 131,
+      "column": 24,
+      "owner": "_run_streaming._reader",
+      "representation_line": 132
+    },
+    {
+      "kind": "Expr",
+      "line_start": 132,
+      "line_end": 132,
+      "column": 24,
+      "owner": "_run_streaming._reader",
+      "representation_line": 132
+    },
+    {
+      "kind": "Pass",
+      "line_start": 134,
+      "line_end": 134,
+      "column": 20,
+      "owner": "_run_streaming._reader",
+      "representation_line": 138
+    },
+    {
+      "kind": "Try",
+      "line_start": 135,
+      "line_end": 138,
+      "column": 8,
+      "owner": "_run_streaming._reader",
+      "representation_line": 142
+    },
+    {
+      "kind": "Expr",
+      "line_start": 136,
+      "line_end": 136,
+      "column": 12,
+      "owner": "_run_streaming._reader",
+      "representation_line": 145
+    },
+    {
+      "kind": "Pass",
+      "line_start": 138,
+      "line_end": 138,
+      "column": 12,
+      "owner": "_run_streaming._reader",
+      "representation_line": 150
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 140,
+      "line_end": 150,
+      "column": 4,
+      "owner": "_run_streaming",
+      "representation_line": 154
+    },
+    {
+      "kind": "Expr",
+      "line_start": 141,
+      "line_end": 141,
+      "column": 8,
+      "owner": "_run_streaming._err_reader",
+      "representation_line": 160
+    },
+    {
+      "kind": "Try",
+      "line_start": 142,
+      "line_end": 146,
+      "column": 8,
+      "owner": "_run_streaming._err_reader",
+      "representation_line": 161
+    },
+    {
+      "kind": "For",
+      "line_start": 143,
+      "line_end": 144,
+      "column": 12,
+      "owner": "_run_streaming._err_reader",
+      "representation_line": 163
+    },
+    {
+      "kind": "Expr",
+      "line_start": 144,
+      "line_end": 144,
+      "column": 16,
+      "owner": "_run_streaming._err_reader",
+      "representation_line": 166
+    },
+    {
+      "kind": "Pass",
+      "line_start": 146,
+      "line_end": 146,
+      "column": 12,
+      "owner": "_run_streaming._err_reader",
+      "representation_line": 172
+    },
+    {
+      "kind": "Try",
+      "line_start": 147,
+      "line_end": 150,
+      "column": 8,
+      "owner": "_run_streaming._err_reader",
+      "representation_line": 174
+    },
+    {
+      "kind": "Expr",
+      "line_start": 148,
+      "line_end": 148,
+      "column": 12,
+      "owner": "_run_streaming._err_reader",
+      "representation_line": 177
+    },
+    {
+      "kind": "Pass",
+      "line_start": 150,
+      "line_end": 150,
+      "column": 12,
+      "owner": "_run_streaming._err_reader",
+      "representation_line": 182
+    },
+    {
+      "kind": "With",
+      "line_start": 152,
+      "line_end": 196,
+      "column": 4,
+      "owner": "_run_streaming",
+      "representation_line": 186
+    },
+    {
+      "kind": "With",
+      "line_start": 165,
+      "line_end": 166,
+      "column": 8,
+      "owner": "_run_streaming",
+      "representation_line": 188
+    },
+    {
+      "kind": "Expr",
+      "line_start": 166,
+      "line_end": 166,
+      "column": 12,
+      "owner": "_run_streaming",
+      "representation_line": 191
+    },
+    {
+      "kind": "Assign",
+      "line_start": 167,
+      "line_end": 167,
+      "column": 8,
+      "owner": "_run_streaming",
+      "representation_line": 195
+    },
+    {
+      "kind": "Assign",
+      "line_start": 168,
+      "line_end": 169,
+      "column": 8,
+      "owner": "_run_streaming",
+      "representation_line": 195
+    },
+    {
+      "kind": "Expr",
+      "line_start": 170,
+      "line_end": 170,
+      "column": 8,
+      "owner": "_run_streaming",
+      "representation_line": 195
+    },
+    {
+      "kind": "Expr",
+      "line_start": 171,
+      "line_end": 171,
+      "column": 8,
+      "owner": "_run_streaming",
+      "representation_line": 195
+    },
+    {
+      "kind": "Try",
+      "line_start": 172,
+      "line_end": 194,
+      "column": 8,
+      "owner": "_run_streaming",
+      "representation_line": 196
+    },
+    {
+      "kind": "If",
+      "line_start": 173,
+      "line_end": 178,
+      "column": 12,
+      "owner": "_run_streaming",
+      "representation_line": 198
+    },
+    {
+      "kind": "Try",
+      "line_start": 174,
+      "line_end": 178,
+      "column": 16,
+      "owner": "_run_streaming",
+      "representation_line": 200
+    },
+    {
+      "kind": "Expr",
+      "line_start": 175,
+      "line_end": 175,
+      "column": 20,
+      "owner": "_run_streaming",
+      "representation_line": 203
+    },
+    {
+      "kind": "Expr",
+      "line_start": 176,
+      "line_end": 176,
+      "column": 20,
+      "owner": "_run_streaming",
+      "representation_line": 203
+    },
+    {
+      "kind": "Pass",
+      "line_start": 178,
+      "line_end": 178,
+      "column": 20,
+      "owner": "_run_streaming",
+      "representation_line": 208
+    },
+    {
+      "kind": "Try",
+      "line_start": 179,
+      "line_end": 187,
+      "column": 12,
+      "owner": "_run_streaming",
+      "representation_line": 211
+    },
+    {
+      "kind": "Expr",
+      "line_start": 180,
+      "line_end": 180,
+      "column": 16,
+      "owner": "_run_streaming",
+      "representation_line": 214
+    },
+    {
+      "kind": "Expr",
+      "line_start": 182,
+      "line_end": 182,
+      "column": 16,
+      "owner": "_run_streaming",
+      "representation_line": 219
+    },
+    {
+      "kind": "Expr",
+      "line_start": 183,
+      "line_end": 183,
+      "column": 16,
+      "owner": "_run_streaming",
+      "representation_line": 219
+    },
+    {
+      "kind": "Expr",
+      "line_start": 184,
+      "line_end": 184,
+      "column": 16,
+      "owner": "_run_streaming",
+      "representation_line": 219
+    },
+    {
+      "kind": "Raise",
+      "line_start": 185,
+      "line_end": 187,
+      "column": 16,
+      "owner": "_run_streaming",
+      "representation_line": 220
+    },
+    {
+      "kind": "Expr",
+      "line_start": 189,
+      "line_end": 189,
+      "column": 12,
+      "owner": "_run_streaming",
+      "representation_line": 227
+    },
+    {
+      "kind": "Expr",
+      "line_start": 190,
+      "line_end": 190,
+      "column": 12,
+      "owner": "_run_streaming",
+      "representation_line": 227
+    },
+    {
+      "kind": "Raise",
+      "line_start": 191,
+      "line_end": 191,
+      "column": 12,
+      "owner": "_run_streaming",
+      "representation_line": 228
+    },
+    {
+      "kind": "With",
+      "line_start": 193,
+      "line_end": 194,
+      "column": 12,
+      "owner": "_run_streaming",
+      "representation_line": 232
+    },
+    {
+      "kind": "Expr",
+      "line_start": 194,
+      "line_end": 194,
+      "column": 16,
+      "owner": "_run_streaming",
+      "representation_line": 235
+    },
+    {
+      "kind": "Expr",
+      "line_start": 195,
+      "line_end": 195,
+      "column": 8,
+      "owner": "_run_streaming",
+      "representation_line": 240
+    },
+    {
+      "kind": "Expr",
+      "line_start": 196,
+      "line_end": 196,
+      "column": 8,
+      "owner": "_run_streaming",
+      "representation_line": 240
+    },
+    {
+      "kind": "Assign",
+      "line_start": 197,
+      "line_end": 198,
+      "column": 4,
+      "owner": "_run_streaming",
+      "representation_line": 244
+    },
+    {
+      "kind": "If",
+      "line_start": 199,
+      "line_end": 201,
+      "column": 4,
+      "owner": "_run_streaming",
+      "representation_line": 245
+    },
+    {
+      "kind": "Expr",
+      "line_start": 201,
+      "line_end": 201,
+      "column": 8,
+      "owner": "_run_streaming",
+      "representation_line": 248
+    },
+    {
+      "kind": "Return",
+      "line_start": 202,
+      "line_end": 202,
+      "column": 4,
+      "owner": "_run_streaming",
+      "representation_line": 250
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 206,
+      "line_end": 206,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 255
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 209,
+      "line_end": 215,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 256
+    },
+    {
+      "kind": "Expr",
+      "line_start": 210,
+      "line_end": 210,
+      "column": 4,
+      "owner": "_was_stopped",
+      "representation_line": 262
+    },
+    {
+      "kind": "Assign",
+      "line_start": 211,
+      "line_end": 211,
+      "column": 4,
+      "owner": "_was_stopped",
+      "representation_line": 262
+    },
+    {
+      "kind": "If",
+      "line_start": 212,
+      "line_end": 214,
+      "column": 4,
+      "owner": "_was_stopped",
+      "representation_line": 263
+    },
+    {
+      "kind": "Expr",
+      "line_start": 213,
+      "line_end": 213,
+      "column": 8,
+      "owner": "_was_stopped",
+      "representation_line": 266
+    },
+    {
+      "kind": "Return",
+      "line_start": 214,
+      "line_end": 214,
+      "column": 8,
+      "owner": "_was_stopped",
+      "representation_line": 267
+    },
+    {
+      "kind": "Return",
+      "line_start": 215,
+      "line_end": 215,
+      "column": 4,
+      "owner": "_was_stopped",
+      "representation_line": 270
+    },
+    {
+      "kind": "Assign",
+      "line_start": 219,
+      "line_end": 219,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 275
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 222,
+      "line_end": 223,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 276
+    },
+    {
+      "kind": "Expr",
+      "line_start": 223,
+      "line_end": 223,
+      "column": 4,
+      "owner": "_trace_print",
+      "representation_line": 282
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 226,
+      "line_end": 266,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 285
+    },
+    {
+      "kind": "Expr",
+      "line_start": 227,
+      "line_end": 227,
+      "column": 4,
+      "owner": "stream_trace",
+      "representation_line": 291
+    },
+    {
+      "kind": "Assign",
+      "line_start": 228,
+      "line_end": 228,
+      "column": 4,
+      "owner": "stream_trace",
+      "representation_line": 291
+    },
+    {
+      "kind": "Assign",
+      "line_start": 229,
+      "line_end": 229,
+      "column": 4,
+      "owner": "stream_trace",
+      "representation_line": 291
+    },
+    {
+      "kind": "If",
+      "line_start": 230,
+      "line_end": 231,
+      "column": 4,
+      "owner": "stream_trace",
+      "representation_line": 292
+    },
+    {
+      "kind": "Return",
+      "line_start": 231,
+      "line_end": 231,
+      "column": 8,
+      "owner": "stream_trace",
+      "representation_line": 294
+    },
+    {
+      "kind": "Try",
+      "line_start": 232,
+      "line_end": 235,
+      "column": 4,
+      "owner": "stream_trace",
+      "representation_line": 297
+    },
+    {
+      "kind": "Assign",
+      "line_start": 233,
+      "line_end": 233,
+      "column": 8,
+      "owner": "stream_trace",
+      "representation_line": 300
+    },
+    {
+      "kind": "Return",
+      "line_start": 235,
+      "line_end": 235,
+      "column": 8,
+      "owner": "stream_trace",
+      "representation_line": 304
+    },
+    {
+      "kind": "Assign",
+      "line_start": 236,
+      "line_end": 236,
+      "column": 4,
+      "owner": "stream_trace",
+      "representation_line": 308
+    },
+    {
+      "kind": "If",
+      "line_start": 237,
+      "line_end": 266,
+      "column": 4,
+      "owner": "stream_trace",
+      "representation_line": 309
+    },
+    {
+      "kind": "For",
+      "line_start": 238,
+      "line_end": 250,
+      "column": 8,
+      "owner": "stream_trace",
+      "representation_line": 311
+    },
+    {
+      "kind": "If",
+      "line_start": 239,
+      "line_end": 240,
+      "column": 12,
+      "owner": "stream_trace",
+      "representation_line": 313
+    },
+    {
+      "kind": "Continue",
+      "line_start": 240,
+      "line_end": 240,
+      "column": 16,
+      "owner": "stream_trace",
+      "representation_line": 315
+    },
+    {
+      "kind": "If",
+      "line_start": 241,
+      "line_end": 250,
+      "column": 12,
+      "owner": "stream_trace",
+      "representation_line": 318
+    },
+    {
+      "kind": "Expr",
+      "line_start": 242,
+      "line_end": 242,
+      "column": 16,
+      "owner": "stream_trace",
+      "representation_line": 321
+    },
+    {
+      "kind": "If",
+      "line_start": 243,
+      "line_end": 250,
+      "column": 12,
+      "owner": "stream_trace",
+      "representation_line": 324
+    },
+    {
+      "kind": "Assign",
+      "line_start": 244,
+      "line_end": 244,
+      "column": 16,
+      "owner": "stream_trace",
+      "representation_line": 327
+    },
+    {
+      "kind": "Assign",
+      "line_start": 245,
+      "line_end": 245,
+      "column": 16,
+      "owner": "stream_trace",
+      "representation_line": 327
+    },
+    {
+      "kind": "Assign",
+      "line_start": 246,
+      "line_end": 246,
+      "column": 16,
+      "owner": "stream_trace",
+      "representation_line": 327
+    },
+    {
+      "kind": "Assign",
+      "line_start": 247,
+      "line_end": 247,
+      "column": 16,
+      "owner": "stream_trace",
+      "representation_line": 327
+    },
+    {
+      "kind": "If",
+      "line_start": 248,
+      "line_end": 249,
+      "column": 16,
+      "owner": "stream_trace",
+      "representation_line": 328
+    },
+    {
+      "kind": "Assign",
+      "line_start": 249,
+      "line_end": 249,
+      "column": 20,
+      "owner": "stream_trace",
+      "representation_line": 331
+    },
+    {
+      "kind": "Expr",
+      "line_start": 250,
+      "line_end": 250,
+      "column": 16,
+      "owner": "stream_trace",
+      "representation_line": 334
+    },
+    {
+      "kind": "If",
+      "line_start": 251,
+      "line_end": 266,
+      "column": 4,
+      "owner": "stream_trace",
+      "representation_line": 340
+    },
+    {
+      "kind": "For",
+      "line_start": 253,
+      "line_end": 261,
+      "column": 8,
+      "owner": "stream_trace",
+      "representation_line": 342
+    },
+    {
+      "kind": "If",
+      "line_start": 254,
+      "line_end": 261,
+      "column": 12,
+      "owner": "stream_trace",
+      "representation_line": 344
+    },
+    {
+      "kind": "Assign",
+      "line_start": 255,
+      "line_end": 255,
+      "column": 16,
+      "owner": "stream_trace",
+      "representation_line": 347
+    },
+    {
+      "kind": "If",
+      "line_start": 256,
+      "line_end": 259,
+      "column": 16,
+      "owner": "stream_trace",
+      "representation_line": 348
+    },
+    {
+      "kind": "Assign",
+      "line_start": 257,
+      "line_end": 259,
+      "column": 20,
+      "owner": "stream_trace",
+      "representation_line": 351
+    },
+    {
+      "kind": "Assign",
+      "line_start": 260,
+      "line_end": 260,
+      "column": 16,
+      "owner": "stream_trace",
+      "representation_line": 354
+    },
+    {
+      "kind": "Expr",
+      "line_start": 261,
+      "line_end": 261,
+      "column": 16,
+      "owner": "stream_trace",
+      "representation_line": 354
+    },
+    {
+      "kind": "If",
+      "line_start": 262,
+      "line_end": 266,
+      "column": 4,
+      "owner": "stream_trace",
+      "representation_line": 359
+    },
+    {
+      "kind": "If",
+      "line_start": 263,
+      "line_end": 266,
+      "column": 8,
+      "owner": "stream_trace",
+      "representation_line": 361
+    },
+    {
+      "kind": "Expr",
+      "line_start": 264,
+      "line_end": 266,
+      "column": 12,
+      "owner": "stream_trace",
+      "representation_line": 364
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 6,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='logs', ctx=Load()), attr='get_logger', ctx=Load()), args=[Name(id='__name__', ctx=Load())], keywords=[])",
+      "rendered": "logs.get_logger(__name__)"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 15,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[None, None, None], values=[Attribute(value=Name(id='os', ctx=Load()), attr='environ', ctx=Load()), Attribute(value=Name(id='_env', ctx=Load()), attr='_tls_extra', ctx=Load()), BoolOp(op=Or(), values=[Name(id='env', ctx=Load()), Dict(keys=[], values=[])])])",
+      "rendered": "{**os.environ, **_env._tls_extra, **(env or {})}"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Compare(left=Name(id='stream_cb', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), Compare(left=Name(id='should_stop', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])])",
+      "rendered": "stream_cb is not None or should_stop is not None"
+    },
+    {
+      "line_start": 49,
+      "line_end": 52,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_run_streaming', ctx=Load()), args=[Name(id='cmd', ctx=Load())], keywords=[keyword(arg='input', value=Name(id='input', ctx=Load())), keyword(arg='cwd', value=Name(id='cwd', ctx=Load())), keyword(arg='timeout', value=Name(id='timeout', ctx=Load())), keyword(arg='proc_env', value=Name(id='proc_env', ctx=Load())), keyword(arg='stream_cb', value=BoolOp(op=Or(), values=[Name(id='stream_cb', ctx=Load()), Lambda(args=arguments(posonlyargs=[], args=[arg(arg='_line')], kwonlyargs=[], kw_defaults=[], defaults=[]), body=Constant(value=None))])), keyword(arg='should_stop', value=Name(id='should_stop', ctx=Load()))])",
+      "rendered": "_run_streaming(cmd, input=input, cwd=cwd, timeout=timeout, proc_env=proc_env, stream_cb=stream_cb or (lambda _line: None), should_stop=should_stop)"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='time', ctx=Load()), attr='monotonic', ctx=Load()), args=[], keywords=[])",
+      "rendered": "time.monotonic()"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 15,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Name(id='start', ctx=Load()), op=Add(), right=Name(id='timeout', ctx=Load()))",
+      "rendered": "start + timeout"
+    },
+    {
+      "line_start": 56,
+      "line_end": 56,
+      "column": 20,
+      "kind": "Name",
+      "original_ast": "Name(id='input', ctx=Load())",
+      "rendered": "input"
+    },
+    {
+      "line_start": 58,
+      "line_end": 69,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='subprocess', ctx=Load()), attr='Popen', ctx=Load()), args=[Name(id='cmd', ctx=Load())], keywords=[keyword(arg='stdin', value=IfExp(test=Compare(left=Name(id='input', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), body=Attribute(value=Name(id='subprocess', ctx=Load()), attr='PIPE', ctx=Load()), orelse=Constant(value=None))), keyword(arg='stdout', value=Attribute(value=Name(id='subprocess', ctx=Load()), attr='PIPE', ctx=Load())), keyword(arg='stderr', value=Attribute(value=Name(id='subprocess', ctx=Load()), attr='PIPE', ctx=Load())), keyword(arg='text', value=Constant(value=True)), keyword(arg='encoding', value=Constant(value='utf-8')), keyword(arg='errors', value=Constant(value='replace')), keyword(arg='cwd', value=Name(id='cwd', ctx=Load())), keyword(arg='env', value=Name(id='proc_env', ctx=Load())), keyword(value=Attribute(value=Name(id='_cancel', ctx=Load()), attr='_NEW_GROUP_KW', ctx=Load()))])",
+      "rendered": "subprocess.Popen(cmd, stdin=subprocess.PIPE if input is not None else None, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace', cwd=cwd, env=proc_env, **_cancel._NEW_GROUP_KW)"
+    },
+    {
+      "line_start": 70,
+      "line_end": 70,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='_cancel', ctx=Load()), attr='_LIVE_LOCK', ctx=Load())",
+      "rendered": "_cancel._LIVE_LOCK"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='_cancel', ctx=Load()), attr='_LIVE', ctx=Load()), attr='add', ctx=Load()), args=[Name(id='proc', ctx=Load())], keywords=[])",
+      "rendered": "_cancel._LIVE.add(proc)"
+    },
+    {
+      "line_start": 73,
+      "line_end": 73,
+      "column": 18,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 74,
+      "line_end": 74,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='_cancel', ctx=Load()), attr='_ABORT', ctx=Load()), attr='is_set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "_cancel._ABORT.is_set()"
+    },
+    {
+      "line_start": 75,
+      "line_end": 75,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_cancel', ctx=Load()), attr='_kill_tree', ctx=Load()), args=[Name(id='proc', ctx=Load())], keywords=[])",
+      "rendered": "_cancel._kill_tree(proc)"
+    },
+    {
+      "line_start": 76,
+      "line_end": 76,
+      "column": 31,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='proc', ctx=Load()), attr='communicate', ctx=Load()), args=[], keywords=[])",
+      "rendered": "proc.communicate()"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='RuntimeError', ctx=Load()), args=[Constant(value='aborted by user (Ctrl-C)')], keywords=[])",
+      "rendered": "RuntimeError('aborted by user (Ctrl-C)')"
+    },
+    {
+      "line_start": 78,
+      "line_end": 78,
+      "column": 28,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Name(id='deadline', ctx=Load()), op=Sub(), right=Call(func=Attribute(value=Name(id='time', ctx=Load()), attr='monotonic', ctx=Load()), args=[], keywords=[]))",
+      "rendered": "deadline - time.monotonic()"
+    },
+    {
+      "line_start": 79,
+      "line_end": 79,
+      "column": 19,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='remaining', ctx=Load()), ops=[LtE()], comparators=[Constant(value=0)])",
+      "rendered": "remaining <= 0"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_cancel', ctx=Load()), attr='_stop_tree', ctx=Load()), args=[Name(id='proc', ctx=Load()), Name(id='TIMEOUT_STOP_GRACE_SECONDS', ctx=Load())], keywords=[])",
+      "rendered": "_cancel._stop_tree(proc, TIMEOUT_STOP_GRACE_SECONDS)"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 31,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='proc', ctx=Load()), attr='communicate', ctx=Load()), args=[], keywords=[])",
+      "rendered": "proc.communicate()"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='subprocess', ctx=Load()), attr='TimeoutExpired', ctx=Load()), args=[Name(id='cmd', ctx=Load()), Name(id='timeout', ctx=Load())], keywords=[keyword(arg='output', value=Name(id='out', ctx=Load())), keyword(arg='stderr', value=Name(id='err', ctx=Load()))])",
+      "rendered": "subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)"
+    },
+    {
+      "line_start": 85,
+      "line_end": 88,
+      "column": 31,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='proc', ctx=Load()), attr='communicate', ctx=Load()), args=[], keywords=[keyword(arg='input', value=Name(id='pending_input', ctx=Load())), keyword(arg='timeout', value=Call(func=Name(id='min', ctx=Load()), args=[Call(func=Name(id='float', ctx=Load()), args=[Name(id='heartbeat_interval', ctx=Load())], keywords=[]), Name(id='remaining', ctx=Load())], keywords=[]))])",
+      "rendered": "proc.communicate(input=pending_input, timeout=min(float(heartbeat_interval), remaining))"
+    },
+    {
+      "line_start": 90,
+      "line_end": 90,
+      "column": 23,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='subprocess', ctx=Load()), attr='TimeoutExpired', ctx=Load())",
+      "rendered": "subprocess.TimeoutExpired"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='heartbeat_label', ctx=Load())",
+      "rendered": "heartbeat_label"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 34,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='int', ctx=Load()), args=[BinOp(left=Call(func=Attribute(value=Name(id='time', ctx=Load()), attr='monotonic', ctx=Load()), args=[], keywords=[]), op=Sub(), right=Name(id='start', ctx=Load()))], keywords=[])",
+      "rendered": "int(time.monotonic() - start)"
+    },
+    {
+      "line_start": 93,
+      "line_end": 94,
+      "column": 24,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='    [cli] '), FormattedValue(value=Name(id='heartbeat_label', ctx=Load()), conversion=-1), Constant(value=' still running... '), FormattedValue(value=Name(id='elapsed', ctx=Load()), conversion=-1), Constant(value='s elapsed')])], keywords=[])",
+      "rendered": "console.write(source_template_94_28)"
+    },
+    {
+      "line_start": 95,
+      "line_end": 95,
+      "column": 36,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='KeyboardInterrupt', ctx=Load())",
+      "rendered": "KeyboardInterrupt"
+    },
+    {
+      "line_start": 97,
+      "line_end": 97,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='_cancel', ctx=Load()), attr='_ABORT', ctx=Load()), attr='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "_cancel._ABORT.set()"
+    },
+    {
+      "line_start": 98,
+      "line_end": 98,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_cancel', ctx=Load()), attr='_kill_tree', ctx=Load()), args=[Name(id='proc', ctx=Load())], keywords=[])",
+      "rendered": "_cancel._kill_tree(proc)"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='proc', ctx=Load()), attr='communicate', ctx=Load()), args=[], keywords=[keyword(arg='timeout', value=Constant(value=2))])",
+      "rendered": "proc.communicate(timeout=2)"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 105,
+      "line_end": 105,
+      "column": 17,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='_cancel', ctx=Load()), attr='_LIVE_LOCK', ctx=Load())",
+      "rendered": "_cancel._LIVE_LOCK"
+    },
+    {
+      "line_start": 106,
+      "line_end": 106,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='_cancel', ctx=Load()), attr='_LIVE', ctx=Load()), attr='discard', ctx=Load()), args=[Name(id='proc', ctx=Load())], keywords=[])",
+      "rendered": "_cancel._LIVE.discard(proc)"
+    },
+    {
+      "line_start": 108,
+      "line_end": 108,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='subprocess', ctx=Load()), attr='CompletedProcess', ctx=Load()), args=[Attribute(value=Name(id='proc', ctx=Load()), attr='args', ctx=Load()), Attribute(value=Name(id='proc', ctx=Load()), attr='returncode', ctx=Load()), Name(id='out', ctx=Load()), Name(id='err', ctx=Load())], keywords=[])",
+      "rendered": "subprocess.CompletedProcess(proc.args, proc.returncode, out, err)"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 24,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 118,
+      "line_end": 118,
+      "column": 28,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='threading', ctx=Load()), attr='Event', ctx=Load()), args=[], keywords=[])",
+      "rendered": "threading.Event()"
+    },
+    {
+      "line_start": 122,
+      "line_end": 122,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='iter', ctx=Load()), args=[Attribute(value=Name(id='pipe', ctx=Load()), attr='readline', ctx=Load()), Constant(value='')], keywords=[])",
+      "rendered": "iter(pipe.readline, '')"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='chunks', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='line', ctx=Load())], keywords=[])",
+      "rendered": "chunks.append(line)"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='stream_cb', ctx=Load()), args=[Name(id='line', ctx=Load())], keywords=[])",
+      "rendered": "stream_cb(line)"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 128,
+      "line_end": 128,
+      "column": 15,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='should_stop', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='stopped', ctx=Load()), attr='is_set', ctx=Load()), args=[], keywords=[]))])",
+      "rendered": "should_stop is not None and (not stopped.is_set())"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='should_stop', ctx=Load()), args=[Name(id='line', ctx=Load())], keywords=[])",
+      "rendered": "should_stop(line)"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 24,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='stopped', ctx=Load()), attr='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "stopped.set()"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 24,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_cancel', ctx=Load()), attr='_kill_tree', ctx=Load()), args=[Name(id='proc', ctx=Load())], keywords=[])",
+      "rendered": "_cancel._kill_tree(proc)"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='pipe', ctx=Load()), attr='close', ctx=Load()), args=[], keywords=[])",
+      "rendered": "pipe.close()"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 24,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='iter', ctx=Load()), args=[Attribute(value=Name(id='pipe', ctx=Load()), attr='readline', ctx=Load()), Constant(value='')], keywords=[])",
+      "rendered": "iter(pipe.readline, '')"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='err_chunks', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='line', ctx=Load())], keywords=[])",
+      "rendered": "err_chunks.append(line)"
+    },
+    {
+      "line_start": 145,
+      "line_end": 145,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 148,
+      "line_end": 148,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='pipe', ctx=Load()), attr='close', ctx=Load()), args=[], keywords=[])",
+      "rendered": "pipe.close()"
+    },
+    {
+      "line_start": 149,
+      "line_end": 149,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 152,
+      "line_end": 164,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='subprocess', ctx=Load()), attr='Popen', ctx=Load()), args=[Name(id='cmd', ctx=Load())], keywords=[keyword(arg='stdin', value=IfExp(test=Compare(left=Name(id='input', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), body=Attribute(value=Name(id='subprocess', ctx=Load()), attr='PIPE', ctx=Load()), orelse=Constant(value=None))), keyword(arg='stdout', value=Attribute(value=Name(id='subprocess', ctx=Load()), attr='PIPE', ctx=Load())), keyword(arg='stderr', value=Attribute(value=Name(id='subprocess', ctx=Load()), attr='PIPE', ctx=Load())), keyword(arg='text', value=Constant(value=True)), keyword(arg='encoding', value=Constant(value='utf-8')), keyword(arg='errors', value=Constant(value='replace')), keyword(arg='cwd', value=Name(id='cwd', ctx=Load())), keyword(arg='env', value=Name(id='proc_env', ctx=Load())), keyword(arg='bufsize', value=Constant(value=1)), keyword(value=Attribute(value=Name(id='_cancel', ctx=Load()), attr='_NEW_GROUP_KW', ctx=Load()))])",
+      "rendered": "subprocess.Popen(cmd, stdin=subprocess.PIPE if input is not None else None, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace', cwd=cwd, env=proc_env, bufsize=1, **_cancel._NEW_GROUP_KW)"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='_cancel', ctx=Load()), attr='_LIVE_LOCK', ctx=Load())",
+      "rendered": "_cancel._LIVE_LOCK"
+    },
+    {
+      "line_start": 166,
+      "line_end": 166,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='_cancel', ctx=Load()), attr='_LIVE', ctx=Load()), attr='add', ctx=Load()), args=[Name(id='proc', ctx=Load())], keywords=[])",
+      "rendered": "_cancel._LIVE.add(proc)"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='threading', ctx=Load()), attr='Thread', ctx=Load()), args=[], keywords=[keyword(arg='target', value=Name(id='_reader', ctx=Load())), keyword(arg='args', value=Tuple(elts=[Attribute(value=Name(id='proc', ctx=Load()), attr='stdout', ctx=Load())], ctx=Load())), keyword(arg='daemon', value=Constant(value=True))])",
+      "rendered": "threading.Thread(target=_reader, args=(proc.stdout,), daemon=True)"
+    },
+    {
+      "line_start": 168,
+      "line_end": 169,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='threading', ctx=Load()), attr='Thread', ctx=Load()), args=[], keywords=[keyword(arg='target', value=Name(id='_err_reader', ctx=Load())), keyword(arg='args', value=Tuple(elts=[Attribute(value=Name(id='proc', ctx=Load()), attr='stderr', ctx=Load())], ctx=Load())), keyword(arg='daemon', value=Constant(value=True))])",
+      "rendered": "threading.Thread(target=_err_reader, args=(proc.stderr,), daemon=True)"
+    },
+    {
+      "line_start": 170,
+      "line_end": 170,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='reader', ctx=Load()), attr='start', ctx=Load()), args=[], keywords=[])",
+      "rendered": "reader.start()"
+    },
+    {
+      "line_start": 171,
+      "line_end": 171,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='err_thread', ctx=Load()), attr='start', ctx=Load()), args=[], keywords=[])",
+      "rendered": "err_thread.start()"
+    },
+    {
+      "line_start": 173,
+      "line_end": 173,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='input', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "input is not None"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='proc', ctx=Load()), attr='stdin', ctx=Load()), attr='write', ctx=Load()), args=[Name(id='input', ctx=Load())], keywords=[])",
+      "rendered": "proc.stdin.write(input)"
+    },
+    {
+      "line_start": 176,
+      "line_end": 176,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='proc', ctx=Load()), attr='stdin', ctx=Load()), attr='close', ctx=Load()), args=[], keywords=[])",
+      "rendered": "proc.stdin.close()"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='BrokenPipeError', ctx=Load())",
+      "rendered": "BrokenPipeError"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='proc', ctx=Load()), attr='wait', ctx=Load()), args=[], keywords=[keyword(arg='timeout', value=Name(id='timeout', ctx=Load()))])",
+      "rendered": "proc.wait(timeout=timeout)"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 19,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='subprocess', ctx=Load()), attr='TimeoutExpired', ctx=Load())",
+      "rendered": "subprocess.TimeoutExpired"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_cancel', ctx=Load()), attr='_stop_tree', ctx=Load()), args=[Name(id='proc', ctx=Load()), Name(id='TIMEOUT_STOP_GRACE_SECONDS', ctx=Load())], keywords=[])",
+      "rendered": "_cancel._stop_tree(proc, TIMEOUT_STOP_GRACE_SECONDS)"
+    },
+    {
+      "line_start": 183,
+      "line_end": 183,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='reader', ctx=Load()), attr='join', ctx=Load()), args=[], keywords=[keyword(arg='timeout', value=Constant(value=2))])",
+      "rendered": "reader.join(timeout=2)"
+    },
+    {
+      "line_start": 184,
+      "line_end": 184,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='err_thread', ctx=Load()), attr='join', ctx=Load()), args=[], keywords=[keyword(arg='timeout', value=Constant(value=2))])",
+      "rendered": "err_thread.join(timeout=2)"
+    },
+    {
+      "line_start": 185,
+      "line_end": 187,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='subprocess', ctx=Load()), attr='TimeoutExpired', ctx=Load()), args=[Name(id='cmd', ctx=Load()), Name(id='timeout', ctx=Load())], keywords=[keyword(arg='output', value=Call(func=Attribute(value=Constant(value=''), attr='join', ctx=Load()), args=[Name(id='chunks', ctx=Load())], keywords=[])), keyword(arg='stderr', value=Call(func=Attribute(value=Constant(value=''), attr='join', ctx=Load()), args=[Name(id='err_chunks', ctx=Load())], keywords=[]))])",
+      "rendered": "subprocess.TimeoutExpired(cmd, timeout, output=''.join(chunks), stderr=''.join(err_chunks))"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='KeyboardInterrupt', ctx=Load())",
+      "rendered": "KeyboardInterrupt"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='_cancel', ctx=Load()), attr='_ABORT', ctx=Load()), attr='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "_cancel._ABORT.set()"
+    },
+    {
+      "line_start": 190,
+      "line_end": 190,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_cancel', ctx=Load()), attr='_kill_tree', ctx=Load()), args=[Name(id='proc', ctx=Load())], keywords=[])",
+      "rendered": "_cancel._kill_tree(proc)"
+    },
+    {
+      "line_start": 193,
+      "line_end": 193,
+      "column": 17,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='_cancel', ctx=Load()), attr='_LIVE_LOCK', ctx=Load())",
+      "rendered": "_cancel._LIVE_LOCK"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='_cancel', ctx=Load()), attr='_LIVE', ctx=Load()), attr='discard', ctx=Load()), args=[Name(id='proc', ctx=Load())], keywords=[])",
+      "rendered": "_cancel._LIVE.discard(proc)"
+    },
+    {
+      "line_start": 195,
+      "line_end": 195,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='reader', ctx=Load()), attr='join', ctx=Load()), args=[], keywords=[keyword(arg='timeout', value=Constant(value=5))])",
+      "rendered": "reader.join(timeout=5)"
+    },
+    {
+      "line_start": 196,
+      "line_end": 196,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='err_thread', ctx=Load()), attr='join', ctx=Load()), args=[], keywords=[keyword(arg='timeout', value=Constant(value=5))])",
+      "rendered": "err_thread.join(timeout=5)"
+    },
+    {
+      "line_start": 197,
+      "line_end": 198,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='subprocess', ctx=Load()), attr='CompletedProcess', ctx=Load()), args=[Name(id='cmd', ctx=Load()), Attribute(value=Name(id='proc', ctx=Load()), attr='returncode', ctx=Load()), Call(func=Attribute(value=Constant(value=''), attr='join', ctx=Load()), args=[Name(id='chunks', ctx=Load())], keywords=[]), Call(func=Attribute(value=Constant(value=''), attr='join', ctx=Load()), args=[Name(id='err_chunks', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "subprocess.CompletedProcess(cmd, proc.returncode, ''.join(chunks), ''.join(err_chunks))"
+    },
+    {
+      "line_start": 199,
+      "line_end": 199,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='stopped', ctx=Load()), attr='is_set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "stopped.is_set()"
+    },
+    {
+      "line_start": 201,
+      "line_end": 201,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_WATCHDOG_STOPPED', ctx=Load()), attr='add', ctx=Load()), args=[Call(func=Name(id='id', ctx=Load()), args=[Name(id='result', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "_WATCHDOG_STOPPED.add(id(result))"
+    },
+    {
+      "line_start": 202,
+      "line_end": 202,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='result', ctx=Load())",
+      "rendered": "result"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 30,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 211,
+      "line_end": 211,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='id', ctx=Load()), args=[Name(id='result', ctx=Load())], keywords=[])",
+      "rendered": "id(result)"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='key', ctx=Load()), ops=[In()], comparators=[Name(id='_WATCHDOG_STOPPED', ctx=Load())])",
+      "rendered": "key in _WATCHDOG_STOPPED"
+    },
+    {
+      "line_start": 213,
+      "line_end": 213,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_WATCHDOG_STOPPED', ctx=Load()), attr='discard', ctx=Load()), args=[Name(id='key', ctx=Load())], keywords=[])",
+      "rendered": "_WATCHDOG_STOPPED.discard(key)"
+    },
+    {
+      "line_start": 214,
+      "line_end": 214,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 215,
+      "line_end": 215,
+      "column": 11,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 219,
+      "line_end": 219,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='re', ctx=Load()), attr='compile', ctx=Load()), args=[Constant(value='[\\x00-\\x1f\\x7f-\\x9f]')], keywords=[])",
+      "rendered": "re.compile('[\\x00-\\x1f\\x7f-\\x9f]')"
+    },
+    {
+      "line_start": 223,
+      "line_end": 223,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='print', ctx=Load()), args=[Call(func=Attribute(value=Name(id='_TERMINAL_CONTROL_RX', ctx=Load()), attr='sub', ctx=Load()), args=[Constant(value=' '), Name(id='text', ctx=Load())], keywords=[])], keywords=[keyword(arg='file', value=Name(id='out', ctx=Load())), keyword(arg='flush', value=Constant(value=True))])",
+      "rendered": "print(_TERMINAL_CONTROL_RX.sub(' ', text), file=out, flush=True)"
+    },
+    {
+      "line_start": 228,
+      "line_end": 228,
+      "column": 10,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Name(id='out', ctx=Load()), Attribute(value=Name(id='sys', ctx=Load()), attr='stderr', ctx=Load())])",
+      "rendered": "out or sys.stderr"
+    },
+    {
+      "line_start": 229,
+      "line_end": 229,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=BoolOp(op=Or(), values=[Name(id='line', ctx=Load()), Constant(value='')]), attr='strip', ctx=Load()), args=[], keywords=[])",
+      "rendered": "(line or '').strip()"
+    },
+    {
+      "line_start": 230,
+      "line_end": 230,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='line', ctx=Load()))",
+      "rendered": "not line"
+    },
+    {
+      "line_start": 233,
+      "line_end": 233,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='json', ctx=Load()), attr='loads', ctx=Load()), args=[Name(id='line', ctx=Load())], keywords=[])",
+      "rendered": "json.loads(line)"
+    },
+    {
+      "line_start": 234,
+      "line_end": 234,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Attribute(value=Name(id='json', ctx=Load()), attr='JSONDecodeError', ctx=Load()), Name(id='TypeError', ctx=Load())], ctx=Load())",
+      "rendered": "(json.JSONDecodeError, TypeError)"
+    },
+    {
+      "line_start": 236,
+      "line_end": 236,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='evt', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='type')], keywords=[])",
+      "rendered": "evt.get('type')"
+    },
+    {
+      "line_start": 237,
+      "line_end": 237,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='etype', ctx=Load()), ops=[Eq()], comparators=[Constant(value='assistant')])",
+      "rendered": "etype == 'assistant'"
+    },
+    {
+      "line_start": 238,
+      "line_end": 238,
+      "column": 19,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Attribute(value=BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='evt', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='message'), Dict(keys=[], values=[])], keywords=[]), Dict(keys=[], values=[])]), attr='get', ctx=Load()), args=[Constant(value='content'), List(elts=[], ctx=Load())], keywords=[]), List(elts=[], ctx=Load())])",
+      "rendered": "(evt.get('message', {}) or {}).get('content', []) or []"
+    },
+    {
+      "line_start": 239,
+      "line_end": 239,
+      "column": 15,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='blk', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[]))",
+      "rendered": "not isinstance(blk, dict)"
+    },
+    {
+      "line_start": 241,
+      "line_end": 241,
+      "column": 15,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Call(func=Attribute(value=Name(id='blk', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='type')], keywords=[]), ops=[Eq()], comparators=[Constant(value='text')]), Call(func=Attribute(value=Call(func=Attribute(value=Name(id='blk', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='text'), Constant(value='')], keywords=[]), attr='strip', ctx=Load()), args=[], keywords=[])])",
+      "rendered": "blk.get('type') == 'text' and blk.get('text', '').strip()"
+    },
+    {
+      "line_start": 242,
+      "line_end": 242,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_trace_print', ctx=Load()), args=[JoinedStr(values=[Constant(value='    [agent] 💬 '), FormattedValue(value=Subscript(value=Call(func=Name(id='redact', ctx=Load()), args=[Call(func=Attribute(value=Subscript(value=Name(id='blk', ctx=Load()), slice=Constant(value='text'), ctx=Load()), attr='strip', ctx=Load()), args=[], keywords=[])], keywords=[]), slice=Slice(upper=Constant(value=400)), ctx=Load()), conversion=-1)]), Name(id='out', ctx=Load())], keywords=[])",
+      "rendered": "_trace_print(source_template_242_29, out)"
+    },
+    {
+      "line_start": 243,
+      "line_end": 243,
+      "column": 17,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Attribute(value=Name(id='blk', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='type')], keywords=[]), ops=[Eq()], comparators=[Constant(value='tool_use')])",
+      "rendered": "blk.get('type') == 'tool_use'"
+    },
+    {
+      "line_start": 244,
+      "line_end": 244,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='blk', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='name'), Constant(value='?')], keywords=[])",
+      "rendered": "blk.get('name', '?')"
+    },
+    {
+      "line_start": 245,
+      "line_end": 245,
+      "column": 23,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='blk', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='input'), Dict(keys=[], values=[])], keywords=[]), Dict(keys=[], values=[])])",
+      "rendered": "blk.get('input', {}) or {}"
+    },
+    {
+      "line_start": 246,
+      "line_end": 246,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Constant(value=', '), attr='join', ctx=Load()), args=[GeneratorExp(elt=JoinedStr(values=[FormattedValue(value=Name(id='k', ctx=Load()), conversion=-1), Constant(value='='), FormattedValue(value=Name(id='v', ctx=Load()), conversion=114)]), generators=[comprehension(target=Tuple(elts=[Name(id='k', ctx=Store()), Name(id='v', ctx=Store())], ctx=Store()), iter=Call(func=Attribute(value=Name(id='args', ctx=Load()), attr='items', ctx=Load()), args=[], keywords=[]), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "', '.join((source_template_246_33 for k, v in args.items()))"
+    },
+    {
+      "line_start": 247,
+      "line_end": 247,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='redact', ctx=Load()), args=[Name(id='summ', ctx=Load())], keywords=[])",
+      "rendered": "redact(summ)"
+    },
+    {
+      "line_start": 248,
+      "line_end": 248,
+      "column": 19,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='summ', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Constant(value=160)])",
+      "rendered": "len(summ) > 160"
+    },
+    {
+      "line_start": 249,
+      "line_end": 249,
+      "column": 27,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Subscript(value=Name(id='summ', ctx=Load()), slice=Slice(upper=Constant(value=157)), ctx=Load()), op=Add(), right=Constant(value='...'))",
+      "rendered": "summ[:157] + '...'"
+    },
+    {
+      "line_start": 250,
+      "line_end": 250,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_trace_print', ctx=Load()), args=[JoinedStr(values=[Constant(value='    [agent] 🔧 '), FormattedValue(value=Name(id='name', ctx=Load()), conversion=-1), Constant(value='('), FormattedValue(value=Name(id='summ', ctx=Load()), conversion=-1), Constant(value=')')]), Name(id='out', ctx=Load())], keywords=[])",
+      "rendered": "_trace_print(source_template_250_29, out)"
+    },
+    {
+      "line_start": 251,
+      "line_end": 251,
+      "column": 9,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='etype', ctx=Load()), ops=[Eq()], comparators=[Constant(value='user')])",
+      "rendered": "etype == 'user'"
+    },
+    {
+      "line_start": 253,
+      "line_end": 253,
+      "column": 19,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Attribute(value=BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='evt', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='message'), Dict(keys=[], values=[])], keywords=[]), Dict(keys=[], values=[])]), attr='get', ctx=Load()), args=[Constant(value='content'), List(elts=[], ctx=Load())], keywords=[]), List(elts=[], ctx=Load())])",
+      "rendered": "(evt.get('message', {}) or {}).get('content', []) or []"
+    },
+    {
+      "line_start": 254,
+      "line_end": 254,
+      "column": 15,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='blk', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[]), Compare(left=Call(func=Attribute(value=Name(id='blk', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='type')], keywords=[]), ops=[Eq()], comparators=[Constant(value='tool_result')])])",
+      "rendered": "isinstance(blk, dict) and blk.get('type') == 'tool_result'"
+    },
+    {
+      "line_start": 255,
+      "line_end": 255,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='blk', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='content')], keywords=[])",
+      "rendered": "blk.get('content')"
+    },
+    {
+      "line_start": 256,
+      "line_end": 256,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='content', ctx=Load()), Name(id='list', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(content, list)"
+    },
+    {
+      "line_start": 257,
+      "line_end": 259,
+      "column": 30,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Constant(value=' '), attr='join', ctx=Load()), args=[GeneratorExp(elt=Call(func=Attribute(value=Name(id='c', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='text'), Constant(value='')], keywords=[]), generators=[comprehension(target=Name(id='c', ctx=Store()), iter=Name(id='content', ctx=Load()), ifs=[Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='c', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[])], is_async=0)])], keywords=[])",
+      "rendered": "' '.join((c.get('text', '') for c in content if isinstance(c, dict)))"
+    },
+    {
+      "line_start": 260,
+      "line_end": 260,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='len', ctx=Load()), args=[Call(func=Name(id='str', ctx=Load()), args=[BoolOp(op=Or(), values=[Name(id='content', ctx=Load()), Constant(value='')])], keywords=[])], keywords=[])",
+      "rendered": "len(str(content or ''))"
+    },
+    {
+      "line_start": 261,
+      "line_end": 261,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_trace_print', ctx=Load()), args=[JoinedStr(values=[Constant(value='    [agent] ↩ tool result ('), FormattedValue(value=Name(id='n', ctx=Load()), conversion=-1), Constant(value=' chars)')]), Name(id='out', ctx=Load())], keywords=[])",
+      "rendered": "_trace_print(source_template_261_29, out)"
+    },
+    {
+      "line_start": 262,
+      "line_end": 262,
+      "column": 9,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='etype', ctx=Load()), ops=[Eq()], comparators=[Constant(value='result')])",
+      "rendered": "etype == 'result'"
+    },
+    {
+      "line_start": 263,
+      "line_end": 263,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='evt', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='is_error')], keywords=[])",
+      "rendered": "evt.get('is_error')"
+    },
+    {
+      "line_start": 264,
+      "line_end": 266,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_trace_print', ctx=Load()), args=[JoinedStr(values=[Constant(value='    [agent] ✗ '), FormattedValue(value=Subscript(value=Call(func=Name(id='redact', ctx=Load()), args=[Call(func=Name(id='str', ctx=Load()), args=[BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='evt', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='result')], keywords=[]), Call(func=Attribute(value=Name(id='evt', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='error')], keywords=[]), Constant(value='')])], keywords=[])], keywords=[]), slice=Slice(upper=Constant(value=200)), ctx=Load()), conversion=-1)]), Name(id='out', ctx=Load())], keywords=[])",
+      "rendered": "_trace_print(source_template_265_16, out)"
+    }
+  ],
+  "calls": [
+    {
+      "line": 34,
+      "end_line": 34,
+      "callee": "logs.get_logger",
+      "enclosing": "module initialization",
+      "expression": "logs.get_logger(__name__)"
+    },
+    {
+      "line": 206,
+      "end_line": 206,
+      "callee": "set",
+      "enclosing": "module initialization",
+      "expression": "set()"
+    },
+    {
+      "line": 219,
+      "end_line": 219,
+      "callee": "re.compile",
+      "enclosing": "module initialization",
+      "expression": "re.compile(\"[\\x00-\\x1f\\x7f-\\x9f]\")"
+    },
+    {
+      "line": 54,
+      "end_line": 54,
+      "callee": "time.monotonic",
+      "enclosing": "_run",
+      "expression": "time.monotonic()"
+    },
+    {
+      "line": 119,
+      "end_line": 119,
+      "callee": "threading.Event",
+      "enclosing": "_run_streaming",
+      "expression": "threading.Event()"
+    },
+    {
+      "line": 197,
+      "end_line": 198,
+      "callee": "subprocess.CompletedProcess",
+      "enclosing": "_run_streaming",
+      "expression": "subprocess.CompletedProcess(cmd, proc.returncode, \"\".join(chunks),\n                                         \"\".join(err_chunks))"
+    },
+    {
+      "line": 199,
+      "end_line": 199,
+      "callee": "stopped.is_set",
+      "enclosing": "_run_streaming",
+      "expression": "stopped.is_set()"
+    },
+    {
+      "line": 211,
+      "end_line": 211,
+      "callee": "id",
+      "enclosing": "_was_stopped",
+      "expression": "id(result)"
+    },
+    {
+      "line": 223,
+      "end_line": 223,
+      "callee": "print",
+      "enclosing": "_trace_print",
+      "expression": "print(_TERMINAL_CONTROL_RX.sub(\" \", text), file=out, flush=True)"
+    },
+    {
+      "line": 229,
+      "end_line": 229,
+      "callee": "(line or '').strip",
+      "enclosing": "stream_trace",
+      "expression": "(line or \"\").strip()"
+    },
+    {
+      "line": 236,
+      "end_line": 236,
+      "callee": "evt.get",
+      "enclosing": "stream_trace",
+      "expression": "evt.get(\"type\")"
+    },
+    {
+      "line": 49,
+      "end_line": 52,
+      "callee": "_run_streaming",
+      "enclosing": "_run",
+      "expression": "_run_streaming(cmd, input=input, cwd=cwd, timeout=timeout,\n                              proc_env=proc_env,\n                              stream_cb=stream_cb or (lambda _line: None),\n                              should_stop=should_stop)"
+    },
+    {
+      "line": 58,
+      "end_line": 69,
+      "callee": "subprocess.Popen",
+      "enclosing": "_run",
+      "expression": "subprocess.Popen(\n        cmd,\n        stdin=subprocess.PIPE if input is not None else None,\n        stdout=subprocess.PIPE,\n        stderr=subprocess.PIPE,\n        text=True,\n        encoding=\"utf-8\",\n        errors=\"replace\",\n        cwd=cwd,\n        env=proc_env,\n        **_cancel._NEW_GROUP_KW,\n    )"
+    },
+    {
+      "line": 108,
+      "end_line": 108,
+      "callee": "subprocess.CompletedProcess",
+      "enclosing": "_run",
+      "expression": "subprocess.CompletedProcess(proc.args, proc.returncode, out, err)"
+    },
+    {
+      "line": 122,
+      "end_line": 122,
+      "callee": "iter",
+      "enclosing": "_run_streaming._reader",
+      "expression": "iter(pipe.readline, \"\")"
+    },
+    {
+      "line": 152,
+      "end_line": 164,
+      "callee": "subprocess.Popen",
+      "enclosing": "_run_streaming",
+      "expression": "subprocess.Popen(\n        cmd,\n        stdin=subprocess.PIPE if input is not None else None,\n        stdout=subprocess.PIPE,\n        stderr=subprocess.PIPE,\n        text=True,\n        encoding=\"utf-8\",\n        errors=\"replace\",\n        cwd=cwd,\n        env=proc_env,\n        bufsize=1,  # line-buffered\n        **_cancel._NEW_GROUP_KW,\n    )"
+    },
+    {
+      "line": 167,
+      "end_line": 167,
+      "callee": "threading.Thread",
+      "enclosing": "_run_streaming",
+      "expression": "threading.Thread(target=_reader, args=(proc.stdout,), daemon=True)"
+    },
+    {
+      "line": 168,
+      "end_line": 169,
+      "callee": "threading.Thread",
+      "enclosing": "_run_streaming",
+      "expression": "threading.Thread(target=_err_reader, args=(proc.stderr,),\n                                      daemon=True)"
+    },
+    {
+      "line": 170,
+      "end_line": 170,
+      "callee": "reader.start",
+      "enclosing": "_run_streaming",
+      "expression": "reader.start()"
+    },
+    {
+      "line": 171,
+      "end_line": 171,
+      "callee": "err_thread.start",
+      "enclosing": "_run_streaming",
+      "expression": "err_thread.start()"
+    },
+    {
+      "line": 195,
+      "end_line": 195,
+      "callee": "reader.join",
+      "enclosing": "_run_streaming",
+      "expression": "reader.join(timeout=5)"
+    },
+    {
+      "line": 196,
+      "end_line": 196,
+      "callee": "err_thread.join",
+      "enclosing": "_run_streaming",
+      "expression": "err_thread.join(timeout=5)"
+    },
+    {
+      "line": 197,
+      "end_line": 197,
+      "callee": "''.join",
+      "enclosing": "_run_streaming",
+      "expression": "\"\".join(chunks)"
+    },
+    {
+      "line": 198,
+      "end_line": 198,
+      "callee": "''.join",
+      "enclosing": "_run_streaming",
+      "expression": "\"\".join(err_chunks)"
+    },
+    {
+      "line": 201,
+      "end_line": 201,
+      "callee": "_WATCHDOG_STOPPED.add",
+      "enclosing": "_run_streaming",
+      "expression": "_WATCHDOG_STOPPED.add(id(result))"
+    },
+    {
+      "line": 213,
+      "end_line": 213,
+      "callee": "_WATCHDOG_STOPPED.discard",
+      "enclosing": "_was_stopped",
+      "expression": "_WATCHDOG_STOPPED.discard(key)"
+    },
+    {
+      "line": 223,
+      "end_line": 223,
+      "callee": "_TERMINAL_CONTROL_RX.sub",
+      "enclosing": "_trace_print",
+      "expression": "_TERMINAL_CONTROL_RX.sub(\" \", text)"
+    },
+    {
+      "line": 233,
+      "end_line": 233,
+      "callee": "json.loads",
+      "enclosing": "stream_trace",
+      "expression": "json.loads(line)"
+    },
+    {
+      "line": 71,
+      "end_line": 71,
+      "callee": "_cancel._LIVE.add",
+      "enclosing": "_run",
+      "expression": "_cancel._LIVE.add(proc)"
+    },
+    {
+      "line": 123,
+      "end_line": 123,
+      "callee": "chunks.append",
+      "enclosing": "_run_streaming._reader",
+      "expression": "chunks.append(line)"
+    },
+    {
+      "line": 136,
+      "end_line": 136,
+      "callee": "pipe.close",
+      "enclosing": "_run_streaming._reader",
+      "expression": "pipe.close()"
+    },
+    {
+      "line": 143,
+      "end_line": 143,
+      "callee": "iter",
+      "enclosing": "_run_streaming._err_reader",
+      "expression": "iter(pipe.readline, \"\")"
+    },
+    {
+      "line": 148,
+      "end_line": 148,
+      "callee": "pipe.close",
+      "enclosing": "_run_streaming._err_reader",
+      "expression": "pipe.close()"
+    },
+    {
+      "line": 166,
+      "end_line": 166,
+      "callee": "_cancel._LIVE.add",
+      "enclosing": "_run_streaming",
+      "expression": "_cancel._LIVE.add(proc)"
+    },
+    {
+      "line": 201,
+      "end_line": 201,
+      "callee": "id",
+      "enclosing": "_run_streaming",
+      "expression": "id(result)"
+    },
+    {
+      "line": 238,
+      "end_line": 238,
+      "callee": "(evt.get('message', {}) or {}).get",
+      "enclosing": "stream_trace",
+      "expression": "(evt.get(\"message\", {}) or {}).get(\"content\", [])"
+    },
+    {
+      "line": 74,
+      "end_line": 74,
+      "callee": "_cancel._ABORT.is_set",
+      "enclosing": "_run",
+      "expression": "_cancel._ABORT.is_set()"
+    },
+    {
+      "line": 97,
+      "end_line": 97,
+      "callee": "_cancel._ABORT.set",
+      "enclosing": "_run",
+      "expression": "_cancel._ABORT.set()"
+    },
+    {
+      "line": 98,
+      "end_line": 98,
+      "callee": "_cancel._kill_tree",
+      "enclosing": "_run",
+      "expression": "_cancel._kill_tree(proc)"
+    },
+    {
+      "line": 106,
+      "end_line": 106,
+      "callee": "_cancel._LIVE.discard",
+      "enclosing": "_run",
+      "expression": "_cancel._LIVE.discard(proc)"
+    },
+    {
+      "line": 125,
+      "end_line": 125,
+      "callee": "stream_cb",
+      "enclosing": "_run_streaming._reader",
+      "expression": "stream_cb(line)"
+    },
+    {
+      "line": 144,
+      "end_line": 144,
+      "callee": "err_chunks.append",
+      "enclosing": "_run_streaming._err_reader",
+      "expression": "err_chunks.append(line)"
+    },
+    {
+      "line": 180,
+      "end_line": 180,
+      "callee": "proc.wait",
+      "enclosing": "_run_streaming",
+      "expression": "proc.wait(timeout=timeout)"
+    },
+    {
+      "line": 189,
+      "end_line": 189,
+      "callee": "_cancel._ABORT.set",
+      "enclosing": "_run_streaming",
+      "expression": "_cancel._ABORT.set()"
+    },
+    {
+      "line": 190,
+      "end_line": 190,
+      "callee": "_cancel._kill_tree",
+      "enclosing": "_run_streaming",
+      "expression": "_cancel._kill_tree(proc)"
+    },
+    {
+      "line": 194,
+      "end_line": 194,
+      "callee": "_cancel._LIVE.discard",
+      "enclosing": "_run_streaming",
+      "expression": "_cancel._LIVE.discard(proc)"
+    },
+    {
+      "line": 239,
+      "end_line": 239,
+      "callee": "isinstance",
+      "enclosing": "stream_trace",
+      "expression": "isinstance(blk, dict)"
+    },
+    {
+      "line": 241,
+      "end_line": 241,
+      "callee": "blk.get('text', '').strip",
+      "enclosing": "stream_trace",
+      "expression": "blk.get(\"text\", \"\").strip()"
+    },
+    {
+      "line": 242,
+      "end_line": 242,
+      "callee": "_trace_print",
+      "enclosing": "stream_trace",
+      "expression": "_trace_print(f\"    [agent] 💬 {redact(blk['text'].strip())[:400]}\", out)"
+    },
+    {
+      "line": 253,
+      "end_line": 253,
+      "callee": "(evt.get('message', {}) or {}).get",
+      "enclosing": "stream_trace",
+      "expression": "(evt.get(\"message\", {}) or {}).get(\"content\", [])"
+    },
+    {
+      "line": 263,
+      "end_line": 263,
+      "callee": "evt.get",
+      "enclosing": "stream_trace",
+      "expression": "evt.get(\"is_error\")"
+    },
+    {
+      "line": 75,
+      "end_line": 75,
+      "callee": "_cancel._kill_tree",
+      "enclosing": "_run",
+      "expression": "_cancel._kill_tree(proc)"
+    },
+    {
+      "line": 76,
+      "end_line": 76,
+      "callee": "proc.communicate",
+      "enclosing": "_run",
+      "expression": "proc.communicate()"
+    },
+    {
+      "line": 77,
+      "end_line": 77,
+      "callee": "RuntimeError",
+      "enclosing": "_run",
+      "expression": "RuntimeError(\"aborted by user (Ctrl-C)\")"
+    },
+    {
+      "line": 78,
+      "end_line": 78,
+      "callee": "time.monotonic",
+      "enclosing": "_run",
+      "expression": "time.monotonic()"
+    },
+    {
+      "line": 80,
+      "end_line": 80,
+      "callee": "_cancel._stop_tree",
+      "enclosing": "_run",
+      "expression": "_cancel._stop_tree(proc, TIMEOUT_STOP_GRACE_SECONDS)"
+    },
+    {
+      "line": 81,
+      "end_line": 81,
+      "callee": "proc.communicate",
+      "enclosing": "_run",
+      "expression": "proc.communicate()"
+    },
+    {
+      "line": 82,
+      "end_line": 82,
+      "callee": "subprocess.TimeoutExpired",
+      "enclosing": "_run",
+      "expression": "subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)"
+    },
+    {
+      "line": 85,
+      "end_line": 88,
+      "callee": "proc.communicate",
+      "enclosing": "_run",
+      "expression": "proc.communicate(\n                        input=pending_input,\n                        timeout=min(float(heartbeat_interval), remaining),\n                    )"
+    },
+    {
+      "line": 100,
+      "end_line": 100,
+      "callee": "proc.communicate",
+      "enclosing": "_run",
+      "expression": "proc.communicate(timeout=2)"
+    },
+    {
+      "line": 128,
+      "end_line": 128,
+      "callee": "stopped.is_set",
+      "enclosing": "_run_streaming._reader",
+      "expression": "stopped.is_set()"
+    },
+    {
+      "line": 130,
+      "end_line": 130,
+      "callee": "should_stop",
+      "enclosing": "_run_streaming._reader",
+      "expression": "should_stop(line)"
+    },
+    {
+      "line": 175,
+      "end_line": 175,
+      "callee": "proc.stdin.write",
+      "enclosing": "_run_streaming",
+      "expression": "proc.stdin.write(input)"
+    },
+    {
+      "line": 176,
+      "end_line": 176,
+      "callee": "proc.stdin.close",
+      "enclosing": "_run_streaming",
+      "expression": "proc.stdin.close()"
+    },
+    {
+      "line": 182,
+      "end_line": 182,
+      "callee": "_cancel._stop_tree",
+      "enclosing": "_run_streaming",
+      "expression": "_cancel._stop_tree(proc, TIMEOUT_STOP_GRACE_SECONDS)"
+    },
+    {
+      "line": 183,
+      "end_line": 183,
+      "callee": "reader.join",
+      "enclosing": "_run_streaming",
+      "expression": "reader.join(timeout=2)"
+    },
+    {
+      "line": 184,
+      "end_line": 184,
+      "callee": "err_thread.join",
+      "enclosing": "_run_streaming",
+      "expression": "err_thread.join(timeout=2)"
+    },
+    {
+      "line": 185,
+      "end_line": 187,
+      "callee": "subprocess.TimeoutExpired",
+      "enclosing": "_run_streaming",
+      "expression": "subprocess.TimeoutExpired(\n                    cmd, timeout, output=\"\".join(chunks),\n                    stderr=\"\".join(err_chunks))"
+    },
+    {
+      "line": 241,
+      "end_line": 241,
+      "callee": "blk.get",
+      "enclosing": "stream_trace",
+      "expression": "blk.get(\"type\")"
+    },
+    {
+      "line": 243,
+      "end_line": 243,
+      "callee": "blk.get",
+      "enclosing": "stream_trace",
+      "expression": "blk.get(\"type\")"
+    },
+    {
+      "line": 244,
+      "end_line": 244,
+      "callee": "blk.get",
+      "enclosing": "stream_trace",
+      "expression": "blk.get(\"name\", \"?\")"
+    },
+    {
+      "line": 246,
+      "end_line": 246,
+      "callee": "', '.join",
+      "enclosing": "stream_trace",
+      "expression": "\", \".join(f\"{k}={v!r}\" for k, v in args.items())"
+    },
+    {
+      "line": 247,
+      "end_line": 247,
+      "callee": "redact",
+      "enclosing": "stream_trace",
+      "expression": "redact(summ)"
+    },
+    {
+      "line": 250,
+      "end_line": 250,
+      "callee": "_trace_print",
+      "enclosing": "stream_trace",
+      "expression": "_trace_print(f\"    [agent] 🔧 {name}({summ})\", out)"
+    },
+    {
+      "line": 254,
+      "end_line": 254,
+      "callee": "isinstance",
+      "enclosing": "stream_trace",
+      "expression": "isinstance(blk, dict)"
+    },
+    {
+      "line": 255,
+      "end_line": 255,
+      "callee": "blk.get",
+      "enclosing": "stream_trace",
+      "expression": "blk.get(\"content\")"
+    },
+    {
+      "line": 256,
+      "end_line": 256,
+      "callee": "isinstance",
+      "enclosing": "stream_trace",
+      "expression": "isinstance(content, list)"
+    },
+    {
+      "line": 260,
+      "end_line": 260,
+      "callee": "len",
+      "enclosing": "stream_trace",
+      "expression": "len(str(content or \"\"))"
+    },
+    {
+      "line": 261,
+      "end_line": 261,
+      "callee": "_trace_print",
+      "enclosing": "stream_trace",
+      "expression": "_trace_print(f\"    [agent] ↩ tool result ({n} chars)\", out)"
+    },
+    {
+      "line": 264,
+      "end_line": 266,
+      "callee": "_trace_print",
+      "enclosing": "stream_trace",
+      "expression": "_trace_print(\n                f\"    [agent] ✗ {redact(str(evt.get('result') or evt.get('error') or ''))[:200]}\",\n                out)"
+    },
+    {
+      "line": 131,
+      "end_line": 131,
+      "callee": "stopped.set",
+      "enclosing": "_run_streaming._reader",
+      "expression": "stopped.set()"
+    },
+    {
+      "line": 132,
+      "end_line": 132,
+      "callee": "_cancel._kill_tree",
+      "enclosing": "_run_streaming._reader",
+      "expression": "_cancel._kill_tree(proc)"
+    },
+    {
+      "line": 238,
+      "end_line": 238,
+      "callee": "evt.get",
+      "enclosing": "stream_trace",
+      "expression": "evt.get(\"message\", {})"
+    },
+    {
+      "line": 241,
+      "end_line": 241,
+      "callee": "blk.get",
+      "enclosing": "stream_trace",
+      "expression": "blk.get(\"text\", \"\")"
+    },
+    {
+      "line": 245,
+      "end_line": 245,
+      "callee": "blk.get",
+      "enclosing": "stream_trace",
+      "expression": "blk.get(\"input\", {})"
+    },
+    {
+      "line": 248,
+      "end_line": 248,
+      "callee": "len",
+      "enclosing": "stream_trace",
+      "expression": "len(summ)"
+    },
+    {
+      "line": 254,
+      "end_line": 254,
+      "callee": "blk.get",
+      "enclosing": "stream_trace",
+      "expression": "blk.get(\"type\")"
+    },
+    {
+      "line": 257,
+      "end_line": 259,
+      "callee": "' '.join",
+      "enclosing": "stream_trace",
+      "expression": "\" \".join(\n                        c.get(\"text\", \"\") for c in content\n                        if isinstance(c, dict))"
+    },
+    {
+      "line": 260,
+      "end_line": 260,
+      "callee": "str",
+      "enclosing": "stream_trace",
+      "expression": "str(content or \"\")"
+    },
+    {
+      "line": 87,
+      "end_line": 87,
+      "callee": "min",
+      "enclosing": "_run",
+      "expression": "min(float(heartbeat_interval), remaining)"
+    },
+    {
+      "line": 92,
+      "end_line": 92,
+      "callee": "int",
+      "enclosing": "_run",
+      "expression": "int(time.monotonic() - start)"
+    },
+    {
+      "line": 93,
+      "end_line": 94,
+      "callee": "console.write",
+      "enclosing": "_run",
+      "expression": "console.write(\n                            f\"    [cli] {heartbeat_label} still running... {elapsed}s elapsed\")"
+    },
+    {
+      "line": 186,
+      "end_line": 186,
+      "callee": "''.join",
+      "enclosing": "_run_streaming",
+      "expression": "\"\".join(chunks)"
+    },
+    {
+      "line": 187,
+      "end_line": 187,
+      "callee": "''.join",
+      "enclosing": "_run_streaming",
+      "expression": "\"\".join(err_chunks)"
+    },
+    {
+      "line": 253,
+      "end_line": 253,
+      "callee": "evt.get",
+      "enclosing": "stream_trace",
+      "expression": "evt.get(\"message\", {})"
+    },
+    {
+      "line": 87,
+      "end_line": 87,
+      "callee": "float",
+      "enclosing": "_run",
+      "expression": "float(heartbeat_interval)"
+    },
+    {
+      "line": 242,
+      "end_line": 242,
+      "callee": "redact",
+      "enclosing": "stream_trace",
+      "expression": "redact(blk['text'].strip())"
+    },
+    {
+      "line": 246,
+      "end_line": 246,
+      "callee": "args.items",
+      "enclosing": "stream_trace",
+      "expression": "args.items()"
+    },
+    {
+      "line": 258,
+      "end_line": 258,
+      "callee": "c.get",
+      "enclosing": "stream_trace",
+      "expression": "c.get(\"text\", \"\")"
+    },
+    {
+      "line": 92,
+      "end_line": 92,
+      "callee": "time.monotonic",
+      "enclosing": "_run",
+      "expression": "time.monotonic()"
+    },
+    {
+      "line": 242,
+      "end_line": 242,
+      "callee": "blk['text'].strip",
+      "enclosing": "stream_trace",
+      "expression": "blk['text'].strip()"
+    },
+    {
+      "line": 259,
+      "end_line": 259,
+      "callee": "isinstance",
+      "enclosing": "stream_trace",
+      "expression": "isinstance(c, dict)"
+    },
+    {
+      "line": 265,
+      "end_line": 265,
+      "callee": "redact",
+      "enclosing": "stream_trace",
+      "expression": "redact(str(evt.get('result') or evt.get('error') or ''))"
+    },
+    {
+      "line": 265,
+      "end_line": 265,
+      "callee": "str",
+      "enclosing": "stream_trace",
+      "expression": "str(evt.get('result') or evt.get('error') or '')"
+    },
+    {
+      "line": 265,
+      "end_line": 265,
+      "callee": "evt.get",
+      "enclosing": "stream_trace",
+      "expression": "evt.get('result')"
+    },
+    {
+      "line": 265,
+      "end_line": 265,
+      "callee": "evt.get",
+      "enclosing": "stream_trace",
+      "expression": "evt.get('error')"
+    }
+  ],
+  "imports": [
+    {
+      "line": 16,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 18,
+      "source_expression": "import json",
+      "targets": [
+        "json"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "import os",
+      "targets": [
+        "os"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "import re",
+      "targets": [
+        "re"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "import subprocess",
+      "targets": [
+        "subprocess"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "import sys",
+      "targets": [
+        "sys"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 23,
+      "source_expression": "import threading",
+      "targets": [
+        "threading"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 24,
+      "source_expression": "import time",
+      "targets": [
+        "time"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 26,
+      "source_expression": "from vvaharness.backends.llm.cli import cancel as _cancel",
+      "targets": [
+        "vvaharness.backends.llm.cli",
+        "vvaharness.backends.llm.cli.cancel"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/llm/cli/__init__.py",
+        "vvaharness/backends/llm/cli/cancel.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 27,
+      "source_expression": "from vvaharness.backends.llm.cli import env as _env",
+      "targets": [
+        "vvaharness.backends.llm.cli",
+        "vvaharness.backends.llm.cli.env"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/llm/cli/__init__.py",
+        "vvaharness/backends/llm/cli/env.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 28,
+      "source_expression": "from vvaharness.backends.llm.models import TIMEOUT_STOP_GRACE_SECONDS",
+      "targets": [
+        "vvaharness.backends.llm.models",
+        "vvaharness.backends.llm.models.TIMEOUT_STOP_GRACE_SECONDS"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/llm/models.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 31,
+      "source_expression": "from vvaharness.report.redact import redact",
+      "targets": [
+        "vvaharness.report.redact",
+        "vvaharness.report.redact.redact"
+      ],
+      "local_source_paths": [
+        "vvaharness/report/redact.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 32,
+      "source_expression": "from vvaharness.util import console, logs",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.console",
+        "vvaharness.util.logs"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/console.py",
+        "vvaharness/util/logs.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

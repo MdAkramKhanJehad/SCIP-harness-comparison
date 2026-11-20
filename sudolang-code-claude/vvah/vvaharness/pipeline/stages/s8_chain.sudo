@@ -1,0 +1,164 @@
+# vvaharness/pipeline/stages/s8_chain.py
+
+Stage 8, chain analysis and report assembly. A deterministic ranking floor (`s8.outcomes.deterministic_report`) is always computable. On top of it, one model call may rank findings by chaining opportunity and propose chains; every model output is re-checked by code during hydration (`s8.outcomes.hydrate_report`). Any failure of the model enrichment still ships the ranked report, marked degraded.
+
+Source: `vvaharness/pipeline/stages/s8_chain.py` (lines 1-275)
+Executor: mixed
+Called from: `vvaharness/orchestrator/scan.py` scan_repo (Stage 8, `s8_chain.run(canonical, ctx, cfg, dropped=all_dropped, raw_findings_count=raw_count, metrics=metrics)`)
+
+// src: vvaharness/pipeline/stages/s8_chain.py:55
+_RANKED_INVALID = "s8_ranked_findings_entry_invalid"   // counter name of salvaged-away ranking entries
+
+// src: vvaharness/pipeline/stages/s8_chain.py:147-275
+fn run(findings, ctx, cfg, dropped?, raw_findings_count=0, metrics?):executor=mixed {
+  dropped = dropped or []
+
+  // src: s8_chain.py:152-170 — no findings: "read nothing" and "found nothing" get different summaries
+  if (findings is empty) {
+    empty = metrics != null && !metrics.total_files_in_scope
+    return FinalReport(repo_root=ctx.repo_root, findings=[], chains=[], dropped, raw_findings_count, metrics,
+      summary = if (empty) "0 files analysed — no conclusion can be drawn about this repository; check the S1 file inventory and exclusions."
+                else "No findings survived adversarial verification.",
+      degraded=empty, enrichment_unavailable=empty,
+      degraded_reason = if (empty) "scope was empty: 0 files reached analysis" else "")
+  }
+
+  // src: s8_chain.py:172-180 — window selection must never fail the stage
+  try window = s8.window.select_window(findings, ctx, cfg);
+  catch error => {
+    warn S8_WINDOW_SELECTION_FAILED
+    errlog.log("s8", "chain-window", error, recovered=true)
+    window = all indices 0..length(findings)-1   // falls back to the un-windowed call
+  }
+  // src: s8_chain.py:181-187
+  if (window is empty) {
+    return s8.outcomes.deterministic_report(ctx, findings, dropped, raw_findings_count, metrics,
+      enrichment_failure="prompt_token_budget admits no findings into the enrichment window")   // a model that saw zero findings must not author the report
+  }
+  sub = findings at window
+  labels = for each i in window: "f$i"   // ORIGINAL ids, so a windowed reply resolves against the full list
+
+  // src: s8_chain.py:191-202 — the model call, with one half-window retry on an at-cap clip
+  try [raw, window, labels, invalid0] = _chain_call_with_half_window_retry(sub, labels, window, findings, ctx, cfg);
+  catch error => {
+    if (is_halt_error(error)) throw error
+    warn S8_CALL_FAILED; errlog.log("s8", "chain", error)
+    return s8.outcomes.deterministic_report(ctx, findings, dropped, raw_findings_count, metrics,
+      enrichment_failure=_enrichment_failure_text(error))
+  }
+  windowed = length(window) < length(findings)
+
+  // src: s8_chain.py:205-206 — raw reply persisted (redacted) BEFORE parsing
+  _persist_raw(raw or "", "_s8_raw.txt")
+
+  // src: s8_chain.py:208-231 — parse, with one json-repair re-ask
+  try data = s8.outcomes.parse_chain_reply(raw);
+  catch (ValueError or TypeError) error => {
+    invalid0 = COUNTERS.get(_RANKED_INVALID)   // the discarded reply's validation must not count against the repaired one
+    [repaired, repaired_raw, repair_extra] = _json_repair(raw, error, ctx, cfg)
+    if (repaired == null) {
+      safe_raw = if (raw is a string) redact(raw) else ""   // redact BEFORE the slice
+      head = first 500 characters of safe_raw, newlines escaped
+      tail = last 200 characters of safe_raw, newlines escaped
+      warn S8_RESPONSE_UNPARSEABLE
+      errlog.log("s8", "chain", error, raw_head=head, raw_tail=tail, ...repair_extra)   // ONE row about the original reply
+      // abstracted: console echo of head and tail
+      return s8.outcomes.deterministic_report(ctx, findings, dropped, raw_findings_count, metrics,
+        enrichment_failure="reply unparseable (${ _redacted_err(error) })")
+    }
+    data = repaired
+    raw = repaired_raw   // later rows quote the reply that shipped
+  }
+
+  // src: s8_chain.py:233-247 — hydration; ranked_finding stamps severity in place, so it is restored on failure
+  original_severity = { identity of f: f.severity for each f in findings }
+  try [report, covered] = s8.outcomes.hydrate_report(data, ctx, findings, dropped, raw_findings_count, metrics,
+        window = if (windowed) set(window) else null, cfg=cfg);
+  catch error => {
+    for each f in findings, f.severity = original_severity[identity of f];
+    warn S8_HYDRATION_FAILED; errlog.log("s8", "chain-hydrate", error)
+    return s8.outcomes.deterministic_report(ctx, findings, dropped, raw_findings_count, metrics,
+      enrichment_failure="hydration failed (${ _redacted_err(error) })")
+  }
+
+  // src: s8_chain.py:249-251 — a windowed model saw only part of the report
+  if (windowed) report.summary = "${report.summary}\n\n${ s8.outcomes.templated_summary(report.findings) }"
+
+  // src: s8_chain.py:253-270 — sparse ranking is by design; data loss is logged
+  if (length(covered) < length(window)) {
+    missing = length(window) - length(covered)
+    msg = "chain reply ranked ${length(covered)}/${length(window)} findings it was shown; $missing ship unranked"
+    nothing_dropped = length(data.ranked_findings) == length(covered) && COUNTERS.get(_RANKED_INVALID) == invalid0
+    if (nothing_dropped) {
+      COUNTERS.bump("s8_sparse_ranking_recovered")   // console: "sparse ranking (by design); shipping unranked"
+    } else {
+      warn S8_NO_RANKED_FINDINGS
+      errlog.log("s8", "chain", msg, raw_head=first 500 characters of redact(raw), newlines escaped (empty when raw is not a string))
+    }
+    // report.degraded is not set here
+  }
+  // abstracted: console "done" line (ranked findings, chains, chains_dropped)
+  return report
+}
+
+// src: vvaharness/pipeline/stages/s8_chain.py:72-99
+fn _chain_call_with_half_window_retry(sub, labels, window, findings, ctx, cfg):executor=mixed {
+  invalid0 = COUNTERS.get(_RANKED_INVALID)   // read before each call: sdk and deepagents validate inside the backend
+  try return [s8.session.chain_call(sub, ctx, cfg, labels=labels), window, labels, invalid0];
+  catch TruncatedResponseError error => {
+    // only a clip the route could not retry at a larger budget (retried=0)
+    require is_truncated_without_retry(error) => throw error
+    half = s8.window.half_window(findings, window)
+    require half != window => throw error   // already at the smallest window
+    // abstracted: console "clipped at the output cap; retrying once over half the window"
+    half_labels = for each i in half: "f$i"
+    invalid0 = COUNTERS.get(_RANKED_INVALID)
+    raw = s8.session.chain_call(findings at half, ctx, cfg, labels=half_labels, allow_resend=false)   // a second clip is re-raised
+    return [raw, half, half_labels, invalid0]
+  }
+}
+
+// src: vvaharness/pipeline/stages/s8_chain.py:115-144
+fn _json_repair(raw, err, ctx, cfg):executor=mixed {
+  // src: s8_chain.py:120-127 — gates on the repair re-ask
+  require s8.session.repairable(raw) => return [null, null, {}]
+  text = string(raw)
+  require s8.session.repair_fits(text, cfg) => {
+    COUNTERS.bump("s8_parse_repair_skipped_oversize")   // console: too large to restate under the replay cap
+    return [null, null, {}]
+  }
+  COUNTERS.bump("s8_parse_repair_attempted")
+  // src: s8_chain.py:130-141
+  try {
+    repaired = s8.session.repair_call(text, err, ctx, cfg)   // model role: chain (no tools)
+    data = s8.outcomes.parse_chain_reply(repaired)
+  }
+  catch error2 => {
+    if (is_halt_error(error2)) throw error2
+    extra = { repair_error: first 400 characters of redact(error2) }
+    if (repaired is a string) extra.repair_head = first 500 characters of redact(repaired), newlines escaped
+    return [null, null, extra]
+  }
+  COUNTERS.bump("s8_parse_repair_recovered")
+  _persist_raw(repaired, "_s8_raw_repaired.txt")
+  return [data, repaired, {}]
+}
+
+// src: vvaharness/pipeline/stages/s8_chain.py:63-69
+fn _enrichment_failure_text(e):executor=code {
+  // A refusal's exception text names route, category and stage, which would otherwise leak into the shipped report
+  if (e is ModelRefusal) return "no chain analysis: the chain model refused the request"
+  return "chain call failed (${ _redacted_err(e) })"
+}
+
+// src: vvaharness/pipeline/stages/s8_chain.py:58-60
+fn _redacted_err(e, cap=400):executor=code {
+  return first cap characters of redact(string(e))   // full text redacted before capping
+}
+
+// src: vvaharness/pipeline/stages/s8_chain.py:102-112
+fn _persist_raw(text, suffix):executor=code {
+  // Writes redact(text) beside the current errlog file as "<stem><suffix>" (stem = errlog name minus "_errors.jsonl")
+  try write redact(text) to errlog directory / "$stem$suffix";
+  catch OSError => warn S8_RAW_PERSIST_FAILED   // a write failure only warns
+}

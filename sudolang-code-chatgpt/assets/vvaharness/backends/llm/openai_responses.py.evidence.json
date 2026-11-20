@@ -1,0 +1,5430 @@
+{
+  "source": "vvaharness/backends/llm/openai_responses.py",
+  "sha256": "fa4f6bae81e07ffb436b73a6ebe8423ad0c51bd44a85dc56e4bf7cd275dbd8ad",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Pure Chat <-> Responses API translation for the openai route.\n\nNo I/O, no client, no logging: every function here is a plain dict-in,\ndict-out mapping so the openai route can replay the same Chat-shaped\ntranscript over either wire. Private keys on the canonical transcript\n(`_reasoning_items` on an assistant entry, `_item_id` inside a tool call)\ncarry Responses-only replay state and never reach the Chat wire.\n\"\"\"\nfrom __future__ import annotations\n\nfrom typing import Any, Final\n\nfrom vvaharness.backends.llm.models import REASONING_OFF\n\n__all__ = [\n    \"INCLUDE_ENCRYPTED_REASONING\",\n    \"ITEM_ID_KEY\",\n    \"REASONING_ITEMS_KEY\",\n    \"finish_of\",\n    \"from_response\",\n    \"to_chat_messages\",\n    \"to_responses_input\",\n    \"to_responses_request\",\n    \"to_responses_tool_choice\",\n    \"to_responses_tools\",\n    \"usage_as_chat\",\n]\n\n#: Carries the Responses `reasoning` items (encrypted_content kept, OUTPUT-only fields\n#: dropped -- see _REASONING_INPUT_FIELDS) on an assistant transcript entry, for next-turn\n#: replay. Stripped before the Chat wire.\nREASONING_ITEMS_KEY = \"_reasoning_items\"\n\n#: Carries a tool call's Responses `function_call` item id, for next-turn replay.\n#: Stripped before the Chat wire.\nITEM_ID_KEY = \"_item_id\"\n\n#: With `store=False` the endpoint keeps no per-turn state; encrypted reasoning replays it.\nINCLUDE_ENCRYPTED_REASONING: Final[tuple[str, ...]] = (\"reasoning.encrypted_content\",)\n\n#: A stored reasoning item is replayed as an INPUT item, which accepts only these fields.\n#: A gateway's own OUTPUT item (what a reasoning item's model_dump() actually returns) also\n#: carries OUTPUT-only fields such as `status`; replaying one of those back verbatim is\n#: rejected as an unknown input parameter, so only this allowlist is ever stored or replayed.\n_REASONING_INPUT_FIELDS: Final[tuple[str, ...]] = (\"type\", \"id\", \"encrypted_content\", \"summary\")\n\n\ndef _get(obj: Any, key: str, default: Any = None) -> Any:\n    \"\"\"Read *key* from a dict, a SimpleNamespace fake, or an SDK model alike.\"\"\"\n    if obj is None:\n        return default\n    if isinstance(obj, dict):\n        return obj.get(key, default)\n    return getattr(obj, key, default)\n\n\ndef _as_dict(obj: Any) -> dict:\n    \"\"\"Best-effort mapping view of *obj*, for dicts, SDK models and namespace fakes.\"\"\"\n    if obj is None:\n        return {}\n    if isinstance(obj, dict):\n        return dict(obj)\n    return obj.model_dump() if hasattr(obj, \"model_dump\") else dict(vars(obj))\n\n\ndef to_responses_tools(tools: list[dict] | None) -> list[dict]:\n    \"\"\"Flatten Chat `function` tool entries to the Responses tool shape.\"\"\"\n    if not tools:\n        return []\n    flattened = []\n    for tool in tools:\n        fn = tool[\"function\"]\n        flattened.append({\n            \"type\": \"function\",\n            \"name\": fn[\"name\"],\n            \"description\": fn.get(\"description\"),\n            \"parameters\": fn.get(\"parameters\"),\n            # Explicit: the Responses API attempts strict mode when this is omitted.\n            \"strict\": False,\n        })\n    return flattened\n\n\ndef _is_forced_function_choice(tool_choice: Any) -> bool:\n    return (\n        isinstance(tool_choice, dict)\n        and tool_choice.get(\"type\") == \"function\"\n        and \"function\" in tool_choice\n    )\n\n\ndef to_responses_tool_choice(tool_choice: Any) -> Any:\n    \"\"\"Convert a forced Chat `tool_choice` to its Responses shape; strings pass through.\"\"\"\n    if _is_forced_function_choice(tool_choice):\n        return {\"type\": \"function\", \"name\": tool_choice[\"function\"][\"name\"]}\n    return tool_choice\n\n\ndef _input_content(content: Any) -> Any:\n    if isinstance(content, list):\n        return [\n            {\"type\": \"input_text\", \"text\": block.get(\"text\", \"\")}\n            if isinstance(block, dict) and block.get(\"type\") == \"text\"\n            else block\n            for block in content\n        ]\n    return content\n\n\ndef _reasoning_input_items(entry: dict) -> list[dict]:\n    # A plain copy, not a re-filter: _encrypted_reasoning_items() already stored each item\n    # allowlisted to _REASONING_INPUT_FIELDS, so there is nothing OUTPUT-only left to drop here.\n    return [\n        dict(item) for item in entry.get(REASONING_ITEMS_KEY) or []\n        if item.get(\"encrypted_content\")\n    ]\n\n\ndef _text_input_item(entry: dict) -> dict | None:\n    content = entry.get(\"content\")\n    if not content:\n        return None\n    return {\n        \"type\": \"message\",\n        \"role\": \"assistant\",\n        \"content\": [{\"type\": \"output_text\", \"text\": content, \"annotations\": []}],\n    }\n\n\ndef _function_call_items(entry: dict) -> list[dict]:\n    # Allowlist by construction: only id/function.name/function.arguments/the replay item id\n    # are ever read off *tool_call*, so an OUTPUT-only field such as `status` never reaches\n    # this item either, the same discipline _encrypted_reasoning_items() applies.\n    items = []\n    for tool_call in entry.get(\"tool_calls\") or []:\n        fn = tool_call.get(\"function\") or {}\n        call_item = {\n            \"type\": \"function_call\",\n            \"call_id\": tool_call.get(\"id\"),\n            \"name\": fn.get(\"name\"),\n            \"arguments\": fn.get(\"arguments\"),\n        }\n        item_id = tool_call.get(ITEM_ID_KEY)\n        if item_id is not None:\n            call_item[\"id\"] = item_id\n        items.append(call_item)\n    return items\n\n\ndef _assistant_items(entry: dict) -> list[dict]:\n    items = _reasoning_input_items(entry)\n    text_item = _text_input_item(entry)\n    if text_item is not None:\n        items.append(text_item)\n    items.extend(_function_call_items(entry))\n    return items\n\n\ndef to_responses_input(messages: list[dict]) -> list[dict]:\n    \"\"\"Map a Chat-shaped transcript to Responses `input` items.\"\"\"\n    items: list[dict] = []\n    for entry in messages:\n        role = entry.get(\"role\")\n        if role == \"assistant\":\n            items.extend(_assistant_items(entry))\n        elif role == \"tool\":\n            items.append({\n                \"type\": \"function_call_output\",\n                \"call_id\": entry.get(\"tool_call_id\"),\n                \"output\": entry.get(\"content\"),\n            })\n        else:\n            items.append({\"role\": role, \"content\": _input_content(entry.get(\"content\"))})\n    return items\n\n\ndef _tool_kwargs(base_kw: dict) -> dict:\n    kwargs: dict = {}\n    tools = to_responses_tools(base_kw.get(\"tools\"))\n    if tools:\n        kwargs[\"tools\"] = tools\n    tool_choice = base_kw.get(\"tool_choice\")\n    if tool_choice is not None:\n        kwargs[\"tool_choice\"] = to_responses_tool_choice(tool_choice)\n    return kwargs\n\n\ndef _responses_only_kwargs(base_kw: dict, *, include_encrypted: bool) -> dict:\n    # `store=False`: no per-turn server state, so encrypted reasoning does the replay.\n    kwargs: dict = {\"store\": False}\n    max_tokens = base_kw.get(\"max_completion_tokens\", base_kw.get(\"max_tokens\"))\n    if max_tokens is not None:\n        kwargs[\"max_output_tokens\"] = max_tokens\n    effort = base_kw.get(\"reasoning_effort\")\n    # Never 'none' on the wire here: a gateway that reasons on Responses must stay silenced-off\n    # by OMITTING the field (its own default), not by this route muting it the Chat way.\n    if effort is not None and effort != REASONING_OFF:\n        kwargs[\"reasoning\"] = {\"effort\": effort}\n    cache_key = base_kw.get(\"prompt_cache_key\")\n    if cache_key is not None:\n        kwargs[\"prompt_cache_key\"] = cache_key\n    if include_encrypted:\n        kwargs[\"include\"] = list(INCLUDE_ENCRYPTED_REASONING)\n    return kwargs\n\n\ndef to_responses_request(\n    messages: list[dict], base_kw: dict, *, include_encrypted: bool,\n) -> dict:\n    \"\"\"Map a Chat `base_kw` call (plus its transcript) to a Responses `create` payload.\n\n    Reads only the keys Responses understands, so Chat-only keys (`stream`,\n    `stream_options`, `messages`, `response_format`, `temperature`) are dropped\n    by omission rather than by an explicit pop.\n    \"\"\"\n    request: dict = {\"model\": base_kw[\"model\"], \"input\": to_responses_input(messages)}\n    request.update(_tool_kwargs(base_kw))\n    request.update(_responses_only_kwargs(base_kw, include_encrypted=include_encrypted))\n    return request\n\n\ndef to_chat_messages(messages: list[dict]) -> list[dict]:\n    \"\"\"Copy a transcript with the Responses-only replay keys stripped, for the Chat wire.\"\"\"\n    out = []\n    for entry in messages:\n        copy = {k: v for k, v in entry.items() if k != REASONING_ITEMS_KEY}\n        tool_calls = copy.get(\"tool_calls\")\n        if tool_calls:\n            copy[\"tool_calls\"] = [\n                {k: v for k, v in tc.items() if k != ITEM_ID_KEY} for tc in tool_calls\n            ]\n        out.append(copy)\n    return out\n\n\ndef usage_as_chat(usage: Any) -> dict | None:\n    \"\"\"Convert a Responses `usage` (object or dict) to the Chat usage field names.\"\"\"\n    if usage is None:\n        return None\n    input_tokens = _get(usage, \"input_tokens\") or 0\n    output_tokens = _get(usage, \"output_tokens\") or 0\n    total_tokens = _get(usage, \"total_tokens\")\n    if total_tokens is None:\n        total_tokens = input_tokens + output_tokens\n\n    prompt_details = _as_dict(_get(usage, \"input_tokens_details\"))\n    prompt_details.setdefault(\"cached_tokens\", 0)\n    prompt_details.setdefault(\"cache_write_tokens\", 0)\n\n    completion_details = _as_dict(_get(usage, \"output_tokens_details\"))\n    completion_details.setdefault(\"reasoning_tokens\", 0)\n\n    return {\n        \"prompt_tokens\": input_tokens,\n        \"completion_tokens\": output_tokens,\n        \"total_tokens\": total_tokens,\n        \"prompt_tokens_details\": prompt_details,\n        \"completion_tokens_details\": completion_details,\n    }\n\n\ndef finish_of(resp: Any, has_tool_calls: bool) -> str:\n    \"\"\"Map a Responses `status`/`incomplete_details` to a Chat `finish_reason`.\"\"\"\n    status = _get(resp, \"status\")\n    incomplete = _get(resp, \"incomplete_details\")\n    reason = _get(incomplete, \"reason\") if incomplete is not None else None\n    if status == \"incomplete\" and reason == \"max_output_tokens\":\n        return \"length\"\n    if reason == \"content_filter\":\n        return \"content_filter\"\n    return \"tool_calls\" if has_tool_calls else \"stop\"\n\n\nclass _Function:\n    __slots__ = (\"arguments\", \"name\")\n\n    def __init__(self, name: str | None, arguments: str | None) -> None:\n        self.name = name\n        self.arguments = arguments\n\n\nclass _ToolCall:\n    __slots__ = (\"_item_id\", \"function\", \"id\", \"type\")\n\n    def __init__(self, call_id: str | None, name: str | None, arguments: str | None,\n                 item_id: str | None) -> None:\n        self.id = call_id\n        self.type = \"function\"\n        self.function = _Function(name, arguments)\n        self._item_id = item_id\n\n    def model_dump(self) -> dict:\n        dumped = {\n            \"id\": self.id,\n            \"type\": \"function\",\n            \"function\": {\"name\": self.function.name, \"arguments\": self.function.arguments},\n        }\n        if self._item_id is not None:\n            dumped[ITEM_ID_KEY] = self._item_id\n        return dumped\n\n\nclass _Message:\n    __slots__ = (\"content\", \"reasoning_items\", \"refusal\", \"tool_calls\")\n\n    def __init__(self, content: str | None, tool_calls: list[_ToolCall],\n                 refusal: str | None, reasoning_items: list[dict]) -> None:\n        self.content = content\n        self.tool_calls = tool_calls\n        self.refusal = refusal\n        self.reasoning_items = reasoning_items\n\n\nclass _Choice:\n    __slots__ = (\"finish_reason\", \"message\")\n\n    def __init__(self, message: _Message, finish_reason: str) -> None:\n        self.message = message\n        self.finish_reason = finish_reason\n\n\nclass _ResponsesReply:\n    __slots__ = (\"choices\", \"usage\")\n\n    def __init__(self, choices: list[_Choice], usage: dict | None) -> None:\n        self.choices = choices\n        self.usage = usage\n\n\ndef _raise_for_error(resp: Any) -> None:\n    error = _get(resp, \"error\")\n    status = _get(resp, \"status\")\n    if not error and status != \"failed\":\n        return\n    if error:\n        message = error if isinstance(error, str) else (_get(error, \"message\") or str(error))\n    else:\n        # A failed call with no error body is still a failure: nothing downstream must read\n        # it as a normal, empty \"stop\" the way Chat Completions can never shape a reply.\n        message = f\"Responses call ended with status={status!r} and no error body\"\n    raise RuntimeError(message)\n\n\ndef _message_content(item: Any) -> tuple[list[str], str | None]:\n    text_parts: list[str] = []\n    refusal: str | None = None\n    for block in _get(item, \"content\") or []:\n        block_type = _get(block, \"type\")\n        if block_type == \"output_text\":\n            text_parts.append(_get(block, \"text\") or \"\")\n        elif block_type == \"refusal\" and refusal is None:\n            refusal = _get(block, \"refusal\")\n    return text_parts, refusal\n\n\ndef _tool_call_from_item(item: Any) -> _ToolCall:\n    # Allowlist by construction: only call_id/name/arguments/id are ever read off *item*, so an\n    # OUTPUT-only field such as `status` never reaches the stored tool call or its replay.\n    return _ToolCall(\n        _get(item, \"call_id\"), _get(item, \"name\"), _get(item, \"arguments\"), _get(item, \"id\"),\n    )\n\n\ndef _encrypted_reasoning_items(items: list) -> list[dict]:\n    return [\n        {field: _get(item, field) for field in _REASONING_INPUT_FIELDS\n         if _get(item, field) is not None}\n        for item in items\n        if _get(item, \"type\") == \"reasoning\" and _get(item, \"encrypted_content\")\n    ]\n\n\ndef from_response(resp: Any) -> _ResponsesReply:\n    \"\"\"Build a Chat-like reply (`.choices[0].message`, `.usage`) from a Responses object.\"\"\"\n    _raise_for_error(resp)\n\n    output_items = _get(resp, \"output\") or []\n    output_text_parts: list[str] = []\n    refusal_text: str | None = None\n    tool_calls: list[_ToolCall] = []\n    for item in output_items:\n        item_type = _get(item, \"type\")\n        if item_type == \"message\":\n            text_parts, refusal = _message_content(item)\n            output_text_parts.extend(text_parts)\n            if refusal_text is None:\n                refusal_text = refusal\n        elif item_type == \"function_call\":\n            tool_calls.append(_tool_call_from_item(item))\n\n    content = \"\".join(output_text_parts) if output_text_parts else None\n    message = _Message(content, tool_calls, refusal_text, _encrypted_reasoning_items(output_items))\n    choice = _Choice(message, finish_of(resp, has_tool_calls=bool(tool_calls)))\n    return _ResponsesReply([choice], usage_as_chat(_get(resp, \"usage\")))\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/backends/llm/openai_responses.py",
+      "line_start": 15,
+      "line_end": 22,
+      "value": "Pure Chat <-> Responses API translation for the openai route.\n\nNo I/O, no client, no logging: every function here is a plain dict-in,\ndict-out mapping so the openai route can replay the same Chat-shaped\ntranscript over either wire. Private keys on the canonical transcript\n(`_reasoning_items` on an assistant entry, `_item_id` inside a tool call)\ncarry Responses-only replay state and never reach the Chat wire.\n",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_63_4": {
+      "source": "vvaharness/backends/llm/openai_responses.py",
+      "line_start": 63,
+      "line_end": 63,
+      "value": "Read *key* from a dict, a SimpleNamespace fake, or an SDK model alike.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_72_4": {
+      "source": "vvaharness/backends/llm/openai_responses.py",
+      "line_start": 72,
+      "line_end": 72,
+      "value": "Best-effort mapping view of *obj*, for dicts, SDK models and namespace fakes.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_81_4": {
+      "source": "vvaharness/backends/llm/openai_responses.py",
+      "line_start": 81,
+      "line_end": 81,
+      "value": "Flatten Chat `function` tool entries to the Responses tool shape.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_107_4": {
+      "source": "vvaharness/backends/llm/openai_responses.py",
+      "line_start": 107,
+      "line_end": 107,
+      "value": "Convert a forced Chat `tool_choice` to its Responses shape; strings pass through.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_174_4": {
+      "source": "vvaharness/backends/llm/openai_responses.py",
+      "line_start": 174,
+      "line_end": 174,
+      "value": "Map a Chat-shaped transcript to Responses `input` items.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_224_4": {
+      "source": "vvaharness/backends/llm/openai_responses.py",
+      "line_start": 224,
+      "line_end": 229,
+      "value": "Map a Chat `base_kw` call (plus its transcript) to a Responses `create` payload.\n\n    Reads only the keys Responses understands, so Chat-only keys (`stream`,\n    `stream_options`, `messages`, `response_format`, `temperature`) are dropped\n    by omission rather than by an explicit pop.\n    ",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_237_4": {
+      "source": "vvaharness/backends/llm/openai_responses.py",
+      "line_start": 237,
+      "line_end": 237,
+      "value": "Copy a transcript with the Responses-only replay keys stripped, for the Chat wire.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_251_4": {
+      "source": "vvaharness/backends/llm/openai_responses.py",
+      "line_start": 251,
+      "line_end": 251,
+      "value": "Convert a Responses `usage` (object or dict) to the Chat usage field names.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_277_4": {
+      "source": "vvaharness/backends/llm/openai_responses.py",
+      "line_start": 277,
+      "line_end": 277,
+      "value": "Map a Responses `status`/`incomplete_details` to a Chat `finish_reason`.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_354_18": {
+      "source": "vvaharness/backends/llm/openai_responses.py",
+      "line_start": 354,
+      "line_end": 354,
+      "source_expression": "f\"Responses call ended with status={status!r} and no error body\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_388_4": {
+      "source": "vvaharness/backends/llm/openai_responses.py",
+      "line_start": 388,
+      "line_end": 388,
+      "value": "Build a Chat-like reply (`.choices[0].message`, `.usage`) from a Responses object.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 22,
+      "column": 0,
+      "value": "Pure Chat <-> Responses API translation for the openai route.\n\nNo I/O, no client, no logging: every function here is a plain dict-in,\ndict-out mapping so the openai route can replay the same Chat-shaped\ntranscript over either wire. Private keys on the canonical transcript\n(`_reasoning_items` on an assistant entry, `_item_id` inside a tool call)\ncarry Responses-only replay state and never reach the Chat wire.\n",
+      "context": "literal"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 22,
+      "value": "_reasoning_items",
+      "context": "literal"
+    },
+    {
+      "line_start": 50,
+      "line_end": 50,
+      "column": 14,
+      "value": "_item_id",
+      "context": "literal"
+    },
+    {
+      "line_start": 30,
+      "line_end": 30,
+      "column": 4,
+      "value": "INCLUDE_ENCRYPTED_REASONING",
+      "context": "literal"
+    },
+    {
+      "line_start": 31,
+      "line_end": 31,
+      "column": 4,
+      "value": "ITEM_ID_KEY",
+      "context": "literal"
+    },
+    {
+      "line_start": 32,
+      "line_end": 32,
+      "column": 4,
+      "value": "REASONING_ITEMS_KEY",
+      "context": "literal"
+    },
+    {
+      "line_start": 33,
+      "line_end": 33,
+      "column": 4,
+      "value": "finish_of",
+      "context": "literal"
+    },
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 4,
+      "value": "from_response",
+      "context": "literal"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 4,
+      "value": "to_chat_messages",
+      "context": "literal"
+    },
+    {
+      "line_start": 36,
+      "line_end": 36,
+      "column": 4,
+      "value": "to_responses_input",
+      "context": "literal"
+    },
+    {
+      "line_start": 37,
+      "line_end": 37,
+      "column": 4,
+      "value": "to_responses_request",
+      "context": "literal"
+    },
+    {
+      "line_start": 38,
+      "line_end": 38,
+      "column": 4,
+      "value": "to_responses_tool_choice",
+      "context": "literal"
+    },
+    {
+      "line_start": 39,
+      "line_end": 39,
+      "column": 4,
+      "value": "to_responses_tools",
+      "context": "literal"
+    },
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 4,
+      "value": "usage_as_chat",
+      "context": "literal"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 55,
+      "value": "reasoning.encrypted_content",
+      "context": "literal"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 51,
+      "value": "type",
+      "context": "literal"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 59,
+      "value": "id",
+      "context": "literal"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 65,
+      "value": "encrypted_content",
+      "context": "literal"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 86,
+      "value": "summary",
+      "context": "literal"
+    },
+    {
+      "line_start": 63,
+      "line_end": 63,
+      "column": 4,
+      "value": "Read *key* from a dict, a SimpleNamespace fake, or an SDK model alike.",
+      "context": "literal"
+    },
+    {
+      "line_start": 72,
+      "line_end": 72,
+      "column": 4,
+      "value": "Best-effort mapping view of *obj*, for dicts, SDK models and namespace fakes.",
+      "context": "literal"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 4,
+      "value": "Flatten Chat `function` tool entries to the Responses tool shape.",
+      "context": "literal"
+    },
+    {
+      "line_start": 107,
+      "line_end": 107,
+      "column": 4,
+      "value": "Convert a forced Chat `tool_choice` to its Responses shape; strings pass through.",
+      "context": "literal"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 4,
+      "value": "Map a Chat-shaped transcript to Responses `input` items.",
+      "context": "literal"
+    },
+    {
+      "line_start": 224,
+      "line_end": 229,
+      "column": 4,
+      "value": "Map a Chat `base_kw` call (plus its transcript) to a Responses `create` payload.\n\n    Reads only the keys Responses understands, so Chat-only keys (`stream`,\n    `stream_options`, `messages`, `response_format`, `temperature`) are dropped\n    by omission rather than by an explicit pop.\n    ",
+      "context": "literal"
+    },
+    {
+      "line_start": 237,
+      "line_end": 237,
+      "column": 4,
+      "value": "Copy a transcript with the Responses-only replay keys stripped, for the Chat wire.",
+      "context": "literal"
+    },
+    {
+      "line_start": 251,
+      "line_end": 251,
+      "column": 4,
+      "value": "Convert a Responses `usage` (object or dict) to the Chat usage field names.",
+      "context": "literal"
+    },
+    {
+      "line_start": 277,
+      "line_end": 277,
+      "column": 4,
+      "value": "Map a Responses `status`/`incomplete_details` to a Chat `finish_reason`.",
+      "context": "literal"
+    },
+    {
+      "line_start": 388,
+      "line_end": 388,
+      "column": 4,
+      "value": "Build a Chat-like reply (`.choices[0].message`, `.usage`) from a Responses object.",
+      "context": "literal"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 24,
+      "value": "content",
+      "context": "literal"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 8,
+      "value": "type",
+      "context": "literal"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 8,
+      "value": "role",
+      "context": "literal"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 8,
+      "value": "content",
+      "context": "literal"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 16,
+      "value": "message",
+      "context": "literal"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 16,
+      "value": "assistant",
+      "context": "literal"
+    },
+    {
+      "line_start": 196,
+      "line_end": 196,
+      "column": 30,
+      "value": "tool_choice",
+      "context": "literal"
+    },
+    {
+      "line_start": 204,
+      "line_end": 204,
+      "column": 20,
+      "value": "store",
+      "context": "literal"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 29,
+      "value": "max_completion_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 208,
+      "line_end": 208,
+      "column": 25,
+      "value": "reasoning_effort",
+      "context": "literal"
+    },
+    {
+      "line_start": 213,
+      "line_end": 213,
+      "column": 28,
+      "value": "prompt_cache_key",
+      "context": "literal"
+    },
+    {
+      "line_start": 230,
+      "line_end": 230,
+      "column": 21,
+      "value": "model",
+      "context": "literal"
+    },
+    {
+      "line_start": 230,
+      "line_end": 230,
+      "column": 48,
+      "value": "input",
+      "context": "literal"
+    },
+    {
+      "line_start": 256,
+      "line_end": 256,
+      "column": 31,
+      "value": "total_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 261,
+      "line_end": 261,
+      "column": 30,
+      "value": "cached_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 262,
+      "line_end": 262,
+      "column": 30,
+      "value": "cache_write_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 265,
+      "line_end": 265,
+      "column": 34,
+      "value": "reasoning_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 268,
+      "line_end": 268,
+      "column": 8,
+      "value": "prompt_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 269,
+      "line_end": 269,
+      "column": 8,
+      "value": "completion_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 270,
+      "line_end": 270,
+      "column": 8,
+      "value": "total_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 271,
+      "line_end": 271,
+      "column": 8,
+      "value": "prompt_tokens_details",
+      "context": "literal"
+    },
+    {
+      "line_start": 272,
+      "line_end": 272,
+      "column": 8,
+      "value": "completion_tokens_details",
+      "context": "literal"
+    },
+    {
+      "line_start": 278,
+      "line_end": 278,
+      "column": 24,
+      "value": "status",
+      "context": "literal"
+    },
+    {
+      "line_start": 279,
+      "line_end": 279,
+      "column": 28,
+      "value": "incomplete_details",
+      "context": "literal"
+    },
+    {
+      "line_start": 282,
+      "line_end": 282,
+      "column": 15,
+      "value": "length",
+      "context": "literal"
+    },
+    {
+      "line_start": 283,
+      "line_end": 283,
+      "column": 17,
+      "value": "content_filter",
+      "context": "literal"
+    },
+    {
+      "line_start": 284,
+      "line_end": 284,
+      "column": 15,
+      "value": "content_filter",
+      "context": "literal"
+    },
+    {
+      "line_start": 285,
+      "line_end": 285,
+      "column": 11,
+      "value": "tool_calls",
+      "context": "literal"
+    },
+    {
+      "line_start": 285,
+      "line_end": 285,
+      "column": 47,
+      "value": "stop",
+      "context": "literal"
+    },
+    {
+      "line_start": 289,
+      "line_end": 289,
+      "column": 17,
+      "value": "arguments",
+      "context": "literal"
+    },
+    {
+      "line_start": 289,
+      "line_end": 289,
+      "column": 30,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 297,
+      "line_end": 297,
+      "column": 17,
+      "value": "_item_id",
+      "context": "literal"
+    },
+    {
+      "line_start": 297,
+      "line_end": 297,
+      "column": 29,
+      "value": "function",
+      "context": "literal"
+    },
+    {
+      "line_start": 297,
+      "line_end": 297,
+      "column": 41,
+      "value": "id",
+      "context": "literal"
+    },
+    {
+      "line_start": 297,
+      "line_end": 297,
+      "column": 47,
+      "value": "type",
+      "context": "literal"
+    },
+    {
+      "line_start": 302,
+      "line_end": 302,
+      "column": 20,
+      "value": "function",
+      "context": "literal"
+    },
+    {
+      "line_start": 318,
+      "line_end": 318,
+      "column": 17,
+      "value": "content",
+      "context": "literal"
+    },
+    {
+      "line_start": 318,
+      "line_end": 318,
+      "column": 28,
+      "value": "reasoning_items",
+      "context": "literal"
+    },
+    {
+      "line_start": 318,
+      "line_end": 318,
+      "column": 47,
+      "value": "refusal",
+      "context": "literal"
+    },
+    {
+      "line_start": 318,
+      "line_end": 318,
+      "column": 58,
+      "value": "tool_calls",
+      "context": "literal"
+    },
+    {
+      "line_start": 329,
+      "line_end": 329,
+      "column": 17,
+      "value": "finish_reason",
+      "context": "literal"
+    },
+    {
+      "line_start": 329,
+      "line_end": 329,
+      "column": 34,
+      "value": "message",
+      "context": "literal"
+    },
+    {
+      "line_start": 337,
+      "line_end": 337,
+      "column": 17,
+      "value": "choices",
+      "context": "literal"
+    },
+    {
+      "line_start": 337,
+      "line_end": 337,
+      "column": 28,
+      "value": "usage",
+      "context": "literal"
+    },
+    {
+      "line_start": 345,
+      "line_end": 345,
+      "column": 23,
+      "value": "error",
+      "context": "literal"
+    },
+    {
+      "line_start": 346,
+      "line_end": 346,
+      "column": 24,
+      "value": "status",
+      "context": "literal"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 44,
+      "value": "model_dump",
+      "context": "literal"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 18,
+      "value": "function",
+      "context": "literal"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 39,
+      "value": "function",
+      "context": "literal"
+    },
+    {
+      "line_start": 102,
+      "line_end": 102,
+      "column": 12,
+      "value": "function",
+      "context": "literal"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 16,
+      "value": "type",
+      "context": "literal"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 36,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 24,
+      "value": "function",
+      "context": "literal"
+    },
+    {
+      "line_start": 149,
+      "line_end": 149,
+      "column": 31,
+      "value": "tool_calls",
+      "context": "literal"
+    },
+    {
+      "line_start": 152,
+      "line_end": 152,
+      "column": 12,
+      "value": "type",
+      "context": "literal"
+    },
+    {
+      "line_start": 153,
+      "line_end": 153,
+      "column": 12,
+      "value": "call_id",
+      "context": "literal"
+    },
+    {
+      "line_start": 154,
+      "line_end": 154,
+      "column": 12,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 12,
+      "value": "arguments",
+      "context": "literal"
+    },
+    {
+      "line_start": 152,
+      "line_end": 152,
+      "column": 20,
+      "value": "function_call",
+      "context": "literal"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 25,
+      "value": "role",
+      "context": "literal"
+    },
+    {
+      "line_start": 178,
+      "line_end": 178,
+      "column": 19,
+      "value": "assistant",
+      "context": "literal"
+    },
+    {
+      "line_start": 193,
+      "line_end": 193,
+      "column": 43,
+      "value": "tools",
+      "context": "literal"
+    },
+    {
+      "line_start": 195,
+      "line_end": 195,
+      "column": 15,
+      "value": "tools",
+      "context": "literal"
+    },
+    {
+      "line_start": 198,
+      "line_end": 198,
+      "column": 15,
+      "value": "tool_choice",
+      "context": "literal"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 66,
+      "value": "max_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 207,
+      "line_end": 207,
+      "column": 15,
+      "value": "max_output_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 15,
+      "value": "reasoning",
+      "context": "literal"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 31,
+      "value": "effort",
+      "context": "literal"
+    },
+    {
+      "line_start": 215,
+      "line_end": 215,
+      "column": 15,
+      "value": "prompt_cache_key",
+      "context": "literal"
+    },
+    {
+      "line_start": 217,
+      "line_end": 217,
+      "column": 15,
+      "value": "include",
+      "context": "literal"
+    },
+    {
+      "line_start": 230,
+      "line_end": 230,
+      "column": 38,
+      "value": "model",
+      "context": "literal"
+    },
+    {
+      "line_start": 241,
+      "line_end": 241,
+      "column": 30,
+      "value": "tool_calls",
+      "context": "literal"
+    },
+    {
+      "line_start": 254,
+      "line_end": 254,
+      "column": 31,
+      "value": "input_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 255,
+      "line_end": 255,
+      "column": 32,
+      "value": "output_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 260,
+      "line_end": 260,
+      "column": 42,
+      "value": "input_tokens_details",
+      "context": "literal"
+    },
+    {
+      "line_start": 264,
+      "line_end": 264,
+      "column": 46,
+      "value": "output_tokens_details",
+      "context": "literal"
+    },
+    {
+      "line_start": 280,
+      "line_end": 280,
+      "column": 30,
+      "value": "reason",
+      "context": "literal"
+    },
+    {
+      "line_start": 281,
+      "line_end": 281,
+      "column": 17,
+      "value": "incomplete",
+      "context": "literal"
+    },
+    {
+      "line_start": 281,
+      "line_end": 281,
+      "column": 44,
+      "value": "max_output_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 308,
+      "line_end": 308,
+      "column": 12,
+      "value": "id",
+      "context": "literal"
+    },
+    {
+      "line_start": 309,
+      "line_end": 309,
+      "column": 12,
+      "value": "type",
+      "context": "literal"
+    },
+    {
+      "line_start": 310,
+      "line_end": 310,
+      "column": 12,
+      "value": "function",
+      "context": "literal"
+    },
+    {
+      "line_start": 309,
+      "line_end": 309,
+      "column": 20,
+      "value": "function",
+      "context": "literal"
+    },
+    {
+      "line_start": 347,
+      "line_end": 347,
+      "column": 31,
+      "value": "failed",
+      "context": "literal"
+    },
+    {
+      "line_start": 354,
+      "line_end": 354,
+      "column": 20,
+      "value": "Responses call ended with status=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 354,
+      "line_end": 354,
+      "column": 63,
+      "value": " and no error body",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 361,
+      "line_end": 361,
+      "column": 28,
+      "value": "content",
+      "context": "literal"
+    },
+    {
+      "line_start": 362,
+      "line_end": 362,
+      "column": 33,
+      "value": "type",
+      "context": "literal"
+    },
+    {
+      "line_start": 363,
+      "line_end": 363,
+      "column": 25,
+      "value": "output_text",
+      "context": "literal"
+    },
+    {
+      "line_start": 374,
+      "line_end": 374,
+      "column": 19,
+      "value": "call_id",
+      "context": "literal"
+    },
+    {
+      "line_start": 374,
+      "line_end": 374,
+      "column": 42,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 374,
+      "line_end": 374,
+      "column": 62,
+      "value": "arguments",
+      "context": "literal"
+    },
+    {
+      "line_start": 374,
+      "line_end": 374,
+      "column": 87,
+      "value": "id",
+      "context": "literal"
+    },
+    {
+      "line_start": 391,
+      "line_end": 391,
+      "column": 30,
+      "value": "output",
+      "context": "literal"
+    },
+    {
+      "line_start": 396,
+      "line_end": 396,
+      "column": 31,
+      "value": "type",
+      "context": "literal"
+    },
+    {
+      "line_start": 397,
+      "line_end": 397,
+      "column": 24,
+      "value": "message",
+      "context": "literal"
+    },
+    {
+      "line_start": 88,
+      "line_end": 88,
+      "column": 12,
+      "value": "type",
+      "context": "literal"
+    },
+    {
+      "line_start": 89,
+      "line_end": 89,
+      "column": 12,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 90,
+      "line_end": 90,
+      "column": 12,
+      "value": "description",
+      "context": "literal"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 12,
+      "value": "parameters",
+      "context": "literal"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 12,
+      "value": "strict",
+      "context": "literal"
+    },
+    {
+      "line_start": 88,
+      "line_end": 88,
+      "column": 20,
+      "value": "function",
+      "context": "literal"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 28,
+      "value": "type",
+      "context": "literal"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 68,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 129,
+      "line_end": 129,
+      "column": 20,
+      "value": "encrypted_content",
+      "context": "literal"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 21,
+      "value": "type",
+      "context": "literal"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 44,
+      "value": "text",
+      "context": "literal"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 61,
+      "value": "annotations",
+      "context": "literal"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 29,
+      "value": "output_text",
+      "context": "literal"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 27,
+      "value": "function",
+      "context": "literal"
+    },
+    {
+      "line_start": 153,
+      "line_end": 153,
+      "column": 37,
+      "value": "id",
+      "context": "literal"
+    },
+    {
+      "line_start": 154,
+      "line_end": 154,
+      "column": 27,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 32,
+      "value": "arguments",
+      "context": "literal"
+    },
+    {
+      "line_start": 159,
+      "line_end": 159,
+      "column": 22,
+      "value": "id",
+      "context": "literal"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 21,
+      "value": "tool",
+      "context": "literal"
+    },
+    {
+      "line_start": 243,
+      "line_end": 243,
+      "column": 17,
+      "value": "tool_calls",
+      "context": "literal"
+    },
+    {
+      "line_start": 310,
+      "line_end": 310,
+      "column": 25,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 310,
+      "line_end": 310,
+      "column": 53,
+      "value": "arguments",
+      "context": "literal"
+    },
+    {
+      "line_start": 402,
+      "line_end": 402,
+      "column": 26,
+      "value": "function_call",
+      "context": "literal"
+    },
+    {
+      "line_start": 405,
+      "line_end": 405,
+      "column": 14,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 408,
+      "line_end": 408,
+      "column": 62,
+      "value": "usage",
+      "context": "literal"
+    },
+    {
+      "line_start": 89,
+      "line_end": 89,
+      "column": 23,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 90,
+      "line_end": 90,
+      "column": 34,
+      "value": "description",
+      "context": "literal"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 33,
+      "value": "parameters",
+      "context": "literal"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 56,
+      "value": "function",
+      "context": "literal"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 13,
+      "value": "type",
+      "context": "literal"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 35,
+      "value": "text",
+      "context": "literal"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 21,
+      "value": "input_text",
+      "context": "literal"
+    },
+    {
+      "line_start": 350,
+      "line_end": 350,
+      "column": 68,
+      "value": "message",
+      "context": "literal"
+    },
+    {
+      "line_start": 364,
+      "line_end": 364,
+      "column": 53,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 365,
+      "line_end": 365,
+      "column": 27,
+      "value": "refusal",
+      "context": "literal"
+    },
+    {
+      "line_start": 366,
+      "line_end": 366,
+      "column": 34,
+      "value": "refusal",
+      "context": "literal"
+    },
+    {
+      "line_start": 383,
+      "line_end": 383,
+      "column": 33,
+      "value": "reasoning",
+      "context": "literal"
+    },
+    {
+      "line_start": 383,
+      "line_end": 383,
+      "column": 60,
+      "value": "encrypted_content",
+      "context": "literal"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 64,
+      "value": "text",
+      "context": "literal"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 53,
+      "value": "text",
+      "context": "literal"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 61,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 16,
+      "value": "type",
+      "context": "literal"
+    },
+    {
+      "line_start": 183,
+      "line_end": 183,
+      "column": 16,
+      "value": "call_id",
+      "context": "literal"
+    },
+    {
+      "line_start": 184,
+      "line_end": 184,
+      "column": 16,
+      "value": "output",
+      "context": "literal"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 24,
+      "value": "function_call_output",
+      "context": "literal"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 26,
+      "value": "role",
+      "context": "literal"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 40,
+      "value": "content",
+      "context": "literal"
+    },
+    {
+      "line_start": 364,
+      "line_end": 364,
+      "column": 42,
+      "value": "text",
+      "context": "literal"
+    },
+    {
+      "line_start": 383,
+      "line_end": 383,
+      "column": 22,
+      "value": "type",
+      "context": "literal"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 53,
+      "value": "type",
+      "context": "literal"
+    },
+    {
+      "line_start": 183,
+      "line_end": 183,
+      "column": 37,
+      "value": "tool_call_id",
+      "context": "literal"
+    },
+    {
+      "line_start": 184,
+      "line_end": 184,
+      "column": 36,
+      "value": "content",
+      "context": "literal"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 76,
+      "value": "content",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 43,
+      "text": "#: Carries the Responses `reasoning` items (encrypted_content kept, OUTPUT-only fields"
+    },
+    {
+      "line": 44,
+      "text": "#: dropped -- see _REASONING_INPUT_FIELDS) on an assistant transcript entry, for next-turn"
+    },
+    {
+      "line": 45,
+      "text": "#: replay. Stripped before the Chat wire."
+    },
+    {
+      "line": 48,
+      "text": "#: Carries a tool call's Responses `function_call` item id, for next-turn replay."
+    },
+    {
+      "line": 49,
+      "text": "#: Stripped before the Chat wire."
+    },
+    {
+      "line": 52,
+      "text": "#: With `store=False` the endpoint keeps no per-turn state; encrypted reasoning replays it."
+    },
+    {
+      "line": 55,
+      "text": "#: A stored reasoning item is replayed as an INPUT item, which accepts only these fields."
+    },
+    {
+      "line": 56,
+      "text": "#: A gateway's own OUTPUT item (what a reasoning item's model_dump() actually returns) also"
+    },
+    {
+      "line": 57,
+      "text": "#: carries OUTPUT-only fields such as `status`; replaying one of those back verbatim is"
+    },
+    {
+      "line": 58,
+      "text": "#: rejected as an unknown input parameter, so only this allowlist is ever stored or replayed."
+    },
+    {
+      "line": 92,
+      "text": "# Explicit: the Responses API attempts strict mode when this is omitted."
+    },
+    {
+      "line": 125,
+      "text": "# A plain copy, not a re-filter: _encrypted_reasoning_items() already stored each item"
+    },
+    {
+      "line": 126,
+      "text": "# allowlisted to _REASONING_INPUT_FIELDS, so there is nothing OUTPUT-only left to drop here."
+    },
+    {
+      "line": 145,
+      "text": "# Allowlist by construction: only id/function.name/function.arguments/the replay item id"
+    },
+    {
+      "line": 146,
+      "text": "# are ever read off *tool_call*, so an OUTPUT-only field such as `status` never reaches"
+    },
+    {
+      "line": 147,
+      "text": "# this item either, the same discipline _encrypted_reasoning_items() applies."
+    },
+    {
+      "line": 203,
+      "text": "# `store=False`: no per-turn server state, so encrypted reasoning does the replay."
+    },
+    {
+      "line": 209,
+      "text": "# Never 'none' on the wire here: a gateway that reasons on Responses must stay silenced-off"
+    },
+    {
+      "line": 210,
+      "text": "# by OMITTING the field (its own default), not by this route muting it the Chat way."
+    },
+    {
+      "line": 352,
+      "text": "# A failed call with no error body is still a failure: nothing downstream must read"
+    },
+    {
+      "line": 353,
+      "text": "# it as a normal, empty \"stop\" the way Chat Completions can never shape a reply."
+    },
+    {
+      "line": 371,
+      "text": "# Allowlist by construction: only call_id/name/arguments/id are ever read off *item*, so an"
+    },
+    {
+      "line": 372,
+      "text": "# OUTPUT-only field such as `status` never reaches the stored tool call or its replay."
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 23,
+      "line_end": 23,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 27,
+      "line_end": 27,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Assign",
+      "line_start": 29,
+      "line_end": 41,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Assign",
+      "line_start": 46,
+      "line_end": 46,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "Assign",
+      "line_start": 50,
+      "line_end": 50,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 53,
+      "line_end": 53,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 59,
+      "line_end": 59,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 62,
+      "line_end": 68,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 5
+    },
+    {
+      "kind": "Expr",
+      "line_start": 63,
+      "line_end": 63,
+      "column": 4,
+      "owner": "_get",
+      "representation_line": 11
+    },
+    {
+      "kind": "If",
+      "line_start": 64,
+      "line_end": 65,
+      "column": 4,
+      "owner": "_get",
+      "representation_line": 12
+    },
+    {
+      "kind": "Return",
+      "line_start": 65,
+      "line_end": 65,
+      "column": 8,
+      "owner": "_get",
+      "representation_line": 14
+    },
+    {
+      "kind": "If",
+      "line_start": 66,
+      "line_end": 67,
+      "column": 4,
+      "owner": "_get",
+      "representation_line": 17
+    },
+    {
+      "kind": "Return",
+      "line_start": 67,
+      "line_end": 67,
+      "column": 8,
+      "owner": "_get",
+      "representation_line": 19
+    },
+    {
+      "kind": "Return",
+      "line_start": 68,
+      "line_end": 68,
+      "column": 4,
+      "owner": "_get",
+      "representation_line": 22
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 71,
+      "line_end": 77,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 26
+    },
+    {
+      "kind": "Expr",
+      "line_start": 72,
+      "line_end": 72,
+      "column": 4,
+      "owner": "_as_dict",
+      "representation_line": 32
+    },
+    {
+      "kind": "If",
+      "line_start": 73,
+      "line_end": 74,
+      "column": 4,
+      "owner": "_as_dict",
+      "representation_line": 33
+    },
+    {
+      "kind": "Return",
+      "line_start": 74,
+      "line_end": 74,
+      "column": 8,
+      "owner": "_as_dict",
+      "representation_line": 35
+    },
+    {
+      "kind": "If",
+      "line_start": 75,
+      "line_end": 76,
+      "column": 4,
+      "owner": "_as_dict",
+      "representation_line": 38
+    },
+    {
+      "kind": "Return",
+      "line_start": 76,
+      "line_end": 76,
+      "column": 8,
+      "owner": "_as_dict",
+      "representation_line": 40
+    },
+    {
+      "kind": "Return",
+      "line_start": 77,
+      "line_end": 77,
+      "column": 4,
+      "owner": "_as_dict",
+      "representation_line": 43
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 80,
+      "line_end": 95,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 47
+    },
+    {
+      "kind": "Expr",
+      "line_start": 81,
+      "line_end": 81,
+      "column": 4,
+      "owner": "to_responses_tools",
+      "representation_line": 53
+    },
+    {
+      "kind": "If",
+      "line_start": 82,
+      "line_end": 83,
+      "column": 4,
+      "owner": "to_responses_tools",
+      "representation_line": 54
+    },
+    {
+      "kind": "Return",
+      "line_start": 83,
+      "line_end": 83,
+      "column": 8,
+      "owner": "to_responses_tools",
+      "representation_line": 56
+    },
+    {
+      "kind": "Assign",
+      "line_start": 84,
+      "line_end": 84,
+      "column": 4,
+      "owner": "to_responses_tools",
+      "representation_line": 60
+    },
+    {
+      "kind": "For",
+      "line_start": 85,
+      "line_end": 94,
+      "column": 4,
+      "owner": "to_responses_tools",
+      "representation_line": 61
+    },
+    {
+      "kind": "Assign",
+      "line_start": 86,
+      "line_end": 86,
+      "column": 8,
+      "owner": "to_responses_tools",
+      "representation_line": 64
+    },
+    {
+      "kind": "Expr",
+      "line_start": 87,
+      "line_end": 94,
+      "column": 8,
+      "owner": "to_responses_tools",
+      "representation_line": 64
+    },
+    {
+      "kind": "Return",
+      "line_start": 95,
+      "line_end": 95,
+      "column": 4,
+      "owner": "to_responses_tools",
+      "representation_line": 66
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 98,
+      "line_end": 103,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 70
+    },
+    {
+      "kind": "Return",
+      "line_start": 99,
+      "line_end": 103,
+      "column": 4,
+      "owner": "_is_forced_function_choice",
+      "representation_line": 75
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 106,
+      "line_end": 110,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 79
+    },
+    {
+      "kind": "Expr",
+      "line_start": 107,
+      "line_end": 107,
+      "column": 4,
+      "owner": "to_responses_tool_choice",
+      "representation_line": 85
+    },
+    {
+      "kind": "If",
+      "line_start": 108,
+      "line_end": 109,
+      "column": 4,
+      "owner": "to_responses_tool_choice",
+      "representation_line": 86
+    },
+    {
+      "kind": "Return",
+      "line_start": 109,
+      "line_end": 109,
+      "column": 8,
+      "owner": "to_responses_tool_choice",
+      "representation_line": 88
+    },
+    {
+      "kind": "Return",
+      "line_start": 110,
+      "line_end": 110,
+      "column": 4,
+      "owner": "to_responses_tool_choice",
+      "representation_line": 91
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 113,
+      "line_end": 121,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 95
+    },
+    {
+      "kind": "If",
+      "line_start": 114,
+      "line_end": 120,
+      "column": 4,
+      "owner": "_input_content",
+      "representation_line": 100
+    },
+    {
+      "kind": "Return",
+      "line_start": 115,
+      "line_end": 120,
+      "column": 8,
+      "owner": "_input_content",
+      "representation_line": 102
+    },
+    {
+      "kind": "Return",
+      "line_start": 121,
+      "line_end": 121,
+      "column": 4,
+      "owner": "_input_content",
+      "representation_line": 105
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 124,
+      "line_end": 130,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 109
+    },
+    {
+      "kind": "Return",
+      "line_start": 127,
+      "line_end": 130,
+      "column": 4,
+      "owner": "_reasoning_input_items",
+      "representation_line": 114
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 133,
+      "line_end": 141,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 118
+    },
+    {
+      "kind": "Assign",
+      "line_start": 134,
+      "line_end": 134,
+      "column": 4,
+      "owner": "_text_input_item",
+      "representation_line": 124
+    },
+    {
+      "kind": "If",
+      "line_start": 135,
+      "line_end": 136,
+      "column": 4,
+      "owner": "_text_input_item",
+      "representation_line": 125
+    },
+    {
+      "kind": "Return",
+      "line_start": 136,
+      "line_end": 136,
+      "column": 8,
+      "owner": "_text_input_item",
+      "representation_line": 127
+    },
+    {
+      "kind": "Return",
+      "line_start": 137,
+      "line_end": 141,
+      "column": 4,
+      "owner": "_text_input_item",
+      "representation_line": 130
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 144,
+      "line_end": 161,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 134
+    },
+    {
+      "kind": "Assign",
+      "line_start": 148,
+      "line_end": 148,
+      "column": 4,
+      "owner": "_function_call_items",
+      "representation_line": 140
+    },
+    {
+      "kind": "For",
+      "line_start": 149,
+      "line_end": 160,
+      "column": 4,
+      "owner": "_function_call_items",
+      "representation_line": 141
+    },
+    {
+      "kind": "Assign",
+      "line_start": 150,
+      "line_end": 150,
+      "column": 8,
+      "owner": "_function_call_items",
+      "representation_line": 144
+    },
+    {
+      "kind": "Assign",
+      "line_start": 151,
+      "line_end": 156,
+      "column": 8,
+      "owner": "_function_call_items",
+      "representation_line": 144
+    },
+    {
+      "kind": "Assign",
+      "line_start": 157,
+      "line_end": 157,
+      "column": 8,
+      "owner": "_function_call_items",
+      "representation_line": 144
+    },
+    {
+      "kind": "If",
+      "line_start": 158,
+      "line_end": 159,
+      "column": 8,
+      "owner": "_function_call_items",
+      "representation_line": 145
+    },
+    {
+      "kind": "Assign",
+      "line_start": 159,
+      "line_end": 159,
+      "column": 12,
+      "owner": "_function_call_items",
+      "representation_line": 148
+    },
+    {
+      "kind": "Expr",
+      "line_start": 160,
+      "line_end": 160,
+      "column": 8,
+      "owner": "_function_call_items",
+      "representation_line": 151
+    },
+    {
+      "kind": "Return",
+      "line_start": 161,
+      "line_end": 161,
+      "column": 4,
+      "owner": "_function_call_items",
+      "representation_line": 153
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 164,
+      "line_end": 170,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 157
+    },
+    {
+      "kind": "Assign",
+      "line_start": 165,
+      "line_end": 165,
+      "column": 4,
+      "owner": "_assistant_items",
+      "representation_line": 163
+    },
+    {
+      "kind": "Assign",
+      "line_start": 166,
+      "line_end": 166,
+      "column": 4,
+      "owner": "_assistant_items",
+      "representation_line": 163
+    },
+    {
+      "kind": "If",
+      "line_start": 167,
+      "line_end": 168,
+      "column": 4,
+      "owner": "_assistant_items",
+      "representation_line": 164
+    },
+    {
+      "kind": "Expr",
+      "line_start": 168,
+      "line_end": 168,
+      "column": 8,
+      "owner": "_assistant_items",
+      "representation_line": 167
+    },
+    {
+      "kind": "Expr",
+      "line_start": 169,
+      "line_end": 169,
+      "column": 4,
+      "owner": "_assistant_items",
+      "representation_line": 170
+    },
+    {
+      "kind": "Return",
+      "line_start": 170,
+      "line_end": 170,
+      "column": 4,
+      "owner": "_assistant_items",
+      "representation_line": 171
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 173,
+      "line_end": 188,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 175
+    },
+    {
+      "kind": "Expr",
+      "line_start": 174,
+      "line_end": 174,
+      "column": 4,
+      "owner": "to_responses_input",
+      "representation_line": 181
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 175,
+      "line_end": 175,
+      "column": 4,
+      "owner": "to_responses_input",
+      "representation_line": 181
+    },
+    {
+      "kind": "For",
+      "line_start": 176,
+      "line_end": 187,
+      "column": 4,
+      "owner": "to_responses_input",
+      "representation_line": 182
+    },
+    {
+      "kind": "Assign",
+      "line_start": 177,
+      "line_end": 177,
+      "column": 8,
+      "owner": "to_responses_input",
+      "representation_line": 185
+    },
+    {
+      "kind": "If",
+      "line_start": 178,
+      "line_end": 187,
+      "column": 8,
+      "owner": "to_responses_input",
+      "representation_line": 186
+    },
+    {
+      "kind": "Expr",
+      "line_start": 179,
+      "line_end": 179,
+      "column": 12,
+      "owner": "to_responses_input",
+      "representation_line": 189
+    },
+    {
+      "kind": "If",
+      "line_start": 180,
+      "line_end": 187,
+      "column": 8,
+      "owner": "to_responses_input",
+      "representation_line": 192
+    },
+    {
+      "kind": "Expr",
+      "line_start": 181,
+      "line_end": 185,
+      "column": 12,
+      "owner": "to_responses_input",
+      "representation_line": 195
+    },
+    {
+      "kind": "Expr",
+      "line_start": 187,
+      "line_end": 187,
+      "column": 12,
+      "owner": "to_responses_input",
+      "representation_line": 199
+    },
+    {
+      "kind": "Return",
+      "line_start": 188,
+      "line_end": 188,
+      "column": 4,
+      "owner": "to_responses_input",
+      "representation_line": 203
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 191,
+      "line_end": 199,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 207
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 192,
+      "line_end": 192,
+      "column": 4,
+      "owner": "_tool_kwargs",
+      "representation_line": 213
+    },
+    {
+      "kind": "Assign",
+      "line_start": 193,
+      "line_end": 193,
+      "column": 4,
+      "owner": "_tool_kwargs",
+      "representation_line": 213
+    },
+    {
+      "kind": "If",
+      "line_start": 194,
+      "line_end": 195,
+      "column": 4,
+      "owner": "_tool_kwargs",
+      "representation_line": 214
+    },
+    {
+      "kind": "Assign",
+      "line_start": 195,
+      "line_end": 195,
+      "column": 8,
+      "owner": "_tool_kwargs",
+      "representation_line": 217
+    },
+    {
+      "kind": "Assign",
+      "line_start": 196,
+      "line_end": 196,
+      "column": 4,
+      "owner": "_tool_kwargs",
+      "representation_line": 220
+    },
+    {
+      "kind": "If",
+      "line_start": 197,
+      "line_end": 198,
+      "column": 4,
+      "owner": "_tool_kwargs",
+      "representation_line": 221
+    },
+    {
+      "kind": "Assign",
+      "line_start": 198,
+      "line_end": 198,
+      "column": 8,
+      "owner": "_tool_kwargs",
+      "representation_line": 224
+    },
+    {
+      "kind": "Return",
+      "line_start": 199,
+      "line_end": 199,
+      "column": 4,
+      "owner": "_tool_kwargs",
+      "representation_line": 226
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 202,
+      "line_end": 218,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 230
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 204,
+      "line_end": 204,
+      "column": 4,
+      "owner": "_responses_only_kwargs",
+      "representation_line": 236
+    },
+    {
+      "kind": "Assign",
+      "line_start": 205,
+      "line_end": 205,
+      "column": 4,
+      "owner": "_responses_only_kwargs",
+      "representation_line": 236
+    },
+    {
+      "kind": "If",
+      "line_start": 206,
+      "line_end": 207,
+      "column": 4,
+      "owner": "_responses_only_kwargs",
+      "representation_line": 237
+    },
+    {
+      "kind": "Assign",
+      "line_start": 207,
+      "line_end": 207,
+      "column": 8,
+      "owner": "_responses_only_kwargs",
+      "representation_line": 240
+    },
+    {
+      "kind": "Assign",
+      "line_start": 208,
+      "line_end": 208,
+      "column": 4,
+      "owner": "_responses_only_kwargs",
+      "representation_line": 243
+    },
+    {
+      "kind": "If",
+      "line_start": 211,
+      "line_end": 212,
+      "column": 4,
+      "owner": "_responses_only_kwargs",
+      "representation_line": 244
+    },
+    {
+      "kind": "Assign",
+      "line_start": 212,
+      "line_end": 212,
+      "column": 8,
+      "owner": "_responses_only_kwargs",
+      "representation_line": 247
+    },
+    {
+      "kind": "Assign",
+      "line_start": 213,
+      "line_end": 213,
+      "column": 4,
+      "owner": "_responses_only_kwargs",
+      "representation_line": 250
+    },
+    {
+      "kind": "If",
+      "line_start": 214,
+      "line_end": 215,
+      "column": 4,
+      "owner": "_responses_only_kwargs",
+      "representation_line": 251
+    },
+    {
+      "kind": "Assign",
+      "line_start": 215,
+      "line_end": 215,
+      "column": 8,
+      "owner": "_responses_only_kwargs",
+      "representation_line": 254
+    },
+    {
+      "kind": "If",
+      "line_start": 216,
+      "line_end": 217,
+      "column": 4,
+      "owner": "_responses_only_kwargs",
+      "representation_line": 256
+    },
+    {
+      "kind": "Assign",
+      "line_start": 217,
+      "line_end": 217,
+      "column": 8,
+      "owner": "_responses_only_kwargs",
+      "representation_line": 259
+    },
+    {
+      "kind": "Return",
+      "line_start": 218,
+      "line_end": 218,
+      "column": 4,
+      "owner": "_responses_only_kwargs",
+      "representation_line": 261
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 221,
+      "line_end": 233,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 265
+    },
+    {
+      "kind": "Expr",
+      "line_start": 224,
+      "line_end": 229,
+      "column": 4,
+      "owner": "to_responses_request",
+      "representation_line": 271
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 230,
+      "line_end": 230,
+      "column": 4,
+      "owner": "to_responses_request",
+      "representation_line": 271
+    },
+    {
+      "kind": "Expr",
+      "line_start": 231,
+      "line_end": 231,
+      "column": 4,
+      "owner": "to_responses_request",
+      "representation_line": 271
+    },
+    {
+      "kind": "Expr",
+      "line_start": 232,
+      "line_end": 232,
+      "column": 4,
+      "owner": "to_responses_request",
+      "representation_line": 271
+    },
+    {
+      "kind": "Return",
+      "line_start": 233,
+      "line_end": 233,
+      "column": 4,
+      "owner": "to_responses_request",
+      "representation_line": 272
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 236,
+      "line_end": 247,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 276
+    },
+    {
+      "kind": "Expr",
+      "line_start": 237,
+      "line_end": 237,
+      "column": 4,
+      "owner": "to_chat_messages",
+      "representation_line": 282
+    },
+    {
+      "kind": "Assign",
+      "line_start": 238,
+      "line_end": 238,
+      "column": 4,
+      "owner": "to_chat_messages",
+      "representation_line": 282
+    },
+    {
+      "kind": "For",
+      "line_start": 239,
+      "line_end": 246,
+      "column": 4,
+      "owner": "to_chat_messages",
+      "representation_line": 283
+    },
+    {
+      "kind": "Assign",
+      "line_start": 240,
+      "line_end": 240,
+      "column": 8,
+      "owner": "to_chat_messages",
+      "representation_line": 286
+    },
+    {
+      "kind": "Assign",
+      "line_start": 241,
+      "line_end": 241,
+      "column": 8,
+      "owner": "to_chat_messages",
+      "representation_line": 286
+    },
+    {
+      "kind": "If",
+      "line_start": 242,
+      "line_end": 245,
+      "column": 8,
+      "owner": "to_chat_messages",
+      "representation_line": 287
+    },
+    {
+      "kind": "Assign",
+      "line_start": 243,
+      "line_end": 245,
+      "column": 12,
+      "owner": "to_chat_messages",
+      "representation_line": 290
+    },
+    {
+      "kind": "Expr",
+      "line_start": 246,
+      "line_end": 246,
+      "column": 8,
+      "owner": "to_chat_messages",
+      "representation_line": 293
+    },
+    {
+      "kind": "Return",
+      "line_start": 247,
+      "line_end": 247,
+      "column": 4,
+      "owner": "to_chat_messages",
+      "representation_line": 295
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 250,
+      "line_end": 273,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 299
+    },
+    {
+      "kind": "Expr",
+      "line_start": 251,
+      "line_end": 251,
+      "column": 4,
+      "owner": "usage_as_chat",
+      "representation_line": 305
+    },
+    {
+      "kind": "If",
+      "line_start": 252,
+      "line_end": 253,
+      "column": 4,
+      "owner": "usage_as_chat",
+      "representation_line": 306
+    },
+    {
+      "kind": "Return",
+      "line_start": 253,
+      "line_end": 253,
+      "column": 8,
+      "owner": "usage_as_chat",
+      "representation_line": 308
+    },
+    {
+      "kind": "Assign",
+      "line_start": 254,
+      "line_end": 254,
+      "column": 4,
+      "owner": "usage_as_chat",
+      "representation_line": 312
+    },
+    {
+      "kind": "Assign",
+      "line_start": 255,
+      "line_end": 255,
+      "column": 4,
+      "owner": "usage_as_chat",
+      "representation_line": 312
+    },
+    {
+      "kind": "Assign",
+      "line_start": 256,
+      "line_end": 256,
+      "column": 4,
+      "owner": "usage_as_chat",
+      "representation_line": 312
+    },
+    {
+      "kind": "If",
+      "line_start": 257,
+      "line_end": 258,
+      "column": 4,
+      "owner": "usage_as_chat",
+      "representation_line": 313
+    },
+    {
+      "kind": "Assign",
+      "line_start": 258,
+      "line_end": 258,
+      "column": 8,
+      "owner": "usage_as_chat",
+      "representation_line": 316
+    },
+    {
+      "kind": "Assign",
+      "line_start": 260,
+      "line_end": 260,
+      "column": 4,
+      "owner": "usage_as_chat",
+      "representation_line": 319
+    },
+    {
+      "kind": "Expr",
+      "line_start": 261,
+      "line_end": 261,
+      "column": 4,
+      "owner": "usage_as_chat",
+      "representation_line": 319
+    },
+    {
+      "kind": "Expr",
+      "line_start": 262,
+      "line_end": 262,
+      "column": 4,
+      "owner": "usage_as_chat",
+      "representation_line": 319
+    },
+    {
+      "kind": "Assign",
+      "line_start": 264,
+      "line_end": 264,
+      "column": 4,
+      "owner": "usage_as_chat",
+      "representation_line": 319
+    },
+    {
+      "kind": "Expr",
+      "line_start": 265,
+      "line_end": 265,
+      "column": 4,
+      "owner": "usage_as_chat",
+      "representation_line": 319
+    },
+    {
+      "kind": "Return",
+      "line_start": 267,
+      "line_end": 273,
+      "column": 4,
+      "owner": "usage_as_chat",
+      "representation_line": 320
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 276,
+      "line_end": 285,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 324
+    },
+    {
+      "kind": "Expr",
+      "line_start": 277,
+      "line_end": 277,
+      "column": 4,
+      "owner": "finish_of",
+      "representation_line": 330
+    },
+    {
+      "kind": "Assign",
+      "line_start": 278,
+      "line_end": 278,
+      "column": 4,
+      "owner": "finish_of",
+      "representation_line": 330
+    },
+    {
+      "kind": "Assign",
+      "line_start": 279,
+      "line_end": 279,
+      "column": 4,
+      "owner": "finish_of",
+      "representation_line": 330
+    },
+    {
+      "kind": "Assign",
+      "line_start": 280,
+      "line_end": 280,
+      "column": 4,
+      "owner": "finish_of",
+      "representation_line": 330
+    },
+    {
+      "kind": "If",
+      "line_start": 281,
+      "line_end": 282,
+      "column": 4,
+      "owner": "finish_of",
+      "representation_line": 331
+    },
+    {
+      "kind": "Return",
+      "line_start": 282,
+      "line_end": 282,
+      "column": 8,
+      "owner": "finish_of",
+      "representation_line": 333
+    },
+    {
+      "kind": "If",
+      "line_start": 283,
+      "line_end": 284,
+      "column": 4,
+      "owner": "finish_of",
+      "representation_line": 336
+    },
+    {
+      "kind": "Return",
+      "line_start": 284,
+      "line_end": 284,
+      "column": 8,
+      "owner": "finish_of",
+      "representation_line": 338
+    },
+    {
+      "kind": "Return",
+      "line_start": 285,
+      "line_end": 285,
+      "column": 4,
+      "owner": "finish_of",
+      "representation_line": 341
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 288,
+      "line_end": 293,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 345
+    },
+    {
+      "kind": "Assign",
+      "line_start": 289,
+      "line_end": 289,
+      "column": 4,
+      "owner": "_Function",
+      "representation_line": 350
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 291,
+      "line_end": 293,
+      "column": 4,
+      "owner": "_Function",
+      "representation_line": 351
+    },
+    {
+      "kind": "Assign",
+      "line_start": 292,
+      "line_end": 292,
+      "column": 8,
+      "owner": "_Function.__init__",
+      "representation_line": 357
+    },
+    {
+      "kind": "Assign",
+      "line_start": 293,
+      "line_end": 293,
+      "column": 8,
+      "owner": "_Function.__init__",
+      "representation_line": 357
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 296,
+      "line_end": 314,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 361
+    },
+    {
+      "kind": "Assign",
+      "line_start": 297,
+      "line_end": 297,
+      "column": 4,
+      "owner": "_ToolCall",
+      "representation_line": 366
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 299,
+      "line_end": 304,
+      "column": 4,
+      "owner": "_ToolCall",
+      "representation_line": 367
+    },
+    {
+      "kind": "Assign",
+      "line_start": 301,
+      "line_end": 301,
+      "column": 8,
+      "owner": "_ToolCall.__init__",
+      "representation_line": 373
+    },
+    {
+      "kind": "Assign",
+      "line_start": 302,
+      "line_end": 302,
+      "column": 8,
+      "owner": "_ToolCall.__init__",
+      "representation_line": 373
+    },
+    {
+      "kind": "Assign",
+      "line_start": 303,
+      "line_end": 303,
+      "column": 8,
+      "owner": "_ToolCall.__init__",
+      "representation_line": 373
+    },
+    {
+      "kind": "Assign",
+      "line_start": 304,
+      "line_end": 304,
+      "column": 8,
+      "owner": "_ToolCall.__init__",
+      "representation_line": 373
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 306,
+      "line_end": 314,
+      "column": 4,
+      "owner": "_ToolCall",
+      "representation_line": 376
+    },
+    {
+      "kind": "Assign",
+      "line_start": 307,
+      "line_end": 311,
+      "column": 8,
+      "owner": "_ToolCall.model_dump",
+      "representation_line": 382
+    },
+    {
+      "kind": "If",
+      "line_start": 312,
+      "line_end": 313,
+      "column": 8,
+      "owner": "_ToolCall.model_dump",
+      "representation_line": 383
+    },
+    {
+      "kind": "Assign",
+      "line_start": 313,
+      "line_end": 313,
+      "column": 12,
+      "owner": "_ToolCall.model_dump",
+      "representation_line": 386
+    },
+    {
+      "kind": "Return",
+      "line_start": 314,
+      "line_end": 314,
+      "column": 8,
+      "owner": "_ToolCall.model_dump",
+      "representation_line": 388
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 317,
+      "line_end": 325,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 393
+    },
+    {
+      "kind": "Assign",
+      "line_start": 318,
+      "line_end": 318,
+      "column": 4,
+      "owner": "_Message",
+      "representation_line": 398
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 320,
+      "line_end": 325,
+      "column": 4,
+      "owner": "_Message",
+      "representation_line": 399
+    },
+    {
+      "kind": "Assign",
+      "line_start": 322,
+      "line_end": 322,
+      "column": 8,
+      "owner": "_Message.__init__",
+      "representation_line": 405
+    },
+    {
+      "kind": "Assign",
+      "line_start": 323,
+      "line_end": 323,
+      "column": 8,
+      "owner": "_Message.__init__",
+      "representation_line": 405
+    },
+    {
+      "kind": "Assign",
+      "line_start": 324,
+      "line_end": 324,
+      "column": 8,
+      "owner": "_Message.__init__",
+      "representation_line": 405
+    },
+    {
+      "kind": "Assign",
+      "line_start": 325,
+      "line_end": 325,
+      "column": 8,
+      "owner": "_Message.__init__",
+      "representation_line": 405
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 328,
+      "line_end": 333,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 409
+    },
+    {
+      "kind": "Assign",
+      "line_start": 329,
+      "line_end": 329,
+      "column": 4,
+      "owner": "_Choice",
+      "representation_line": 414
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 331,
+      "line_end": 333,
+      "column": 4,
+      "owner": "_Choice",
+      "representation_line": 415
+    },
+    {
+      "kind": "Assign",
+      "line_start": 332,
+      "line_end": 332,
+      "column": 8,
+      "owner": "_Choice.__init__",
+      "representation_line": 421
+    },
+    {
+      "kind": "Assign",
+      "line_start": 333,
+      "line_end": 333,
+      "column": 8,
+      "owner": "_Choice.__init__",
+      "representation_line": 421
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 336,
+      "line_end": 341,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 425
+    },
+    {
+      "kind": "Assign",
+      "line_start": 337,
+      "line_end": 337,
+      "column": 4,
+      "owner": "_ResponsesReply",
+      "representation_line": 430
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 339,
+      "line_end": 341,
+      "column": 4,
+      "owner": "_ResponsesReply",
+      "representation_line": 431
+    },
+    {
+      "kind": "Assign",
+      "line_start": 340,
+      "line_end": 340,
+      "column": 8,
+      "owner": "_ResponsesReply.__init__",
+      "representation_line": 437
+    },
+    {
+      "kind": "Assign",
+      "line_start": 341,
+      "line_end": 341,
+      "column": 8,
+      "owner": "_ResponsesReply.__init__",
+      "representation_line": 437
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 344,
+      "line_end": 355,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 441
+    },
+    {
+      "kind": "Assign",
+      "line_start": 345,
+      "line_end": 345,
+      "column": 4,
+      "owner": "_raise_for_error",
+      "representation_line": 447
+    },
+    {
+      "kind": "Assign",
+      "line_start": 346,
+      "line_end": 346,
+      "column": 4,
+      "owner": "_raise_for_error",
+      "representation_line": 447
+    },
+    {
+      "kind": "If",
+      "line_start": 347,
+      "line_end": 348,
+      "column": 4,
+      "owner": "_raise_for_error",
+      "representation_line": 448
+    },
+    {
+      "kind": "Return",
+      "line_start": 348,
+      "line_end": 348,
+      "column": 8,
+      "owner": "_raise_for_error",
+      "representation_line": 450
+    },
+    {
+      "kind": "If",
+      "line_start": 349,
+      "line_end": 354,
+      "column": 4,
+      "owner": "_raise_for_error",
+      "representation_line": 453
+    },
+    {
+      "kind": "Assign",
+      "line_start": 350,
+      "line_end": 350,
+      "column": 8,
+      "owner": "_raise_for_error",
+      "representation_line": 456
+    },
+    {
+      "kind": "Assign",
+      "line_start": 354,
+      "line_end": 354,
+      "column": 8,
+      "owner": "_raise_for_error",
+      "representation_line": 460
+    },
+    {
+      "kind": "Raise",
+      "line_start": 355,
+      "line_end": 355,
+      "column": 4,
+      "owner": "_raise_for_error",
+      "representation_line": 462
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 358,
+      "line_end": 367,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 466
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 359,
+      "line_end": 359,
+      "column": 4,
+      "owner": "_message_content",
+      "representation_line": 472
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 360,
+      "line_end": 360,
+      "column": 4,
+      "owner": "_message_content",
+      "representation_line": 472
+    },
+    {
+      "kind": "For",
+      "line_start": 361,
+      "line_end": 366,
+      "column": 4,
+      "owner": "_message_content",
+      "representation_line": 473
+    },
+    {
+      "kind": "Assign",
+      "line_start": 362,
+      "line_end": 362,
+      "column": 8,
+      "owner": "_message_content",
+      "representation_line": 476
+    },
+    {
+      "kind": "If",
+      "line_start": 363,
+      "line_end": 366,
+      "column": 8,
+      "owner": "_message_content",
+      "representation_line": 477
+    },
+    {
+      "kind": "Expr",
+      "line_start": 364,
+      "line_end": 364,
+      "column": 12,
+      "owner": "_message_content",
+      "representation_line": 480
+    },
+    {
+      "kind": "If",
+      "line_start": 365,
+      "line_end": 366,
+      "column": 8,
+      "owner": "_message_content",
+      "representation_line": 483
+    },
+    {
+      "kind": "Assign",
+      "line_start": 366,
+      "line_end": 366,
+      "column": 12,
+      "owner": "_message_content",
+      "representation_line": 486
+    },
+    {
+      "kind": "Return",
+      "line_start": 367,
+      "line_end": 367,
+      "column": 4,
+      "owner": "_message_content",
+      "representation_line": 490
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 370,
+      "line_end": 375,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 494
+    },
+    {
+      "kind": "Return",
+      "line_start": 373,
+      "line_end": 375,
+      "column": 4,
+      "owner": "_tool_call_from_item",
+      "representation_line": 499
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 378,
+      "line_end": 384,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 503
+    },
+    {
+      "kind": "Return",
+      "line_start": 379,
+      "line_end": 384,
+      "column": 4,
+      "owner": "_encrypted_reasoning_items",
+      "representation_line": 508
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 387,
+      "line_end": 408,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 512
+    },
+    {
+      "kind": "Expr",
+      "line_start": 388,
+      "line_end": 388,
+      "column": 4,
+      "owner": "from_response",
+      "representation_line": 518
+    },
+    {
+      "kind": "Expr",
+      "line_start": 389,
+      "line_end": 389,
+      "column": 4,
+      "owner": "from_response",
+      "representation_line": 518
+    },
+    {
+      "kind": "Assign",
+      "line_start": 391,
+      "line_end": 391,
+      "column": 4,
+      "owner": "from_response",
+      "representation_line": 518
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 392,
+      "line_end": 392,
+      "column": 4,
+      "owner": "from_response",
+      "representation_line": 518
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 393,
+      "line_end": 393,
+      "column": 4,
+      "owner": "from_response",
+      "representation_line": 518
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 394,
+      "line_end": 394,
+      "column": 4,
+      "owner": "from_response",
+      "representation_line": 520
+    },
+    {
+      "kind": "For",
+      "line_start": 395,
+      "line_end": 403,
+      "column": 4,
+      "owner": "from_response",
+      "representation_line": 521
+    },
+    {
+      "kind": "Assign",
+      "line_start": 396,
+      "line_end": 396,
+      "column": 8,
+      "owner": "from_response",
+      "representation_line": 524
+    },
+    {
+      "kind": "If",
+      "line_start": 397,
+      "line_end": 403,
+      "column": 8,
+      "owner": "from_response",
+      "representation_line": 525
+    },
+    {
+      "kind": "Assign",
+      "line_start": 398,
+      "line_end": 398,
+      "column": 12,
+      "owner": "from_response",
+      "representation_line": 528
+    },
+    {
+      "kind": "Expr",
+      "line_start": 399,
+      "line_end": 399,
+      "column": 12,
+      "owner": "from_response",
+      "representation_line": 528
+    },
+    {
+      "kind": "If",
+      "line_start": 400,
+      "line_end": 401,
+      "column": 12,
+      "owner": "from_response",
+      "representation_line": 529
+    },
+    {
+      "kind": "Assign",
+      "line_start": 401,
+      "line_end": 401,
+      "column": 16,
+      "owner": "from_response",
+      "representation_line": 532
+    },
+    {
+      "kind": "If",
+      "line_start": 402,
+      "line_end": 403,
+      "column": 8,
+      "owner": "from_response",
+      "representation_line": 536
+    },
+    {
+      "kind": "Expr",
+      "line_start": 403,
+      "line_end": 403,
+      "column": 12,
+      "owner": "from_response",
+      "representation_line": 539
+    },
+    {
+      "kind": "Assign",
+      "line_start": 405,
+      "line_end": 405,
+      "column": 4,
+      "owner": "from_response",
+      "representation_line": 544
+    },
+    {
+      "kind": "Assign",
+      "line_start": 406,
+      "line_end": 406,
+      "column": 4,
+      "owner": "from_response",
+      "representation_line": 544
+    },
+    {
+      "kind": "Assign",
+      "line_start": 407,
+      "line_end": 407,
+      "column": 4,
+      "owner": "from_response",
+      "representation_line": 544
+    },
+    {
+      "kind": "Return",
+      "line_start": 408,
+      "line_end": 408,
+      "column": 4,
+      "owner": "from_response",
+      "representation_line": 545
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 29,
+      "line_end": 41,
+      "column": 10,
+      "kind": "List",
+      "original_ast": "List(elts=[Constant(value='INCLUDE_ENCRYPTED_REASONING'), Constant(value='ITEM_ID_KEY'), Constant(value='REASONING_ITEMS_KEY'), Constant(value='finish_of'), Constant(value='from_response'), Constant(value='to_chat_messages'), Constant(value='to_responses_input'), Constant(value='to_responses_request'), Constant(value='to_responses_tool_choice'), Constant(value='to_responses_tools'), Constant(value='usage_as_chat')], ctx=Load())",
+      "rendered": "['INCLUDE_ENCRYPTED_REASONING', 'ITEM_ID_KEY', 'REASONING_ITEMS_KEY', 'finish_of', 'from_response', 'to_chat_messages', 'to_responses_input', 'to_responses_request', 'to_responses_tool_choice', 'to_responses_tools', 'usage_as_chat']"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 22,
+      "kind": "Constant",
+      "original_ast": "Constant(value='_reasoning_items')",
+      "rendered": "'_reasoning_items'"
+    },
+    {
+      "line_start": 50,
+      "line_end": 50,
+      "column": 14,
+      "kind": "Constant",
+      "original_ast": "Constant(value='_item_id')",
+      "rendered": "'_item_id'"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 54,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value='reasoning.encrypted_content')], ctx=Load())",
+      "rendered": "('reasoning.encrypted_content',)"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 50,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value='type'), Constant(value='id'), Constant(value='encrypted_content'), Constant(value='summary')], ctx=Load())",
+      "rendered": "('type', 'id', 'encrypted_content', 'summary')"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='obj', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "obj is None"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='default', ctx=Load())",
+      "rendered": "default"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='obj', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(obj, dict)"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='obj', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='key', ctx=Load()), Name(id='default', ctx=Load())], keywords=[])",
+      "rendered": "obj.get(key, default)"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='obj', ctx=Load()), Name(id='key', ctx=Load()), Name(id='default', ctx=Load())], keywords=[])",
+      "rendered": "getattr(obj, key, default)"
+    },
+    {
+      "line_start": 73,
+      "line_end": 73,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='obj', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "obj is None"
+    },
+    {
+      "line_start": 74,
+      "line_end": 74,
+      "column": 15,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 75,
+      "line_end": 75,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='obj', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(obj, dict)"
+    },
+    {
+      "line_start": 76,
+      "line_end": 76,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dict', ctx=Load()), args=[Name(id='obj', ctx=Load())], keywords=[])",
+      "rendered": "dict(obj)"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Name(id='hasattr', ctx=Load()), args=[Name(id='obj', ctx=Load()), Constant(value='model_dump')], keywords=[]), body=Call(func=Attribute(value=Name(id='obj', ctx=Load()), attr='model_dump', ctx=Load()), args=[], keywords=[]), orelse=Call(func=Name(id='dict', ctx=Load()), args=[Call(func=Name(id='vars', ctx=Load()), args=[Name(id='obj', ctx=Load())], keywords=[])], keywords=[]))",
+      "rendered": "obj.model_dump() if hasattr(obj, 'model_dump') else dict(vars(obj))"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='tools', ctx=Load()))",
+      "rendered": "not tools"
+    },
+    {
+      "line_start": 83,
+      "line_end": 83,
+      "column": 15,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 84,
+      "line_end": 84,
+      "column": 16,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 85,
+      "line_end": 85,
+      "column": 16,
+      "kind": "Name",
+      "original_ast": "Name(id='tools', ctx=Load())",
+      "rendered": "tools"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 13,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Name(id='tool', ctx=Load()), slice=Constant(value='function'), ctx=Load())",
+      "rendered": "tool['function']"
+    },
+    {
+      "line_start": 87,
+      "line_end": 94,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='flattened', ctx=Load()), attr='append', ctx=Load()), args=[Dict(keys=[Constant(value='type'), Constant(value='name'), Constant(value='description'), Constant(value='parameters'), Constant(value='strict')], values=[Constant(value='function'), Subscript(value=Name(id='fn', ctx=Load()), slice=Constant(value='name'), ctx=Load()), Call(func=Attribute(value=Name(id='fn', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='description')], keywords=[]), Call(func=Attribute(value=Name(id='fn', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='parameters')], keywords=[]), Constant(value=False)])], keywords=[])",
+      "rendered": "flattened.append({'type': 'function', 'name': fn['name'], 'description': fn.get('description'), 'parameters': fn.get('parameters'), 'strict': False})"
+    },
+    {
+      "line_start": 95,
+      "line_end": 95,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='flattened', ctx=Load())",
+      "rendered": "flattened"
+    },
+    {
+      "line_start": 100,
+      "line_end": 102,
+      "column": 8,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='tool_choice', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[]), Compare(left=Call(func=Attribute(value=Name(id='tool_choice', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='type')], keywords=[]), ops=[Eq()], comparators=[Constant(value='function')]), Compare(left=Constant(value='function'), ops=[In()], comparators=[Name(id='tool_choice', ctx=Load())])])",
+      "rendered": "isinstance(tool_choice, dict) and tool_choice.get('type') == 'function' and ('function' in tool_choice)"
+    },
+    {
+      "line_start": 108,
+      "line_end": 108,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_is_forced_function_choice', ctx=Load()), args=[Name(id='tool_choice', ctx=Load())], keywords=[])",
+      "rendered": "_is_forced_function_choice(tool_choice)"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 15,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='type'), Constant(value='name')], values=[Constant(value='function'), Subscript(value=Subscript(value=Name(id='tool_choice', ctx=Load()), slice=Constant(value='function'), ctx=Load()), slice=Constant(value='name'), ctx=Load())])",
+      "rendered": "{'type': 'function', 'name': tool_choice['function']['name']}"
+    },
+    {
+      "line_start": 110,
+      "line_end": 110,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='tool_choice', ctx=Load())",
+      "rendered": "tool_choice"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='content', ctx=Load()), Name(id='list', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(content, list)"
+    },
+    {
+      "line_start": 115,
+      "line_end": 120,
+      "column": 15,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=IfExp(test=BoolOp(op=And(), values=[Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='block', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[]), Compare(left=Call(func=Attribute(value=Name(id='block', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='type')], keywords=[]), ops=[Eq()], comparators=[Constant(value='text')])]), body=Dict(keys=[Constant(value='type'), Constant(value='text')], values=[Constant(value='input_text'), Call(func=Attribute(value=Name(id='block', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='text'), Constant(value='')], keywords=[])]), orelse=Name(id='block', ctx=Load())), generators=[comprehension(target=Name(id='block', ctx=Store()), iter=Name(id='content', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "[{'type': 'input_text', 'text': block.get('text', '')} if isinstance(block, dict) and block.get('type') == 'text' else block for block in content]"
+    },
+    {
+      "line_start": 121,
+      "line_end": 121,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='content', ctx=Load())",
+      "rendered": "content"
+    },
+    {
+      "line_start": 127,
+      "line_end": 130,
+      "column": 11,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Call(func=Name(id='dict', ctx=Load()), args=[Name(id='item', ctx=Load())], keywords=[]), generators=[comprehension(target=Name(id='item', ctx=Store()), iter=BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='entry', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='REASONING_ITEMS_KEY', ctx=Load())], keywords=[]), List(elts=[], ctx=Load())]), ifs=[Call(func=Attribute(value=Name(id='item', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='encrypted_content')], keywords=[])], is_async=0)])",
+      "rendered": "[dict(item) for item in entry.get(REASONING_ITEMS_KEY) or [] if item.get('encrypted_content')]"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='entry', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='content')], keywords=[])",
+      "rendered": "entry.get('content')"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='content', ctx=Load()))",
+      "rendered": "not content"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 137,
+      "line_end": 141,
+      "column": 11,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='type'), Constant(value='role'), Constant(value='content')], values=[Constant(value='message'), Constant(value='assistant'), List(elts=[Dict(keys=[Constant(value='type'), Constant(value='text'), Constant(value='annotations')], values=[Constant(value='output_text'), Name(id='content', ctx=Load()), List(elts=[], ctx=Load())])], ctx=Load())])",
+      "rendered": "{'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': content, 'annotations': []}]}"
+    },
+    {
+      "line_start": 148,
+      "line_end": 148,
+      "column": 12,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 149,
+      "line_end": 149,
+      "column": 21,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='entry', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='tool_calls')], keywords=[]), List(elts=[], ctx=Load())])",
+      "rendered": "entry.get('tool_calls') or []"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 13,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='tool_call', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='function')], keywords=[]), Dict(keys=[], values=[])])",
+      "rendered": "tool_call.get('function') or {}"
+    },
+    {
+      "line_start": 151,
+      "line_end": 156,
+      "column": 20,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='type'), Constant(value='call_id'), Constant(value='name'), Constant(value='arguments')], values=[Constant(value='function_call'), Call(func=Attribute(value=Name(id='tool_call', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='id')], keywords=[]), Call(func=Attribute(value=Name(id='fn', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='name')], keywords=[]), Call(func=Attribute(value=Name(id='fn', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='arguments')], keywords=[])])",
+      "rendered": "{'type': 'function_call', 'call_id': tool_call.get('id'), 'name': fn.get('name'), 'arguments': fn.get('arguments')}"
+    },
+    {
+      "line_start": 157,
+      "line_end": 157,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='tool_call', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='ITEM_ID_KEY', ctx=Load())], keywords=[])",
+      "rendered": "tool_call.get(ITEM_ID_KEY)"
+    },
+    {
+      "line_start": 158,
+      "line_end": 158,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='item_id', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "item_id is not None"
+    },
+    {
+      "line_start": 159,
+      "line_end": 159,
+      "column": 30,
+      "kind": "Name",
+      "original_ast": "Name(id='item_id', ctx=Load())",
+      "rendered": "item_id"
+    },
+    {
+      "line_start": 160,
+      "line_end": 160,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='items', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='call_item', ctx=Load())], keywords=[])",
+      "rendered": "items.append(call_item)"
+    },
+    {
+      "line_start": 161,
+      "line_end": 161,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='items', ctx=Load())",
+      "rendered": "items"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_reasoning_input_items', ctx=Load()), args=[Name(id='entry', ctx=Load())], keywords=[])",
+      "rendered": "_reasoning_input_items(entry)"
+    },
+    {
+      "line_start": 166,
+      "line_end": 166,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_text_input_item', ctx=Load()), args=[Name(id='entry', ctx=Load())], keywords=[])",
+      "rendered": "_text_input_item(entry)"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='text_item', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "text_item is not None"
+    },
+    {
+      "line_start": 168,
+      "line_end": 168,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='items', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='text_item', ctx=Load())], keywords=[])",
+      "rendered": "items.append(text_item)"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='items', ctx=Load()), attr='extend', ctx=Load()), args=[Call(func=Name(id='_function_call_items', ctx=Load()), args=[Name(id='entry', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "items.extend(_function_call_items(entry))"
+    },
+    {
+      "line_start": 170,
+      "line_end": 170,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='items', ctx=Load())",
+      "rendered": "items"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 24,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 176,
+      "line_end": 176,
+      "column": 17,
+      "kind": "Name",
+      "original_ast": "Name(id='messages', ctx=Load())",
+      "rendered": "messages"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='entry', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='role')], keywords=[])",
+      "rendered": "entry.get('role')"
+    },
+    {
+      "line_start": 178,
+      "line_end": 178,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='role', ctx=Load()), ops=[Eq()], comparators=[Constant(value='assistant')])",
+      "rendered": "role == 'assistant'"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='items', ctx=Load()), attr='extend', ctx=Load()), args=[Call(func=Name(id='_assistant_items', ctx=Load()), args=[Name(id='entry', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "items.extend(_assistant_items(entry))"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 13,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='role', ctx=Load()), ops=[Eq()], comparators=[Constant(value='tool')])",
+      "rendered": "role == 'tool'"
+    },
+    {
+      "line_start": 181,
+      "line_end": 185,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='items', ctx=Load()), attr='append', ctx=Load()), args=[Dict(keys=[Constant(value='type'), Constant(value='call_id'), Constant(value='output')], values=[Constant(value='function_call_output'), Call(func=Attribute(value=Name(id='entry', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='tool_call_id')], keywords=[]), Call(func=Attribute(value=Name(id='entry', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='content')], keywords=[])])], keywords=[])",
+      "rendered": "items.append({'type': 'function_call_output', 'call_id': entry.get('tool_call_id'), 'output': entry.get('content')})"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='items', ctx=Load()), attr='append', ctx=Load()), args=[Dict(keys=[Constant(value='role'), Constant(value='content')], values=[Name(id='role', ctx=Load()), Call(func=Name(id='_input_content', ctx=Load()), args=[Call(func=Attribute(value=Name(id='entry', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='content')], keywords=[])], keywords=[])])], keywords=[])",
+      "rendered": "items.append({'role': role, 'content': _input_content(entry.get('content'))})"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='items', ctx=Load())",
+      "rendered": "items"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 19,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 193,
+      "line_end": 193,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='to_responses_tools', ctx=Load()), args=[Call(func=Attribute(value=Name(id='base_kw', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='tools')], keywords=[])], keywords=[])",
+      "rendered": "to_responses_tools(base_kw.get('tools'))"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='tools', ctx=Load())",
+      "rendered": "tools"
+    },
+    {
+      "line_start": 195,
+      "line_end": 195,
+      "column": 26,
+      "kind": "Name",
+      "original_ast": "Name(id='tools', ctx=Load())",
+      "rendered": "tools"
+    },
+    {
+      "line_start": 196,
+      "line_end": 196,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='base_kw', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='tool_choice')], keywords=[])",
+      "rendered": "base_kw.get('tool_choice')"
+    },
+    {
+      "line_start": 197,
+      "line_end": 197,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='tool_choice', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "tool_choice is not None"
+    },
+    {
+      "line_start": 198,
+      "line_end": 198,
+      "column": 32,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='to_responses_tool_choice', ctx=Load()), args=[Name(id='tool_choice', ctx=Load())], keywords=[])",
+      "rendered": "to_responses_tool_choice(tool_choice)"
+    },
+    {
+      "line_start": 199,
+      "line_end": 199,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='kwargs', ctx=Load())",
+      "rendered": "kwargs"
+    },
+    {
+      "line_start": 204,
+      "line_end": 204,
+      "column": 19,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='store')], values=[Constant(value=False)])",
+      "rendered": "{'store': False}"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='base_kw', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='max_completion_tokens'), Call(func=Attribute(value=Name(id='base_kw', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='max_tokens')], keywords=[])], keywords=[])",
+      "rendered": "base_kw.get('max_completion_tokens', base_kw.get('max_tokens'))"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='max_tokens', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "max_tokens is not None"
+    },
+    {
+      "line_start": 207,
+      "line_end": 207,
+      "column": 38,
+      "kind": "Name",
+      "original_ast": "Name(id='max_tokens', ctx=Load())",
+      "rendered": "max_tokens"
+    },
+    {
+      "line_start": 208,
+      "line_end": 208,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='base_kw', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='reasoning_effort')], keywords=[])",
+      "rendered": "base_kw.get('reasoning_effort')"
+    },
+    {
+      "line_start": 211,
+      "line_end": 211,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='effort', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), Compare(left=Name(id='effort', ctx=Load()), ops=[NotEq()], comparators=[Name(id='REASONING_OFF', ctx=Load())])])",
+      "rendered": "effort is not None and effort != REASONING_OFF"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 30,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='effort')], values=[Name(id='effort', ctx=Load())])",
+      "rendered": "{'effort': effort}"
+    },
+    {
+      "line_start": 213,
+      "line_end": 213,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='base_kw', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='prompt_cache_key')], keywords=[])",
+      "rendered": "base_kw.get('prompt_cache_key')"
+    },
+    {
+      "line_start": 214,
+      "line_end": 214,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='cache_key', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "cache_key is not None"
+    },
+    {
+      "line_start": 215,
+      "line_end": 215,
+      "column": 37,
+      "kind": "Name",
+      "original_ast": "Name(id='cache_key', ctx=Load())",
+      "rendered": "cache_key"
+    },
+    {
+      "line_start": 216,
+      "line_end": 216,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='include_encrypted', ctx=Load())",
+      "rendered": "include_encrypted"
+    },
+    {
+      "line_start": 217,
+      "line_end": 217,
+      "column": 28,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='list', ctx=Load()), args=[Name(id='INCLUDE_ENCRYPTED_REASONING', ctx=Load())], keywords=[])",
+      "rendered": "list(INCLUDE_ENCRYPTED_REASONING)"
+    },
+    {
+      "line_start": 218,
+      "line_end": 218,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='kwargs', ctx=Load())",
+      "rendered": "kwargs"
+    },
+    {
+      "line_start": 230,
+      "line_end": 230,
+      "column": 20,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='model'), Constant(value='input')], values=[Subscript(value=Name(id='base_kw', ctx=Load()), slice=Constant(value='model'), ctx=Load()), Call(func=Name(id='to_responses_input', ctx=Load()), args=[Name(id='messages', ctx=Load())], keywords=[])])",
+      "rendered": "{'model': base_kw['model'], 'input': to_responses_input(messages)}"
+    },
+    {
+      "line_start": 231,
+      "line_end": 231,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='request', ctx=Load()), attr='update', ctx=Load()), args=[Call(func=Name(id='_tool_kwargs', ctx=Load()), args=[Name(id='base_kw', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "request.update(_tool_kwargs(base_kw))"
+    },
+    {
+      "line_start": 232,
+      "line_end": 232,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='request', ctx=Load()), attr='update', ctx=Load()), args=[Call(func=Name(id='_responses_only_kwargs', ctx=Load()), args=[Name(id='base_kw', ctx=Load())], keywords=[keyword(arg='include_encrypted', value=Name(id='include_encrypted', ctx=Load()))])], keywords=[])",
+      "rendered": "request.update(_responses_only_kwargs(base_kw, include_encrypted=include_encrypted))"
+    },
+    {
+      "line_start": 233,
+      "line_end": 233,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='request', ctx=Load())",
+      "rendered": "request"
+    },
+    {
+      "line_start": 238,
+      "line_end": 238,
+      "column": 10,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 239,
+      "line_end": 239,
+      "column": 17,
+      "kind": "Name",
+      "original_ast": "Name(id='messages', ctx=Load())",
+      "rendered": "messages"
+    },
+    {
+      "line_start": 240,
+      "line_end": 240,
+      "column": 15,
+      "kind": "DictComp",
+      "original_ast": "DictComp(key=Name(id='k', ctx=Load()), value=Name(id='v', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='k', ctx=Store()), Name(id='v', ctx=Store())], ctx=Store()), iter=Call(func=Attribute(value=Name(id='entry', ctx=Load()), attr='items', ctx=Load()), args=[], keywords=[]), ifs=[Compare(left=Name(id='k', ctx=Load()), ops=[NotEq()], comparators=[Name(id='REASONING_ITEMS_KEY', ctx=Load())])], is_async=0)])",
+      "rendered": "{k: v for k, v in entry.items() if k != REASONING_ITEMS_KEY}"
+    },
+    {
+      "line_start": 241,
+      "line_end": 241,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='copy', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='tool_calls')], keywords=[])",
+      "rendered": "copy.get('tool_calls')"
+    },
+    {
+      "line_start": 242,
+      "line_end": 242,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='tool_calls', ctx=Load())",
+      "rendered": "tool_calls"
+    },
+    {
+      "line_start": 243,
+      "line_end": 245,
+      "column": 33,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=DictComp(key=Name(id='k', ctx=Load()), value=Name(id='v', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='k', ctx=Store()), Name(id='v', ctx=Store())], ctx=Store()), iter=Call(func=Attribute(value=Name(id='tc', ctx=Load()), attr='items', ctx=Load()), args=[], keywords=[]), ifs=[Compare(left=Name(id='k', ctx=Load()), ops=[NotEq()], comparators=[Name(id='ITEM_ID_KEY', ctx=Load())])], is_async=0)]), generators=[comprehension(target=Name(id='tc', ctx=Store()), iter=Name(id='tool_calls', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "[{k: v for k, v in tc.items() if k != ITEM_ID_KEY} for tc in tool_calls]"
+    },
+    {
+      "line_start": 246,
+      "line_end": 246,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='out', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='copy', ctx=Load())], keywords=[])",
+      "rendered": "out.append(copy)"
+    },
+    {
+      "line_start": 247,
+      "line_end": 247,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='out', ctx=Load())",
+      "rendered": "out"
+    },
+    {
+      "line_start": 252,
+      "line_end": 252,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='usage', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "usage is None"
+    },
+    {
+      "line_start": 253,
+      "line_end": 253,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 254,
+      "line_end": 254,
+      "column": 19,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Name(id='_get', ctx=Load()), args=[Name(id='usage', ctx=Load()), Constant(value='input_tokens')], keywords=[]), Constant(value=0)])",
+      "rendered": "_get(usage, 'input_tokens') or 0"
+    },
+    {
+      "line_start": 255,
+      "line_end": 255,
+      "column": 20,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Name(id='_get', ctx=Load()), args=[Name(id='usage', ctx=Load()), Constant(value='output_tokens')], keywords=[]), Constant(value=0)])",
+      "rendered": "_get(usage, 'output_tokens') or 0"
+    },
+    {
+      "line_start": 256,
+      "line_end": 256,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_get', ctx=Load()), args=[Name(id='usage', ctx=Load()), Constant(value='total_tokens')], keywords=[])",
+      "rendered": "_get(usage, 'total_tokens')"
+    },
+    {
+      "line_start": 257,
+      "line_end": 257,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='total_tokens', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "total_tokens is None"
+    },
+    {
+      "line_start": 258,
+      "line_end": 258,
+      "column": 23,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Name(id='input_tokens', ctx=Load()), op=Add(), right=Name(id='output_tokens', ctx=Load()))",
+      "rendered": "input_tokens + output_tokens"
+    },
+    {
+      "line_start": 260,
+      "line_end": 260,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_as_dict', ctx=Load()), args=[Call(func=Name(id='_get', ctx=Load()), args=[Name(id='usage', ctx=Load()), Constant(value='input_tokens_details')], keywords=[])], keywords=[])",
+      "rendered": "_as_dict(_get(usage, 'input_tokens_details'))"
+    },
+    {
+      "line_start": 261,
+      "line_end": 261,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='prompt_details', ctx=Load()), attr='setdefault', ctx=Load()), args=[Constant(value='cached_tokens'), Constant(value=0)], keywords=[])",
+      "rendered": "prompt_details.setdefault('cached_tokens', 0)"
+    },
+    {
+      "line_start": 262,
+      "line_end": 262,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='prompt_details', ctx=Load()), attr='setdefault', ctx=Load()), args=[Constant(value='cache_write_tokens'), Constant(value=0)], keywords=[])",
+      "rendered": "prompt_details.setdefault('cache_write_tokens', 0)"
+    },
+    {
+      "line_start": 264,
+      "line_end": 264,
+      "column": 25,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_as_dict', ctx=Load()), args=[Call(func=Name(id='_get', ctx=Load()), args=[Name(id='usage', ctx=Load()), Constant(value='output_tokens_details')], keywords=[])], keywords=[])",
+      "rendered": "_as_dict(_get(usage, 'output_tokens_details'))"
+    },
+    {
+      "line_start": 265,
+      "line_end": 265,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='completion_details', ctx=Load()), attr='setdefault', ctx=Load()), args=[Constant(value='reasoning_tokens'), Constant(value=0)], keywords=[])",
+      "rendered": "completion_details.setdefault('reasoning_tokens', 0)"
+    },
+    {
+      "line_start": 267,
+      "line_end": 273,
+      "column": 11,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='prompt_tokens'), Constant(value='completion_tokens'), Constant(value='total_tokens'), Constant(value='prompt_tokens_details'), Constant(value='completion_tokens_details')], values=[Name(id='input_tokens', ctx=Load()), Name(id='output_tokens', ctx=Load()), Name(id='total_tokens', ctx=Load()), Name(id='prompt_details', ctx=Load()), Name(id='completion_details', ctx=Load())])",
+      "rendered": "{'prompt_tokens': input_tokens, 'completion_tokens': output_tokens, 'total_tokens': total_tokens, 'prompt_tokens_details': prompt_details, 'completion_tokens_details': completion_details}"
+    },
+    {
+      "line_start": 278,
+      "line_end": 278,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_get', ctx=Load()), args=[Name(id='resp', ctx=Load()), Constant(value='status')], keywords=[])",
+      "rendered": "_get(resp, 'status')"
+    },
+    {
+      "line_start": 279,
+      "line_end": 279,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_get', ctx=Load()), args=[Name(id='resp', ctx=Load()), Constant(value='incomplete_details')], keywords=[])",
+      "rendered": "_get(resp, 'incomplete_details')"
+    },
+    {
+      "line_start": 280,
+      "line_end": 280,
+      "column": 13,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=Name(id='incomplete', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), body=Call(func=Name(id='_get', ctx=Load()), args=[Name(id='incomplete', ctx=Load()), Constant(value='reason')], keywords=[]), orelse=Constant(value=None))",
+      "rendered": "_get(incomplete, 'reason') if incomplete is not None else None"
+    },
+    {
+      "line_start": 281,
+      "line_end": 281,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='status', ctx=Load()), ops=[Eq()], comparators=[Constant(value='incomplete')]), Compare(left=Name(id='reason', ctx=Load()), ops=[Eq()], comparators=[Constant(value='max_output_tokens')])])",
+      "rendered": "status == 'incomplete' and reason == 'max_output_tokens'"
+    },
+    {
+      "line_start": 282,
+      "line_end": 282,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value='length')",
+      "rendered": "'length'"
+    },
+    {
+      "line_start": 283,
+      "line_end": 283,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='reason', ctx=Load()), ops=[Eq()], comparators=[Constant(value='content_filter')])",
+      "rendered": "reason == 'content_filter'"
+    },
+    {
+      "line_start": 284,
+      "line_end": 284,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value='content_filter')",
+      "rendered": "'content_filter'"
+    },
+    {
+      "line_start": 285,
+      "line_end": 285,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='has_tool_calls', ctx=Load()), body=Constant(value='tool_calls'), orelse=Constant(value='stop'))",
+      "rendered": "'tool_calls' if has_tool_calls else 'stop'"
+    },
+    {
+      "line_start": 289,
+      "line_end": 289,
+      "column": 16,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value='arguments'), Constant(value='name')], ctx=Load())",
+      "rendered": "('arguments', 'name')"
+    },
+    {
+      "line_start": 292,
+      "line_end": 292,
+      "column": 20,
+      "kind": "Name",
+      "original_ast": "Name(id='name', ctx=Load())",
+      "rendered": "name"
+    },
+    {
+      "line_start": 293,
+      "line_end": 293,
+      "column": 25,
+      "kind": "Name",
+      "original_ast": "Name(id='arguments', ctx=Load())",
+      "rendered": "arguments"
+    },
+    {
+      "line_start": 297,
+      "line_end": 297,
+      "column": 16,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value='_item_id'), Constant(value='function'), Constant(value='id'), Constant(value='type')], ctx=Load())",
+      "rendered": "('_item_id', 'function', 'id', 'type')"
+    },
+    {
+      "line_start": 301,
+      "line_end": 301,
+      "column": 18,
+      "kind": "Name",
+      "original_ast": "Name(id='call_id', ctx=Load())",
+      "rendered": "call_id"
+    },
+    {
+      "line_start": 302,
+      "line_end": 302,
+      "column": 20,
+      "kind": "Constant",
+      "original_ast": "Constant(value='function')",
+      "rendered": "'function'"
+    },
+    {
+      "line_start": 303,
+      "line_end": 303,
+      "column": 24,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_Function', ctx=Load()), args=[Name(id='name', ctx=Load()), Name(id='arguments', ctx=Load())], keywords=[])",
+      "rendered": "_Function(name, arguments)"
+    },
+    {
+      "line_start": 304,
+      "line_end": 304,
+      "column": 24,
+      "kind": "Name",
+      "original_ast": "Name(id='item_id', ctx=Load())",
+      "rendered": "item_id"
+    },
+    {
+      "line_start": 307,
+      "line_end": 311,
+      "column": 17,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='id'), Constant(value='type'), Constant(value='function')], values=[Attribute(value=Name(id='self', ctx=Load()), attr='id', ctx=Load()), Constant(value='function'), Dict(keys=[Constant(value='name'), Constant(value='arguments')], values=[Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='function', ctx=Load()), attr='name', ctx=Load()), Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='function', ctx=Load()), attr='arguments', ctx=Load())])])",
+      "rendered": "{'id': self.id, 'type': 'function', 'function': {'name': self.function.name, 'arguments': self.function.arguments}}"
+    },
+    {
+      "line_start": 312,
+      "line_end": 312,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='self', ctx=Load()), attr='_item_id', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "self._item_id is not None"
+    },
+    {
+      "line_start": 313,
+      "line_end": 313,
+      "column": 34,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_item_id', ctx=Load())",
+      "rendered": "self._item_id"
+    },
+    {
+      "line_start": 314,
+      "line_end": 314,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='dumped', ctx=Load())",
+      "rendered": "dumped"
+    },
+    {
+      "line_start": 318,
+      "line_end": 318,
+      "column": 16,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value='content'), Constant(value='reasoning_items'), Constant(value='refusal'), Constant(value='tool_calls')], ctx=Load())",
+      "rendered": "('content', 'reasoning_items', 'refusal', 'tool_calls')"
+    },
+    {
+      "line_start": 322,
+      "line_end": 322,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='content', ctx=Load())",
+      "rendered": "content"
+    },
+    {
+      "line_start": 323,
+      "line_end": 323,
+      "column": 26,
+      "kind": "Name",
+      "original_ast": "Name(id='tool_calls', ctx=Load())",
+      "rendered": "tool_calls"
+    },
+    {
+      "line_start": 324,
+      "line_end": 324,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='refusal', ctx=Load())",
+      "rendered": "refusal"
+    },
+    {
+      "line_start": 325,
+      "line_end": 325,
+      "column": 31,
+      "kind": "Name",
+      "original_ast": "Name(id='reasoning_items', ctx=Load())",
+      "rendered": "reasoning_items"
+    },
+    {
+      "line_start": 329,
+      "line_end": 329,
+      "column": 16,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value='finish_reason'), Constant(value='message')], ctx=Load())",
+      "rendered": "('finish_reason', 'message')"
+    },
+    {
+      "line_start": 332,
+      "line_end": 332,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='message', ctx=Load())",
+      "rendered": "message"
+    },
+    {
+      "line_start": 333,
+      "line_end": 333,
+      "column": 29,
+      "kind": "Name",
+      "original_ast": "Name(id='finish_reason', ctx=Load())",
+      "rendered": "finish_reason"
+    },
+    {
+      "line_start": 337,
+      "line_end": 337,
+      "column": 16,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value='choices'), Constant(value='usage')], ctx=Load())",
+      "rendered": "('choices', 'usage')"
+    },
+    {
+      "line_start": 340,
+      "line_end": 340,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='choices', ctx=Load())",
+      "rendered": "choices"
+    },
+    {
+      "line_start": 341,
+      "line_end": 341,
+      "column": 21,
+      "kind": "Name",
+      "original_ast": "Name(id='usage', ctx=Load())",
+      "rendered": "usage"
+    },
+    {
+      "line_start": 345,
+      "line_end": 345,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_get', ctx=Load()), args=[Name(id='resp', ctx=Load()), Constant(value='error')], keywords=[])",
+      "rendered": "_get(resp, 'error')"
+    },
+    {
+      "line_start": 346,
+      "line_end": 346,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_get', ctx=Load()), args=[Name(id='resp', ctx=Load()), Constant(value='status')], keywords=[])",
+      "rendered": "_get(resp, 'status')"
+    },
+    {
+      "line_start": 347,
+      "line_end": 347,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[UnaryOp(op=Not(), operand=Name(id='error', ctx=Load())), Compare(left=Name(id='status', ctx=Load()), ops=[NotEq()], comparators=[Constant(value='failed')])])",
+      "rendered": "not error and status != 'failed'"
+    },
+    {
+      "line_start": 349,
+      "line_end": 349,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='error', ctx=Load())",
+      "rendered": "error"
+    },
+    {
+      "line_start": 350,
+      "line_end": 350,
+      "column": 18,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='error', ctx=Load()), Name(id='str', ctx=Load())], keywords=[]), body=Name(id='error', ctx=Load()), orelse=BoolOp(op=Or(), values=[Call(func=Name(id='_get', ctx=Load()), args=[Name(id='error', ctx=Load()), Constant(value='message')], keywords=[]), Call(func=Name(id='str', ctx=Load()), args=[Name(id='error', ctx=Load())], keywords=[])]))",
+      "rendered": "error if isinstance(error, str) else _get(error, 'message') or str(error)"
+    },
+    {
+      "line_start": 354,
+      "line_end": 354,
+      "column": 18,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[Constant(value='Responses call ended with status='), FormattedValue(value=Name(id='status', ctx=Load()), conversion=114), Constant(value=' and no error body')])",
+      "rendered": "source_template_354_18"
+    },
+    {
+      "line_start": 355,
+      "line_end": 355,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='RuntimeError', ctx=Load()), args=[Name(id='message', ctx=Load())], keywords=[])",
+      "rendered": "RuntimeError(message)"
+    },
+    {
+      "line_start": 359,
+      "line_end": 359,
+      "column": 28,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 360,
+      "line_end": 360,
+      "column": 26,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 361,
+      "line_end": 361,
+      "column": 17,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Name(id='_get', ctx=Load()), args=[Name(id='item', ctx=Load()), Constant(value='content')], keywords=[]), List(elts=[], ctx=Load())])",
+      "rendered": "_get(item, 'content') or []"
+    },
+    {
+      "line_start": 362,
+      "line_end": 362,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_get', ctx=Load()), args=[Name(id='block', ctx=Load()), Constant(value='type')], keywords=[])",
+      "rendered": "_get(block, 'type')"
+    },
+    {
+      "line_start": 363,
+      "line_end": 363,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='block_type', ctx=Load()), ops=[Eq()], comparators=[Constant(value='output_text')])",
+      "rendered": "block_type == 'output_text'"
+    },
+    {
+      "line_start": 364,
+      "line_end": 364,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='text_parts', ctx=Load()), attr='append', ctx=Load()), args=[BoolOp(op=Or(), values=[Call(func=Name(id='_get', ctx=Load()), args=[Name(id='block', ctx=Load()), Constant(value='text')], keywords=[]), Constant(value='')])], keywords=[])",
+      "rendered": "text_parts.append(_get(block, 'text') or '')"
+    },
+    {
+      "line_start": 365,
+      "line_end": 365,
+      "column": 13,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='block_type', ctx=Load()), ops=[Eq()], comparators=[Constant(value='refusal')]), Compare(left=Name(id='refusal', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])])",
+      "rendered": "block_type == 'refusal' and refusal is None"
+    },
+    {
+      "line_start": 366,
+      "line_end": 366,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_get', ctx=Load()), args=[Name(id='block', ctx=Load()), Constant(value='refusal')], keywords=[])",
+      "rendered": "_get(block, 'refusal')"
+    },
+    {
+      "line_start": 367,
+      "line_end": 367,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='text_parts', ctx=Load()), Name(id='refusal', ctx=Load())], ctx=Load())",
+      "rendered": "(text_parts, refusal)"
+    },
+    {
+      "line_start": 373,
+      "line_end": 375,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_ToolCall', ctx=Load()), args=[Call(func=Name(id='_get', ctx=Load()), args=[Name(id='item', ctx=Load()), Constant(value='call_id')], keywords=[]), Call(func=Name(id='_get', ctx=Load()), args=[Name(id='item', ctx=Load()), Constant(value='name')], keywords=[]), Call(func=Name(id='_get', ctx=Load()), args=[Name(id='item', ctx=Load()), Constant(value='arguments')], keywords=[]), Call(func=Name(id='_get', ctx=Load()), args=[Name(id='item', ctx=Load()), Constant(value='id')], keywords=[])], keywords=[])",
+      "rendered": "_ToolCall(_get(item, 'call_id'), _get(item, 'name'), _get(item, 'arguments'), _get(item, 'id'))"
+    },
+    {
+      "line_start": 379,
+      "line_end": 384,
+      "column": 11,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=DictComp(key=Name(id='field', ctx=Load()), value=Call(func=Name(id='_get', ctx=Load()), args=[Name(id='item', ctx=Load()), Name(id='field', ctx=Load())], keywords=[]), generators=[comprehension(target=Name(id='field', ctx=Store()), iter=Name(id='_REASONING_INPUT_FIELDS', ctx=Load()), ifs=[Compare(left=Call(func=Name(id='_get', ctx=Load()), args=[Name(id='item', ctx=Load()), Name(id='field', ctx=Load())], keywords=[]), ops=[IsNot()], comparators=[Constant(value=None)])], is_async=0)]), generators=[comprehension(target=Name(id='item', ctx=Store()), iter=Name(id='items', ctx=Load()), ifs=[BoolOp(op=And(), values=[Compare(left=Call(func=Name(id='_get', ctx=Load()), args=[Name(id='item', ctx=Load()), Constant(value='type')], keywords=[]), ops=[Eq()], comparators=[Constant(value='reasoning')]), Call(func=Name(id='_get', ctx=Load()), args=[Name(id='item', ctx=Load()), Constant(value='encrypted_content')], keywords=[])])], is_async=0)])",
+      "rendered": "[{field: _get(item, field) for field in _REASONING_INPUT_FIELDS if _get(item, field) is not None} for item in items if _get(item, 'type') == 'reasoning' and _get(item, 'encrypted_content')]"
+    },
+    {
+      "line_start": 389,
+      "line_end": 389,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_raise_for_error', ctx=Load()), args=[Name(id='resp', ctx=Load())], keywords=[])",
+      "rendered": "_raise_for_error(resp)"
+    },
+    {
+      "line_start": 391,
+      "line_end": 391,
+      "column": 19,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Name(id='_get', ctx=Load()), args=[Name(id='resp', ctx=Load()), Constant(value='output')], keywords=[]), List(elts=[], ctx=Load())])",
+      "rendered": "_get(resp, 'output') or []"
+    },
+    {
+      "line_start": 392,
+      "line_end": 392,
+      "column": 35,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 393,
+      "line_end": 393,
+      "column": 31,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 394,
+      "line_end": 394,
+      "column": 34,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 395,
+      "line_end": 395,
+      "column": 16,
+      "kind": "Name",
+      "original_ast": "Name(id='output_items', ctx=Load())",
+      "rendered": "output_items"
+    },
+    {
+      "line_start": 396,
+      "line_end": 396,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_get', ctx=Load()), args=[Name(id='item', ctx=Load()), Constant(value='type')], keywords=[])",
+      "rendered": "_get(item, 'type')"
+    },
+    {
+      "line_start": 397,
+      "line_end": 397,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='item_type', ctx=Load()), ops=[Eq()], comparators=[Constant(value='message')])",
+      "rendered": "item_type == 'message'"
+    },
+    {
+      "line_start": 398,
+      "line_end": 398,
+      "column": 34,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_message_content', ctx=Load()), args=[Name(id='item', ctx=Load())], keywords=[])",
+      "rendered": "_message_content(item)"
+    },
+    {
+      "line_start": 399,
+      "line_end": 399,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='output_text_parts', ctx=Load()), attr='extend', ctx=Load()), args=[Name(id='text_parts', ctx=Load())], keywords=[])",
+      "rendered": "output_text_parts.extend(text_parts)"
+    },
+    {
+      "line_start": 400,
+      "line_end": 400,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='refusal_text', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "refusal_text is None"
+    },
+    {
+      "line_start": 401,
+      "line_end": 401,
+      "column": 31,
+      "kind": "Name",
+      "original_ast": "Name(id='refusal', ctx=Load())",
+      "rendered": "refusal"
+    },
+    {
+      "line_start": 402,
+      "line_end": 402,
+      "column": 13,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='item_type', ctx=Load()), ops=[Eq()], comparators=[Constant(value='function_call')])",
+      "rendered": "item_type == 'function_call'"
+    },
+    {
+      "line_start": 403,
+      "line_end": 403,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='tool_calls', ctx=Load()), attr='append', ctx=Load()), args=[Call(func=Name(id='_tool_call_from_item', ctx=Load()), args=[Name(id='item', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "tool_calls.append(_tool_call_from_item(item))"
+    },
+    {
+      "line_start": 405,
+      "line_end": 405,
+      "column": 14,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='output_text_parts', ctx=Load()), body=Call(func=Attribute(value=Constant(value=''), attr='join', ctx=Load()), args=[Name(id='output_text_parts', ctx=Load())], keywords=[]), orelse=Constant(value=None))",
+      "rendered": "''.join(output_text_parts) if output_text_parts else None"
+    },
+    {
+      "line_start": 406,
+      "line_end": 406,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_Message', ctx=Load()), args=[Name(id='content', ctx=Load()), Name(id='tool_calls', ctx=Load()), Name(id='refusal_text', ctx=Load()), Call(func=Name(id='_encrypted_reasoning_items', ctx=Load()), args=[Name(id='output_items', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "_Message(content, tool_calls, refusal_text, _encrypted_reasoning_items(output_items))"
+    },
+    {
+      "line_start": 407,
+      "line_end": 407,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_Choice', ctx=Load()), args=[Name(id='message', ctx=Load()), Call(func=Name(id='finish_of', ctx=Load()), args=[Name(id='resp', ctx=Load())], keywords=[keyword(arg='has_tool_calls', value=Call(func=Name(id='bool', ctx=Load()), args=[Name(id='tool_calls', ctx=Load())], keywords=[]))])], keywords=[])",
+      "rendered": "_Choice(message, finish_of(resp, has_tool_calls=bool(tool_calls)))"
+    },
+    {
+      "line_start": 408,
+      "line_end": 408,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_ResponsesReply', ctx=Load()), args=[List(elts=[Name(id='choice', ctx=Load())], ctx=Load()), Call(func=Name(id='usage_as_chat', ctx=Load()), args=[Call(func=Name(id='_get', ctx=Load()), args=[Name(id='resp', ctx=Load()), Constant(value='usage')], keywords=[])], keywords=[])], keywords=[])",
+      "rendered": "_ResponsesReply([choice], usage_as_chat(_get(resp, 'usage')))"
+    }
+  ],
+  "calls": [
+    {
+      "line": 66,
+      "end_line": 66,
+      "callee": "isinstance",
+      "enclosing": "_get",
+      "expression": "isinstance(obj, dict)"
+    },
+    {
+      "line": 68,
+      "end_line": 68,
+      "callee": "getattr",
+      "enclosing": "_get",
+      "expression": "getattr(obj, key, default)"
+    },
+    {
+      "line": 75,
+      "end_line": 75,
+      "callee": "isinstance",
+      "enclosing": "_as_dict",
+      "expression": "isinstance(obj, dict)"
+    },
+    {
+      "line": 108,
+      "end_line": 108,
+      "callee": "_is_forced_function_choice",
+      "enclosing": "to_responses_tool_choice",
+      "expression": "_is_forced_function_choice(tool_choice)"
+    },
+    {
+      "line": 114,
+      "end_line": 114,
+      "callee": "isinstance",
+      "enclosing": "_input_content",
+      "expression": "isinstance(content, list)"
+    },
+    {
+      "line": 134,
+      "end_line": 134,
+      "callee": "entry.get",
+      "enclosing": "_text_input_item",
+      "expression": "entry.get(\"content\")"
+    },
+    {
+      "line": 165,
+      "end_line": 165,
+      "callee": "_reasoning_input_items",
+      "enclosing": "_assistant_items",
+      "expression": "_reasoning_input_items(entry)"
+    },
+    {
+      "line": 166,
+      "end_line": 166,
+      "callee": "_text_input_item",
+      "enclosing": "_assistant_items",
+      "expression": "_text_input_item(entry)"
+    },
+    {
+      "line": 169,
+      "end_line": 169,
+      "callee": "items.extend",
+      "enclosing": "_assistant_items",
+      "expression": "items.extend(_function_call_items(entry))"
+    },
+    {
+      "line": 193,
+      "end_line": 193,
+      "callee": "to_responses_tools",
+      "enclosing": "_tool_kwargs",
+      "expression": "to_responses_tools(base_kw.get(\"tools\"))"
+    },
+    {
+      "line": 196,
+      "end_line": 196,
+      "callee": "base_kw.get",
+      "enclosing": "_tool_kwargs",
+      "expression": "base_kw.get(\"tool_choice\")"
+    },
+    {
+      "line": 205,
+      "end_line": 205,
+      "callee": "base_kw.get",
+      "enclosing": "_responses_only_kwargs",
+      "expression": "base_kw.get(\"max_completion_tokens\", base_kw.get(\"max_tokens\"))"
+    },
+    {
+      "line": 208,
+      "end_line": 208,
+      "callee": "base_kw.get",
+      "enclosing": "_responses_only_kwargs",
+      "expression": "base_kw.get(\"reasoning_effort\")"
+    },
+    {
+      "line": 213,
+      "end_line": 213,
+      "callee": "base_kw.get",
+      "enclosing": "_responses_only_kwargs",
+      "expression": "base_kw.get(\"prompt_cache_key\")"
+    },
+    {
+      "line": 231,
+      "end_line": 231,
+      "callee": "request.update",
+      "enclosing": "to_responses_request",
+      "expression": "request.update(_tool_kwargs(base_kw))"
+    },
+    {
+      "line": 232,
+      "end_line": 232,
+      "callee": "request.update",
+      "enclosing": "to_responses_request",
+      "expression": "request.update(_responses_only_kwargs(base_kw, include_encrypted=include_encrypted))"
+    },
+    {
+      "line": 256,
+      "end_line": 256,
+      "callee": "_get",
+      "enclosing": "usage_as_chat",
+      "expression": "_get(usage, \"total_tokens\")"
+    },
+    {
+      "line": 260,
+      "end_line": 260,
+      "callee": "_as_dict",
+      "enclosing": "usage_as_chat",
+      "expression": "_as_dict(_get(usage, \"input_tokens_details\"))"
+    },
+    {
+      "line": 261,
+      "end_line": 261,
+      "callee": "prompt_details.setdefault",
+      "enclosing": "usage_as_chat",
+      "expression": "prompt_details.setdefault(\"cached_tokens\", 0)"
+    },
+    {
+      "line": 262,
+      "end_line": 262,
+      "callee": "prompt_details.setdefault",
+      "enclosing": "usage_as_chat",
+      "expression": "prompt_details.setdefault(\"cache_write_tokens\", 0)"
+    },
+    {
+      "line": 264,
+      "end_line": 264,
+      "callee": "_as_dict",
+      "enclosing": "usage_as_chat",
+      "expression": "_as_dict(_get(usage, \"output_tokens_details\"))"
+    },
+    {
+      "line": 265,
+      "end_line": 265,
+      "callee": "completion_details.setdefault",
+      "enclosing": "usage_as_chat",
+      "expression": "completion_details.setdefault(\"reasoning_tokens\", 0)"
+    },
+    {
+      "line": 278,
+      "end_line": 278,
+      "callee": "_get",
+      "enclosing": "finish_of",
+      "expression": "_get(resp, \"status\")"
+    },
+    {
+      "line": 279,
+      "end_line": 279,
+      "callee": "_get",
+      "enclosing": "finish_of",
+      "expression": "_get(resp, \"incomplete_details\")"
+    },
+    {
+      "line": 345,
+      "end_line": 345,
+      "callee": "_get",
+      "enclosing": "_raise_for_error",
+      "expression": "_get(resp, \"error\")"
+    },
+    {
+      "line": 346,
+      "end_line": 346,
+      "callee": "_get",
+      "enclosing": "_raise_for_error",
+      "expression": "_get(resp, \"status\")"
+    },
+    {
+      "line": 355,
+      "end_line": 355,
+      "callee": "RuntimeError",
+      "enclosing": "_raise_for_error",
+      "expression": "RuntimeError(message)"
+    },
+    {
+      "line": 373,
+      "end_line": 375,
+      "callee": "_ToolCall",
+      "enclosing": "_tool_call_from_item",
+      "expression": "_ToolCall(\n        _get(item, \"call_id\"), _get(item, \"name\"), _get(item, \"arguments\"), _get(item, \"id\"),\n    )"
+    },
+    {
+      "line": 389,
+      "end_line": 389,
+      "callee": "_raise_for_error",
+      "enclosing": "from_response",
+      "expression": "_raise_for_error(resp)"
+    },
+    {
+      "line": 406,
+      "end_line": 406,
+      "callee": "_Message",
+      "enclosing": "from_response",
+      "expression": "_Message(content, tool_calls, refusal_text, _encrypted_reasoning_items(output_items))"
+    },
+    {
+      "line": 407,
+      "end_line": 407,
+      "callee": "_Choice",
+      "enclosing": "from_response",
+      "expression": "_Choice(message, finish_of(resp, has_tool_calls=bool(tool_calls)))"
+    },
+    {
+      "line": 408,
+      "end_line": 408,
+      "callee": "_ResponsesReply",
+      "enclosing": "from_response",
+      "expression": "_ResponsesReply([choice], usage_as_chat(_get(resp, \"usage\")))"
+    },
+    {
+      "line": 67,
+      "end_line": 67,
+      "callee": "obj.get",
+      "enclosing": "_get",
+      "expression": "obj.get(key, default)"
+    },
+    {
+      "line": 76,
+      "end_line": 76,
+      "callee": "dict",
+      "enclosing": "_as_dict",
+      "expression": "dict(obj)"
+    },
+    {
+      "line": 77,
+      "end_line": 77,
+      "callee": "hasattr",
+      "enclosing": "_as_dict",
+      "expression": "hasattr(obj, \"model_dump\")"
+    },
+    {
+      "line": 77,
+      "end_line": 77,
+      "callee": "obj.model_dump",
+      "enclosing": "_as_dict",
+      "expression": "obj.model_dump()"
+    },
+    {
+      "line": 77,
+      "end_line": 77,
+      "callee": "dict",
+      "enclosing": "_as_dict",
+      "expression": "dict(vars(obj))"
+    },
+    {
+      "line": 87,
+      "end_line": 94,
+      "callee": "flattened.append",
+      "enclosing": "to_responses_tools",
+      "expression": "flattened.append({\n            \"type\": \"function\",\n            \"name\": fn[\"name\"],\n            \"description\": fn.get(\"description\"),\n            \"parameters\": fn.get(\"parameters\"),\n            # Explicit: the Responses API attempts strict mode when this is omitted.\n            \"strict\": False,\n        })"
+    },
+    {
+      "line": 100,
+      "end_line": 100,
+      "callee": "isinstance",
+      "enclosing": "_is_forced_function_choice",
+      "expression": "isinstance(tool_choice, dict)"
+    },
+    {
+      "line": 128,
+      "end_line": 128,
+      "callee": "dict",
+      "enclosing": "_reasoning_input_items",
+      "expression": "dict(item)"
+    },
+    {
+      "line": 149,
+      "end_line": 149,
+      "callee": "entry.get",
+      "enclosing": "_function_call_items",
+      "expression": "entry.get(\"tool_calls\")"
+    },
+    {
+      "line": 157,
+      "end_line": 157,
+      "callee": "tool_call.get",
+      "enclosing": "_function_call_items",
+      "expression": "tool_call.get(ITEM_ID_KEY)"
+    },
+    {
+      "line": 160,
+      "end_line": 160,
+      "callee": "items.append",
+      "enclosing": "_function_call_items",
+      "expression": "items.append(call_item)"
+    },
+    {
+      "line": 168,
+      "end_line": 168,
+      "callee": "items.append",
+      "enclosing": "_assistant_items",
+      "expression": "items.append(text_item)"
+    },
+    {
+      "line": 169,
+      "end_line": 169,
+      "callee": "_function_call_items",
+      "enclosing": "_assistant_items",
+      "expression": "_function_call_items(entry)"
+    },
+    {
+      "line": 177,
+      "end_line": 177,
+      "callee": "entry.get",
+      "enclosing": "to_responses_input",
+      "expression": "entry.get(\"role\")"
+    },
+    {
+      "line": 193,
+      "end_line": 193,
+      "callee": "base_kw.get",
+      "enclosing": "_tool_kwargs",
+      "expression": "base_kw.get(\"tools\")"
+    },
+    {
+      "line": 198,
+      "end_line": 198,
+      "callee": "to_responses_tool_choice",
+      "enclosing": "_tool_kwargs",
+      "expression": "to_responses_tool_choice(tool_choice)"
+    },
+    {
+      "line": 205,
+      "end_line": 205,
+      "callee": "base_kw.get",
+      "enclosing": "_responses_only_kwargs",
+      "expression": "base_kw.get(\"max_tokens\")"
+    },
+    {
+      "line": 217,
+      "end_line": 217,
+      "callee": "list",
+      "enclosing": "_responses_only_kwargs",
+      "expression": "list(INCLUDE_ENCRYPTED_REASONING)"
+    },
+    {
+      "line": 230,
+      "end_line": 230,
+      "callee": "to_responses_input",
+      "enclosing": "to_responses_request",
+      "expression": "to_responses_input(messages)"
+    },
+    {
+      "line": 231,
+      "end_line": 231,
+      "callee": "_tool_kwargs",
+      "enclosing": "to_responses_request",
+      "expression": "_tool_kwargs(base_kw)"
+    },
+    {
+      "line": 232,
+      "end_line": 232,
+      "callee": "_responses_only_kwargs",
+      "enclosing": "to_responses_request",
+      "expression": "_responses_only_kwargs(base_kw, include_encrypted=include_encrypted)"
+    },
+    {
+      "line": 241,
+      "end_line": 241,
+      "callee": "copy.get",
+      "enclosing": "to_chat_messages",
+      "expression": "copy.get(\"tool_calls\")"
+    },
+    {
+      "line": 246,
+      "end_line": 246,
+      "callee": "out.append",
+      "enclosing": "to_chat_messages",
+      "expression": "out.append(copy)"
+    },
+    {
+      "line": 254,
+      "end_line": 254,
+      "callee": "_get",
+      "enclosing": "usage_as_chat",
+      "expression": "_get(usage, \"input_tokens\")"
+    },
+    {
+      "line": 255,
+      "end_line": 255,
+      "callee": "_get",
+      "enclosing": "usage_as_chat",
+      "expression": "_get(usage, \"output_tokens\")"
+    },
+    {
+      "line": 260,
+      "end_line": 260,
+      "callee": "_get",
+      "enclosing": "usage_as_chat",
+      "expression": "_get(usage, \"input_tokens_details\")"
+    },
+    {
+      "line": 264,
+      "end_line": 264,
+      "callee": "_get",
+      "enclosing": "usage_as_chat",
+      "expression": "_get(usage, \"output_tokens_details\")"
+    },
+    {
+      "line": 280,
+      "end_line": 280,
+      "callee": "_get",
+      "enclosing": "finish_of",
+      "expression": "_get(incomplete, \"reason\")"
+    },
+    {
+      "line": 303,
+      "end_line": 303,
+      "callee": "_Function",
+      "enclosing": "_ToolCall.__init__",
+      "expression": "_Function(name, arguments)"
+    },
+    {
+      "line": 361,
+      "end_line": 361,
+      "callee": "_get",
+      "enclosing": "_message_content",
+      "expression": "_get(item, \"content\")"
+    },
+    {
+      "line": 362,
+      "end_line": 362,
+      "callee": "_get",
+      "enclosing": "_message_content",
+      "expression": "_get(block, \"type\")"
+    },
+    {
+      "line": 374,
+      "end_line": 374,
+      "callee": "_get",
+      "enclosing": "_tool_call_from_item",
+      "expression": "_get(item, \"call_id\")"
+    },
+    {
+      "line": 374,
+      "end_line": 374,
+      "callee": "_get",
+      "enclosing": "_tool_call_from_item",
+      "expression": "_get(item, \"name\")"
+    },
+    {
+      "line": 374,
+      "end_line": 374,
+      "callee": "_get",
+      "enclosing": "_tool_call_from_item",
+      "expression": "_get(item, \"arguments\")"
+    },
+    {
+      "line": 374,
+      "end_line": 374,
+      "callee": "_get",
+      "enclosing": "_tool_call_from_item",
+      "expression": "_get(item, \"id\")"
+    },
+    {
+      "line": 391,
+      "end_line": 391,
+      "callee": "_get",
+      "enclosing": "from_response",
+      "expression": "_get(resp, \"output\")"
+    },
+    {
+      "line": 396,
+      "end_line": 396,
+      "callee": "_get",
+      "enclosing": "from_response",
+      "expression": "_get(item, \"type\")"
+    },
+    {
+      "line": 405,
+      "end_line": 405,
+      "callee": "''.join",
+      "enclosing": "from_response",
+      "expression": "\"\".join(output_text_parts)"
+    },
+    {
+      "line": 406,
+      "end_line": 406,
+      "callee": "_encrypted_reasoning_items",
+      "enclosing": "from_response",
+      "expression": "_encrypted_reasoning_items(output_items)"
+    },
+    {
+      "line": 407,
+      "end_line": 407,
+      "callee": "finish_of",
+      "enclosing": "from_response",
+      "expression": "finish_of(resp, has_tool_calls=bool(tool_calls))"
+    },
+    {
+      "line": 408,
+      "end_line": 408,
+      "callee": "usage_as_chat",
+      "enclosing": "from_response",
+      "expression": "usage_as_chat(_get(resp, \"usage\"))"
+    },
+    {
+      "line": 77,
+      "end_line": 77,
+      "callee": "vars",
+      "enclosing": "_as_dict",
+      "expression": "vars(obj)"
+    },
+    {
+      "line": 101,
+      "end_line": 101,
+      "callee": "tool_choice.get",
+      "enclosing": "_is_forced_function_choice",
+      "expression": "tool_choice.get(\"type\")"
+    },
+    {
+      "line": 129,
+      "end_line": 129,
+      "callee": "item.get",
+      "enclosing": "_reasoning_input_items",
+      "expression": "item.get(\"encrypted_content\")"
+    },
+    {
+      "line": 150,
+      "end_line": 150,
+      "callee": "tool_call.get",
+      "enclosing": "_function_call_items",
+      "expression": "tool_call.get(\"function\")"
+    },
+    {
+      "line": 153,
+      "end_line": 153,
+      "callee": "tool_call.get",
+      "enclosing": "_function_call_items",
+      "expression": "tool_call.get(\"id\")"
+    },
+    {
+      "line": 154,
+      "end_line": 154,
+      "callee": "fn.get",
+      "enclosing": "_function_call_items",
+      "expression": "fn.get(\"name\")"
+    },
+    {
+      "line": 155,
+      "end_line": 155,
+      "callee": "fn.get",
+      "enclosing": "_function_call_items",
+      "expression": "fn.get(\"arguments\")"
+    },
+    {
+      "line": 179,
+      "end_line": 179,
+      "callee": "items.extend",
+      "enclosing": "to_responses_input",
+      "expression": "items.extend(_assistant_items(entry))"
+    },
+    {
+      "line": 350,
+      "end_line": 350,
+      "callee": "isinstance",
+      "enclosing": "_raise_for_error",
+      "expression": "isinstance(error, str)"
+    },
+    {
+      "line": 364,
+      "end_line": 364,
+      "callee": "text_parts.append",
+      "enclosing": "_message_content",
+      "expression": "text_parts.append(_get(block, \"text\") or \"\")"
+    },
+    {
+      "line": 380,
+      "end_line": 380,
+      "callee": "_get",
+      "enclosing": "_encrypted_reasoning_items",
+      "expression": "_get(item, field)"
+    },
+    {
+      "line": 398,
+      "end_line": 398,
+      "callee": "_message_content",
+      "enclosing": "from_response",
+      "expression": "_message_content(item)"
+    },
+    {
+      "line": 399,
+      "end_line": 399,
+      "callee": "output_text_parts.extend",
+      "enclosing": "from_response",
+      "expression": "output_text_parts.extend(text_parts)"
+    },
+    {
+      "line": 408,
+      "end_line": 408,
+      "callee": "_get",
+      "enclosing": "from_response",
+      "expression": "_get(resp, \"usage\")"
+    },
+    {
+      "line": 90,
+      "end_line": 90,
+      "callee": "fn.get",
+      "enclosing": "to_responses_tools",
+      "expression": "fn.get(\"description\")"
+    },
+    {
+      "line": 91,
+      "end_line": 91,
+      "callee": "fn.get",
+      "enclosing": "to_responses_tools",
+      "expression": "fn.get(\"parameters\")"
+    },
+    {
+      "line": 128,
+      "end_line": 128,
+      "callee": "entry.get",
+      "enclosing": "_reasoning_input_items",
+      "expression": "entry.get(REASONING_ITEMS_KEY)"
+    },
+    {
+      "line": 179,
+      "end_line": 179,
+      "callee": "_assistant_items",
+      "enclosing": "to_responses_input",
+      "expression": "_assistant_items(entry)"
+    },
+    {
+      "line": 181,
+      "end_line": 185,
+      "callee": "items.append",
+      "enclosing": "to_responses_input",
+      "expression": "items.append({\n                \"type\": \"function_call_output\",\n                \"call_id\": entry.get(\"tool_call_id\"),\n                \"output\": entry.get(\"content\"),\n            })"
+    },
+    {
+      "line": 187,
+      "end_line": 187,
+      "callee": "items.append",
+      "enclosing": "to_responses_input",
+      "expression": "items.append({\"role\": role, \"content\": _input_content(entry.get(\"content\"))})"
+    },
+    {
+      "line": 240,
+      "end_line": 240,
+      "callee": "entry.items",
+      "enclosing": "to_chat_messages",
+      "expression": "entry.items()"
+    },
+    {
+      "line": 350,
+      "end_line": 350,
+      "callee": "_get",
+      "enclosing": "_raise_for_error",
+      "expression": "_get(error, \"message\")"
+    },
+    {
+      "line": 350,
+      "end_line": 350,
+      "callee": "str",
+      "enclosing": "_raise_for_error",
+      "expression": "str(error)"
+    },
+    {
+      "line": 366,
+      "end_line": 366,
+      "callee": "_get",
+      "enclosing": "_message_content",
+      "expression": "_get(block, \"refusal\")"
+    },
+    {
+      "line": 383,
+      "end_line": 383,
+      "callee": "_get",
+      "enclosing": "_encrypted_reasoning_items",
+      "expression": "_get(item, \"encrypted_content\")"
+    },
+    {
+      "line": 403,
+      "end_line": 403,
+      "callee": "tool_calls.append",
+      "enclosing": "from_response",
+      "expression": "tool_calls.append(_tool_call_from_item(item))"
+    },
+    {
+      "line": 407,
+      "end_line": 407,
+      "callee": "bool",
+      "enclosing": "from_response",
+      "expression": "bool(tool_calls)"
+    },
+    {
+      "line": 117,
+      "end_line": 117,
+      "callee": "isinstance",
+      "enclosing": "_input_content",
+      "expression": "isinstance(block, dict)"
+    },
+    {
+      "line": 116,
+      "end_line": 116,
+      "callee": "block.get",
+      "enclosing": "_input_content",
+      "expression": "block.get(\"text\", \"\")"
+    },
+    {
+      "line": 364,
+      "end_line": 364,
+      "callee": "_get",
+      "enclosing": "_message_content",
+      "expression": "_get(block, \"text\")"
+    },
+    {
+      "line": 381,
+      "end_line": 381,
+      "callee": "_get",
+      "enclosing": "_encrypted_reasoning_items",
+      "expression": "_get(item, field)"
+    },
+    {
+      "line": 383,
+      "end_line": 383,
+      "callee": "_get",
+      "enclosing": "_encrypted_reasoning_items",
+      "expression": "_get(item, \"type\")"
+    },
+    {
+      "line": 403,
+      "end_line": 403,
+      "callee": "_tool_call_from_item",
+      "enclosing": "from_response",
+      "expression": "_tool_call_from_item(item)"
+    },
+    {
+      "line": 117,
+      "end_line": 117,
+      "callee": "block.get",
+      "enclosing": "_input_content",
+      "expression": "block.get(\"type\")"
+    },
+    {
+      "line": 183,
+      "end_line": 183,
+      "callee": "entry.get",
+      "enclosing": "to_responses_input",
+      "expression": "entry.get(\"tool_call_id\")"
+    },
+    {
+      "line": 184,
+      "end_line": 184,
+      "callee": "entry.get",
+      "enclosing": "to_responses_input",
+      "expression": "entry.get(\"content\")"
+    },
+    {
+      "line": 187,
+      "end_line": 187,
+      "callee": "_input_content",
+      "enclosing": "to_responses_input",
+      "expression": "_input_content(entry.get(\"content\"))"
+    },
+    {
+      "line": 244,
+      "end_line": 244,
+      "callee": "tc.items",
+      "enclosing": "to_chat_messages",
+      "expression": "tc.items()"
+    },
+    {
+      "line": 187,
+      "end_line": 187,
+      "callee": "entry.get",
+      "enclosing": "to_responses_input",
+      "expression": "entry.get(\"content\")"
+    }
+  ],
+  "imports": [
+    {
+      "line": 23,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 25,
+      "source_expression": "from typing import Any, Final",
+      "targets": [
+        "typing",
+        "typing.Any",
+        "typing.Final"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 27,
+      "source_expression": "from vvaharness.backends.llm.models import REASONING_OFF",
+      "targets": [
+        "vvaharness.backends.llm.models",
+        "vvaharness.backends.llm.models.REASONING_OFF"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/llm/models.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

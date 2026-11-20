@@ -1,0 +1,2875 @@
+{
+  "source": "vvaharness/evidence/gather.py",
+  "sha256": "6127e019810a981b8f9790a25a02b2ad950b54f6e33d1b1af736430f2c6fe90e",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"The deterministic (no-LLM) threat-model evidence snapshot: ThreatEvidence DTO + gather().\"\"\"\nfrom __future__ import annotations\n\nfrom collections import Counter\nfrom dataclasses import dataclass\nfrom pathlib import Path, PurePosixPath\n\nfrom pydantic import BaseModel, ConfigDict\n\nfrom vvaharness.evidence.api_artefacts import gather_api_artefacts\nfrom vvaharness.evidence.configs import gather_config_reps\nfrom vvaharness.evidence.docs import gather_docs\nfrom vvaharness.evidence.manifests import gather_manifests\nfrom vvaharness.lang.detect import EXT_TO_LANG, LANG_DISPLAY\nfrom vvaharness.models import ContextPackage\nfrom vvaharness.util import logs\nfrom vvaharness.util.counters import COUNTERS\nfrom vvaharness.util.events import Event\n\nlog = logs.get_logger(__name__)\n\n_LANG_BY_EXT = {ext: LANG_DISPLAY.get(key, key) for ext, key in EXT_TO_LANG.items()}\n\n\ndef _cap_int(s2: object, key: str, default: int) -> int:\n    \"\"\"An operator-configured integer cap; 0 survives, anything unusable falls back to `default`.\"\"\"\n    v = getattr(s2, key, None)\n    if v is None:\n        return default\n    try:\n        n = int(v)\n    except (TypeError, ValueError, OverflowError):\n        return default\n    return n if n >= 0 else default\n\n\n@dataclass(frozen=True)\nclass _Caps:\n    \"\"\"Every `step2.*` integer cap `gather()` reads, sanitized through `_cap_int`.\"\"\"\n\n    doc_cap: int\n    manifest_cap: int\n    manifest_total_cap: int\n    max_manifest_depth: int\n    max_manifests: int\n    max_manifests_per_kind: int\n    max_graph_files: int\n    max_entry_points: int\n    max_graph_sinks: int\n    max_modules: int\n    max_graph_edges: int\n    max_config_reps: int\n    max_config_rep_chars: int\n    max_config_rep_bodies: int\n    max_api_artefacts: int\n    max_modules_prompt: int\n    max_entry_points_prompt: int\n    max_inventory_files: int\n\n\ndef _resolve_caps(s2: object) -> _Caps:\n    return _Caps(\n        doc_cap=_cap_int(s2, \"max_doc_chars\", 20000),\n        manifest_cap=_cap_int(s2, \"max_manifest_chars\", 4000),\n        manifest_total_cap=_cap_int(s2, \"max_manifest_total_chars\", 24000),\n        max_manifest_depth=_cap_int(s2, \"max_manifest_depth\", 3),\n        max_manifests=_cap_int(s2, \"max_manifests\", 12),\n        max_manifests_per_kind=max(1, _cap_int(s2, \"max_manifests_per_kind\", 2)),\n        max_graph_files=_cap_int(s2, \"max_graph_files\", 220),\n        max_entry_points=_cap_int(s2, \"max_entry_points\", 400),\n        max_graph_sinks=_cap_int(s2, \"max_graph_sinks\", 80),\n        max_modules=_cap_int(s2, \"max_modules\", 100),\n        max_graph_edges=_cap_int(s2, \"max_graph_edges\", 100),\n        max_config_reps=_cap_int(s2, \"max_config_reps\", 80),\n        max_config_rep_chars=_cap_int(s2, \"max_config_rep_chars\", 2000),\n        max_config_rep_bodies=_cap_int(s2, \"max_config_rep_bodies\", 12),\n        max_api_artefacts=_cap_int(s2, \"max_api_artefacts\", 100),\n        # Prompt caps are separate keys from the frontier caps above.\n        max_modules_prompt=_cap_int(s2, \"max_prompt_modules\", 100),\n        max_entry_points_prompt=_cap_int(s2, \"max_prompt_entry_points\", 400),\n        max_inventory_files=_cap_int(s2, \"max_inventory_files\", 1200),\n    )\n\n\nclass ThreatEvidence(BaseModel):\n    \"\"\"The deterministic snapshot s2's prompt is built from.\"\"\"\n\n    model_config = ConfigDict(frozen=True, extra=\"forbid\")\n\n    file_count: int\n    original_file_count: int\n    primary_language: str\n    languages: tuple[tuple[str, int], ...] = ()\n    top_dirs: tuple[str, ...] = ()\n    modules: tuple[tuple[str, str, int], ...] = ()             # (name, purpose, loc)\n    modules_truncated: bool = False\n    entry_points: tuple[tuple[str, bool, str, str], ...] = ()  # (kind, unauth, file, function)\n    entry_points_truncated: bool = False\n    config_reps: tuple[tuple[str, str], ...] = ()              # (rel_path, body or \"\")\n    api_artefacts: tuple[str, ...] = ()\n    docs: tuple[tuple[str, str], ...] = ()                     # (name, capped body)\n    manifests: tuple[tuple[str, str], ...] = ()                # (rel_path, truncated body)\n    inventory: tuple[str, ...] = ()\n    inventory_truncated: bool = False\n    s1_notes: str = \"\"\n\n\ndef _build_frontier(ctx: ContextPackage | None, caps: _Caps) -> ContextPackage | None:\n    \"\"\"The AST-relevant sample of `ctx`; graph-derived blocks read this, not `ctx` directly.\"\"\"\n    if not ctx:\n        return None\n    frontier = ctx.ast_context_view(\n        max_files=caps.max_graph_files,\n        max_entry_points=caps.max_entry_points,\n        max_sinks=caps.max_graph_sinks,\n        max_modules=caps.max_modules,\n        max_edges=caps.max_graph_edges,\n    )\n    _note_frontier_cuts(ctx, frontier, caps)\n    return frontier\n\n\ndef _note_cut(counter: str, kind: str, total: int, kept: int, cap_keys: list[str]) -> None:\n    \"\"\"Count and warn when an S2 evidence kind lost items, naming the step2 cap(s) that bound it.\"\"\"\n    if kept >= total:\n        return\n    COUNTERS.bump(counter, total - kept)\n    log.warning(Event.S2_CAP_TRUNCATED, kind=kind, kept=kept, total=total,\n                excluded=total - kept, cap=\",\".join(f\"step2.{k}\" for k in cap_keys))\n\n\ndef _note_frontier_cuts(ctx: ContextPackage, frontier: ContextPackage, caps: _Caps) -> None:\n    \"\"\"Surface every item ast_context_view kept out of the S2 evidence, per kind.\"\"\"\n    # Entry points, sinks and modules lose items two ways: their file fell outside the\n    # max_graph_files frontier, or their own cap; name whichever actually bound\n    allowed = set(frontier.all_files)\n    _note_cut(\"s2_frontier_files_excluded\", \"files\", len(ctx.all_files),\n              len(frontier.all_files), [\"max_graph_files\"])\n    for kind, files, kept, key, limit in (\n        (\"entry_points\", [e.file for e in ctx.entry_points], len(frontier.entry_points),\n         \"max_entry_points\", caps.max_entry_points),\n        (\"sinks\", [s.file for s in ctx.unsafe_sinks], len(frontier.unsafe_sinks),\n         \"max_graph_sinks\", caps.max_graph_sinks),\n    ):\n        inside = sum(f in allowed for f in files)\n        _note_cut(f\"s2_frontier_{kind}_excluded\", kind, len(files), kept,\n                  [k for k, hit in ((\"max_graph_files\", inside < len(files)),\n                                    (key, inside > limit)) if hit])\n    inside = sum(any(p in allowed for p in m.files) for m in ctx.modules)\n    _note_cut(\"s2_frontier_modules_excluded\", \"modules\", len(ctx.modules), len(frontier.modules),\n              [k for k, hit in ((\"max_graph_files\", inside < len(ctx.modules)),\n                                (\"max_modules\", inside > caps.max_modules)) if hit])\n\n\ndef _language_counts(full_files: list[str]) -> Counter[str]:\n    counts: Counter[str] = Counter()\n    for rel in full_files:\n        lang = _LANG_BY_EXT.get(PurePosixPath(rel).suffix.lower())\n        if lang:\n            counts[lang] += 1\n    return counts\n\n\ndef _sorted_entry_points(active_ctx: ContextPackage | None) -> list[tuple[str, bool, str, str]]:\n    eps = [(e.kind, e.reachable_from_unauth, e.file, e.function)\n           for e in (active_ctx.entry_points if active_ctx else [])]\n    eps.sort(key=lambda t: (t[0] != \"network\", not t[1], t[0], t[2]))\n    return eps\n\n\ndef gather(repo_root: str, cfg: object, ctx: ContextPackage | None) -> ThreatEvidence:\n    \"\"\"Assemble ThreatEvidence: graph blocks read the AST frontier, shape blocks read all files.\"\"\"\n    root = Path(repo_root)\n    caps = _resolve_caps(getattr(cfg, \"step2\", None))\n\n    frontier = _build_frontier(ctx, caps)\n    active_ctx = frontier or ctx\n    frontier_files = list(active_ctx.all_files) if active_ctx else []\n    full_files = list(ctx.all_files) if ctx else frontier_files\n\n    modules = [(m.name, m.purpose, m.loc) for m in (active_ctx.modules if active_ctx else [])]\n    eps = _sorted_entry_points(active_ctx)\n\n    docs = gather_docs(root, full_files, caps.doc_cap)\n    manifests = gather_manifests(\n        root, (caps.max_manifest_depth, caps.max_manifests, caps.max_manifests_per_kind),\n        caps.manifest_cap, caps.manifest_total_cap)\n    cfg_reps = gather_config_reps(root, full_files, caps.max_config_reps,\n                                  caps.max_config_rep_chars, caps.max_config_rep_bodies)\n    api_artefacts = gather_api_artefacts(full_files, caps.max_api_artefacts)\n    top_dirs = sorted({rel.split(\"/\", 1)[0] for rel in full_files if \"/\" in rel})\n\n    # The prompt marks these cuts \"…(truncated)\" for the model; the operator gets the same signal\n    for counter, kind, total, limit, key in (\n        (\"s2_prompt_modules_truncated\", \"prompt_modules\", len(modules),\n         caps.max_modules_prompt, \"max_prompt_modules\"),\n        (\"s2_prompt_entry_points_truncated\", \"prompt_entry_points\", len(eps),\n         caps.max_entry_points_prompt, \"max_prompt_entry_points\"),\n        (\"s2_inventory_files_truncated\", \"inventory_files\", len(full_files),\n         caps.max_inventory_files, \"max_inventory_files\"),\n    ):\n        _note_cut(counter, kind, total, min(total, limit), [key])\n\n    return ThreatEvidence(\n        file_count=len(frontier_files),\n        original_file_count=len(ctx.all_files) if ctx else len(frontier_files),\n        primary_language=ctx.language if ctx else \"\",\n        languages=tuple(_language_counts(full_files).most_common()),\n        top_dirs=tuple(top_dirs),\n        modules=tuple(modules[:caps.max_modules_prompt]),\n        modules_truncated=len(modules) > caps.max_modules_prompt,\n        entry_points=tuple(eps[:caps.max_entry_points_prompt]),\n        entry_points_truncated=len(eps) > caps.max_entry_points_prompt,\n        config_reps=tuple(cfg_reps),\n        api_artefacts=tuple(api_artefacts),\n        docs=tuple(docs),\n        manifests=tuple(manifests),\n        inventory=tuple(sorted(full_files)[:caps.max_inventory_files]),\n        inventory_truncated=len(full_files) > caps.max_inventory_files,\n        s1_notes=getattr(ctx, \"notes\", \"\") if ctx else \"\",\n    )\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/evidence/gather.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "The deterministic (no-LLM) threat-model evidence snapshot: ThreatEvidence DTO + gather().",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_40_4": {
+      "source": "vvaharness/evidence/gather.py",
+      "line_start": 40,
+      "line_end": 40,
+      "value": "An operator-configured integer cap; 0 survives, anything unusable falls back to `default`.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_53_4": {
+      "source": "vvaharness/evidence/gather.py",
+      "line_start": 53,
+      "line_end": 53,
+      "value": "Every `step2.*` integer cap `gather()` reads, sanitized through `_cap_int`.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_100_4": {
+      "source": "vvaharness/evidence/gather.py",
+      "line_start": 100,
+      "line_end": 100,
+      "value": "The deterministic snapshot s2's prompt is built from.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_123_4": {
+      "source": "vvaharness/evidence/gather.py",
+      "line_start": 123,
+      "line_end": 123,
+      "value": "The AST-relevant sample of `ctx`; graph-derived blocks read this, not `ctx` directly.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_138_4": {
+      "source": "vvaharness/evidence/gather.py",
+      "line_start": 138,
+      "line_end": 138,
+      "value": "Count and warn when an S2 evidence kind lost items, naming the step2 cap(s) that bound it.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_143_52": {
+      "source": "vvaharness/evidence/gather.py",
+      "line_start": 143,
+      "line_end": 143,
+      "source_expression": "f\"step2.{k}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_147_4": {
+      "source": "vvaharness/evidence/gather.py",
+      "line_start": 147,
+      "line_end": 147,
+      "value": "Surface every item ast_context_view kept out of the S2 evidence, per kind.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_160_18": {
+      "source": "vvaharness/evidence/gather.py",
+      "line_start": 160,
+      "line_end": 160,
+      "source_expression": "f\"s2_frontier_{kind}_excluded\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_186_4": {
+      "source": "vvaharness/evidence/gather.py",
+      "line_start": 186,
+      "line_end": 186,
+      "value": "Assemble ThreatEvidence: graph blocks read the AST frontier, shape blocks read all files.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "The deterministic (no-LLM) threat-model evidence snapshot: ThreatEvidence DTO + gather().",
+      "context": "literal"
+    },
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 4,
+      "value": "An operator-configured integer cap; 0 survives, anything unusable falls back to `default`.",
+      "context": "literal"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 4,
+      "value": "Every `step2.*` integer cap `gather()` reads, sanitized through `_cap_int`.",
+      "context": "literal"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 4,
+      "value": "The deterministic snapshot s2's prompt is built from.",
+      "context": "literal"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 20,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 4,
+      "value": "The AST-relevant sample of `ctx`; graph-derived blocks read this, not `ctx` directly.",
+      "context": "literal"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 4,
+      "value": "Count and warn when an S2 evidence kind lost items, naming the step2 cap(s) that bound it.",
+      "context": "literal"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 4,
+      "value": "Surface every item ast_context_view kept out of the S2 evidence, per kind.",
+      "context": "literal"
+    },
+    {
+      "line_start": 186,
+      "line_end": 186,
+      "column": 4,
+      "value": "Assemble ThreatEvidence: graph blocks read the AST frontier, shape blocks read all files.",
+      "context": "literal"
+    },
+    {
+      "line_start": 151,
+      "line_end": 151,
+      "column": 14,
+      "value": "s2_frontier_files_excluded",
+      "context": "literal"
+    },
+    {
+      "line_start": 151,
+      "line_end": 151,
+      "column": 44,
+      "value": "files",
+      "context": "literal"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 14,
+      "value": "s2_frontier_modules_excluded",
+      "context": "literal"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 46,
+      "value": "modules",
+      "context": "literal"
+    },
+    {
+      "line_start": 102,
+      "line_end": 102,
+      "column": 49,
+      "value": "forbid",
+      "context": "literal"
+    },
+    {
+      "line_start": 152,
+      "line_end": 152,
+      "column": 40,
+      "value": "max_graph_files",
+      "context": "literal"
+    },
+    {
+      "line_start": 154,
+      "line_end": 154,
+      "column": 9,
+      "value": "entry_points",
+      "context": "literal"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 9,
+      "value": "max_entry_points",
+      "context": "literal"
+    },
+    {
+      "line_start": 156,
+      "line_end": 156,
+      "column": 9,
+      "value": "sinks",
+      "context": "literal"
+    },
+    {
+      "line_start": 157,
+      "line_end": 157,
+      "column": 9,
+      "value": "max_graph_sinks",
+      "context": "literal"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 38,
+      "value": "step2",
+      "context": "literal"
+    },
+    {
+      "line_start": 209,
+      "line_end": 209,
+      "column": 9,
+      "value": "s2_prompt_modules_truncated",
+      "context": "literal"
+    },
+    {
+      "line_start": 209,
+      "line_end": 209,
+      "column": 40,
+      "value": "prompt_modules",
+      "context": "literal"
+    },
+    {
+      "line_start": 210,
+      "line_end": 210,
+      "column": 34,
+      "value": "max_prompt_modules",
+      "context": "literal"
+    },
+    {
+      "line_start": 211,
+      "line_end": 211,
+      "column": 9,
+      "value": "s2_prompt_entry_points_truncated",
+      "context": "literal"
+    },
+    {
+      "line_start": 211,
+      "line_end": 211,
+      "column": 45,
+      "value": "prompt_entry_points",
+      "context": "literal"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 39,
+      "value": "max_prompt_entry_points",
+      "context": "literal"
+    },
+    {
+      "line_start": 213,
+      "line_end": 213,
+      "column": 9,
+      "value": "s2_inventory_files_truncated",
+      "context": "literal"
+    },
+    {
+      "line_start": 213,
+      "line_end": 213,
+      "column": 41,
+      "value": "inventory_files",
+      "context": "literal"
+    },
+    {
+      "line_start": 214,
+      "line_end": 214,
+      "column": 35,
+      "value": "max_inventory_files",
+      "context": "literal"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 29,
+      "value": "max_doc_chars",
+      "context": "literal"
+    },
+    {
+      "line_start": 78,
+      "line_end": 78,
+      "column": 34,
+      "value": "max_manifest_chars",
+      "context": "literal"
+    },
+    {
+      "line_start": 79,
+      "line_end": 79,
+      "column": 40,
+      "value": "max_manifest_total_chars",
+      "context": "literal"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 40,
+      "value": "max_manifest_depth",
+      "context": "literal"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 35,
+      "value": "max_manifests",
+      "context": "literal"
+    },
+    {
+      "line_start": 83,
+      "line_end": 83,
+      "column": 37,
+      "value": "max_graph_files",
+      "context": "literal"
+    },
+    {
+      "line_start": 84,
+      "line_end": 84,
+      "column": 38,
+      "value": "max_entry_points",
+      "context": "literal"
+    },
+    {
+      "line_start": 85,
+      "line_end": 85,
+      "column": 37,
+      "value": "max_graph_sinks",
+      "context": "literal"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 33,
+      "value": "max_modules",
+      "context": "literal"
+    },
+    {
+      "line_start": 87,
+      "line_end": 87,
+      "column": 37,
+      "value": "max_graph_edges",
+      "context": "literal"
+    },
+    {
+      "line_start": 88,
+      "line_end": 88,
+      "column": 37,
+      "value": "max_config_reps",
+      "context": "literal"
+    },
+    {
+      "line_start": 89,
+      "line_end": 89,
+      "column": 42,
+      "value": "max_config_rep_chars",
+      "context": "literal"
+    },
+    {
+      "line_start": 90,
+      "line_end": 90,
+      "column": 43,
+      "value": "max_config_rep_bodies",
+      "context": "literal"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 39,
+      "value": "max_api_artefacts",
+      "context": "literal"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 40,
+      "value": "max_prompt_modules",
+      "context": "literal"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 45,
+      "value": "max_prompt_entry_points",
+      "context": "literal"
+    },
+    {
+      "line_start": 95,
+      "line_end": 95,
+      "column": 41,
+      "value": "max_inventory_files",
+      "context": "literal"
+    },
+    {
+      "line_start": 160,
+      "line_end": 160,
+      "column": 20,
+      "value": "s2_frontier_",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 160,
+      "line_end": 160,
+      "column": 38,
+      "value": "_excluded",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 221,
+      "line_end": 221,
+      "column": 50,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 234,
+      "line_end": 234,
+      "column": 55,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 51,
+      "value": "max_manifests_per_kind",
+      "context": "literal"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 43,
+      "value": ",",
+      "context": "literal"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 33,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 69,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 234,
+      "line_end": 234,
+      "column": 30,
+      "value": "notes",
+      "context": "literal"
+    },
+    {
+      "line_start": 234,
+      "line_end": 234,
+      "column": 39,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 54,
+      "value": "step2.",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 33,
+      "value": "max_graph_files",
+      "context": "literal"
+    },
+    {
+      "line_start": 166,
+      "line_end": 166,
+      "column": 33,
+      "value": "max_modules",
+      "context": "literal"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 36,
+      "value": "network",
+      "context": "literal"
+    },
+    {
+      "line_start": 161,
+      "line_end": 161,
+      "column": 37,
+      "value": "max_graph_files",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 92,
+      "text": "# Prompt caps are separate keys from the frontier caps above."
+    },
+    {
+      "line": 109,
+      "text": "# (name, purpose, loc)"
+    },
+    {
+      "line": 111,
+      "text": "# (kind, unauth, file, function)"
+    },
+    {
+      "line": 113,
+      "text": "# (rel_path, body or \"\")"
+    },
+    {
+      "line": 115,
+      "text": "# (name, capped body)"
+    },
+    {
+      "line": 116,
+      "text": "# (rel_path, truncated body)"
+    },
+    {
+      "line": 148,
+      "text": "# Entry points, sinks and modules lose items two ways: their file fell outside the"
+    },
+    {
+      "line": 149,
+      "text": "# max_graph_files frontier, or their own cap; name whichever actually bound"
+    },
+    {
+      "line": 207,
+      "text": "# The prompt marks these cuts \"…(truncated)\" for the model; the operator gets the same signal"
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 18,
+      "line_end": 18,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 26,
+      "line_end": 26,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 27,
+      "line_end": 27,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 28,
+      "line_end": 28,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 29,
+      "line_end": 29,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 30,
+      "line_end": 30,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 31,
+      "line_end": 31,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 32,
+      "line_end": 32,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 34,
+      "line_end": 34,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "Assign",
+      "line_start": 36,
+      "line_end": 36,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 39,
+      "line_end": 48,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 9
+    },
+    {
+      "kind": "Expr",
+      "line_start": 40,
+      "line_end": 40,
+      "column": 4,
+      "owner": "_cap_int",
+      "representation_line": 15
+    },
+    {
+      "kind": "Assign",
+      "line_start": 41,
+      "line_end": 41,
+      "column": 4,
+      "owner": "_cap_int",
+      "representation_line": 15
+    },
+    {
+      "kind": "If",
+      "line_start": 42,
+      "line_end": 43,
+      "column": 4,
+      "owner": "_cap_int",
+      "representation_line": 16
+    },
+    {
+      "kind": "Return",
+      "line_start": 43,
+      "line_end": 43,
+      "column": 8,
+      "owner": "_cap_int",
+      "representation_line": 18
+    },
+    {
+      "kind": "Try",
+      "line_start": 44,
+      "line_end": 47,
+      "column": 4,
+      "owner": "_cap_int",
+      "representation_line": 21
+    },
+    {
+      "kind": "Assign",
+      "line_start": 45,
+      "line_end": 45,
+      "column": 8,
+      "owner": "_cap_int",
+      "representation_line": 24
+    },
+    {
+      "kind": "Return",
+      "line_start": 47,
+      "line_end": 47,
+      "column": 8,
+      "owner": "_cap_int",
+      "representation_line": 28
+    },
+    {
+      "kind": "Return",
+      "line_start": 48,
+      "line_end": 48,
+      "column": 4,
+      "owner": "_cap_int",
+      "representation_line": 31
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 52,
+      "line_end": 72,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 35
+    },
+    {
+      "kind": "Expr",
+      "line_start": 53,
+      "line_end": 53,
+      "column": 4,
+      "owner": "_Caps",
+      "representation_line": 43
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 55,
+      "line_end": 55,
+      "column": 4,
+      "owner": "_Caps",
+      "representation_line": 43
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 56,
+      "line_end": 56,
+      "column": 4,
+      "owner": "_Caps",
+      "representation_line": 43
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 57,
+      "line_end": 57,
+      "column": 4,
+      "owner": "_Caps",
+      "representation_line": 43
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 58,
+      "line_end": 58,
+      "column": 4,
+      "owner": "_Caps",
+      "representation_line": 43
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 59,
+      "line_end": 59,
+      "column": 4,
+      "owner": "_Caps",
+      "representation_line": 45
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 60,
+      "line_end": 60,
+      "column": 4,
+      "owner": "_Caps",
+      "representation_line": 45
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 61,
+      "line_end": 61,
+      "column": 4,
+      "owner": "_Caps",
+      "representation_line": 45
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 62,
+      "line_end": 62,
+      "column": 4,
+      "owner": "_Caps",
+      "representation_line": 45
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 63,
+      "line_end": 63,
+      "column": 4,
+      "owner": "_Caps",
+      "representation_line": 45
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 64,
+      "line_end": 64,
+      "column": 4,
+      "owner": "_Caps",
+      "representation_line": 47
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 65,
+      "line_end": 65,
+      "column": 4,
+      "owner": "_Caps",
+      "representation_line": 47
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 66,
+      "line_end": 66,
+      "column": 4,
+      "owner": "_Caps",
+      "representation_line": 47
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 67,
+      "line_end": 67,
+      "column": 4,
+      "owner": "_Caps",
+      "representation_line": 47
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 68,
+      "line_end": 68,
+      "column": 4,
+      "owner": "_Caps",
+      "representation_line": 47
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 69,
+      "line_end": 69,
+      "column": 4,
+      "owner": "_Caps",
+      "representation_line": 49
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 70,
+      "line_end": 70,
+      "column": 4,
+      "owner": "_Caps",
+      "representation_line": 49
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 71,
+      "line_end": 71,
+      "column": 4,
+      "owner": "_Caps",
+      "representation_line": 49
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 72,
+      "line_end": 72,
+      "column": 4,
+      "owner": "_Caps",
+      "representation_line": 49
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 75,
+      "line_end": 96,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 52
+    },
+    {
+      "kind": "Return",
+      "line_start": 76,
+      "line_end": 96,
+      "column": 4,
+      "owner": "_resolve_caps",
+      "representation_line": 57
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 99,
+      "line_end": 119,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 61
+    },
+    {
+      "kind": "Expr",
+      "line_start": 100,
+      "line_end": 100,
+      "column": 4,
+      "owner": "ThreatEvidence",
+      "representation_line": 66
+    },
+    {
+      "kind": "Assign",
+      "line_start": 102,
+      "line_end": 102,
+      "column": 4,
+      "owner": "ThreatEvidence",
+      "representation_line": 66
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 104,
+      "line_end": 104,
+      "column": 4,
+      "owner": "ThreatEvidence",
+      "representation_line": 66
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 105,
+      "line_end": 105,
+      "column": 4,
+      "owner": "ThreatEvidence",
+      "representation_line": 66
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 106,
+      "line_end": 106,
+      "column": 4,
+      "owner": "ThreatEvidence",
+      "representation_line": 66
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 107,
+      "line_end": 107,
+      "column": 4,
+      "owner": "ThreatEvidence",
+      "representation_line": 68
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 108,
+      "line_end": 108,
+      "column": 4,
+      "owner": "ThreatEvidence",
+      "representation_line": 68
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 109,
+      "line_end": 109,
+      "column": 4,
+      "owner": "ThreatEvidence",
+      "representation_line": 68
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 110,
+      "line_end": 110,
+      "column": 4,
+      "owner": "ThreatEvidence",
+      "representation_line": 68
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 111,
+      "line_end": 111,
+      "column": 4,
+      "owner": "ThreatEvidence",
+      "representation_line": 68
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 112,
+      "line_end": 112,
+      "column": 4,
+      "owner": "ThreatEvidence",
+      "representation_line": 70
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 113,
+      "line_end": 113,
+      "column": 4,
+      "owner": "ThreatEvidence",
+      "representation_line": 70
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 114,
+      "line_end": 114,
+      "column": 4,
+      "owner": "ThreatEvidence",
+      "representation_line": 70
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 115,
+      "line_end": 115,
+      "column": 4,
+      "owner": "ThreatEvidence",
+      "representation_line": 70
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 116,
+      "line_end": 116,
+      "column": 4,
+      "owner": "ThreatEvidence",
+      "representation_line": 70
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 117,
+      "line_end": 117,
+      "column": 4,
+      "owner": "ThreatEvidence",
+      "representation_line": 72
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 118,
+      "line_end": 118,
+      "column": 4,
+      "owner": "ThreatEvidence",
+      "representation_line": 72
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 119,
+      "line_end": 119,
+      "column": 4,
+      "owner": "ThreatEvidence",
+      "representation_line": 72
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 122,
+      "line_end": 134,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 74
+    },
+    {
+      "kind": "Expr",
+      "line_start": 123,
+      "line_end": 123,
+      "column": 4,
+      "owner": "_build_frontier",
+      "representation_line": 80
+    },
+    {
+      "kind": "If",
+      "line_start": 124,
+      "line_end": 125,
+      "column": 4,
+      "owner": "_build_frontier",
+      "representation_line": 81
+    },
+    {
+      "kind": "Return",
+      "line_start": 125,
+      "line_end": 125,
+      "column": 8,
+      "owner": "_build_frontier",
+      "representation_line": 83
+    },
+    {
+      "kind": "Assign",
+      "line_start": 126,
+      "line_end": 132,
+      "column": 4,
+      "owner": "_build_frontier",
+      "representation_line": 87
+    },
+    {
+      "kind": "Expr",
+      "line_start": 133,
+      "line_end": 133,
+      "column": 4,
+      "owner": "_build_frontier",
+      "representation_line": 87
+    },
+    {
+      "kind": "Return",
+      "line_start": 134,
+      "line_end": 134,
+      "column": 4,
+      "owner": "_build_frontier",
+      "representation_line": 88
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 137,
+      "line_end": 143,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 92
+    },
+    {
+      "kind": "Expr",
+      "line_start": 138,
+      "line_end": 138,
+      "column": 4,
+      "owner": "_note_cut",
+      "representation_line": 98
+    },
+    {
+      "kind": "If",
+      "line_start": 139,
+      "line_end": 140,
+      "column": 4,
+      "owner": "_note_cut",
+      "representation_line": 99
+    },
+    {
+      "kind": "Return",
+      "line_start": 140,
+      "line_end": 140,
+      "column": 8,
+      "owner": "_note_cut",
+      "representation_line": 101
+    },
+    {
+      "kind": "Expr",
+      "line_start": 141,
+      "line_end": 141,
+      "column": 4,
+      "owner": "_note_cut",
+      "representation_line": 105
+    },
+    {
+      "kind": "Expr",
+      "line_start": 142,
+      "line_end": 143,
+      "column": 4,
+      "owner": "_note_cut",
+      "representation_line": 105
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 146,
+      "line_end": 166,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 108
+    },
+    {
+      "kind": "Expr",
+      "line_start": 147,
+      "line_end": 147,
+      "column": 4,
+      "owner": "_note_frontier_cuts",
+      "representation_line": 114
+    },
+    {
+      "kind": "Assign",
+      "line_start": 150,
+      "line_end": 150,
+      "column": 4,
+      "owner": "_note_frontier_cuts",
+      "representation_line": 114
+    },
+    {
+      "kind": "Expr",
+      "line_start": 151,
+      "line_end": 152,
+      "column": 4,
+      "owner": "_note_frontier_cuts",
+      "representation_line": 114
+    },
+    {
+      "kind": "For",
+      "line_start": 153,
+      "line_end": 162,
+      "column": 4,
+      "owner": "_note_frontier_cuts",
+      "representation_line": 115
+    },
+    {
+      "kind": "Assign",
+      "line_start": 159,
+      "line_end": 159,
+      "column": 8,
+      "owner": "_note_frontier_cuts",
+      "representation_line": 118
+    },
+    {
+      "kind": "Expr",
+      "line_start": 160,
+      "line_end": 162,
+      "column": 8,
+      "owner": "_note_frontier_cuts",
+      "representation_line": 118
+    },
+    {
+      "kind": "Assign",
+      "line_start": 163,
+      "line_end": 163,
+      "column": 4,
+      "owner": "_note_frontier_cuts",
+      "representation_line": 121
+    },
+    {
+      "kind": "Expr",
+      "line_start": 164,
+      "line_end": 166,
+      "column": 4,
+      "owner": "_note_frontier_cuts",
+      "representation_line": 121
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 169,
+      "line_end": 175,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 124
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 170,
+      "line_end": 170,
+      "column": 4,
+      "owner": "_language_counts",
+      "representation_line": 130
+    },
+    {
+      "kind": "For",
+      "line_start": 171,
+      "line_end": 174,
+      "column": 4,
+      "owner": "_language_counts",
+      "representation_line": 131
+    },
+    {
+      "kind": "Assign",
+      "line_start": 172,
+      "line_end": 172,
+      "column": 8,
+      "owner": "_language_counts",
+      "representation_line": 134
+    },
+    {
+      "kind": "If",
+      "line_start": 173,
+      "line_end": 174,
+      "column": 8,
+      "owner": "_language_counts",
+      "representation_line": 135
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 174,
+      "line_end": 174,
+      "column": 12,
+      "owner": "_language_counts",
+      "representation_line": 138
+    },
+    {
+      "kind": "Return",
+      "line_start": 175,
+      "line_end": 175,
+      "column": 4,
+      "owner": "_language_counts",
+      "representation_line": 141
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 178,
+      "line_end": 182,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 145
+    },
+    {
+      "kind": "Assign",
+      "line_start": 179,
+      "line_end": 180,
+      "column": 4,
+      "owner": "_sorted_entry_points",
+      "representation_line": 151
+    },
+    {
+      "kind": "Expr",
+      "line_start": 181,
+      "line_end": 181,
+      "column": 4,
+      "owner": "_sorted_entry_points",
+      "representation_line": 151
+    },
+    {
+      "kind": "Return",
+      "line_start": 182,
+      "line_end": 182,
+      "column": 4,
+      "owner": "_sorted_entry_points",
+      "representation_line": 152
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 185,
+      "line_end": 235,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 156
+    },
+    {
+      "kind": "Expr",
+      "line_start": 186,
+      "line_end": 186,
+      "column": 4,
+      "owner": "gather",
+      "representation_line": 162
+    },
+    {
+      "kind": "Assign",
+      "line_start": 187,
+      "line_end": 187,
+      "column": 4,
+      "owner": "gather",
+      "representation_line": 162
+    },
+    {
+      "kind": "Assign",
+      "line_start": 188,
+      "line_end": 188,
+      "column": 4,
+      "owner": "gather",
+      "representation_line": 162
+    },
+    {
+      "kind": "Assign",
+      "line_start": 190,
+      "line_end": 190,
+      "column": 4,
+      "owner": "gather",
+      "representation_line": 162
+    },
+    {
+      "kind": "Assign",
+      "line_start": 191,
+      "line_end": 191,
+      "column": 4,
+      "owner": "gather",
+      "representation_line": 162
+    },
+    {
+      "kind": "Assign",
+      "line_start": 192,
+      "line_end": 192,
+      "column": 4,
+      "owner": "gather",
+      "representation_line": 164
+    },
+    {
+      "kind": "Assign",
+      "line_start": 193,
+      "line_end": 193,
+      "column": 4,
+      "owner": "gather",
+      "representation_line": 164
+    },
+    {
+      "kind": "Assign",
+      "line_start": 195,
+      "line_end": 195,
+      "column": 4,
+      "owner": "gather",
+      "representation_line": 164
+    },
+    {
+      "kind": "Assign",
+      "line_start": 196,
+      "line_end": 196,
+      "column": 4,
+      "owner": "gather",
+      "representation_line": 164
+    },
+    {
+      "kind": "Assign",
+      "line_start": 198,
+      "line_end": 198,
+      "column": 4,
+      "owner": "gather",
+      "representation_line": 164
+    },
+    {
+      "kind": "Assign",
+      "line_start": 199,
+      "line_end": 201,
+      "column": 4,
+      "owner": "gather",
+      "representation_line": 166
+    },
+    {
+      "kind": "Assign",
+      "line_start": 202,
+      "line_end": 203,
+      "column": 4,
+      "owner": "gather",
+      "representation_line": 166
+    },
+    {
+      "kind": "Assign",
+      "line_start": 204,
+      "line_end": 204,
+      "column": 4,
+      "owner": "gather",
+      "representation_line": 166
+    },
+    {
+      "kind": "Assign",
+      "line_start": 205,
+      "line_end": 205,
+      "column": 4,
+      "owner": "gather",
+      "representation_line": 166
+    },
+    {
+      "kind": "For",
+      "line_start": 208,
+      "line_end": 216,
+      "column": 4,
+      "owner": "gather",
+      "representation_line": 167
+    },
+    {
+      "kind": "Expr",
+      "line_start": 216,
+      "line_end": 216,
+      "column": 8,
+      "owner": "gather",
+      "representation_line": 170
+    },
+    {
+      "kind": "Return",
+      "line_start": 218,
+      "line_end": 235,
+      "column": 4,
+      "owner": "gather",
+      "representation_line": 172
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 6,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='logs', ctx=Load()), attr='get_logger', ctx=Load()), args=[Name(id='__name__', ctx=Load())], keywords=[])",
+      "rendered": "logs.get_logger(__name__)"
+    },
+    {
+      "line_start": 36,
+      "line_end": 36,
+      "column": 15,
+      "kind": "DictComp",
+      "original_ast": "DictComp(key=Name(id='ext', ctx=Load()), value=Call(func=Attribute(value=Name(id='LANG_DISPLAY', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='key', ctx=Load()), Name(id='key', ctx=Load())], keywords=[]), generators=[comprehension(target=Tuple(elts=[Name(id='ext', ctx=Store()), Name(id='key', ctx=Store())], ctx=Store()), iter=Call(func=Attribute(value=Name(id='EXT_TO_LANG', ctx=Load()), attr='items', ctx=Load()), args=[], keywords=[]), ifs=[], is_async=0)])",
+      "rendered": "{ext: LANG_DISPLAY.get(key, key) for ext, key in EXT_TO_LANG.items()}"
+    },
+    {
+      "line_start": 41,
+      "line_end": 41,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='s2', ctx=Load()), Name(id='key', ctx=Load()), Constant(value=None)], keywords=[])",
+      "rendered": "getattr(s2, key, None)"
+    },
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='v', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "v is None"
+    },
+    {
+      "line_start": 43,
+      "line_end": 43,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='default', ctx=Load())",
+      "rendered": "default"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='int', ctx=Load()), args=[Name(id='v', ctx=Load())], keywords=[])",
+      "rendered": "int(v)"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='TypeError', ctx=Load()), Name(id='ValueError', ctx=Load()), Name(id='OverflowError', ctx=Load())], ctx=Load())",
+      "rendered": "(TypeError, ValueError, OverflowError)"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='default', ctx=Load())",
+      "rendered": "default"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=Name(id='n', ctx=Load()), ops=[GtE()], comparators=[Constant(value=0)]), body=Name(id='n', ctx=Load()), orelse=Name(id='default', ctx=Load()))",
+      "rendered": "n if n >= 0 else default"
+    },
+    {
+      "line_start": 51,
+      "line_end": 51,
+      "column": 1,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dataclass', ctx=Load()), args=[], keywords=[keyword(arg='frozen', value=Constant(value=True))])",
+      "rendered": "dataclass(frozen=True)"
+    },
+    {
+      "line_start": 76,
+      "line_end": 96,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_Caps', ctx=Load()), args=[], keywords=[keyword(arg='doc_cap', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='max_doc_chars'), Constant(value=20000)], keywords=[])), keyword(arg='manifest_cap', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='max_manifest_chars'), Constant(value=4000)], keywords=[])), keyword(arg='manifest_total_cap', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='max_manifest_total_chars'), Constant(value=24000)], keywords=[])), keyword(arg='max_manifest_depth', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='max_manifest_depth'), Constant(value=3)], keywords=[])), keyword(arg='max_manifests', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='max_manifests'), Constant(value=12)], keywords=[])), keyword(arg='max_manifests_per_kind', value=Call(func=Name(id='max', ctx=Load()), args=[Constant(value=1), Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='max_manifests_per_kind'), Constant(value=2)], keywords=[])], keywords=[])), keyword(arg='max_graph_files', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='max_graph_files'), Constant(value=220)], keywords=[])), keyword(arg='max_entry_points', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='max_entry_points'), Constant(value=400)], keywords=[])), keyword(arg='max_graph_sinks', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='max_graph_sinks'), Constant(value=80)], keywords=[])), keyword(arg='max_modules', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='max_modules'), Constant(value=100)], keywords=[])), keyword(arg='max_graph_edges', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='max_graph_edges'), Constant(value=100)], keywords=[])), keyword(arg='max_config_reps', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='max_config_reps'), Constant(value=80)], keywords=[])), keyword(arg='max_config_rep_chars', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='max_config_rep_chars'), Constant(value=2000)], keywords=[])), keyword(arg='max_config_rep_bodies', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='max_config_rep_bodies'), Constant(value=12)], keywords=[])), keyword(arg='max_api_artefacts', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='max_api_artefacts'), Constant(value=100)], keywords=[])), keyword(arg='max_modules_prompt', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='max_prompt_modules'), Constant(value=100)], keywords=[])), keyword(arg='max_entry_points_prompt', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='max_prompt_entry_points'), Constant(value=400)], keywords=[])), keyword(arg='max_inventory_files', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='max_inventory_files'), Constant(value=1200)], keywords=[]))])",
+      "rendered": "_Caps(doc_cap=_cap_int(s2, 'max_doc_chars', 20000), manifest_cap=_cap_int(s2, 'max_manifest_chars', 4000), manifest_total_cap=_cap_int(s2, 'max_manifest_total_chars', 24000), max_manifest_depth=_cap_int(s2, 'max_manifest_depth', 3), max_manifests=_cap_int(s2, 'max_manifests', 12), max_manifests_per_kind=max(1, _cap_int(s2, 'max_manifests_per_kind', 2)), max_graph_files=_cap_int(s2, 'max_graph_files', 220), max_entry_points=_cap_int(s2, 'max_entry_points', 400), max_graph_sinks=_cap_int(s2, 'max_graph_sinks', 80), max_modules=_cap_int(s2, 'max_modules', 100), max_graph_edges=_cap_int(s2, 'max_graph_edges', 100), max_config_reps=_cap_int(s2, 'max_config_reps', 80), max_config_rep_chars=_cap_int(s2, 'max_config_rep_chars', 2000), max_config_rep_bodies=_cap_int(s2, 'max_config_rep_bodies', 12), max_api_artefacts=_cap_int(s2, 'max_api_artefacts', 100), max_modules_prompt=_cap_int(s2, 'max_prompt_modules', 100), max_entry_points_prompt=_cap_int(s2, 'max_prompt_entry_points', 400), max_inventory_files=_cap_int(s2, 'max_inventory_files', 1200))"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 21,
+      "kind": "Name",
+      "original_ast": "Name(id='BaseModel', ctx=Load())",
+      "rendered": "BaseModel"
+    },
+    {
+      "line_start": 102,
+      "line_end": 102,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ConfigDict', ctx=Load()), args=[], keywords=[keyword(arg='frozen', value=Constant(value=True)), keyword(arg='extra', value=Constant(value='forbid'))])",
+      "rendered": "ConfigDict(frozen=True, extra='forbid')"
+    },
+    {
+      "line_start": 107,
+      "line_end": 107,
+      "column": 45,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[], ctx=Load())",
+      "rendered": "()"
+    },
+    {
+      "line_start": 108,
+      "line_end": 108,
+      "column": 32,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[], ctx=Load())",
+      "rendered": "()"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 48,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[], ctx=Load())",
+      "rendered": "()"
+    },
+    {
+      "line_start": 110,
+      "line_end": 110,
+      "column": 30,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 111,
+      "line_end": 111,
+      "column": 59,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[], ctx=Load())",
+      "rendered": "()"
+    },
+    {
+      "line_start": 112,
+      "line_end": 112,
+      "column": 35,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 113,
+      "line_end": 113,
+      "column": 47,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[], ctx=Load())",
+      "rendered": "()"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 37,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[], ctx=Load())",
+      "rendered": "()"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 40,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[], ctx=Load())",
+      "rendered": "()"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 45,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[], ctx=Load())",
+      "rendered": "()"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 33,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[], ctx=Load())",
+      "rendered": "()"
+    },
+    {
+      "line_start": 118,
+      "line_end": 118,
+      "column": 32,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 20,
+      "kind": "Constant",
+      "original_ast": "Constant(value='')",
+      "rendered": "''"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='ctx', ctx=Load()))",
+      "rendered": "not ctx"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 126,
+      "line_end": 132,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='ctx', ctx=Load()), attr='ast_context_view', ctx=Load()), args=[], keywords=[keyword(arg='max_files', value=Attribute(value=Name(id='caps', ctx=Load()), attr='max_graph_files', ctx=Load())), keyword(arg='max_entry_points', value=Attribute(value=Name(id='caps', ctx=Load()), attr='max_entry_points', ctx=Load())), keyword(arg='max_sinks', value=Attribute(value=Name(id='caps', ctx=Load()), attr='max_graph_sinks', ctx=Load())), keyword(arg='max_modules', value=Attribute(value=Name(id='caps', ctx=Load()), attr='max_modules', ctx=Load())), keyword(arg='max_edges', value=Attribute(value=Name(id='caps', ctx=Load()), attr='max_graph_edges', ctx=Load()))])",
+      "rendered": "ctx.ast_context_view(max_files=caps.max_graph_files, max_entry_points=caps.max_entry_points, max_sinks=caps.max_graph_sinks, max_modules=caps.max_modules, max_edges=caps.max_graph_edges)"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_note_frontier_cuts', ctx=Load()), args=[Name(id='ctx', ctx=Load()), Name(id='frontier', ctx=Load()), Name(id='caps', ctx=Load())], keywords=[])",
+      "rendered": "_note_frontier_cuts(ctx, frontier, caps)"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='frontier', ctx=Load())",
+      "rendered": "frontier"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='kept', ctx=Load()), ops=[GtE()], comparators=[Name(id='total', ctx=Load())])",
+      "rendered": "kept >= total"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Name(id='counter', ctx=Load()), BinOp(left=Name(id='total', ctx=Load()), op=Sub(), right=Name(id='kept', ctx=Load()))], keywords=[])",
+      "rendered": "COUNTERS.bump(counter, total - kept)"
+    },
+    {
+      "line_start": 142,
+      "line_end": 143,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Attribute(value=Name(id='Event', ctx=Load()), attr='S2_CAP_TRUNCATED', ctx=Load())], keywords=[keyword(arg='kind', value=Name(id='kind', ctx=Load())), keyword(arg='kept', value=Name(id='kept', ctx=Load())), keyword(arg='total', value=Name(id='total', ctx=Load())), keyword(arg='excluded', value=BinOp(left=Name(id='total', ctx=Load()), op=Sub(), right=Name(id='kept', ctx=Load()))), keyword(arg='cap', value=Call(func=Attribute(value=Constant(value=','), attr='join', ctx=Load()), args=[GeneratorExp(elt=JoinedStr(values=[Constant(value='step2.'), FormattedValue(value=Name(id='k', ctx=Load()), conversion=-1)]), generators=[comprehension(target=Name(id='k', ctx=Store()), iter=Name(id='cap_keys', ctx=Load()), ifs=[], is_async=0)])], keywords=[]))])",
+      "rendered": "log.warning(Event.S2_CAP_TRUNCATED, kind=kind, kept=kept, total=total, excluded=total - kept, cap=','.join((source_template_143_52 for k in cap_keys)))"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[Attribute(value=Name(id='frontier', ctx=Load()), attr='all_files', ctx=Load())], keywords=[])",
+      "rendered": "set(frontier.all_files)"
+    },
+    {
+      "line_start": 151,
+      "line_end": 152,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_note_cut', ctx=Load()), args=[Constant(value='s2_frontier_files_excluded'), Constant(value='files'), Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='ctx', ctx=Load()), attr='all_files', ctx=Load())], keywords=[]), Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='frontier', ctx=Load()), attr='all_files', ctx=Load())], keywords=[]), List(elts=[Constant(value='max_graph_files')], ctx=Load())], keywords=[])",
+      "rendered": "_note_cut('s2_frontier_files_excluded', 'files', len(ctx.all_files), len(frontier.all_files), ['max_graph_files'])"
+    },
+    {
+      "line_start": 153,
+      "line_end": 158,
+      "column": 41,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Tuple(elts=[Constant(value='entry_points'), ListComp(elt=Attribute(value=Name(id='e', ctx=Load()), attr='file', ctx=Load()), generators=[comprehension(target=Name(id='e', ctx=Store()), iter=Attribute(value=Name(id='ctx', ctx=Load()), attr='entry_points', ctx=Load()), ifs=[], is_async=0)]), Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='frontier', ctx=Load()), attr='entry_points', ctx=Load())], keywords=[]), Constant(value='max_entry_points'), Attribute(value=Name(id='caps', ctx=Load()), attr='max_entry_points', ctx=Load())], ctx=Load()), Tuple(elts=[Constant(value='sinks'), ListComp(elt=Attribute(value=Name(id='s', ctx=Load()), attr='file', ctx=Load()), generators=[comprehension(target=Name(id='s', ctx=Store()), iter=Attribute(value=Name(id='ctx', ctx=Load()), attr='unsafe_sinks', ctx=Load()), ifs=[], is_async=0)]), Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='frontier', ctx=Load()), attr='unsafe_sinks', ctx=Load())], keywords=[]), Constant(value='max_graph_sinks'), Attribute(value=Name(id='caps', ctx=Load()), attr='max_graph_sinks', ctx=Load())], ctx=Load())], ctx=Load())",
+      "rendered": "(('entry_points', [e.file for e in ctx.entry_points], len(frontier.entry_points), 'max_entry_points', caps.max_entry_points), ('sinks', [s.file for s in ctx.unsafe_sinks], len(frontier.unsafe_sinks), 'max_graph_sinks', caps.max_graph_sinks))"
+    },
+    {
+      "line_start": 159,
+      "line_end": 159,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sum', ctx=Load()), args=[GeneratorExp(elt=Compare(left=Name(id='f', ctx=Load()), ops=[In()], comparators=[Name(id='allowed', ctx=Load())]), generators=[comprehension(target=Name(id='f', ctx=Store()), iter=Name(id='files', ctx=Load()), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "sum((f in allowed for f in files))"
+    },
+    {
+      "line_start": 160,
+      "line_end": 162,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_note_cut', ctx=Load()), args=[JoinedStr(values=[Constant(value='s2_frontier_'), FormattedValue(value=Name(id='kind', ctx=Load()), conversion=-1), Constant(value='_excluded')]), Name(id='kind', ctx=Load()), Call(func=Name(id='len', ctx=Load()), args=[Name(id='files', ctx=Load())], keywords=[]), Name(id='kept', ctx=Load()), ListComp(elt=Name(id='k', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='k', ctx=Store()), Name(id='hit', ctx=Store())], ctx=Store()), iter=Tuple(elts=[Tuple(elts=[Constant(value='max_graph_files'), Compare(left=Name(id='inside', ctx=Load()), ops=[Lt()], comparators=[Call(func=Name(id='len', ctx=Load()), args=[Name(id='files', ctx=Load())], keywords=[])])], ctx=Load()), Tuple(elts=[Name(id='key', ctx=Load()), Compare(left=Name(id='inside', ctx=Load()), ops=[Gt()], comparators=[Name(id='limit', ctx=Load())])], ctx=Load())], ctx=Load()), ifs=[Name(id='hit', ctx=Load())], is_async=0)])], keywords=[])",
+      "rendered": "_note_cut(source_template_160_18, kind, len(files), kept, [k for k, hit in (('max_graph_files', inside < len(files)), (key, inside > limit)) if hit])"
+    },
+    {
+      "line_start": 163,
+      "line_end": 163,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sum', ctx=Load()), args=[GeneratorExp(elt=Call(func=Name(id='any', ctx=Load()), args=[GeneratorExp(elt=Compare(left=Name(id='p', ctx=Load()), ops=[In()], comparators=[Name(id='allowed', ctx=Load())]), generators=[comprehension(target=Name(id='p', ctx=Store()), iter=Attribute(value=Name(id='m', ctx=Load()), attr='files', ctx=Load()), ifs=[], is_async=0)])], keywords=[]), generators=[comprehension(target=Name(id='m', ctx=Store()), iter=Attribute(value=Name(id='ctx', ctx=Load()), attr='modules', ctx=Load()), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "sum((any((p in allowed for p in m.files)) for m in ctx.modules))"
+    },
+    {
+      "line_start": 164,
+      "line_end": 166,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_note_cut', ctx=Load()), args=[Constant(value='s2_frontier_modules_excluded'), Constant(value='modules'), Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='ctx', ctx=Load()), attr='modules', ctx=Load())], keywords=[]), Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='frontier', ctx=Load()), attr='modules', ctx=Load())], keywords=[]), ListComp(elt=Name(id='k', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='k', ctx=Store()), Name(id='hit', ctx=Store())], ctx=Store()), iter=Tuple(elts=[Tuple(elts=[Constant(value='max_graph_files'), Compare(left=Name(id='inside', ctx=Load()), ops=[Lt()], comparators=[Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='ctx', ctx=Load()), attr='modules', ctx=Load())], keywords=[])])], ctx=Load()), Tuple(elts=[Constant(value='max_modules'), Compare(left=Name(id='inside', ctx=Load()), ops=[Gt()], comparators=[Attribute(value=Name(id='caps', ctx=Load()), attr='max_modules', ctx=Load())])], ctx=Load())], ctx=Load()), ifs=[Name(id='hit', ctx=Load())], is_async=0)])], keywords=[])",
+      "rendered": "_note_cut('s2_frontier_modules_excluded', 'modules', len(ctx.modules), len(frontier.modules), [k for k, hit in (('max_graph_files', inside < len(ctx.modules)), ('max_modules', inside > caps.max_modules)) if hit])"
+    },
+    {
+      "line_start": 170,
+      "line_end": 170,
+      "column": 27,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='Counter', ctx=Load()), args=[], keywords=[])",
+      "rendered": "Counter()"
+    },
+    {
+      "line_start": 171,
+      "line_end": 171,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='full_files', ctx=Load())",
+      "rendered": "full_files"
+    },
+    {
+      "line_start": 172,
+      "line_end": 172,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_LANG_BY_EXT', ctx=Load()), attr='get', ctx=Load()), args=[Call(func=Attribute(value=Attribute(value=Call(func=Name(id='PurePosixPath', ctx=Load()), args=[Name(id='rel', ctx=Load())], keywords=[]), attr='suffix', ctx=Load()), attr='lower', ctx=Load()), args=[], keywords=[])], keywords=[])",
+      "rendered": "_LANG_BY_EXT.get(PurePosixPath(rel).suffix.lower())"
+    },
+    {
+      "line_start": 173,
+      "line_end": 173,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='lang', ctx=Load())",
+      "rendered": "lang"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Subscript(value=Name(id='counts', ctx=Load()), slice=Name(id='lang', ctx=Load()), ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "counts[lang] += 1"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='counts', ctx=Load())",
+      "rendered": "counts"
+    },
+    {
+      "line_start": 179,
+      "line_end": 180,
+      "column": 10,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Tuple(elts=[Attribute(value=Name(id='e', ctx=Load()), attr='kind', ctx=Load()), Attribute(value=Name(id='e', ctx=Load()), attr='reachable_from_unauth', ctx=Load()), Attribute(value=Name(id='e', ctx=Load()), attr='file', ctx=Load()), Attribute(value=Name(id='e', ctx=Load()), attr='function', ctx=Load())], ctx=Load()), generators=[comprehension(target=Name(id='e', ctx=Store()), iter=IfExp(test=Name(id='active_ctx', ctx=Load()), body=Attribute(value=Name(id='active_ctx', ctx=Load()), attr='entry_points', ctx=Load()), orelse=List(elts=[], ctx=Load())), ifs=[], is_async=0)])",
+      "rendered": "[(e.kind, e.reachable_from_unauth, e.file, e.function) for e in (active_ctx.entry_points if active_ctx else [])]"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='eps', ctx=Load()), attr='sort', ctx=Load()), args=[], keywords=[keyword(arg='key', value=Lambda(args=arguments(posonlyargs=[], args=[arg(arg='t')], kwonlyargs=[], kw_defaults=[], defaults=[]), body=Tuple(elts=[Compare(left=Subscript(value=Name(id='t', ctx=Load()), slice=Constant(value=0), ctx=Load()), ops=[NotEq()], comparators=[Constant(value='network')]), UnaryOp(op=Not(), operand=Subscript(value=Name(id='t', ctx=Load()), slice=Constant(value=1), ctx=Load())), Subscript(value=Name(id='t', ctx=Load()), slice=Constant(value=0), ctx=Load()), Subscript(value=Name(id='t', ctx=Load()), slice=Constant(value=2), ctx=Load())], ctx=Load())))])",
+      "rendered": "eps.sort(key=lambda t: (t[0] != 'network', not t[1], t[0], t[2]))"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='eps', ctx=Load())",
+      "rendered": "eps"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='Path', ctx=Load()), args=[Name(id='repo_root', ctx=Load())], keywords=[])",
+      "rendered": "Path(repo_root)"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_resolve_caps', ctx=Load()), args=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='cfg', ctx=Load()), Constant(value='step2'), Constant(value=None)], keywords=[])], keywords=[])",
+      "rendered": "_resolve_caps(getattr(cfg, 'step2', None))"
+    },
+    {
+      "line_start": 190,
+      "line_end": 190,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_build_frontier', ctx=Load()), args=[Name(id='ctx', ctx=Load()), Name(id='caps', ctx=Load())], keywords=[])",
+      "rendered": "_build_frontier(ctx, caps)"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 17,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Name(id='frontier', ctx=Load()), Name(id='ctx', ctx=Load())])",
+      "rendered": "frontier or ctx"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 21,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='active_ctx', ctx=Load()), body=Call(func=Name(id='list', ctx=Load()), args=[Attribute(value=Name(id='active_ctx', ctx=Load()), attr='all_files', ctx=Load())], keywords=[]), orelse=List(elts=[], ctx=Load()))",
+      "rendered": "list(active_ctx.all_files) if active_ctx else []"
+    },
+    {
+      "line_start": 193,
+      "line_end": 193,
+      "column": 17,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='ctx', ctx=Load()), body=Call(func=Name(id='list', ctx=Load()), args=[Attribute(value=Name(id='ctx', ctx=Load()), attr='all_files', ctx=Load())], keywords=[]), orelse=Name(id='frontier_files', ctx=Load()))",
+      "rendered": "list(ctx.all_files) if ctx else frontier_files"
+    },
+    {
+      "line_start": 195,
+      "line_end": 195,
+      "column": 14,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Tuple(elts=[Attribute(value=Name(id='m', ctx=Load()), attr='name', ctx=Load()), Attribute(value=Name(id='m', ctx=Load()), attr='purpose', ctx=Load()), Attribute(value=Name(id='m', ctx=Load()), attr='loc', ctx=Load())], ctx=Load()), generators=[comprehension(target=Name(id='m', ctx=Store()), iter=IfExp(test=Name(id='active_ctx', ctx=Load()), body=Attribute(value=Name(id='active_ctx', ctx=Load()), attr='modules', ctx=Load()), orelse=List(elts=[], ctx=Load())), ifs=[], is_async=0)])",
+      "rendered": "[(m.name, m.purpose, m.loc) for m in (active_ctx.modules if active_ctx else [])]"
+    },
+    {
+      "line_start": 196,
+      "line_end": 196,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_sorted_entry_points', ctx=Load()), args=[Name(id='active_ctx', ctx=Load())], keywords=[])",
+      "rendered": "_sorted_entry_points(active_ctx)"
+    },
+    {
+      "line_start": 198,
+      "line_end": 198,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='gather_docs', ctx=Load()), args=[Name(id='root', ctx=Load()), Name(id='full_files', ctx=Load()), Attribute(value=Name(id='caps', ctx=Load()), attr='doc_cap', ctx=Load())], keywords=[])",
+      "rendered": "gather_docs(root, full_files, caps.doc_cap)"
+    },
+    {
+      "line_start": 199,
+      "line_end": 201,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='gather_manifests', ctx=Load()), args=[Name(id='root', ctx=Load()), Tuple(elts=[Attribute(value=Name(id='caps', ctx=Load()), attr='max_manifest_depth', ctx=Load()), Attribute(value=Name(id='caps', ctx=Load()), attr='max_manifests', ctx=Load()), Attribute(value=Name(id='caps', ctx=Load()), attr='max_manifests_per_kind', ctx=Load())], ctx=Load()), Attribute(value=Name(id='caps', ctx=Load()), attr='manifest_cap', ctx=Load()), Attribute(value=Name(id='caps', ctx=Load()), attr='manifest_total_cap', ctx=Load())], keywords=[])",
+      "rendered": "gather_manifests(root, (caps.max_manifest_depth, caps.max_manifests, caps.max_manifests_per_kind), caps.manifest_cap, caps.manifest_total_cap)"
+    },
+    {
+      "line_start": 202,
+      "line_end": 203,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='gather_config_reps', ctx=Load()), args=[Name(id='root', ctx=Load()), Name(id='full_files', ctx=Load()), Attribute(value=Name(id='caps', ctx=Load()), attr='max_config_reps', ctx=Load()), Attribute(value=Name(id='caps', ctx=Load()), attr='max_config_rep_chars', ctx=Load()), Attribute(value=Name(id='caps', ctx=Load()), attr='max_config_rep_bodies', ctx=Load())], keywords=[])",
+      "rendered": "gather_config_reps(root, full_files, caps.max_config_reps, caps.max_config_rep_chars, caps.max_config_rep_bodies)"
+    },
+    {
+      "line_start": 204,
+      "line_end": 204,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='gather_api_artefacts', ctx=Load()), args=[Name(id='full_files', ctx=Load()), Attribute(value=Name(id='caps', ctx=Load()), attr='max_api_artefacts', ctx=Load())], keywords=[])",
+      "rendered": "gather_api_artefacts(full_files, caps.max_api_artefacts)"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[SetComp(elt=Subscript(value=Call(func=Attribute(value=Name(id='rel', ctx=Load()), attr='split', ctx=Load()), args=[Constant(value='/'), Constant(value=1)], keywords=[]), slice=Constant(value=0), ctx=Load()), generators=[comprehension(target=Name(id='rel', ctx=Store()), iter=Name(id='full_files', ctx=Load()), ifs=[Compare(left=Constant(value='/'), ops=[In()], comparators=[Name(id='rel', ctx=Load())])], is_async=0)])], keywords=[])",
+      "rendered": "sorted({rel.split('/', 1)[0] for rel in full_files if '/' in rel})"
+    },
+    {
+      "line_start": 208,
+      "line_end": 215,
+      "column": 44,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Tuple(elts=[Constant(value='s2_prompt_modules_truncated'), Constant(value='prompt_modules'), Call(func=Name(id='len', ctx=Load()), args=[Name(id='modules', ctx=Load())], keywords=[]), Attribute(value=Name(id='caps', ctx=Load()), attr='max_modules_prompt', ctx=Load()), Constant(value='max_prompt_modules')], ctx=Load()), Tuple(elts=[Constant(value='s2_prompt_entry_points_truncated'), Constant(value='prompt_entry_points'), Call(func=Name(id='len', ctx=Load()), args=[Name(id='eps', ctx=Load())], keywords=[]), Attribute(value=Name(id='caps', ctx=Load()), attr='max_entry_points_prompt', ctx=Load()), Constant(value='max_prompt_entry_points')], ctx=Load()), Tuple(elts=[Constant(value='s2_inventory_files_truncated'), Constant(value='inventory_files'), Call(func=Name(id='len', ctx=Load()), args=[Name(id='full_files', ctx=Load())], keywords=[]), Attribute(value=Name(id='caps', ctx=Load()), attr='max_inventory_files', ctx=Load()), Constant(value='max_inventory_files')], ctx=Load())], ctx=Load())",
+      "rendered": "(('s2_prompt_modules_truncated', 'prompt_modules', len(modules), caps.max_modules_prompt, 'max_prompt_modules'), ('s2_prompt_entry_points_truncated', 'prompt_entry_points', len(eps), caps.max_entry_points_prompt, 'max_prompt_entry_points'), ('s2_inventory_files_truncated', 'inventory_files', len(full_files), caps.max_inventory_files, 'max_inventory_files'))"
+    },
+    {
+      "line_start": 216,
+      "line_end": 216,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_note_cut', ctx=Load()), args=[Name(id='counter', ctx=Load()), Name(id='kind', ctx=Load()), Name(id='total', ctx=Load()), Call(func=Name(id='min', ctx=Load()), args=[Name(id='total', ctx=Load()), Name(id='limit', ctx=Load())], keywords=[]), List(elts=[Name(id='key', ctx=Load())], ctx=Load())], keywords=[])",
+      "rendered": "_note_cut(counter, kind, total, min(total, limit), [key])"
+    },
+    {
+      "line_start": 218,
+      "line_end": 235,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ThreatEvidence', ctx=Load()), args=[], keywords=[keyword(arg='file_count', value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='frontier_files', ctx=Load())], keywords=[])), keyword(arg='original_file_count', value=IfExp(test=Name(id='ctx', ctx=Load()), body=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='ctx', ctx=Load()), attr='all_files', ctx=Load())], keywords=[]), orelse=Call(func=Name(id='len', ctx=Load()), args=[Name(id='frontier_files', ctx=Load())], keywords=[]))), keyword(arg='primary_language', value=IfExp(test=Name(id='ctx', ctx=Load()), body=Attribute(value=Name(id='ctx', ctx=Load()), attr='language', ctx=Load()), orelse=Constant(value=''))), keyword(arg='languages', value=Call(func=Name(id='tuple', ctx=Load()), args=[Call(func=Attribute(value=Call(func=Name(id='_language_counts', ctx=Load()), args=[Name(id='full_files', ctx=Load())], keywords=[]), attr='most_common', ctx=Load()), args=[], keywords=[])], keywords=[])), keyword(arg='top_dirs', value=Call(func=Name(id='tuple', ctx=Load()), args=[Name(id='top_dirs', ctx=Load())], keywords=[])), keyword(arg='modules', value=Call(func=Name(id='tuple', ctx=Load()), args=[Subscript(value=Name(id='modules', ctx=Load()), slice=Slice(upper=Attribute(value=Name(id='caps', ctx=Load()), attr='max_modules_prompt', ctx=Load())), ctx=Load())], keywords=[])), keyword(arg='modules_truncated', value=Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='modules', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Attribute(value=Name(id='caps', ctx=Load()), attr='max_modules_prompt', ctx=Load())])), keyword(arg='entry_points', value=Call(func=Name(id='tuple', ctx=Load()), args=[Subscript(value=Name(id='eps', ctx=Load()), slice=Slice(upper=Attribute(value=Name(id='caps', ctx=Load()), attr='max_entry_points_prompt', ctx=Load())), ctx=Load())], keywords=[])), keyword(arg='entry_points_truncated', value=Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='eps', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Attribute(value=Name(id='caps', ctx=Load()), attr='max_entry_points_prompt', ctx=Load())])), keyword(arg='config_reps', value=Call(func=Name(id='tuple', ctx=Load()), args=[Name(id='cfg_reps', ctx=Load())], keywords=[])), keyword(arg='api_artefacts', value=Call(func=Name(id='tuple', ctx=Load()), args=[Name(id='api_artefacts', ctx=Load())], keywords=[])), keyword(arg='docs', value=Call(func=Name(id='tuple', ctx=Load()), args=[Name(id='docs', ctx=Load())], keywords=[])), keyword(arg='manifests', value=Call(func=Name(id='tuple', ctx=Load()), args=[Name(id='manifests', ctx=Load())], keywords=[])), keyword(arg='inventory', value=Call(func=Name(id='tuple', ctx=Load()), args=[Subscript(value=Call(func=Name(id='sorted', ctx=Load()), args=[Name(id='full_files', ctx=Load())], keywords=[]), slice=Slice(upper=Attribute(value=Name(id='caps', ctx=Load()), attr='max_inventory_files', ctx=Load())), ctx=Load())], keywords=[])), keyword(arg='inventory_truncated', value=Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='full_files', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Attribute(value=Name(id='caps', ctx=Load()), attr='max_inventory_files', ctx=Load())])), keyword(arg='s1_notes', value=IfExp(test=Name(id='ctx', ctx=Load()), body=Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='ctx', ctx=Load()), Constant(value='notes'), Constant(value='')], keywords=[]), orelse=Constant(value='')))])",
+      "rendered": "ThreatEvidence(file_count=len(frontier_files), original_file_count=len(ctx.all_files) if ctx else len(frontier_files), primary_language=ctx.language if ctx else '', languages=tuple(_language_counts(full_files).most_common()), top_dirs=tuple(top_dirs), modules=tuple(modules[:caps.max_modules_prompt]), modules_truncated=len(modules) > caps.max_modules_prompt, entry_points=tuple(eps[:caps.max_entry_points_prompt]), entry_points_truncated=len(eps) > caps.max_entry_points_prompt, config_reps=tuple(cfg_reps), api_artefacts=tuple(api_artefacts), docs=tuple(docs), manifests=tuple(manifests), inventory=tuple(sorted(full_files)[:caps.max_inventory_files]), inventory_truncated=len(full_files) > caps.max_inventory_files, s1_notes=getattr(ctx, 'notes', '') if ctx else '')"
+    }
+  ],
+  "calls": [
+    {
+      "line": 34,
+      "end_line": 34,
+      "callee": "logs.get_logger",
+      "enclosing": "module initialization",
+      "expression": "logs.get_logger(__name__)"
+    },
+    {
+      "line": 51,
+      "end_line": 51,
+      "callee": "dataclass",
+      "enclosing": "_Caps",
+      "expression": "dataclass(frozen=True)"
+    },
+    {
+      "line": 36,
+      "end_line": 36,
+      "callee": "LANG_DISPLAY.get",
+      "enclosing": "module initialization",
+      "expression": "LANG_DISPLAY.get(key, key)"
+    },
+    {
+      "line": 41,
+      "end_line": 41,
+      "callee": "getattr",
+      "enclosing": "_cap_int",
+      "expression": "getattr(s2, key, None)"
+    },
+    {
+      "line": 76,
+      "end_line": 96,
+      "callee": "_Caps",
+      "enclosing": "_resolve_caps",
+      "expression": "_Caps(\n        doc_cap=_cap_int(s2, \"max_doc_chars\", 20000),\n        manifest_cap=_cap_int(s2, \"max_manifest_chars\", 4000),\n        manifest_total_cap=_cap_int(s2, \"max_manifest_total_chars\", 24000),\n        max_manifest_depth=_cap_int(s2, \"max_manifest_depth\", 3),\n        max_manifests=_cap_int(s2, \"max_manifests\", 12),\n        max_manifests_per_kind=max(1, _cap_int(s2, \"max_manifests_per_kind\", 2)),\n        max_graph_files=_cap_int(s2, \"max_graph_files\", 220),\n        max_entry_points=_cap_int(s2, \"max_entry_points\", 400),\n        max_graph_sinks=_cap_int(s2, \"max_graph_sinks\", 80),\n        max_modules=_cap_int(s2, \"max_modules\", 100),\n        max_graph_edges=_cap_int(s2, \"max_graph_edges\", 100),\n        max_config_reps=_cap_int(s2, \"max_config_reps\", 80),\n        max_config_rep_chars=_cap_int(s2, \"max_config_rep_chars\", 2000),\n        max_config_rep_bodies=_cap_int(s2, \"max_config_rep_bodies\", 12),\n        max_api_artefacts=_cap_int(s2, \"max_api_artefacts\", 100),\n        # Prompt caps are separate keys from the frontier caps above.\n        max_modules_prompt=_cap_int(s2, \"max_prompt_modules\", 100),\n        max_entry_points_prompt=_cap_int(s2, \"max_prompt_entry_points\", 400),\n        max_inventory_files=_cap_int(s2, \"max_inventory_files\", 1200),\n    )"
+    },
+    {
+      "line": 102,
+      "end_line": 102,
+      "callee": "ConfigDict",
+      "enclosing": "ThreatEvidence",
+      "expression": "ConfigDict(frozen=True, extra=\"forbid\")"
+    },
+    {
+      "line": 126,
+      "end_line": 132,
+      "callee": "ctx.ast_context_view",
+      "enclosing": "_build_frontier",
+      "expression": "ctx.ast_context_view(\n        max_files=caps.max_graph_files,\n        max_entry_points=caps.max_entry_points,\n        max_sinks=caps.max_graph_sinks,\n        max_modules=caps.max_modules,\n        max_edges=caps.max_graph_edges,\n    )"
+    },
+    {
+      "line": 133,
+      "end_line": 133,
+      "callee": "_note_frontier_cuts",
+      "enclosing": "_build_frontier",
+      "expression": "_note_frontier_cuts(ctx, frontier, caps)"
+    },
+    {
+      "line": 141,
+      "end_line": 141,
+      "callee": "COUNTERS.bump",
+      "enclosing": "_note_cut",
+      "expression": "COUNTERS.bump(counter, total - kept)"
+    },
+    {
+      "line": 142,
+      "end_line": 143,
+      "callee": "log.warning",
+      "enclosing": "_note_cut",
+      "expression": "log.warning(Event.S2_CAP_TRUNCATED, kind=kind, kept=kept, total=total,\n                excluded=total - kept, cap=\",\".join(f\"step2.{k}\" for k in cap_keys))"
+    },
+    {
+      "line": 150,
+      "end_line": 150,
+      "callee": "set",
+      "enclosing": "_note_frontier_cuts",
+      "expression": "set(frontier.all_files)"
+    },
+    {
+      "line": 151,
+      "end_line": 152,
+      "callee": "_note_cut",
+      "enclosing": "_note_frontier_cuts",
+      "expression": "_note_cut(\"s2_frontier_files_excluded\", \"files\", len(ctx.all_files),\n              len(frontier.all_files), [\"max_graph_files\"])"
+    },
+    {
+      "line": 163,
+      "end_line": 163,
+      "callee": "sum",
+      "enclosing": "_note_frontier_cuts",
+      "expression": "sum(any(p in allowed for p in m.files) for m in ctx.modules)"
+    },
+    {
+      "line": 164,
+      "end_line": 166,
+      "callee": "_note_cut",
+      "enclosing": "_note_frontier_cuts",
+      "expression": "_note_cut(\"s2_frontier_modules_excluded\", \"modules\", len(ctx.modules), len(frontier.modules),\n              [k for k, hit in ((\"max_graph_files\", inside < len(ctx.modules)),\n                                (\"max_modules\", inside > caps.max_modules)) if hit])"
+    },
+    {
+      "line": 170,
+      "end_line": 170,
+      "callee": "Counter",
+      "enclosing": "_language_counts",
+      "expression": "Counter()"
+    },
+    {
+      "line": 181,
+      "end_line": 181,
+      "callee": "eps.sort",
+      "enclosing": "_sorted_entry_points",
+      "expression": "eps.sort(key=lambda t: (t[0] != \"network\", not t[1], t[0], t[2]))"
+    },
+    {
+      "line": 187,
+      "end_line": 187,
+      "callee": "Path",
+      "enclosing": "gather",
+      "expression": "Path(repo_root)"
+    },
+    {
+      "line": 188,
+      "end_line": 188,
+      "callee": "_resolve_caps",
+      "enclosing": "gather",
+      "expression": "_resolve_caps(getattr(cfg, \"step2\", None))"
+    },
+    {
+      "line": 190,
+      "end_line": 190,
+      "callee": "_build_frontier",
+      "enclosing": "gather",
+      "expression": "_build_frontier(ctx, caps)"
+    },
+    {
+      "line": 196,
+      "end_line": 196,
+      "callee": "_sorted_entry_points",
+      "enclosing": "gather",
+      "expression": "_sorted_entry_points(active_ctx)"
+    },
+    {
+      "line": 198,
+      "end_line": 198,
+      "callee": "gather_docs",
+      "enclosing": "gather",
+      "expression": "gather_docs(root, full_files, caps.doc_cap)"
+    },
+    {
+      "line": 199,
+      "end_line": 201,
+      "callee": "gather_manifests",
+      "enclosing": "gather",
+      "expression": "gather_manifests(\n        root, (caps.max_manifest_depth, caps.max_manifests, caps.max_manifests_per_kind),\n        caps.manifest_cap, caps.manifest_total_cap)"
+    },
+    {
+      "line": 202,
+      "end_line": 203,
+      "callee": "gather_config_reps",
+      "enclosing": "gather",
+      "expression": "gather_config_reps(root, full_files, caps.max_config_reps,\n                                  caps.max_config_rep_chars, caps.max_config_rep_bodies)"
+    },
+    {
+      "line": 204,
+      "end_line": 204,
+      "callee": "gather_api_artefacts",
+      "enclosing": "gather",
+      "expression": "gather_api_artefacts(full_files, caps.max_api_artefacts)"
+    },
+    {
+      "line": 205,
+      "end_line": 205,
+      "callee": "sorted",
+      "enclosing": "gather",
+      "expression": "sorted({rel.split(\"/\", 1)[0] for rel in full_files if \"/\" in rel})"
+    },
+    {
+      "line": 218,
+      "end_line": 235,
+      "callee": "ThreatEvidence",
+      "enclosing": "gather",
+      "expression": "ThreatEvidence(\n        file_count=len(frontier_files),\n        original_file_count=len(ctx.all_files) if ctx else len(frontier_files),\n        primary_language=ctx.language if ctx else \"\",\n        languages=tuple(_language_counts(full_files).most_common()),\n        top_dirs=tuple(top_dirs),\n        modules=tuple(modules[:caps.max_modules_prompt]),\n        modules_truncated=len(modules) > caps.max_modules_prompt,\n        entry_points=tuple(eps[:caps.max_entry_points_prompt]),\n        entry_points_truncated=len(eps) > caps.max_entry_points_prompt,\n        config_reps=tuple(cfg_reps),\n        api_artefacts=tuple(api_artefacts),\n        docs=tuple(docs),\n        manifests=tuple(manifests),\n        inventory=tuple(sorted(full_files)[:caps.max_inventory_files]),\n        inventory_truncated=len(full_files) > caps.max_inventory_files,\n        s1_notes=getattr(ctx, \"notes\", \"\") if ctx else \"\",\n    )"
+    },
+    {
+      "line": 36,
+      "end_line": 36,
+      "callee": "EXT_TO_LANG.items",
+      "enclosing": "module initialization",
+      "expression": "EXT_TO_LANG.items()"
+    },
+    {
+      "line": 45,
+      "end_line": 45,
+      "callee": "int",
+      "enclosing": "_cap_int",
+      "expression": "int(v)"
+    },
+    {
+      "line": 151,
+      "end_line": 151,
+      "callee": "len",
+      "enclosing": "_note_frontier_cuts",
+      "expression": "len(ctx.all_files)"
+    },
+    {
+      "line": 152,
+      "end_line": 152,
+      "callee": "len",
+      "enclosing": "_note_frontier_cuts",
+      "expression": "len(frontier.all_files)"
+    },
+    {
+      "line": 159,
+      "end_line": 159,
+      "callee": "sum",
+      "enclosing": "_note_frontier_cuts",
+      "expression": "sum(f in allowed for f in files)"
+    },
+    {
+      "line": 160,
+      "end_line": 162,
+      "callee": "_note_cut",
+      "enclosing": "_note_frontier_cuts",
+      "expression": "_note_cut(f\"s2_frontier_{kind}_excluded\", kind, len(files), kept,\n                  [k for k, hit in ((\"max_graph_files\", inside < len(files)),\n                                    (key, inside > limit)) if hit])"
+    },
+    {
+      "line": 164,
+      "end_line": 164,
+      "callee": "len",
+      "enclosing": "_note_frontier_cuts",
+      "expression": "len(ctx.modules)"
+    },
+    {
+      "line": 164,
+      "end_line": 164,
+      "callee": "len",
+      "enclosing": "_note_frontier_cuts",
+      "expression": "len(frontier.modules)"
+    },
+    {
+      "line": 172,
+      "end_line": 172,
+      "callee": "_LANG_BY_EXT.get",
+      "enclosing": "_language_counts",
+      "expression": "_LANG_BY_EXT.get(PurePosixPath(rel).suffix.lower())"
+    },
+    {
+      "line": 188,
+      "end_line": 188,
+      "callee": "getattr",
+      "enclosing": "gather",
+      "expression": "getattr(cfg, \"step2\", None)"
+    },
+    {
+      "line": 192,
+      "end_line": 192,
+      "callee": "list",
+      "enclosing": "gather",
+      "expression": "list(active_ctx.all_files)"
+    },
+    {
+      "line": 193,
+      "end_line": 193,
+      "callee": "list",
+      "enclosing": "gather",
+      "expression": "list(ctx.all_files)"
+    },
+    {
+      "line": 216,
+      "end_line": 216,
+      "callee": "_note_cut",
+      "enclosing": "gather",
+      "expression": "_note_cut(counter, kind, total, min(total, limit), [key])"
+    },
+    {
+      "line": 77,
+      "end_line": 77,
+      "callee": "_cap_int",
+      "enclosing": "_resolve_caps",
+      "expression": "_cap_int(s2, \"max_doc_chars\", 20000)"
+    },
+    {
+      "line": 78,
+      "end_line": 78,
+      "callee": "_cap_int",
+      "enclosing": "_resolve_caps",
+      "expression": "_cap_int(s2, \"max_manifest_chars\", 4000)"
+    },
+    {
+      "line": 79,
+      "end_line": 79,
+      "callee": "_cap_int",
+      "enclosing": "_resolve_caps",
+      "expression": "_cap_int(s2, \"max_manifest_total_chars\", 24000)"
+    },
+    {
+      "line": 80,
+      "end_line": 80,
+      "callee": "_cap_int",
+      "enclosing": "_resolve_caps",
+      "expression": "_cap_int(s2, \"max_manifest_depth\", 3)"
+    },
+    {
+      "line": 81,
+      "end_line": 81,
+      "callee": "_cap_int",
+      "enclosing": "_resolve_caps",
+      "expression": "_cap_int(s2, \"max_manifests\", 12)"
+    },
+    {
+      "line": 82,
+      "end_line": 82,
+      "callee": "max",
+      "enclosing": "_resolve_caps",
+      "expression": "max(1, _cap_int(s2, \"max_manifests_per_kind\", 2))"
+    },
+    {
+      "line": 83,
+      "end_line": 83,
+      "callee": "_cap_int",
+      "enclosing": "_resolve_caps",
+      "expression": "_cap_int(s2, \"max_graph_files\", 220)"
+    },
+    {
+      "line": 84,
+      "end_line": 84,
+      "callee": "_cap_int",
+      "enclosing": "_resolve_caps",
+      "expression": "_cap_int(s2, \"max_entry_points\", 400)"
+    },
+    {
+      "line": 85,
+      "end_line": 85,
+      "callee": "_cap_int",
+      "enclosing": "_resolve_caps",
+      "expression": "_cap_int(s2, \"max_graph_sinks\", 80)"
+    },
+    {
+      "line": 86,
+      "end_line": 86,
+      "callee": "_cap_int",
+      "enclosing": "_resolve_caps",
+      "expression": "_cap_int(s2, \"max_modules\", 100)"
+    },
+    {
+      "line": 87,
+      "end_line": 87,
+      "callee": "_cap_int",
+      "enclosing": "_resolve_caps",
+      "expression": "_cap_int(s2, \"max_graph_edges\", 100)"
+    },
+    {
+      "line": 88,
+      "end_line": 88,
+      "callee": "_cap_int",
+      "enclosing": "_resolve_caps",
+      "expression": "_cap_int(s2, \"max_config_reps\", 80)"
+    },
+    {
+      "line": 89,
+      "end_line": 89,
+      "callee": "_cap_int",
+      "enclosing": "_resolve_caps",
+      "expression": "_cap_int(s2, \"max_config_rep_chars\", 2000)"
+    },
+    {
+      "line": 90,
+      "end_line": 90,
+      "callee": "_cap_int",
+      "enclosing": "_resolve_caps",
+      "expression": "_cap_int(s2, \"max_config_rep_bodies\", 12)"
+    },
+    {
+      "line": 91,
+      "end_line": 91,
+      "callee": "_cap_int",
+      "enclosing": "_resolve_caps",
+      "expression": "_cap_int(s2, \"max_api_artefacts\", 100)"
+    },
+    {
+      "line": 93,
+      "end_line": 93,
+      "callee": "_cap_int",
+      "enclosing": "_resolve_caps",
+      "expression": "_cap_int(s2, \"max_prompt_modules\", 100)"
+    },
+    {
+      "line": 94,
+      "end_line": 94,
+      "callee": "_cap_int",
+      "enclosing": "_resolve_caps",
+      "expression": "_cap_int(s2, \"max_prompt_entry_points\", 400)"
+    },
+    {
+      "line": 95,
+      "end_line": 95,
+      "callee": "_cap_int",
+      "enclosing": "_resolve_caps",
+      "expression": "_cap_int(s2, \"max_inventory_files\", 1200)"
+    },
+    {
+      "line": 143,
+      "end_line": 143,
+      "callee": "','.join",
+      "enclosing": "_note_cut",
+      "expression": "\",\".join(f\"step2.{k}\" for k in cap_keys)"
+    },
+    {
+      "line": 154,
+      "end_line": 154,
+      "callee": "len",
+      "enclosing": "_note_frontier_cuts",
+      "expression": "len(frontier.entry_points)"
+    },
+    {
+      "line": 156,
+      "end_line": 156,
+      "callee": "len",
+      "enclosing": "_note_frontier_cuts",
+      "expression": "len(frontier.unsafe_sinks)"
+    },
+    {
+      "line": 160,
+      "end_line": 160,
+      "callee": "len",
+      "enclosing": "_note_frontier_cuts",
+      "expression": "len(files)"
+    },
+    {
+      "line": 163,
+      "end_line": 163,
+      "callee": "any",
+      "enclosing": "_note_frontier_cuts",
+      "expression": "any(p in allowed for p in m.files)"
+    },
+    {
+      "line": 172,
+      "end_line": 172,
+      "callee": "PurePosixPath(rel).suffix.lower",
+      "enclosing": "_language_counts",
+      "expression": "PurePosixPath(rel).suffix.lower()"
+    },
+    {
+      "line": 209,
+      "end_line": 209,
+      "callee": "len",
+      "enclosing": "gather",
+      "expression": "len(modules)"
+    },
+    {
+      "line": 211,
+      "end_line": 211,
+      "callee": "len",
+      "enclosing": "gather",
+      "expression": "len(eps)"
+    },
+    {
+      "line": 213,
+      "end_line": 213,
+      "callee": "len",
+      "enclosing": "gather",
+      "expression": "len(full_files)"
+    },
+    {
+      "line": 216,
+      "end_line": 216,
+      "callee": "min",
+      "enclosing": "gather",
+      "expression": "min(total, limit)"
+    },
+    {
+      "line": 219,
+      "end_line": 219,
+      "callee": "len",
+      "enclosing": "gather",
+      "expression": "len(frontier_files)"
+    },
+    {
+      "line": 222,
+      "end_line": 222,
+      "callee": "tuple",
+      "enclosing": "gather",
+      "expression": "tuple(_language_counts(full_files).most_common())"
+    },
+    {
+      "line": 223,
+      "end_line": 223,
+      "callee": "tuple",
+      "enclosing": "gather",
+      "expression": "tuple(top_dirs)"
+    },
+    {
+      "line": 224,
+      "end_line": 224,
+      "callee": "tuple",
+      "enclosing": "gather",
+      "expression": "tuple(modules[:caps.max_modules_prompt])"
+    },
+    {
+      "line": 226,
+      "end_line": 226,
+      "callee": "tuple",
+      "enclosing": "gather",
+      "expression": "tuple(eps[:caps.max_entry_points_prompt])"
+    },
+    {
+      "line": 228,
+      "end_line": 228,
+      "callee": "tuple",
+      "enclosing": "gather",
+      "expression": "tuple(cfg_reps)"
+    },
+    {
+      "line": 229,
+      "end_line": 229,
+      "callee": "tuple",
+      "enclosing": "gather",
+      "expression": "tuple(api_artefacts)"
+    },
+    {
+      "line": 230,
+      "end_line": 230,
+      "callee": "tuple",
+      "enclosing": "gather",
+      "expression": "tuple(docs)"
+    },
+    {
+      "line": 231,
+      "end_line": 231,
+      "callee": "tuple",
+      "enclosing": "gather",
+      "expression": "tuple(manifests)"
+    },
+    {
+      "line": 232,
+      "end_line": 232,
+      "callee": "tuple",
+      "enclosing": "gather",
+      "expression": "tuple(sorted(full_files)[:caps.max_inventory_files])"
+    },
+    {
+      "line": 82,
+      "end_line": 82,
+      "callee": "_cap_int",
+      "enclosing": "_resolve_caps",
+      "expression": "_cap_int(s2, \"max_manifests_per_kind\", 2)"
+    },
+    {
+      "line": 205,
+      "end_line": 205,
+      "callee": "rel.split",
+      "enclosing": "gather",
+      "expression": "rel.split(\"/\", 1)"
+    },
+    {
+      "line": 220,
+      "end_line": 220,
+      "callee": "len",
+      "enclosing": "gather",
+      "expression": "len(ctx.all_files)"
+    },
+    {
+      "line": 220,
+      "end_line": 220,
+      "callee": "len",
+      "enclosing": "gather",
+      "expression": "len(frontier_files)"
+    },
+    {
+      "line": 222,
+      "end_line": 222,
+      "callee": "_language_counts(full_files).most_common",
+      "enclosing": "gather",
+      "expression": "_language_counts(full_files).most_common()"
+    },
+    {
+      "line": 225,
+      "end_line": 225,
+      "callee": "len",
+      "enclosing": "gather",
+      "expression": "len(modules)"
+    },
+    {
+      "line": 227,
+      "end_line": 227,
+      "callee": "len",
+      "enclosing": "gather",
+      "expression": "len(eps)"
+    },
+    {
+      "line": 233,
+      "end_line": 233,
+      "callee": "len",
+      "enclosing": "gather",
+      "expression": "len(full_files)"
+    },
+    {
+      "line": 234,
+      "end_line": 234,
+      "callee": "getattr",
+      "enclosing": "gather",
+      "expression": "getattr(ctx, \"notes\", \"\")"
+    },
+    {
+      "line": 232,
+      "end_line": 232,
+      "callee": "sorted",
+      "enclosing": "gather",
+      "expression": "sorted(full_files)"
+    },
+    {
+      "line": 172,
+      "end_line": 172,
+      "callee": "PurePosixPath",
+      "enclosing": "_language_counts",
+      "expression": "PurePosixPath(rel)"
+    },
+    {
+      "line": 222,
+      "end_line": 222,
+      "callee": "_language_counts",
+      "enclosing": "gather",
+      "expression": "_language_counts(full_files)"
+    },
+    {
+      "line": 165,
+      "end_line": 165,
+      "callee": "len",
+      "enclosing": "_note_frontier_cuts",
+      "expression": "len(ctx.modules)"
+    },
+    {
+      "line": 161,
+      "end_line": 161,
+      "callee": "len",
+      "enclosing": "_note_frontier_cuts",
+      "expression": "len(files)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 16,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 18,
+      "source_expression": "from collections import Counter",
+      "targets": [
+        "collections",
+        "collections.Counter"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "from dataclasses import dataclass",
+      "targets": [
+        "dataclasses",
+        "dataclasses.dataclass"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "from pathlib import Path, PurePosixPath",
+      "targets": [
+        "pathlib",
+        "pathlib.Path",
+        "pathlib.PurePosixPath"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "from pydantic import BaseModel, ConfigDict",
+      "targets": [
+        "pydantic",
+        "pydantic.BaseModel",
+        "pydantic.ConfigDict"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 24,
+      "source_expression": "from vvaharness.evidence.api_artefacts import gather_api_artefacts",
+      "targets": [
+        "vvaharness.evidence.api_artefacts",
+        "vvaharness.evidence.api_artefacts.gather_api_artefacts"
+      ],
+      "local_source_paths": [
+        "vvaharness/evidence/api_artefacts.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 25,
+      "source_expression": "from vvaharness.evidence.configs import gather_config_reps",
+      "targets": [
+        "vvaharness.evidence.configs",
+        "vvaharness.evidence.configs.gather_config_reps"
+      ],
+      "local_source_paths": [
+        "vvaharness/evidence/configs.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 26,
+      "source_expression": "from vvaharness.evidence.docs import gather_docs",
+      "targets": [
+        "vvaharness.evidence.docs",
+        "vvaharness.evidence.docs.gather_docs"
+      ],
+      "local_source_paths": [
+        "vvaharness/evidence/docs.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 27,
+      "source_expression": "from vvaharness.evidence.manifests import gather_manifests",
+      "targets": [
+        "vvaharness.evidence.manifests",
+        "vvaharness.evidence.manifests.gather_manifests"
+      ],
+      "local_source_paths": [
+        "vvaharness/evidence/manifests.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 28,
+      "source_expression": "from vvaharness.lang.detect import EXT_TO_LANG, LANG_DISPLAY",
+      "targets": [
+        "vvaharness.lang.detect",
+        "vvaharness.lang.detect.EXT_TO_LANG",
+        "vvaharness.lang.detect.LANG_DISPLAY"
+      ],
+      "local_source_paths": [
+        "vvaharness/lang/detect.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 29,
+      "source_expression": "from vvaharness.models import ContextPackage",
+      "targets": [
+        "vvaharness.models",
+        "vvaharness.models.ContextPackage"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 30,
+      "source_expression": "from vvaharness.util import logs",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.logs"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/logs.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 31,
+      "source_expression": "from vvaharness.util.counters import COUNTERS",
+      "targets": [
+        "vvaharness.util.counters",
+        "vvaharness.util.counters.COUNTERS"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/counters.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 32,
+      "source_expression": "from vvaharness.util.events import Event",
+      "targets": [
+        "vvaharness.util.events",
+        "vvaharness.util.events.Event"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/events.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

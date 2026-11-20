@@ -1,0 +1,340 @@
+# vvaharness/validation/session/launcher.py
+
+Runs one fix-validation session for one finding case. It optionally injects the `.claude/` configuration into the staged workspace, assembles the system prompt (system.md plus a synthesis section plus a rules section, both chosen by backend), builds the session options (model, limits, tool policy, write gate, fact tools, the three persona subagents, budgets), streams the session under a heartbeat, a repeat guard and a hard timeout backstop, and then persists the outputs: the orchestrator's structured `ValidationOutput` becomes `validation_report.json`, and the host itself synthesizes `synthesized_gates.json` from the persona reports when the backend returns schema-validated reports.
+
+Source: `vvaharness/validation/session/launcher.py` (lines 1-631)
+Executor: mixed (the code builds the call and checks the result; the orchestrator model and its three personas do the review)
+Called from: `vvaharness/validation/execution/pipeline.sudo` execute_plan
+
+// src: vvaharness/validation/session/launcher.py:100-114
+_DEFAULT_VALIDATE_ENV_VARS = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "OPENAI_API_KEY", "OPENAI_BASE_URL"]
+_BACKSTOP_GRACE_S = 2 * TIMEOUT_STOP_GRACE_SECONDS   // TIMEOUT_STOP_GRACE_SECONDS = 20 (vvaharness/backends/llm/models.py:292), so 40 seconds
+_HEARTBEAT_SECS = 60.0
+_STRUCTURED_RETRY_SUBTYPE = "error_max_structured_output_retries"   // src: launcher.py:412
+
+// src: vvaharness/validation/session/launcher.py:596-631
+fn launch_session(config, manifest, workspace_dir, output_dir, harness?):executor=mixed {
+  if (_injects_claude_config(config)) {
+    session.config_inject.inject_claude_config(workspace_dir)   // cli and sdk routes only
+  }
+  create output_dir
+  path_cfg = FIX_VALIDATION
+  options = build_validation_options(config, manifest, workspace=workspace_dir, output_dir,
+    system_prompt=_load_system_prompt(config, path_cfg))
+  // "One case per session, so its id is the only tracking id the personas can report under."
+  tracking_ids = if (manifest.case_id) [manifest.case_id] else []
+  return _run_and_check(
+    harness = harness or, when absent, get_harness(config.agent.via),   // external: vvaharness/backends/harness
+    prompt = session.launch_prompt.build_launch_prompt(manifest),
+    options, session_id=manifest.session_id,
+    log_dir = "$workspace_dir/logging",
+    workspace = workspace_dir, tracking_ids,
+    host_gate_synthesis = _synthesizes_gates_on_host(config),
+    route = config.agent.via)
+}
+
+// src: vvaharness/validation/session/launcher.py:348-350, 369-371
+// Backend traits come from capabilities_for (vvaharness/backends/harness/capabilities.py:39-59):
+//   cli: reads_injected_claude_config=true,  returns_schema_validated_reports=true
+//   sdk: reads_injected_claude_config=true,  returns_schema_validated_reports=true
+//   deepagents: reads_injected_claude_config=false, returns_schema_validated_reports=true
+//   any other value: both false
+fn _injects_claude_config(config):executor=code = capabilities_for(config.agent.via).reads_injected_claude_config
+fn _synthesizes_gates_on_host(config):executor=code = capabilities_for(config.agent.via).returns_schema_validated_reports
+// preserved: every recognised route (cli, sdk, deepagents) has returns_schema_validated_reports=true, so the "agent synthesizes" prompt branch below is reached only for an unrecognised via value.
+
+// src: vvaharness/validation/session/launcher.py:397-409
+fn _load_system_prompt(config, path_cfg):executor=code {
+  prompt_file = path_cfg.system_prompt_file   // "system.md"
+  if (!prompt_file) return null
+  path = config.paths.prompts_dir + "/" + prompt_file   // prompts_dir is the package's prompts/ folder (config/settings/paths.sudo)
+  if (path does not exist) return null   // the session then runs with no system prompt
+  return "${ text of path with trailing whitespace removed }\n\n${ _synthesis_section(config) }\n\n${ _rules_section(config) }\n"
+  // the text of path is VALIDATION_SYSTEM_PROMPT in prompts/system.sudo.md
+}
+
+// src: vvaharness/validation/session/launcher.py:374-394
+// Appended to the system prompt; which branch is chosen depends on the backend.
+VALIDATION_SYNTHESIS_SECTION {
+  // prompt-src: vvaharness/validation/session/launcher.py:376-383
+  if (_synthesizes_gates_on_host(config)) {
+    Constraints {
+      "## Synthesis boundary"
+      "Do NOT synthesize across personas, compute scores, or fill `synthesized_gates` — the host performs deterministic synthesis and scoring from the structured persona reports after you finish. Always emit `synthesized_gates` as an empty list `[]`."
+    }
+  } else {
+    // prompt-src: vvaharness/validation/session/launcher.py:384-394
+    Constraints {
+      "## Synthesis boundary"
+      "Fill `synthesized_gates` with one entry per finding, each carrying all four gates, applying the synthesis rules from the validation rules above: where two or more personas agree on a gate use that status; where only one evaluated it use that status; where they disagree take the LOWEST (most conservative) status and show both perspectives in your justification."
+      "Do NOT compute scores. `raw_score`, `fix_status` and `merge_readiness` are recomputed on the host from the gate statuses you report, and the values you put in those fields are ignored."
+    }
+  }
+  // preserved: in both branches the orchestrator is told not to compute scores, yet the rules section below
+  // (claude_config/rules/scoring-matrix.sudo.md, "Scoring Execution") tells it to "computes the verdict directly from this matrix".
+}
+
+// src: vvaharness/validation/session/launcher.py:353-366
+VALIDATION_RULES_SECTION {
+  if (_injects_claude_config(config)) {
+    // prompt-src: vvaharness/validation/session/launcher.py:356-361
+    Constraints {
+      "## Rules"
+      "Follow the rules auto-loaded from `.claude/rules/`. They define persona isolation, anti-manipulation safeguards, evidence requirements, gate definitions, weights, and decision thresholds."
+    }
+  } else {
+    // prompt-src: vvaharness/validation/session/launcher.py:362-366
+    Constraints {
+      "## Rules"
+      "These are the validation rules referred to above. Follow them as written."
+      $orchestratorRulesText   // session.rules.orchestrator_rules_text(): scoring-matrix rules then adversarial-review rules
+    }
+  }
+}
+
+// src: vvaharness/validation/session/launcher.py:299-345
+fn build_validation_options(config, manifest, workspace, output_dir, system_prompt):executor=code {
+  injects_claude = _injects_claude_config(config)
+  return StreamingOptions {
+    model: config.agent.model
+    model_provider: config.agent.provider
+    use_responses_api: config.agent.use_responses_api
+    cwd: workspace
+    env: _build_env(config, manifest, workspace, output_dir)
+    effort: config.agent.effort
+    max_turns: config.agent.max_turns
+    max_budget_usd: config.agent.max_budget_usd
+    timeout: config.agent.timeout
+    system_prompt: system_prompt
+    setting_sources: ["project"]   // makes Claude Code load .claude/ (rules, skills, settings) from the workspace
+    cli_path: if (injects_claude) _resolve_binary(config.agent.binary) else null
+    tool_policy: VALIDATION_POLICY   // allowed Read, Grep, Glob, Agent; disallowed Write, Edit, NotebookEdit, Bash
+    permissions: session.setup.validation_write_gate(workspace)   // only validation_report.json and synthesized_gates.json under workspace
+    response_model: ValidationOutput   // models/output.sudo
+    force_verdict_only: true   // "force the outcome tool only to end a session, not every turn"
+    tool_builder: tools.deep_tools.build_validation_tools   // deepagents
+    fact_tools: DEFAULT_FACT_TOOLS
+    fact_tool_specs: tools.fact_specs.build_validation_fact_specs(workspace)   // "deepagents ignores these; Claude cli/sdk lacks langchain, needs them for any fact tools"
+    skill_root: if (injects_claude) "$workspace/.claude/skills" else null
+    graph_name: "validation"
+    agents: subagents._loader.load_agents(FIX_VALIDATION.agent_names,
+      model_overrides = _persona_overrides(config),
+      tools_override = config.agent.validate_tools,
+      prompt_suffix = if (injects_claude) SUBMIT_PROMPT_SUFFIX else session.rules.persona_rules_text(),
+      max_model_calls = config.agent.max_model_calls)
+    // Claude reads the rules from the injected .claude/; its suffix carries the mcp__facts__ tool names and the submit tool.
+    // Other backends receive the adversarial-review rules inlined into each persona prompt.
+    parent_middleware: [_orchestrator_call_budget(config)] without null entries
+    cache_markers: config.agent.cache_markers
+  }
+  // external: StreamingOptions is consumed by vvaharness/backends/harness; how each backend applies tool_policy, permissions,
+  // fact tools, budgets and response_model is outside this batch.
+}
+
+// The session the options above produce, in the shared vocabulary.
+// src: vvaharness/validation/session/launcher.py:299-345, 620-631
+SessionCall = callModel({
+  role: "validate",   // models.validate.orchestrator in the profile (cli/_model.sudo)
+  route: config.agent.via,   // "cli" | "sdk" | "deepagents" (a legacy "openai" is rewritten to deepagents)
+  system: VALIDATION_SYSTEM_PROMPT + VALIDATION_SYNTHESIS_SECTION + VALIDATION_RULES_SECTION,
+  prompt: VALIDATION_LAUNCH_PROMPT,   // session/launch_prompt.sudo
+  tools: ["Read", "Grep", "Glob", "Agent"] + fact tools per backend,
+  subagents: { "security-architect", "penetration-tester", "cross-repo-analyzer" },   // each returns a PersonaReport
+  limits: { max_turns: config.agent.max_turns, max_budget_usd: config.agent.max_budget_usd, timeout: config.agent.timeout,
+            orchestrator_max_model_calls: config.agent.orchestrator_max_model_calls /* default 40 */, persona_max_model_calls: config.agent.max_model_calls /* default 60, DEFAULT_PERSONA_MAX_MODEL_CALLS */ },
+  output: ValidationOutput
+})
+
+// src: vvaharness/validation/session/launcher.py:143-173
+fn _build_env(config, manifest, workspace, output_dir):executor=code {
+  effective_api_key = environment ANTHROPIC_AUTH_TOKEN || environment ANTHROPIC_API_KEY || ""
+  env = {
+    ANTHROPIC_API_KEY: effective_api_key,
+    VALIDATION_SESSION: "true",
+    VALIDATION_TARGET_DIR: workspace,
+    VALIDATION_OUTPUT_DIR: output_dir,
+    VALIDATION_MANIFEST: "$workspace/manifest.json",
+    VALIDATION_LOG_DIR: "$workspace/logging",
+    JIRA_KEY: manifest.case_id,
+    SESSION_ID: manifest.session_id,
+    CLAUDE_PROJECT_DIR: workspace
+  }
+  for each name in _DEFAULT_VALIDATE_ENV_VARS, if (environment has name) env[name] = environment value
+  // preserved: this loop runs after the effective key is set, so a present ANTHROPIC_API_KEY in the environment overwrites the ANTHROPIC_AUTH_TOKEN-derived value
+  if (config.ghe.token) env.GH_ENTERPRISE_TOKEN = config.ghe.token
+  if (config.ghe.archived_token) env.GH_ARCHIVED_TOKEN = config.ghe.archived_token
+  return env
+}
+
+// src: vvaharness/validation/session/launcher.py:176-186
+fn _persona_overrides(config):executor=code {
+  return { "security-architect": config.agent.security_architect_model,
+           "penetration-tester": config.agent.penetration_tester_model,
+           "cross-repo-analyzer": config.agent.cross_repo_analyzer_model } without empty values
+  // a persona with no override inherits the validate model
+}
+
+// src: vvaharness/validation/session/launcher.py:189-211
+fn _resolve_binary(binary):executor=code {
+  if (binary is an absolute path) {
+    require binary is a file => throw HarnessCLINotFoundError("Claude binary does not exist: $binary")
+    return resolved binary
+  }
+  require binary is a bare executable name (non-empty, no directory part, no "\\", no ":")
+    => throw HarnessCLINotFoundError("Claude binary must be an absolute path or a bare executable name: ...")
+  for each entry in PATH {
+    if (entry is relative || entry resolves inside the current working directory) skip it
+    found = which(entry/binary)
+    if (found && found resolves outside the current working directory) return resolved found
+  }
+  throw HarnessCLINotFoundError("Claude binary ... not found on an absolute, non-cwd PATH entry; configure agent.binary with an absolute installed executable path")
+}
+
+// src: vvaharness/validation/session/launcher.py:286-296
+fn _orchestrator_call_budget(config):executor=code {
+  limit = config.agent.orchestrator_max_model_calls   // default 40 (DEFAULT_ORCHESTRATOR_MAX_MODEL_CALLS, vvaharness/validation/constants/artifacts.py:140)
+  if (limit <= 0) return null   // unmetered
+  return ModelCallBudget(limit, outcome_tools={"ValidationOutput"}, counter="s11_orchestrator_model_call_budget_final_turn", stage="s11")
+  // external: vvaharness/backends/harness/deepagents/model_call_budget.py; per its docstring it "caps model calls per session and forces the verdict on the last one" (deepagents middleware)
+}
+
+// src: vvaharness/validation/session/launcher.py:528-577
+fn _run_and_check({ harness, prompt, options, session_id, log_dir, workspace, tracking_ids, host_gate_synthesis=true, route="" }):executor=code {
+  [exit_code, observed_sid, messages] = _stream_session(harness, prompt, options, session_id, log_dir,
+    case_label = if (tracking_ids) join(tracking_ids, ", ") else session_id, route)
+  terminal = last message in messages that is a HarnessResult, or null
+
+  // "The exit-code check precedes both writes: a failed session must leave no verdict in workspace."
+  require exit_code == 0 => throw ValidationSessionError(_failure_reason(terminal, exit_code), exit_code)
+  // "Before both writes: a refused turn's partial state must not become gates"
+  _raise_if_session_refused(terminal, exit_code)
+
+  if (terminal && terminal.structured != null) {
+    _write_validation_outputs(workspace, terminal.structured)
+  }
+  // "Backends whose subagents return schema-validated reports get deterministic host synthesis."
+  if (host_gate_synthesis && terminal && terminal.state != null) {
+    _write_host_synthesized_gates(workspace, terminal.state, tracking_ids)   // overwrites any agent-written synthesized_gates.json when it writes
+  }
+  // "A "success" result can persist nothing; state counts only if synthesis wrote it."
+  require !(terminal && terminal.structured == null && (!host_gate_synthesis || terminal.state == null))
+    => throw ValidationSessionError("validation session reported success but returned no structured output and no terminal state; no validation_report.json could be written", exit_code)
+  // preserved: when terminal is null and exit_code is 0 none of these checks fires and the session counts as completed with nothing written.
+  return exit_code
+}
+
+// src: vvaharness/validation/session/launcher.py:461-513
+fn _stream_session(harness, prompt, options, session_id, log_dir, case_label="", route=""):executor=code {
+  messages = []
+  heartbeat = _HeartbeatState { last_activity: now, tool_counts: {} }
+  ticker = start task _heartbeat_ticker(heartbeat, case_label || session_id, started=now)
+  constraint OnEveryExit {
+    cancel ticker and wait for it to stop   // src: launcher.py:509-512
+  }
+  do_stream = () => io.message_logger.stream_and_log(
+      _log_stream(guard_repeats(harness.run_streaming(prompt, options), stage="s11", route), messages, heartbeat),
+      log_dir = "$log_dir/orchestrator", session_id, live=false)
+  // external: guard_repeats (vvaharness/backends/harness/repeat_guard.py) "aborts a repeat loop (VVAH-E009)"
+  try [exit_code, observed_sid] = _bounded_stream(do_stream, options.timeout, options.effort)
+  catch error => match (error) {
+    case HarnessCLINotFoundError => throw error
+    case HarnessError => throw ValidationSessionError("Harness error: ${ type of error }", cause=error, exit_code=error.exit_code)
+    default => throw error
+  }
+  return [exit_code, observed_sid, messages]
+}
+
+// src: vvaharness/validation/session/launcher.py:431-456
+fn _bounded_stream(do_stream, timeout, effort):executor=code {
+  if (timeout == null || timeout <= 0) return do_stream()   // unbounded
+  deadline = timeout + _BACKSTOP_GRACE_S   // a hard stop above options.timeout, "for a harness that ignores it, or whose own graceful stop hangs"
+  try return do_stream() within deadline seconds
+  catch TimeoutError => {
+    if (our deadline did not expire) throw error   // a TimeoutError raised inside the drain itself
+    throw call_timeout_error(stage="s11", route="backstop", budget_s=timeout, effort,
+      cause_text="validation session timed out after ${ timeout + _BACKSTOP_GRACE_S }s")
+  }
+  // CallTimeoutError subclasses both HarnessError and TimeoutError (vvaharness/backends/harness/models.py:652), so _stream_session turns it into ValidationSessionError and the case becomes INCONCLUSIVE
+}
+
+// src: vvaharness/validation/session/launcher.py:580-593
+fn _log_stream(source, collected, heartbeat?):executor=code {
+  for each msg in source {
+    append msg to collected
+    if (heartbeat) {
+      heartbeat.last_activity = now
+      if (msg is HarnessToolUse) heartbeat.tool_counts[msg.agent || "orchestrator"] += 1
+    }
+    yield msg
+  }
+}
+
+// src: vvaharness/validation/session/launcher.py:126-140
+fn _heartbeat_ticker(state, case_label, started):executor=code {
+  loop {
+    sleep _HEARTBEAT_SECS
+    status = if (seconds since state.last_activity >= _HEARTBEAT_SECS) "waiting on model" else "in progress"
+    console: "  [s11] heartbeat: $case_label $status; <elapsed>s elapsed, last activity <quiet>s ago; tool calls: <agent=count ...>"
+  }
+  // observation only; never stops the session
+}
+
+// src: vvaharness/validation/session/launcher.py:415-428
+fn _failure_reason(terminal, exit_code):executor=code {
+  if (terminal == null) return "validation session produced no terminal result (exit=$exit_code)"
+  parts = ["validation session ended with subtype=${ terminal.subtype }"]
+  if (terminal.subtype == "error_max_structured_output_retries") {
+    append "the model never returned a response matching the validation schema -- either schema-validation retries were exhausted, or a model fallback retracted the response and no retry replaced it"
+  }
+  if (terminal.errors) append "errors: " + join(terminal.errors, " | ")
+  return join(parts, " -- ")
+}
+
+// src: vvaharness/validation/session/launcher.py:516-524
+fn _raise_if_session_refused(terminal, exit_code):executor=code {
+  try raise_if_refused(terminal, tag="s11");   // external: vvaharness/backends/llm/deepagents.py; "only deepagents marks refused"
+  catch ModelRefusal => throw ValidationSessionError("validation session ended on a refused turn: ...", cause, exit_code)
+}
+
+// src: vvaharness/validation/session/launcher.py:228-245
+fn _write_validation_outputs(workspace, structured):executor=code {
+  if (structured is a model object) structured = structured as JSON dict
+  require structured is a dict => warn "structured validation output is not a dict; skipping host write"; return
+  findings = structured.findings; gates = structured.synthesized_gates; target_status = structured.target_jira_status
+  if (findings != null) {
+    _write_workspace_json(workspace, "validation_report.json", { target_jira_status: target_status, findings })
+  }
+  if (gates != null) {
+    _write_workspace_json(workspace, "synthesized_gates.json", gates)
+    // with host synthesis the prompt asks for [], and _write_host_synthesized_gates may overwrite this file afterwards
+  }
+}
+
+// src: vvaharness/validation/session/launcher.py:263-283
+fn _write_host_synthesized_gates(workspace, terminal_state, tracking_ids):executor=code {
+  require terminal_state is a dict => warn "terminal harness state is not a dict; skipping host synthesis"; return
+  reports = io.persona_report_stash.extract_subagent_reports(terminal_state)
+  missing = FIX_VALIDATION.agent_names minus { report.persona for each report }
+  if (missing) console: "  [s11] no report from <missing>; gates that need their vote cannot reach consensus"
+  require reports is non-empty => warn "no valid persona reports extracted; skipping host synthesis"; return
+  // "failure leaves prior output": a skipped synthesis leaves whatever synthesized_gates.json the orchestrator output wrote
+  synthesized = _synthesize_gates(reports, tracking_ids)
+  if (synthesized) _write_workspace_json(workspace, "synthesized_gates.json", synthesized)
+}
+
+// src: vvaharness/validation/session/launcher.py:248-260
+fn _synthesize_gates(reports, tracking_ids):executor=code {
+  synthesized = []
+  for each tracking_id in tracking_ids {
+    gates = synthesis._consensus.synthesize_gates_for_finding(reports, tracking_id)
+    if (gates) append { tracking_id, gates } to synthesized
+  }
+  return synthesized
+}
+
+// src: vvaharness/validation/session/launcher.py:214-225
+fn _write_workspace_json(workspace, filename, payload):executor=code {
+  write redact_tree(payload) as indented JSON to "$workspace/$filename.tmp", then atomically replace "$workspace/$filename"
+  catch OSError, TypeError, ValueError => log the failure, delete the temporary file; do not raise
+  // external: redact_tree from vvaharness/report/redact.py
+}

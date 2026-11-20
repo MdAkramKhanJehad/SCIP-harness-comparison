@@ -1,0 +1,198 @@
+# vvaharness/plugins/semgrep/enricher.py
+
+`SemgrepEnricher`: the shipped graph enricher of the Semgrep-enhanced variant. After the code graph is derived, it runs Semgrep once over the repository (no shell, every rule source explicit, bounded by a time budget) and writes a Semgrep subgraph onto the graph: one scan node, rule nodes, finding nodes anchored to the enclosing symbol, and taint-trace edges. It never raises; when the scan cannot run, it writes only a scan node that records why.
+
+Source: `vvaharness/plugins/semgrep/enricher.py` (lines 1-389)
+Executor: code (runs the external `semgrep` program; no model call)
+Called from: `vvaharness/plugins/semgrep/plugin.py` SemgrepPlugin._enrichers builds it; the context-graph SDK pipeline calls `enrich` during `build_graph` (`vvaharness/codegraph/build.py`)
+
+// src: vvaharness/plugins/semgrep/enricher.py:42-60
+SCAN_LABEL = "SemgrepScan"; FINDING_LABEL = "SemgrepFinding"; RULE_LABEL = "SemgrepRule"; LOCATION_LABEL = "SemgrepLocation"
+FLAGGED_BY = "FLAGGED_BY"; DETECTED_BY = "DETECTED_BY"; TRACE_TOUCHES = "TRACE_TOUCHES"
+MAX_FINDING_NODES = 500
+MAX_TRACE_STEPS = 20
+MAX_EDGES = 18_000
+MIN_BUDGET_SECONDS = 15.0
+MAX_TRACE_NESTING = 6
+_TRACE_ROLES = [("taint_source", "source"), ("intermediate_vars", "intermediate"), ("taint_sink", "sink")]   // source first
+_MAX_MESSAGE_CHARS = 1_000
+_SEVERITY_ORDER = { ERROR: 0, WARNING: 1, INFO: 2 }   // anything else ranks 3
+
+// src: vvaharness/plugins/semgrep/enricher.py:305-332
+SemgrepEnricher {
+  // frozen
+  configs: Path[] = []           // already validated as local files by plugin.py _validated_configs
+  rulesets: String[] = []
+  executable: String = "semgrep"
+  timeout_seconds: Number = 120.0
+  priority: Number = 100
+
+  // src: vvaharness/plugins/semgrep/enricher.py:315-319
+  metadata = PluginMetadata({ phase: POST_DERIVATION, priority, name: "semgrep", version: "1" })   // after derivation, so symbols and line spans exist to attach to
+
+  // src: vvaharness/plugins/semgrep/enricher.py:321-332
+  fn enrich(context):executor=code {
+    project_id = context.project.project_id
+    budget = min(timeout_seconds, context.deadline_monotonic - now)
+    refusal = _refusal(context, budget)
+    if (refusal) return _degrade(project_id, refusal)
+    root = context.project.source_path
+    [document, note] = _report(root, budget)
+    if (document == null) return _degrade(project_id, note)
+    return _mutation(project_id, context.graph, document, root)
+  }
+
+  // src: vvaharness/plugins/semgrep/enricher.py:342-352 — the first failing check, in this order, names the refusal
+  fn _refusal(context, budget):executor=code {
+    require !context.cancellation.is_cancelled => return "cancelled before the Semgrep scan started"
+    require context.project.source_path => return "the project carries no source path to scan"
+    require configs || rulesets => return "no local rule files and no rulesets were configured"
+    require budget >= MIN_BUDGET_SECONDS => return "${budget}s is under the 15s floor a Semgrep scan needs"
+    return ""
+  }
+
+  // src: vvaharness/plugins/semgrep/enricher.py:354-367
+  fn _report(root, budget):executor=code {
+    try {
+      work = new temporary directory "vvah-semgrep-*"   // removed when the block exits
+      output = "$work/semgrep.json"
+      done = run process _argv(executable, configs, rulesets, root, output) with timeout=budget, cwd=root, no shell
+      // external: the semgrep program
+      require output is a file => return [null, "semgrep exited ${done.returncode} without a report: <stderr or stdout, cut to 1000 characters>"]
+      return [plugins.semgrep.findings.read_semgrep_json(output), ""]
+      // preserved: the exit code is not checked when a report file exists; a nonzero exit that still wrote a report is used as a normal report
+    }
+    catch error => return [null, "<ErrorType>: <message>" cut to 1000 characters]   // includes the timeout and any SemgrepFindingsError (oversized or malformed report)
+  }
+
+  // src: vvaharness/plugins/semgrep/enricher.py:334-340
+  fn _degrade(project_id, note):executor=code {
+    COUNTERS.bump("semgrep_scan_degraded")
+    warn SEMGREP_SCAN_DEGRADED (reason=note, remedy "install semgrep on PATH and confirm the rule source is reachable (SSL_CERT_FILE / REQUESTS_CA_BUNDLE behind a private CA)")
+    return _degraded(project_id, note)
+  }
+}
+
+// src: vvaharness/plugins/semgrep/enricher.py:104-113
+fn _argv(executable, configs, rulesets, root, output):executor=code {
+  return [executable, "--json", "--quiet", "--metrics=off", "--disable-version-check", "--output", output,
+          "--config" <path> for each config, "--config" <ruleset> for each ruleset,
+          root]
+  // a ruleset such as "p/..." is fetched by semgrep from its registry over the network
+}
+
+// src: vvaharness/plugins/semgrep/enricher.py:283-302
+fn _mutation(project_id, graph, document, root=""):executor=code {
+  raw = document.results
+  results = _ranked(if (raw is a list) raw else [])
+  builder = _Builder(project_id)
+  symbols = _index(graph)
+  written = count of results r (with ordinal i) where _add_finding(builder, symbols, r, i, root) is true
+  error_count = length(document.errors) if it is a list, else 0
+  dropped = length(raw) - length(results) if raw is a list, else 0   // results cut by MAX_FINDING_NODES (and non-dictionary rows)
+  scan = _scan_node(project_id, _Coverage({
+    note: if (dropped) "$dropped of ${length(results) + dropped} results dropped at MAX_FINDING_NODES=500" else "ok",
+    complete: !dropped && !error_count,
+    findings: written, errors: error_count,
+    skipped: length(document.paths.skipped) if it is a list, else 0,
+    rules: number of SemgrepRule nodes written
+  }))
+  add scan unless a node with its id exists
+  return builder.mutation()   // one mutation; the SDK applies or rejects it whole
+  // preserved: "complete" does not account for edges lost to the MAX_EDGES budget, nor for results skipped by _add_finding for lacking a location
+}
+
+// src: vvaharness/plugins/semgrep/enricher.py:165-173
+fn _ranked(results):executor=code {
+  return first MAX_FINDING_NODES of the dictionary results sorted by (_SEVERITY_ORDER[upper(extra.severity)] or 3, path, start line, check_id)   // a cap drops the least severe rows first
+}
+
+// src: vvaharness/plugins/semgrep/enricher.py:63-101
+_Located { path; line }
+_Symbols {
+  spans: { path: [(start, end, node_id)] sorted }
+  files: { path: File node id }
+  fn resolve(at):executor=code {
+    return the node id of the narrowest span on at.path with start <= at.line <= end (first one on a tie), else files[at.path], else null
+  }
+}
+fn _index(graph):executor=code {
+  for each node in graph.nodes with a string filePath property {
+    if ("File" in node.labels) files[path] = first such node id
+    if (startLine and endLine are integers && endLine >= startLine) spans[path] += (startLine, endLine, node.id)
+  }
+}
+
+// src: vvaharness/plugins/semgrep/enricher.py:252-280
+fn _add_finding(builder, symbols, result, ordinal, root):executor=code {
+  require result.path is a string && result.start.line is an integer => return false
+  path = plugins.semgrep.findings.relative_path(result.path, root)
+  check_id = result.check_id || "semgrep"
+  finding = builder.node(id from ("semgrep-finding", check_id, path, line, ordinal), [FINDING_LABEL], {
+    name: check_id, ruleId: check_id, filePath: path, semgrepStartLine: line,
+    semgrepEndLine: end line if an integer else line,
+    severity: upper(extra.severity) || "UNKNOWN",
+    message: (extra.message || check_id) cut to 1000 characters,
+    fingerprint: extra.fingerprint || ""
+  })
+  builder.edge(builder.anchor(symbols, _Located(path, line)), FLAGGED_BY, finding)
+  builder.edge(finding, DETECTED_BY, _rule_id(builder, check_id, extra.metadata))
+  for each (step, (role, located)) in _trace_steps(extra, root) {
+    target = symbols.resolve(located)
+    if (target != null && target != finding) builder.edge(finding, TRACE_TOUCHES, target, discriminator=step, properties={ step, role, filePath: located.path, startLine: located.line })
+    // trace steps that resolve to no symbol or File node are dropped silently (no stand-in node is minted for them)
+  }
+  return true   // preserved: true even when the edge budget refused this finding's edges
+}
+
+// src: vvaharness/plugins/semgrep/enricher.py:244-249
+fn _rule_id(builder, check_id, metadata):executor=code {
+  return builder.node(id from ("semgrep-rule", check_id), [RULE_LABEL], { name: check_id, ruleId: check_id, cweIds: _cwe_ids(metadata), vulnerabilityClasses: _classes(metadata) })   // minted once per rule
+}
+
+// src: vvaharness/plugins/semgrep/enricher.py:116-130
+fn _cwe_ids(metadata):executor=code { return metadata.cwe (string or list of strings), each cut at the first ":" and stripped, blanks dropped, deduplicated in order }
+fn _classes(metadata):executor=code { return non-blank stripped values of metadata.vulnerability_class, metadata.owasp, metadata.category (each string or list), deduplicated in order }
+
+// src: vvaharness/plugins/semgrep/enricher.py:133-162
+fn _trace_steps(extra, root):executor=code {
+  trace = extra.dataflow_trace
+  if (trace is not a dictionary) return []
+  for each (key, role) in _TRACE_ROLES, for each entry in _flatten(trace[key]): if _location(entry, root) is not null, steps += (role, location)
+  return first MAX_TRACE_STEPS of steps
+}
+fn _flatten(value, depth=0):executor=code {
+  match (value) {
+    case a dictionary => [value]
+    case a list && depth < MAX_TRACE_NESTING => flatten each item at depth + 1
+    default => []   // nesting deeper than 6 is dropped
+  }
+}
+fn _location(entry, root):executor=code {
+  return _Located(relative_path(entry.path, root), entry.start.line) if entry.path is a string and entry.start.line is an integer, else null
+}
+
+// src: vvaharness/plugins/semgrep/enricher.py:203-241
+_Builder {
+  nodes: { id: GraphNode }; edges: { id: GraphEdge }
+  fn node(local_id, labels, properties):executor=code { add unless the id is already present; return the id }
+  fn edge(source, relationship, target, discriminator="", properties={}):executor=code {
+    require length(edges) < MAX_EDGES => return false   // the budget exists because the SDK rejects a mutation that breaches it
+    add unless the id is already present; return true
+  }
+  fn anchor(symbols, at):executor=code {
+    return symbols.resolve(at) or, when absent, node(id from ("semgrep-location", at.path), [LOCATION_LABEL], { name: at.path, filePath: at.path })   // a minted stand-in when no symbol or File node covers the line
+  }
+  fn mutation():executor=code = GraphMutation({ project_id, nodes, edges })
+}
+
+// src: vvaharness/plugins/semgrep/enricher.py:176-200
+_Coverage { note; complete = false; findings = 0; errors = 0; skipped = 0; rules = 0 }
+fn _scan_node(project_id, coverage):executor=code {
+  return GraphNode({ local_id from ("semgrep-scan", project id), labels: [SCAN_LABEL], properties: {
+    complete, findingCount: findings, errorCount: errors, skippedCount: skipped, ruleCount: rules,
+    note: note cut to 1000 characters, tool: "semgrep" } })   // the node GraphSemgrepCoverage reads, present even when the scan could not run
+}
+
+// src: vvaharness/plugins/semgrep/enricher.py:370-374
+fn _degraded(project_id, note):executor=code = GraphMutation({ project_id, nodes: [_scan_node(project_id, _Coverage({ note }))] })   // complete=false, all counts 0

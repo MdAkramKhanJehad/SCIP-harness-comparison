@@ -1,0 +1,2028 @@
+{
+  "source": "vvaharness/pipeline/stages/s5/detectors.py",
+  "sha256": "b1298c585596815989172a2e370d4501adf094ec729ddfc1db12ffa70f97e370",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"s5's zero-LLM detector pass — the pipeline consumer of the shared detect/ engine.\"\"\"\nfrom __future__ import annotations\n\nfrom pathlib import PurePosixPath\n\nfrom vvaharness.detect.matcher import Hit, compile_detectors, detector_hits\nfrom vvaharness.detect.patterns import detector_corpus\nfrom vvaharness.lang.detect import EXT_TO_LANG\nfrom vvaharness.models import ContextPackage, Finding, VulnClass\nfrom vvaharness.pipeline.stages.s5.enrich import FileCache\nfrom vvaharness.pipeline.stages.s5.rules import EXCLUDE_PATH_RE\nfrom vvaharness.rules.cwe import weakness_key\nfrom vvaharness.util.counters import COUNTERS\n\n# The only languages the shipped rule corpus is written for; extensions resolve via EXT_TO_LANG.\n_DETECTOR_LANGS: frozenset[str] = frozenset(\n    {\"python\", \"javascript\", \"typescript\", \"web-template\"}\n)\n\n\ndef _file_lang(rel: str) -> str | None:\n    return EXT_TO_LANG.get(PurePosixPath(rel).suffix.lower())\n\n\ndef _in_scope(rel: str, lang: str | None) -> bool:\n    \"\"\"Detector file scope: known language, not test/mock noise, not minified.\"\"\"\n    if lang not in _DETECTOR_LANGS:\n        return False\n    name = PurePosixPath(rel).name.lower()\n    return not (EXCLUDE_PATH_RE.search(rel) or \".min.\" in name)\n\n\ndef _mint(hit: Hit) -> Finding:\n    \"\"\"Returns a Finding for one detector hit, with the rule id in ``chunk_id``.\"\"\"\n    spec = hit.spec\n    xss = spec.cwe == \"CWE-79\"\n    return Finding(\n        title=spec.title or spec.rule_id,\n        file=hit.file,\n        line_start=hit.line,\n        line_end=hit.line_end,\n        vuln_class=VulnClass.INJECTION if xss else VulnClass.OTHER,\n        vuln_class_label=\"\" if xss else spec.kind,\n        cwe=spec.cwe,\n        origin=\"detector\",\n        chunk_id=spec.rule_id,\n        description=(f\"Deterministic detector match ({spec.rule_id}). \"\n                     f\"{spec.citation} Matched: {hit.snippet}\"),\n        # code_snippet stays empty: enrich only backfills rows whose snippet is empty.\n    )\n\n\n# Rules describing the same defect; only within a family does span containment mean one call site.\n_SPAN_FAMILY = {\n    \"detector-httpresponse-concat\": \"html-concat\",\n    \"detector-html-string-concat\": \"html-concat\",\n}\n\n\ndef _dedup(rows: list[Finding], kept: list[Finding], tol: int) -> list[Finding]:\n    \"\"\"Self-dedup per rule, then suppress rows at an already-kept finding (same file+weakness).\"\"\"\n    kept_lines: dict[tuple[str, str], list[int]] = {}\n    for f in kept:\n        key = weakness_key(f.cwe)\n        if key:\n            kept_lines.setdefault((f.file, key), []).append(int(f.line_start))\n    out: list[Finding] = []\n    # Proximity dedup must stay per rule: on (file, cwe) alone it collapses unrelated defects.\n    by_rule: dict[tuple[str, str, str], list[int]] = {}\n    # Overlap dedup crosses rules only within a _SPAN_FAMILY; the first in corpus order wins.\n    by_span: dict[tuple[str, str, str], list[tuple[int, int]]] = {}\n    for row in rows:\n        line = int(row.line_start)\n        end = max(line, int(row.line_end or line))\n        rule_key = (row.file, row.cwe or \"\", row.chunk_id)\n        span_key = (row.file, row.cwe or \"\",\n                    _SPAN_FAMILY.get(row.chunk_id, row.chunk_id))\n        # Keyed on (file, weakness): one defect s4 filed, whichever rule or sibling id re-found it\n        site_key = (row.file, weakness_key(row.cwe) or \"\")\n        if (any(abs(line - n) <= tol for n in by_rule.get(rule_key, []))\n                or any(s <= end and line <= e for s, e in by_span.get(span_key, []))\n                or any(abs(line - n) <= tol or line <= n <= end\n                       for n in kept_lines.get(site_key, []))):\n            COUNTERS.bump(\"s5_det_dup_suppressed\")\n            continue\n        by_rule.setdefault(rule_key, []).append(line)\n        by_span.setdefault(span_key, []).append((line, end))\n        out.append(row)\n    return out\n\n\ndef _cap(survivors: list[Finding], compiled, max_rows: int) -> list[Finding]:\n    \"\"\"At most *max_rows* rows, keeping the highest-priority ones in stable order.\"\"\"\n    if max_rows <= 0 or len(survivors) <= max_rows:\n        return survivors\n    priority = {d.spec.rule_id: i for i, d in enumerate(compiled)}\n    ranked = sorted(range(len(survivors)),\n                    key=lambda i: (priority.get(survivors[i].chunk_id,\n                                                len(priority)), i))\n    keep_idx = frozenset(ranked[:max_rows])\n    COUNTERS.bump(\"s5_det_overflow_suppressed\", len(survivors) - max_rows)\n    return [row for i, row in enumerate(survivors) if i in keep_idx]\n\n\ndef run(kept: list[Finding], ctx: ContextPackage, cache: FileCache,\n        line_tol: int, max_rows: int = 200) -> list[Finding]:\n    \"\"\"Every surviving detector finding for this repo, in deterministic order.\"\"\"\n    compiled = compile_detectors(detector_corpus())\n    if not compiled:\n        return []\n    by_lang = {lang: [d for d in compiled if lang in d.spec.languages]\n               for lang in _DETECTOR_LANGS}\n    rows: list[Finding] = []\n    for rel in sorted(set(ctx.all_files)):\n        lang = _file_lang(rel)\n        if not _in_scope(rel, lang):\n            continue\n        live = by_lang.get(lang or \"\")\n        if not live:\n            continue\n        lines = cache.lines(rel)\n        if lines is None:\n            continue\n        for hit in detector_hits(rel, lines, live):\n            rows.append(_mint(hit))\n    survivors = _cap(_dedup(rows, kept, line_tol), compiled, max_rows)\n    for row in survivors:\n        COUNTERS.bump(\"s5_det_emitted\")\n        rule = row.chunk_id.removeprefix(\"detector-\").replace(\"-\", \"_\")\n        COUNTERS.bump(f\"s5_det_rule_{rule}\")\n    return survivors\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/pipeline/stages/s5/detectors.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "s5's zero-LLM detector pass — the pipeline consumer of the shared detect/ engine.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_40_4": {
+      "source": "vvaharness/pipeline/stages/s5/detectors.py",
+      "line_start": 40,
+      "line_end": 40,
+      "value": "Detector file scope: known language, not test/mock noise, not minified.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_48_4": {
+      "source": "vvaharness/pipeline/stages/s5/detectors.py",
+      "line_start": 48,
+      "line_end": 48,
+      "value": "Returns a Finding for one detector hit, with the rule id in ``chunk_id``.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_61_21": {
+      "source": "vvaharness/pipeline/stages/s5/detectors.py",
+      "line_start": 61,
+      "line_end": 62,
+      "source_expression": "f\"Deterministic detector match ({spec.rule_id}). \"\n                     f\"{spec.citation} Matched: {hit.snippet}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_75_4": {
+      "source": "vvaharness/pipeline/stages/s5/detectors.py",
+      "line_start": 75,
+      "line_end": 75,
+      "value": "Self-dedup per rule, then suppress rows at an already-kept finding (same file+weakness).",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_107_4": {
+      "source": "vvaharness/pipeline/stages/s5/detectors.py",
+      "line_start": 107,
+      "line_end": 107,
+      "value": "At most *max_rows* rows, keeping the highest-priority ones in stable order.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_121_4": {
+      "source": "vvaharness/pipeline/stages/s5/detectors.py",
+      "line_start": 121,
+      "line_end": 121,
+      "value": "Every surviving detector finding for this repo, in deterministic order.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_144_22": {
+      "source": "vvaharness/pipeline/stages/s5/detectors.py",
+      "line_start": 144,
+      "line_end": 144,
+      "source_expression": "f\"s5_det_rule_{rule}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "s5's zero-LLM detector pass — the pipeline consumer of the shared detect/ engine.",
+      "context": "literal"
+    },
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 4,
+      "value": "Detector file scope: known language, not test/mock noise, not minified.",
+      "context": "literal"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 4,
+      "value": "Returns a Finding for one detector hit, with the rule id in ``chunk_id``.",
+      "context": "literal"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 4,
+      "value": "detector-httpresponse-concat",
+      "context": "literal"
+    },
+    {
+      "line_start": 70,
+      "line_end": 70,
+      "column": 4,
+      "value": "detector-html-string-concat",
+      "context": "literal"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 36,
+      "value": "html-concat",
+      "context": "literal"
+    },
+    {
+      "line_start": 70,
+      "line_end": 70,
+      "column": 35,
+      "value": "html-concat",
+      "context": "literal"
+    },
+    {
+      "line_start": 75,
+      "line_end": 75,
+      "column": 4,
+      "value": "Self-dedup per rule, then suppress rows at an already-kept finding (same file+weakness).",
+      "context": "literal"
+    },
+    {
+      "line_start": 107,
+      "line_end": 107,
+      "column": 4,
+      "value": "At most *max_rows* rows, keeping the highest-priority ones in stable order.",
+      "context": "literal"
+    },
+    {
+      "line_start": 121,
+      "line_end": 121,
+      "column": 4,
+      "value": "Every surviving detector finding for this repo, in deterministic order.",
+      "context": "literal"
+    },
+    {
+      "line_start": 31,
+      "line_end": 31,
+      "column": 5,
+      "value": "python",
+      "context": "literal"
+    },
+    {
+      "line_start": 31,
+      "line_end": 31,
+      "column": 15,
+      "value": "javascript",
+      "context": "literal"
+    },
+    {
+      "line_start": 31,
+      "line_end": 31,
+      "column": 29,
+      "value": "typescript",
+      "context": "literal"
+    },
+    {
+      "line_start": 31,
+      "line_end": 31,
+      "column": 43,
+      "value": "web-template",
+      "context": "literal"
+    },
+    {
+      "line_start": 50,
+      "line_end": 50,
+      "column": 22,
+      "value": "CWE-79",
+      "context": "literal"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 18,
+      "value": "s5_det_overflow_suppressed",
+      "context": "literal"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 15,
+      "value": "detector",
+      "context": "literal"
+    },
+    {
+      "line_start": 142,
+      "line_end": 142,
+      "column": 22,
+      "value": "s5_det_emitted",
+      "context": "literal"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 62,
+      "value": "-",
+      "context": "literal"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 67,
+      "value": "_",
+      "context": "literal"
+    },
+    {
+      "line_start": 44,
+      "line_end": 44,
+      "column": 47,
+      "value": ".min.",
+      "context": "literal"
+    },
+    {
+      "line_start": 57,
+      "line_end": 57,
+      "column": 25,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 23,
+      "value": "Deterministic detector match (",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 67,
+      "value": "). ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 62,
+      "line_end": 62,
+      "column": 38,
+      "value": " Matched: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 89,
+      "line_end": 89,
+      "column": 41,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 90,
+      "line_end": 90,
+      "column": 41,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 55,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 98,
+      "line_end": 98,
+      "column": 26,
+      "value": "s5_det_dup_suppressed",
+      "context": "literal"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 35,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 24,
+      "value": "s5_det_rule_",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 41,
+      "value": "detector-",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 29,
+      "text": "# The only languages the shipped rule corpus is written for; extensions resolve via EXT_TO_LANG."
+    },
+    {
+      "line": 63,
+      "text": "# code_snippet stays empty: enrich only backfills rows whose snippet is empty."
+    },
+    {
+      "line": 67,
+      "text": "# Rules describing the same defect; only within a family does span containment mean one call site."
+    },
+    {
+      "line": 82,
+      "text": "# Proximity dedup must stay per rule: on (file, cwe) alone it collapses unrelated defects."
+    },
+    {
+      "line": 84,
+      "text": "# Overlap dedup crosses rules only within a _SPAN_FAMILY; the first in corpus order wins."
+    },
+    {
+      "line": 92,
+      "text": "# Keyed on (file, weakness): one defect s4 filed, whichever rule or sibling id re-found it"
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 18,
+      "line_end": 18,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 23,
+      "line_end": 23,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 26,
+      "line_end": 26,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 27,
+      "line_end": 27,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 30,
+      "line_end": 32,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 35,
+      "line_end": 36,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 7
+    },
+    {
+      "kind": "Return",
+      "line_start": 36,
+      "line_end": 36,
+      "column": 4,
+      "owner": "_file_lang",
+      "representation_line": 12
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 39,
+      "line_end": 44,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 16
+    },
+    {
+      "kind": "Expr",
+      "line_start": 40,
+      "line_end": 40,
+      "column": 4,
+      "owner": "_in_scope",
+      "representation_line": 22
+    },
+    {
+      "kind": "If",
+      "line_start": 41,
+      "line_end": 42,
+      "column": 4,
+      "owner": "_in_scope",
+      "representation_line": 23
+    },
+    {
+      "kind": "Return",
+      "line_start": 42,
+      "line_end": 42,
+      "column": 8,
+      "owner": "_in_scope",
+      "representation_line": 25
+    },
+    {
+      "kind": "Assign",
+      "line_start": 43,
+      "line_end": 43,
+      "column": 4,
+      "owner": "_in_scope",
+      "representation_line": 29
+    },
+    {
+      "kind": "Return",
+      "line_start": 44,
+      "line_end": 44,
+      "column": 4,
+      "owner": "_in_scope",
+      "representation_line": 30
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 47,
+      "line_end": 64,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 34
+    },
+    {
+      "kind": "Expr",
+      "line_start": 48,
+      "line_end": 48,
+      "column": 4,
+      "owner": "_mint",
+      "representation_line": 40
+    },
+    {
+      "kind": "Assign",
+      "line_start": 49,
+      "line_end": 49,
+      "column": 4,
+      "owner": "_mint",
+      "representation_line": 40
+    },
+    {
+      "kind": "Assign",
+      "line_start": 50,
+      "line_end": 50,
+      "column": 4,
+      "owner": "_mint",
+      "representation_line": 40
+    },
+    {
+      "kind": "Return",
+      "line_start": 51,
+      "line_end": 64,
+      "column": 4,
+      "owner": "_mint",
+      "representation_line": 41
+    },
+    {
+      "kind": "Assign",
+      "line_start": 68,
+      "line_end": 71,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 46
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 74,
+      "line_end": 103,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 47
+    },
+    {
+      "kind": "Expr",
+      "line_start": 75,
+      "line_end": 75,
+      "column": 4,
+      "owner": "_dedup",
+      "representation_line": 53
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 76,
+      "line_end": 76,
+      "column": 4,
+      "owner": "_dedup",
+      "representation_line": 53
+    },
+    {
+      "kind": "For",
+      "line_start": 77,
+      "line_end": 80,
+      "column": 4,
+      "owner": "_dedup",
+      "representation_line": 54
+    },
+    {
+      "kind": "Assign",
+      "line_start": 78,
+      "line_end": 78,
+      "column": 8,
+      "owner": "_dedup",
+      "representation_line": 57
+    },
+    {
+      "kind": "If",
+      "line_start": 79,
+      "line_end": 80,
+      "column": 8,
+      "owner": "_dedup",
+      "representation_line": 58
+    },
+    {
+      "kind": "Expr",
+      "line_start": 80,
+      "line_end": 80,
+      "column": 12,
+      "owner": "_dedup",
+      "representation_line": 61
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 81,
+      "line_end": 81,
+      "column": 4,
+      "owner": "_dedup",
+      "representation_line": 65
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 83,
+      "line_end": 83,
+      "column": 4,
+      "owner": "_dedup",
+      "representation_line": 65
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 85,
+      "line_end": 85,
+      "column": 4,
+      "owner": "_dedup",
+      "representation_line": 65
+    },
+    {
+      "kind": "For",
+      "line_start": 86,
+      "line_end": 102,
+      "column": 4,
+      "owner": "_dedup",
+      "representation_line": 66
+    },
+    {
+      "kind": "Assign",
+      "line_start": 87,
+      "line_end": 87,
+      "column": 8,
+      "owner": "_dedup",
+      "representation_line": 69
+    },
+    {
+      "kind": "Assign",
+      "line_start": 88,
+      "line_end": 88,
+      "column": 8,
+      "owner": "_dedup",
+      "representation_line": 69
+    },
+    {
+      "kind": "Assign",
+      "line_start": 89,
+      "line_end": 89,
+      "column": 8,
+      "owner": "_dedup",
+      "representation_line": 69
+    },
+    {
+      "kind": "Assign",
+      "line_start": 90,
+      "line_end": 91,
+      "column": 8,
+      "owner": "_dedup",
+      "representation_line": 69
+    },
+    {
+      "kind": "Assign",
+      "line_start": 93,
+      "line_end": 93,
+      "column": 8,
+      "owner": "_dedup",
+      "representation_line": 69
+    },
+    {
+      "kind": "If",
+      "line_start": 94,
+      "line_end": 99,
+      "column": 8,
+      "owner": "_dedup",
+      "representation_line": 70
+    },
+    {
+      "kind": "Expr",
+      "line_start": 98,
+      "line_end": 98,
+      "column": 12,
+      "owner": "_dedup",
+      "representation_line": 73
+    },
+    {
+      "kind": "Continue",
+      "line_start": 99,
+      "line_end": 99,
+      "column": 12,
+      "owner": "_dedup",
+      "representation_line": 74
+    },
+    {
+      "kind": "Expr",
+      "line_start": 100,
+      "line_end": 100,
+      "column": 8,
+      "owner": "_dedup",
+      "representation_line": 78
+    },
+    {
+      "kind": "Expr",
+      "line_start": 101,
+      "line_end": 101,
+      "column": 8,
+      "owner": "_dedup",
+      "representation_line": 78
+    },
+    {
+      "kind": "Expr",
+      "line_start": 102,
+      "line_end": 102,
+      "column": 8,
+      "owner": "_dedup",
+      "representation_line": 78
+    },
+    {
+      "kind": "Return",
+      "line_start": 103,
+      "line_end": 103,
+      "column": 4,
+      "owner": "_dedup",
+      "representation_line": 80
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 106,
+      "line_end": 116,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 84
+    },
+    {
+      "kind": "Expr",
+      "line_start": 107,
+      "line_end": 107,
+      "column": 4,
+      "owner": "_cap",
+      "representation_line": 90
+    },
+    {
+      "kind": "If",
+      "line_start": 108,
+      "line_end": 109,
+      "column": 4,
+      "owner": "_cap",
+      "representation_line": 91
+    },
+    {
+      "kind": "Return",
+      "line_start": 109,
+      "line_end": 109,
+      "column": 8,
+      "owner": "_cap",
+      "representation_line": 93
+    },
+    {
+      "kind": "Assign",
+      "line_start": 110,
+      "line_end": 110,
+      "column": 4,
+      "owner": "_cap",
+      "representation_line": 97
+    },
+    {
+      "kind": "Assign",
+      "line_start": 111,
+      "line_end": 113,
+      "column": 4,
+      "owner": "_cap",
+      "representation_line": 97
+    },
+    {
+      "kind": "Assign",
+      "line_start": 114,
+      "line_end": 114,
+      "column": 4,
+      "owner": "_cap",
+      "representation_line": 97
+    },
+    {
+      "kind": "Expr",
+      "line_start": 115,
+      "line_end": 115,
+      "column": 4,
+      "owner": "_cap",
+      "representation_line": 97
+    },
+    {
+      "kind": "Return",
+      "line_start": 116,
+      "line_end": 116,
+      "column": 4,
+      "owner": "_cap",
+      "representation_line": 98
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 119,
+      "line_end": 145,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 102
+    },
+    {
+      "kind": "Expr",
+      "line_start": 121,
+      "line_end": 121,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 108
+    },
+    {
+      "kind": "Assign",
+      "line_start": 122,
+      "line_end": 122,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 108
+    },
+    {
+      "kind": "If",
+      "line_start": 123,
+      "line_end": 124,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 109
+    },
+    {
+      "kind": "Return",
+      "line_start": 124,
+      "line_end": 124,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 111
+    },
+    {
+      "kind": "Assign",
+      "line_start": 125,
+      "line_end": 126,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 115
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 127,
+      "line_end": 127,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 115
+    },
+    {
+      "kind": "For",
+      "line_start": 128,
+      "line_end": 139,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 116
+    },
+    {
+      "kind": "Assign",
+      "line_start": 129,
+      "line_end": 129,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 119
+    },
+    {
+      "kind": "If",
+      "line_start": 130,
+      "line_end": 131,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 120
+    },
+    {
+      "kind": "Continue",
+      "line_start": 131,
+      "line_end": 131,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 122
+    },
+    {
+      "kind": "Assign",
+      "line_start": 132,
+      "line_end": 132,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 126
+    },
+    {
+      "kind": "If",
+      "line_start": 133,
+      "line_end": 134,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 127
+    },
+    {
+      "kind": "Continue",
+      "line_start": 134,
+      "line_end": 134,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 129
+    },
+    {
+      "kind": "Assign",
+      "line_start": 135,
+      "line_end": 135,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 133
+    },
+    {
+      "kind": "If",
+      "line_start": 136,
+      "line_end": 137,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 134
+    },
+    {
+      "kind": "Continue",
+      "line_start": 137,
+      "line_end": 137,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 136
+    },
+    {
+      "kind": "For",
+      "line_start": 138,
+      "line_end": 139,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 139
+    },
+    {
+      "kind": "Expr",
+      "line_start": 139,
+      "line_end": 139,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 142
+    },
+    {
+      "kind": "Assign",
+      "line_start": 140,
+      "line_end": 140,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 146
+    },
+    {
+      "kind": "For",
+      "line_start": 141,
+      "line_end": 144,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 147
+    },
+    {
+      "kind": "Expr",
+      "line_start": 142,
+      "line_end": 142,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 150
+    },
+    {
+      "kind": "Assign",
+      "line_start": 143,
+      "line_end": 143,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 150
+    },
+    {
+      "kind": "Expr",
+      "line_start": 144,
+      "line_end": 144,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 150
+    },
+    {
+      "kind": "Return",
+      "line_start": 145,
+      "line_end": 145,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 152
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 30,
+      "line_end": 32,
+      "column": 34,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='frozenset', ctx=Load()), args=[Set(elts=[Constant(value='python'), Constant(value='javascript'), Constant(value='typescript'), Constant(value='web-template')])], keywords=[])",
+      "rendered": "frozenset({'python', 'javascript', 'typescript', 'web-template'})"
+    },
+    {
+      "line_start": 36,
+      "line_end": 36,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='EXT_TO_LANG', ctx=Load()), attr='get', ctx=Load()), args=[Call(func=Attribute(value=Attribute(value=Call(func=Name(id='PurePosixPath', ctx=Load()), args=[Name(id='rel', ctx=Load())], keywords=[]), attr='suffix', ctx=Load()), attr='lower', ctx=Load()), args=[], keywords=[])], keywords=[])",
+      "rendered": "EXT_TO_LANG.get(PurePosixPath(rel).suffix.lower())"
+    },
+    {
+      "line_start": 41,
+      "line_end": 41,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='lang', ctx=Load()), ops=[NotIn()], comparators=[Name(id='_DETECTOR_LANGS', ctx=Load())])",
+      "rendered": "lang not in _DETECTOR_LANGS"
+    },
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 43,
+      "line_end": 43,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Call(func=Name(id='PurePosixPath', ctx=Load()), args=[Name(id='rel', ctx=Load())], keywords=[]), attr='name', ctx=Load()), attr='lower', ctx=Load()), args=[], keywords=[])",
+      "rendered": "PurePosixPath(rel).name.lower()"
+    },
+    {
+      "line_start": 44,
+      "line_end": 44,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='EXCLUDE_PATH_RE', ctx=Load()), attr='search', ctx=Load()), args=[Name(id='rel', ctx=Load())], keywords=[]), Compare(left=Constant(value='.min.'), ops=[In()], comparators=[Name(id='name', ctx=Load())])]))",
+      "rendered": "not (EXCLUDE_PATH_RE.search(rel) or '.min.' in name)"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 11,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='hit', ctx=Load()), attr='spec', ctx=Load())",
+      "rendered": "hit.spec"
+    },
+    {
+      "line_start": 50,
+      "line_end": 50,
+      "column": 10,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='spec', ctx=Load()), attr='cwe', ctx=Load()), ops=[Eq()], comparators=[Constant(value='CWE-79')])",
+      "rendered": "spec.cwe == 'CWE-79'"
+    },
+    {
+      "line_start": 51,
+      "line_end": 64,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='Finding', ctx=Load()), args=[], keywords=[keyword(arg='title', value=BoolOp(op=Or(), values=[Attribute(value=Name(id='spec', ctx=Load()), attr='title', ctx=Load()), Attribute(value=Name(id='spec', ctx=Load()), attr='rule_id', ctx=Load())])), keyword(arg='file', value=Attribute(value=Name(id='hit', ctx=Load()), attr='file', ctx=Load())), keyword(arg='line_start', value=Attribute(value=Name(id='hit', ctx=Load()), attr='line', ctx=Load())), keyword(arg='line_end', value=Attribute(value=Name(id='hit', ctx=Load()), attr='line_end', ctx=Load())), keyword(arg='vuln_class', value=IfExp(test=Name(id='xss', ctx=Load()), body=Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INJECTION', ctx=Load()), orelse=Attribute(value=Name(id='VulnClass', ctx=Load()), attr='OTHER', ctx=Load()))), keyword(arg='vuln_class_label', value=IfExp(test=Name(id='xss', ctx=Load()), body=Constant(value=''), orelse=Attribute(value=Name(id='spec', ctx=Load()), attr='kind', ctx=Load()))), keyword(arg='cwe', value=Attribute(value=Name(id='spec', ctx=Load()), attr='cwe', ctx=Load())), keyword(arg='origin', value=Constant(value='detector')), keyword(arg='chunk_id', value=Attribute(value=Name(id='spec', ctx=Load()), attr='rule_id', ctx=Load())), keyword(arg='description', value=JoinedStr(values=[Constant(value='Deterministic detector match ('), FormattedValue(value=Attribute(value=Name(id='spec', ctx=Load()), attr='rule_id', ctx=Load()), conversion=-1), Constant(value='). '), FormattedValue(value=Attribute(value=Name(id='spec', ctx=Load()), attr='citation', ctx=Load()), conversion=-1), Constant(value=' Matched: '), FormattedValue(value=Attribute(value=Name(id='hit', ctx=Load()), attr='snippet', ctx=Load()), conversion=-1)]))])",
+      "rendered": "Finding(title=spec.title or spec.rule_id, file=hit.file, line_start=hit.line, line_end=hit.line_end, vuln_class=VulnClass.INJECTION if xss else VulnClass.OTHER, vuln_class_label='' if xss else spec.kind, cwe=spec.cwe, origin='detector', chunk_id=spec.rule_id, description=source_template_61_21)"
+    },
+    {
+      "line_start": 68,
+      "line_end": 71,
+      "column": 15,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='detector-httpresponse-concat'), Constant(value='detector-html-string-concat')], values=[Constant(value='html-concat'), Constant(value='html-concat')])",
+      "rendered": "{'detector-httpresponse-concat': 'html-concat', 'detector-html-string-concat': 'html-concat'}"
+    },
+    {
+      "line_start": 76,
+      "line_end": 76,
+      "column": 51,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 13,
+      "kind": "Name",
+      "original_ast": "Name(id='kept', ctx=Load())",
+      "rendered": "kept"
+    },
+    {
+      "line_start": 78,
+      "line_end": 78,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='weakness_key', ctx=Load()), args=[Attribute(value=Name(id='f', ctx=Load()), attr='cwe', ctx=Load())], keywords=[])",
+      "rendered": "weakness_key(f.cwe)"
+    },
+    {
+      "line_start": 79,
+      "line_end": 79,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='key', ctx=Load())",
+      "rendered": "key"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Name(id='kept_lines', ctx=Load()), attr='setdefault', ctx=Load()), args=[Tuple(elts=[Attribute(value=Name(id='f', ctx=Load()), attr='file', ctx=Load()), Name(id='key', ctx=Load())], ctx=Load()), List(elts=[], ctx=Load())], keywords=[]), attr='append', ctx=Load()), args=[Call(func=Name(id='int', ctx=Load()), args=[Attribute(value=Name(id='f', ctx=Load()), attr='line_start', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "kept_lines.setdefault((f.file, key), []).append(int(f.line_start))"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 25,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 83,
+      "line_end": 83,
+      "column": 53,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 85,
+      "line_end": 85,
+      "column": 65,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='rows', ctx=Load())",
+      "rendered": "rows"
+    },
+    {
+      "line_start": 87,
+      "line_end": 87,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='int', ctx=Load()), args=[Attribute(value=Name(id='row', ctx=Load()), attr='line_start', ctx=Load())], keywords=[])",
+      "rendered": "int(row.line_start)"
+    },
+    {
+      "line_start": 88,
+      "line_end": 88,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='max', ctx=Load()), args=[Name(id='line', ctx=Load()), Call(func=Name(id='int', ctx=Load()), args=[BoolOp(op=Or(), values=[Attribute(value=Name(id='row', ctx=Load()), attr='line_end', ctx=Load()), Name(id='line', ctx=Load())])], keywords=[])], keywords=[])",
+      "rendered": "max(line, int(row.line_end or line))"
+    },
+    {
+      "line_start": 89,
+      "line_end": 89,
+      "column": 19,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Attribute(value=Name(id='row', ctx=Load()), attr='file', ctx=Load()), BoolOp(op=Or(), values=[Attribute(value=Name(id='row', ctx=Load()), attr='cwe', ctx=Load()), Constant(value='')]), Attribute(value=Name(id='row', ctx=Load()), attr='chunk_id', ctx=Load())], ctx=Load())",
+      "rendered": "(row.file, row.cwe or '', row.chunk_id)"
+    },
+    {
+      "line_start": 90,
+      "line_end": 91,
+      "column": 19,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Attribute(value=Name(id='row', ctx=Load()), attr='file', ctx=Load()), BoolOp(op=Or(), values=[Attribute(value=Name(id='row', ctx=Load()), attr='cwe', ctx=Load()), Constant(value='')]), Call(func=Attribute(value=Name(id='_SPAN_FAMILY', ctx=Load()), attr='get', ctx=Load()), args=[Attribute(value=Name(id='row', ctx=Load()), attr='chunk_id', ctx=Load()), Attribute(value=Name(id='row', ctx=Load()), attr='chunk_id', ctx=Load())], keywords=[])], ctx=Load())",
+      "rendered": "(row.file, row.cwe or '', _SPAN_FAMILY.get(row.chunk_id, row.chunk_id))"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 19,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Attribute(value=Name(id='row', ctx=Load()), attr='file', ctx=Load()), BoolOp(op=Or(), values=[Call(func=Name(id='weakness_key', ctx=Load()), args=[Attribute(value=Name(id='row', ctx=Load()), attr='cwe', ctx=Load())], keywords=[]), Constant(value='')])], ctx=Load())",
+      "rendered": "(row.file, weakness_key(row.cwe) or '')"
+    },
+    {
+      "line_start": 94,
+      "line_end": 97,
+      "column": 12,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Name(id='any', ctx=Load()), args=[GeneratorExp(elt=Compare(left=Call(func=Name(id='abs', ctx=Load()), args=[BinOp(left=Name(id='line', ctx=Load()), op=Sub(), right=Name(id='n', ctx=Load()))], keywords=[]), ops=[LtE()], comparators=[Name(id='tol', ctx=Load())]), generators=[comprehension(target=Name(id='n', ctx=Store()), iter=Call(func=Attribute(value=Name(id='by_rule', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='rule_key', ctx=Load()), List(elts=[], ctx=Load())], keywords=[]), ifs=[], is_async=0)])], keywords=[]), Call(func=Name(id='any', ctx=Load()), args=[GeneratorExp(elt=BoolOp(op=And(), values=[Compare(left=Name(id='s', ctx=Load()), ops=[LtE()], comparators=[Name(id='end', ctx=Load())]), Compare(left=Name(id='line', ctx=Load()), ops=[LtE()], comparators=[Name(id='e', ctx=Load())])]), generators=[comprehension(target=Tuple(elts=[Name(id='s', ctx=Store()), Name(id='e', ctx=Store())], ctx=Store()), iter=Call(func=Attribute(value=Name(id='by_span', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='span_key', ctx=Load()), List(elts=[], ctx=Load())], keywords=[]), ifs=[], is_async=0)])], keywords=[]), Call(func=Name(id='any', ctx=Load()), args=[GeneratorExp(elt=BoolOp(op=Or(), values=[Compare(left=Call(func=Name(id='abs', ctx=Load()), args=[BinOp(left=Name(id='line', ctx=Load()), op=Sub(), right=Name(id='n', ctx=Load()))], keywords=[]), ops=[LtE()], comparators=[Name(id='tol', ctx=Load())]), Compare(left=Name(id='line', ctx=Load()), ops=[LtE(), LtE()], comparators=[Name(id='n', ctx=Load()), Name(id='end', ctx=Load())])]), generators=[comprehension(target=Name(id='n', ctx=Store()), iter=Call(func=Attribute(value=Name(id='kept_lines', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='site_key', ctx=Load()), List(elts=[], ctx=Load())], keywords=[]), ifs=[], is_async=0)])], keywords=[])])",
+      "rendered": "any((abs(line - n) <= tol for n in by_rule.get(rule_key, []))) or any((s <= end and line <= e for s, e in by_span.get(span_key, []))) or any((abs(line - n) <= tol or line <= n <= end for n in kept_lines.get(site_key, [])))"
+    },
+    {
+      "line_start": 98,
+      "line_end": 98,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Constant(value='s5_det_dup_suppressed')], keywords=[])",
+      "rendered": "COUNTERS.bump('s5_det_dup_suppressed')"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Name(id='by_rule', ctx=Load()), attr='setdefault', ctx=Load()), args=[Name(id='rule_key', ctx=Load()), List(elts=[], ctx=Load())], keywords=[]), attr='append', ctx=Load()), args=[Name(id='line', ctx=Load())], keywords=[])",
+      "rendered": "by_rule.setdefault(rule_key, []).append(line)"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Name(id='by_span', ctx=Load()), attr='setdefault', ctx=Load()), args=[Name(id='span_key', ctx=Load()), List(elts=[], ctx=Load())], keywords=[]), attr='append', ctx=Load()), args=[Tuple(elts=[Name(id='line', ctx=Load()), Name(id='end', ctx=Load())], ctx=Load())], keywords=[])",
+      "rendered": "by_span.setdefault(span_key, []).append((line, end))"
+    },
+    {
+      "line_start": 102,
+      "line_end": 102,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='out', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='row', ctx=Load())], keywords=[])",
+      "rendered": "out.append(row)"
+    },
+    {
+      "line_start": 103,
+      "line_end": 103,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='out', ctx=Load())",
+      "rendered": "out"
+    },
+    {
+      "line_start": 108,
+      "line_end": 108,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Compare(left=Name(id='max_rows', ctx=Load()), ops=[LtE()], comparators=[Constant(value=0)]), Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='survivors', ctx=Load())], keywords=[]), ops=[LtE()], comparators=[Name(id='max_rows', ctx=Load())])])",
+      "rendered": "max_rows <= 0 or len(survivors) <= max_rows"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='survivors', ctx=Load())",
+      "rendered": "survivors"
+    },
+    {
+      "line_start": 110,
+      "line_end": 110,
+      "column": 15,
+      "kind": "DictComp",
+      "original_ast": "DictComp(key=Attribute(value=Attribute(value=Name(id='d', ctx=Load()), attr='spec', ctx=Load()), attr='rule_id', ctx=Load()), value=Name(id='i', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='i', ctx=Store()), Name(id='d', ctx=Store())], ctx=Store()), iter=Call(func=Name(id='enumerate', ctx=Load()), args=[Name(id='compiled', ctx=Load())], keywords=[]), ifs=[], is_async=0)])",
+      "rendered": "{d.spec.rule_id: i for i, d in enumerate(compiled)}"
+    },
+    {
+      "line_start": 111,
+      "line_end": 113,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[Call(func=Name(id='range', ctx=Load()), args=[Call(func=Name(id='len', ctx=Load()), args=[Name(id='survivors', ctx=Load())], keywords=[])], keywords=[])], keywords=[keyword(arg='key', value=Lambda(args=arguments(posonlyargs=[], args=[arg(arg='i')], kwonlyargs=[], kw_defaults=[], defaults=[]), body=Tuple(elts=[Call(func=Attribute(value=Name(id='priority', ctx=Load()), attr='get', ctx=Load()), args=[Attribute(value=Subscript(value=Name(id='survivors', ctx=Load()), slice=Name(id='i', ctx=Load()), ctx=Load()), attr='chunk_id', ctx=Load()), Call(func=Name(id='len', ctx=Load()), args=[Name(id='priority', ctx=Load())], keywords=[])], keywords=[]), Name(id='i', ctx=Load())], ctx=Load())))])",
+      "rendered": "sorted(range(len(survivors)), key=lambda i: (priority.get(survivors[i].chunk_id, len(priority)), i))"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='frozenset', ctx=Load()), args=[Subscript(value=Name(id='ranked', ctx=Load()), slice=Slice(upper=Name(id='max_rows', ctx=Load())), ctx=Load())], keywords=[])",
+      "rendered": "frozenset(ranked[:max_rows])"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Constant(value='s5_det_overflow_suppressed'), BinOp(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='survivors', ctx=Load())], keywords=[]), op=Sub(), right=Name(id='max_rows', ctx=Load()))], keywords=[])",
+      "rendered": "COUNTERS.bump('s5_det_overflow_suppressed', len(survivors) - max_rows)"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 11,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='row', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='i', ctx=Store()), Name(id='row', ctx=Store())], ctx=Store()), iter=Call(func=Name(id='enumerate', ctx=Load()), args=[Name(id='survivors', ctx=Load())], keywords=[]), ifs=[Compare(left=Name(id='i', ctx=Load()), ops=[In()], comparators=[Name(id='keep_idx', ctx=Load())])], is_async=0)])",
+      "rendered": "[row for i, row in enumerate(survivors) if i in keep_idx]"
+    },
+    {
+      "line_start": 122,
+      "line_end": 122,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='compile_detectors', ctx=Load()), args=[Call(func=Name(id='detector_corpus', ctx=Load()), args=[], keywords=[])], keywords=[])",
+      "rendered": "compile_detectors(detector_corpus())"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='compiled', ctx=Load()))",
+      "rendered": "not compiled"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 15,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 125,
+      "line_end": 126,
+      "column": 14,
+      "kind": "DictComp",
+      "original_ast": "DictComp(key=Name(id='lang', ctx=Load()), value=ListComp(elt=Name(id='d', ctx=Load()), generators=[comprehension(target=Name(id='d', ctx=Store()), iter=Name(id='compiled', ctx=Load()), ifs=[Compare(left=Name(id='lang', ctx=Load()), ops=[In()], comparators=[Attribute(value=Attribute(value=Name(id='d', ctx=Load()), attr='spec', ctx=Load()), attr='languages', ctx=Load())])], is_async=0)]), generators=[comprehension(target=Name(id='lang', ctx=Store()), iter=Name(id='_DETECTOR_LANGS', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "{lang: [d for d in compiled if lang in d.spec.languages] for lang in _DETECTOR_LANGS}"
+    },
+    {
+      "line_start": 127,
+      "line_end": 127,
+      "column": 26,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 128,
+      "line_end": 128,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[Call(func=Name(id='set', ctx=Load()), args=[Attribute(value=Name(id='ctx', ctx=Load()), attr='all_files', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "sorted(set(ctx.all_files))"
+    },
+    {
+      "line_start": 129,
+      "line_end": 129,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_file_lang', ctx=Load()), args=[Name(id='rel', ctx=Load())], keywords=[])",
+      "rendered": "_file_lang(rel)"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='_in_scope', ctx=Load()), args=[Name(id='rel', ctx=Load()), Name(id='lang', ctx=Load())], keywords=[]))",
+      "rendered": "not _in_scope(rel, lang)"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='by_lang', ctx=Load()), attr='get', ctx=Load()), args=[BoolOp(op=Or(), values=[Name(id='lang', ctx=Load()), Constant(value='')])], keywords=[])",
+      "rendered": "by_lang.get(lang or '')"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='live', ctx=Load()))",
+      "rendered": "not live"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='cache', ctx=Load()), attr='lines', ctx=Load()), args=[Name(id='rel', ctx=Load())], keywords=[])",
+      "rendered": "cache.lines(rel)"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='lines', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "lines is None"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='detector_hits', ctx=Load()), args=[Name(id='rel', ctx=Load()), Name(id='lines', ctx=Load()), Name(id='live', ctx=Load())], keywords=[])",
+      "rendered": "detector_hits(rel, lines, live)"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='rows', ctx=Load()), attr='append', ctx=Load()), args=[Call(func=Name(id='_mint', ctx=Load()), args=[Name(id='hit', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "rows.append(_mint(hit))"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_cap', ctx=Load()), args=[Call(func=Name(id='_dedup', ctx=Load()), args=[Name(id='rows', ctx=Load()), Name(id='kept', ctx=Load()), Name(id='line_tol', ctx=Load())], keywords=[]), Name(id='compiled', ctx=Load()), Name(id='max_rows', ctx=Load())], keywords=[])",
+      "rendered": "_cap(_dedup(rows, kept, line_tol), compiled, max_rows)"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='survivors', ctx=Load())",
+      "rendered": "survivors"
+    },
+    {
+      "line_start": 142,
+      "line_end": 142,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Constant(value='s5_det_emitted')], keywords=[])",
+      "rendered": "COUNTERS.bump('s5_det_emitted')"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Attribute(value=Name(id='row', ctx=Load()), attr='chunk_id', ctx=Load()), attr='removeprefix', ctx=Load()), args=[Constant(value='detector-')], keywords=[]), attr='replace', ctx=Load()), args=[Constant(value='-'), Constant(value='_')], keywords=[])",
+      "rendered": "row.chunk_id.removeprefix('detector-').replace('-', '_')"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[JoinedStr(values=[Constant(value='s5_det_rule_'), FormattedValue(value=Name(id='rule', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "COUNTERS.bump(source_template_144_22)"
+    },
+    {
+      "line_start": 145,
+      "line_end": 145,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='survivors', ctx=Load())",
+      "rendered": "survivors"
+    }
+  ],
+  "calls": [
+    {
+      "line": 30,
+      "end_line": 32,
+      "callee": "frozenset",
+      "enclosing": "module initialization",
+      "expression": "frozenset(\n    {\"python\", \"javascript\", \"typescript\", \"web-template\"}\n)"
+    },
+    {
+      "line": 36,
+      "end_line": 36,
+      "callee": "EXT_TO_LANG.get",
+      "enclosing": "_file_lang",
+      "expression": "EXT_TO_LANG.get(PurePosixPath(rel).suffix.lower())"
+    },
+    {
+      "line": 43,
+      "end_line": 43,
+      "callee": "PurePosixPath(rel).name.lower",
+      "enclosing": "_in_scope",
+      "expression": "PurePosixPath(rel).name.lower()"
+    },
+    {
+      "line": 51,
+      "end_line": 64,
+      "callee": "Finding",
+      "enclosing": "_mint",
+      "expression": "Finding(\n        title=spec.title or spec.rule_id,\n        file=hit.file,\n        line_start=hit.line,\n        line_end=hit.line_end,\n        vuln_class=VulnClass.INJECTION if xss else VulnClass.OTHER,\n        vuln_class_label=\"\" if xss else spec.kind,\n        cwe=spec.cwe,\n        origin=\"detector\",\n        chunk_id=spec.rule_id,\n        description=(f\"Deterministic detector match ({spec.rule_id}). \"\n                     f\"{spec.citation} Matched: {hit.snippet}\"),\n        # code_snippet stays empty: enrich only backfills rows whose snippet is empty.\n    )"
+    },
+    {
+      "line": 111,
+      "end_line": 113,
+      "callee": "sorted",
+      "enclosing": "_cap",
+      "expression": "sorted(range(len(survivors)),\n                    key=lambda i: (priority.get(survivors[i].chunk_id,\n                                                len(priority)), i))"
+    },
+    {
+      "line": 114,
+      "end_line": 114,
+      "callee": "frozenset",
+      "enclosing": "_cap",
+      "expression": "frozenset(ranked[:max_rows])"
+    },
+    {
+      "line": 115,
+      "end_line": 115,
+      "callee": "COUNTERS.bump",
+      "enclosing": "_cap",
+      "expression": "COUNTERS.bump(\"s5_det_overflow_suppressed\", len(survivors) - max_rows)"
+    },
+    {
+      "line": 122,
+      "end_line": 122,
+      "callee": "compile_detectors",
+      "enclosing": "run",
+      "expression": "compile_detectors(detector_corpus())"
+    },
+    {
+      "line": 128,
+      "end_line": 128,
+      "callee": "sorted",
+      "enclosing": "run",
+      "expression": "sorted(set(ctx.all_files))"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "_cap",
+      "enclosing": "run",
+      "expression": "_cap(_dedup(rows, kept, line_tol), compiled, max_rows)"
+    },
+    {
+      "line": 36,
+      "end_line": 36,
+      "callee": "PurePosixPath(rel).suffix.lower",
+      "enclosing": "_file_lang",
+      "expression": "PurePosixPath(rel).suffix.lower()"
+    },
+    {
+      "line": 78,
+      "end_line": 78,
+      "callee": "weakness_key",
+      "enclosing": "_dedup",
+      "expression": "weakness_key(f.cwe)"
+    },
+    {
+      "line": 87,
+      "end_line": 87,
+      "callee": "int",
+      "enclosing": "_dedup",
+      "expression": "int(row.line_start)"
+    },
+    {
+      "line": 88,
+      "end_line": 88,
+      "callee": "max",
+      "enclosing": "_dedup",
+      "expression": "max(line, int(row.line_end or line))"
+    },
+    {
+      "line": 100,
+      "end_line": 100,
+      "callee": "by_rule.setdefault(rule_key, []).append",
+      "enclosing": "_dedup",
+      "expression": "by_rule.setdefault(rule_key, []).append(line)"
+    },
+    {
+      "line": 101,
+      "end_line": 101,
+      "callee": "by_span.setdefault(span_key, []).append",
+      "enclosing": "_dedup",
+      "expression": "by_span.setdefault(span_key, []).append((line, end))"
+    },
+    {
+      "line": 102,
+      "end_line": 102,
+      "callee": "out.append",
+      "enclosing": "_dedup",
+      "expression": "out.append(row)"
+    },
+    {
+      "line": 111,
+      "end_line": 111,
+      "callee": "range",
+      "enclosing": "_cap",
+      "expression": "range(len(survivors))"
+    },
+    {
+      "line": 122,
+      "end_line": 122,
+      "callee": "detector_corpus",
+      "enclosing": "run",
+      "expression": "detector_corpus()"
+    },
+    {
+      "line": 128,
+      "end_line": 128,
+      "callee": "set",
+      "enclosing": "run",
+      "expression": "set(ctx.all_files)"
+    },
+    {
+      "line": 129,
+      "end_line": 129,
+      "callee": "_file_lang",
+      "enclosing": "run",
+      "expression": "_file_lang(rel)"
+    },
+    {
+      "line": 132,
+      "end_line": 132,
+      "callee": "by_lang.get",
+      "enclosing": "run",
+      "expression": "by_lang.get(lang or \"\")"
+    },
+    {
+      "line": 135,
+      "end_line": 135,
+      "callee": "cache.lines",
+      "enclosing": "run",
+      "expression": "cache.lines(rel)"
+    },
+    {
+      "line": 138,
+      "end_line": 138,
+      "callee": "detector_hits",
+      "enclosing": "run",
+      "expression": "detector_hits(rel, lines, live)"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "_dedup",
+      "enclosing": "run",
+      "expression": "_dedup(rows, kept, line_tol)"
+    },
+    {
+      "line": 142,
+      "end_line": 142,
+      "callee": "COUNTERS.bump",
+      "enclosing": "run",
+      "expression": "COUNTERS.bump(\"s5_det_emitted\")"
+    },
+    {
+      "line": 143,
+      "end_line": 143,
+      "callee": "row.chunk_id.removeprefix('detector-').replace",
+      "enclosing": "run",
+      "expression": "row.chunk_id.removeprefix(\"detector-\").replace(\"-\", \"_\")"
+    },
+    {
+      "line": 144,
+      "end_line": 144,
+      "callee": "COUNTERS.bump",
+      "enclosing": "run",
+      "expression": "COUNTERS.bump(f\"s5_det_rule_{rule}\")"
+    },
+    {
+      "line": 44,
+      "end_line": 44,
+      "callee": "EXCLUDE_PATH_RE.search",
+      "enclosing": "_in_scope",
+      "expression": "EXCLUDE_PATH_RE.search(rel)"
+    },
+    {
+      "line": 80,
+      "end_line": 80,
+      "callee": "kept_lines.setdefault((f.file, key), []).append",
+      "enclosing": "_dedup",
+      "expression": "kept_lines.setdefault((f.file, key), []).append(int(f.line_start))"
+    },
+    {
+      "line": 88,
+      "end_line": 88,
+      "callee": "int",
+      "enclosing": "_dedup",
+      "expression": "int(row.line_end or line)"
+    },
+    {
+      "line": 91,
+      "end_line": 91,
+      "callee": "_SPAN_FAMILY.get",
+      "enclosing": "_dedup",
+      "expression": "_SPAN_FAMILY.get(row.chunk_id, row.chunk_id)"
+    },
+    {
+      "line": 94,
+      "end_line": 94,
+      "callee": "any",
+      "enclosing": "_dedup",
+      "expression": "any(abs(line - n) <= tol for n in by_rule.get(rule_key, []))"
+    },
+    {
+      "line": 95,
+      "end_line": 95,
+      "callee": "any",
+      "enclosing": "_dedup",
+      "expression": "any(s <= end and line <= e for s, e in by_span.get(span_key, []))"
+    },
+    {
+      "line": 96,
+      "end_line": 97,
+      "callee": "any",
+      "enclosing": "_dedup",
+      "expression": "any(abs(line - n) <= tol or line <= n <= end\n                       for n in kept_lines.get(site_key, []))"
+    },
+    {
+      "line": 98,
+      "end_line": 98,
+      "callee": "COUNTERS.bump",
+      "enclosing": "_dedup",
+      "expression": "COUNTERS.bump(\"s5_det_dup_suppressed\")"
+    },
+    {
+      "line": 108,
+      "end_line": 108,
+      "callee": "len",
+      "enclosing": "_cap",
+      "expression": "len(survivors)"
+    },
+    {
+      "line": 110,
+      "end_line": 110,
+      "callee": "enumerate",
+      "enclosing": "_cap",
+      "expression": "enumerate(compiled)"
+    },
+    {
+      "line": 111,
+      "end_line": 111,
+      "callee": "len",
+      "enclosing": "_cap",
+      "expression": "len(survivors)"
+    },
+    {
+      "line": 115,
+      "end_line": 115,
+      "callee": "len",
+      "enclosing": "_cap",
+      "expression": "len(survivors)"
+    },
+    {
+      "line": 116,
+      "end_line": 116,
+      "callee": "enumerate",
+      "enclosing": "_cap",
+      "expression": "enumerate(survivors)"
+    },
+    {
+      "line": 130,
+      "end_line": 130,
+      "callee": "_in_scope",
+      "enclosing": "run",
+      "expression": "_in_scope(rel, lang)"
+    },
+    {
+      "line": 139,
+      "end_line": 139,
+      "callee": "rows.append",
+      "enclosing": "run",
+      "expression": "rows.append(_mint(hit))"
+    },
+    {
+      "line": 43,
+      "end_line": 43,
+      "callee": "PurePosixPath",
+      "enclosing": "_in_scope",
+      "expression": "PurePosixPath(rel)"
+    },
+    {
+      "line": 80,
+      "end_line": 80,
+      "callee": "int",
+      "enclosing": "_dedup",
+      "expression": "int(f.line_start)"
+    },
+    {
+      "line": 93,
+      "end_line": 93,
+      "callee": "weakness_key",
+      "enclosing": "_dedup",
+      "expression": "weakness_key(row.cwe)"
+    },
+    {
+      "line": 100,
+      "end_line": 100,
+      "callee": "by_rule.setdefault",
+      "enclosing": "_dedup",
+      "expression": "by_rule.setdefault(rule_key, [])"
+    },
+    {
+      "line": 101,
+      "end_line": 101,
+      "callee": "by_span.setdefault",
+      "enclosing": "_dedup",
+      "expression": "by_span.setdefault(span_key, [])"
+    },
+    {
+      "line": 139,
+      "end_line": 139,
+      "callee": "_mint",
+      "enclosing": "run",
+      "expression": "_mint(hit)"
+    },
+    {
+      "line": 143,
+      "end_line": 143,
+      "callee": "row.chunk_id.removeprefix",
+      "enclosing": "run",
+      "expression": "row.chunk_id.removeprefix(\"detector-\")"
+    },
+    {
+      "line": 36,
+      "end_line": 36,
+      "callee": "PurePosixPath",
+      "enclosing": "_file_lang",
+      "expression": "PurePosixPath(rel)"
+    },
+    {
+      "line": 80,
+      "end_line": 80,
+      "callee": "kept_lines.setdefault",
+      "enclosing": "_dedup",
+      "expression": "kept_lines.setdefault((f.file, key), [])"
+    },
+    {
+      "line": 112,
+      "end_line": 113,
+      "callee": "priority.get",
+      "enclosing": "_cap",
+      "expression": "priority.get(survivors[i].chunk_id,\n                                                len(priority))"
+    },
+    {
+      "line": 94,
+      "end_line": 94,
+      "callee": "abs",
+      "enclosing": "_dedup",
+      "expression": "abs(line - n)"
+    },
+    {
+      "line": 94,
+      "end_line": 94,
+      "callee": "by_rule.get",
+      "enclosing": "_dedup",
+      "expression": "by_rule.get(rule_key, [])"
+    },
+    {
+      "line": 95,
+      "end_line": 95,
+      "callee": "by_span.get",
+      "enclosing": "_dedup",
+      "expression": "by_span.get(span_key, [])"
+    },
+    {
+      "line": 97,
+      "end_line": 97,
+      "callee": "kept_lines.get",
+      "enclosing": "_dedup",
+      "expression": "kept_lines.get(site_key, [])"
+    },
+    {
+      "line": 113,
+      "end_line": 113,
+      "callee": "len",
+      "enclosing": "_cap",
+      "expression": "len(priority)"
+    },
+    {
+      "line": 96,
+      "end_line": 96,
+      "callee": "abs",
+      "enclosing": "_dedup",
+      "expression": "abs(line - n)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 16,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 18,
+      "source_expression": "from pathlib import PurePosixPath",
+      "targets": [
+        "pathlib",
+        "pathlib.PurePosixPath"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "from vvaharness.detect.matcher import Hit, compile_detectors, detector_hits",
+      "targets": [
+        "vvaharness.detect.matcher",
+        "vvaharness.detect.matcher.Hit",
+        "vvaharness.detect.matcher.compile_detectors",
+        "vvaharness.detect.matcher.detector_hits"
+      ],
+      "local_source_paths": [
+        "vvaharness/detect/matcher.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 21,
+      "source_expression": "from vvaharness.detect.patterns import detector_corpus",
+      "targets": [
+        "vvaharness.detect.patterns",
+        "vvaharness.detect.patterns.detector_corpus"
+      ],
+      "local_source_paths": [
+        "vvaharness/detect/patterns.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 22,
+      "source_expression": "from vvaharness.lang.detect import EXT_TO_LANG",
+      "targets": [
+        "vvaharness.lang.detect",
+        "vvaharness.lang.detect.EXT_TO_LANG"
+      ],
+      "local_source_paths": [
+        "vvaharness/lang/detect.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 23,
+      "source_expression": "from vvaharness.models import ContextPackage, Finding, VulnClass",
+      "targets": [
+        "vvaharness.models",
+        "vvaharness.models.ContextPackage",
+        "vvaharness.models.Finding",
+        "vvaharness.models.VulnClass"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 24,
+      "source_expression": "from vvaharness.pipeline.stages.s5.enrich import FileCache",
+      "targets": [
+        "vvaharness.pipeline.stages.s5.enrich",
+        "vvaharness.pipeline.stages.s5.enrich.FileCache"
+      ],
+      "local_source_paths": [
+        "vvaharness/pipeline/stages/s5/enrich.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 25,
+      "source_expression": "from vvaharness.pipeline.stages.s5.rules import EXCLUDE_PATH_RE",
+      "targets": [
+        "vvaharness.pipeline.stages.s5.rules",
+        "vvaharness.pipeline.stages.s5.rules.EXCLUDE_PATH_RE"
+      ],
+      "local_source_paths": [
+        "vvaharness/pipeline/stages/s5/rules.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 26,
+      "source_expression": "from vvaharness.rules.cwe import weakness_key",
+      "targets": [
+        "vvaharness.rules.cwe",
+        "vvaharness.rules.cwe.weakness_key"
+      ],
+      "local_source_paths": [
+        "vvaharness/rules/cwe.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 27,
+      "source_expression": "from vvaharness.util.counters import COUNTERS",
+      "targets": [
+        "vvaharness.util.counters",
+        "vvaharness.util.counters.COUNTERS"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/counters.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

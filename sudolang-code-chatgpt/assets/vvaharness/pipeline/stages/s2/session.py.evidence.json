@@ -1,0 +1,3930 @@
+{
+  "source": "vvaharness/pipeline/stages/s2/session.py",
+  "sha256": "76c63d95c9953c7608b15634f53ddcdc00255b97e2fc67403c14f9e13aac1ca1",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\n\"\"\"Step 2's dispatch: the agentic threat-model call, its graph gate and its hollow retry.\"\"\"\nfrom __future__ import annotations\nfrom vvaharness.util import logs\n\nimport time\nfrom pathlib import Path\n\n# Module import keeps the monkeypatch seam for tests.\nfrom langchain.agents.middleware import TodoListMiddleware\n\nfrom vvaharness.backends.harness.deepagents.evidence_gate import EvidenceGate\nfrom vvaharness.backends.harness.deepagents.model_call_budget import ModelCallBudget\nfrom vvaharness.backends.harness.deepagents.tool_budget import ToolCallBudget\nfrom vvaharness.backends.harness.models import CallTimeoutError, is_halt_error\nfrom vvaharness.backends.llm import deepagents as _deepagents\nfrom vvaharness.backends.llm.models import RESPONSE_MODEL_VIAS, validate_detection_tools\nfrom vvaharness.backends.llm.registry import resolve\nfrom vvaharness.codegraph.build import graph_is_degenerate\nfrom vvaharness.codegraph.tools import (\n    GRAPH_TOOL_NAMES,\n    build_graph_tool_builder,\n    graph_tool_names,\n)\nfrom vvaharness.evidence import ThreatEvidence, _cap_int\nfrom vvaharness.models import ContextPackage, ThreatModel\nfrom vvaharness.pipeline.stages.replay import (\n    S2_REPLAY_INSTRUCTION,\n    RecordTranscript,\n    Transcript,\n    deadline_bound,\n    release_pinned_session,\n    replay_prompt,\n    resume_or_replay,\n    run_with_deadline,\n    session_id_for,\n)\nfrom vvaharness.pipeline.stages.s2.outcomes import _finalize_threats, _parse_threat_model\nfrom vvaharness.pipeline.stages.s2.prompts import (\n    _AGENTIC_SYSTEM_LINE,\n    _GRAPH_TOOLS_SYSTEM_LINE,\n    _SHELL_SYSTEM_LINE,\n    SYSTEM,\n)\nfrom vvaharness.pipeline.stages.s2_planning import (\n    PLAN_SYSTEM_PROMPT as S2_PLAN_SYSTEM_PROMPT,\n)\nfrom vvaharness.pipeline.stages.s2_planning import (\n    PLAN_TOOL_DESCRIPTION as S2_PLAN_TOOL_DESCRIPTION,\n)\nfrom vvaharness.skills import inject_skills\nfrom vvaharness.util import console\nfrom vvaharness.util.config import knob\nfrom vvaharness.util.counters import COUNTERS\nfrom vvaharness.util.exceptions import S2HollowAfterRetry\nfrom vvaharness.util.warn_once import warn_once\nfrom vvaharness.util.events import Event\n\nlog = logs.get_logger(__name__)\n\n_DISPATCH_TAG = \"s2 threatmodel\"\n\n_GRAPH_NAME = \"s2-threatmodel\"\n\n#: The replay restates a transcript; it needs the smallest reasoning budget, not the stage's.\n_REPLAY_EFFORT = \"low\"\n_WARNED_NO_GRAPH_TOOLS: set[str] = set()\n\n#: Routes already warned that require_graph stood down for a degenerate graph.\n_WARNED_DEGENERATE_GRAPH: set[str] = set()\n\n#: Appended to the retry prompt: the fresh call has no memory of the hollow one, and no tools.\n_HOLLOW_RETRY_DIRECTIVES = {\n    \"no_threats\": (\n        \"A previous attempt returned a threat model with zero threats. This call has no tools: \"\n        \"model the system from the snapshot above, naming surface_files only from FILE INVENTORY.\"),\n    \"no_validated_surface\": (\n        \"A previous attempt returned threats, but not one named a surface_files path that exists \"\n        \"in the FILE INVENTORY, so every threat was unusable and no later stage could act on any \"\n        \"of them. This call has no tools: model the system from the snapshot above, and give each \"\n        \"threat at least one surface_files path copied EXACTLY from FILE INVENTORY.\"),\n}\n\n\ndef _call_budget(s2) -> ModelCallBudget | None:\n    \"\"\"s2's in-session cut: on the last permitted call every tool but ThreatModel is withdrawn.\"\"\"\n    # This is the cut-and-report that step2.deadline approximated from OUTSIDE the session. The\n    # budget does it from INSIDE: same conversation, same message objects, prompt cache intact,\n    # no second API call. A wall clock cannot do that -- it can only kill and re-ask.\n    limit = _cap_int(s2, \"max_model_calls\", 0)\n    if limit <= 0:\n        return None\n    return ModelCallBudget(limit=limit,\n                           outcome_tools=frozenset({ThreatModel.__name__}),\n                           counter=\"s2_model_call_budget_final_turn\")\n\n\ndef _graph_tool_route_ok(cfg: object, *, agentic: bool = True) -> bool:\n    \"\"\"Whether the resolved threatmodel route can actually run the graph tools, warning once if not.\"\"\"\n    via = resolve(cfg.models.threatmodel).via\n    ok, reason = _deepagents.route_carries_tools(cfg, via)\n    if ok:\n        return True\n    warn_once(\n        _WARNED_NO_GRAPH_TOOLS, f\"{via}:{agentic}\",\n        f\"WARN [s2]: step2.graph_tools is on and a code graph exists, but \"\n        f\"{reason} — running S2 without the graph tools, and NOT telling the \"\n        f\"model about tools it cannot call. To use them: route models.threatmodel \"\n        f\"via: deepagents.\")\n    return False\n\n\ndef _threatmodel_call(user: str, cfg: object, repo_root: str,\n                       ctx: ContextPackage | None = None,\n                       *, drop_thinking: bool = False,\n                       require_tool_call: bool = False) -> str:\n    \"\"\"Issues the primary agentic threat-model completion, with graph tools when the route can carry them.\"\"\"\n    s2 = getattr(cfg, \"step2\", None)\n    via = resolve(cfg.models.threatmodel).via\n    tool_builder = None\n    fact_tools: tuple[str, ...] = ()\n    graph_tools_line = \"\"\n    parent_middleware: tuple[ToolCallBudget, ...] = ()\n    gate_installed = False\n    if (ctx is not None and getattr(ctx, \"graph_handle\", None) is not None\n            and getattr(s2, \"graph_tools\", True)\n            and _graph_tool_route_ok(cfg, agentic=True)):\n        tool_builder = build_graph_tool_builder(ctx)\n        fact_tools = graph_tool_names()\n        # Tools stay registered on a degenerate graph; the prompt stops selling them as reliable\n        degenerate = graph_is_degenerate(ctx, cfg)\n        graph_tools_line = \"\" if degenerate else _GRAPH_TOOLS_SYSTEM_LINE\n        parent_middleware = (ToolCallBudget(\n            frozenset(graph_tool_names()),\n            limit=_cap_int(s2, \"graph_tool_budget\", 6),\n            counter=\"s2_graph_tool_budget_exhausted\",\n        ),)\n        if getattr(s2, \"planning\", True):\n            parent_middleware += (TodoListMiddleware(\n                system_prompt=S2_PLAN_SYSTEM_PROMPT,\n                tool_description=S2_PLAN_TOOL_DESCRIPTION,\n            ),)\n        if getattr(s2, \"require_graph\", True):\n            # Standing down drops only the tool half: EvidenceGate._premature still checks the todos\n            required_tools = frozenset(GRAPH_TOOL_NAMES)\n            if degenerate:\n                warn_once(\n                    _WARNED_DEGENERATE_GRAPH, \"s2-require-graph\",\n                    \"WARN [s2]: step2.require_graph is on but the code graph is \"\n                    \"absent or degenerate (zero edges, or fewer nodes than \"\n                    \"step0.min_graph_nodes_for_gate) — standing the graph-tool \"\n                    \"requirement down; the todo-list gate still applies.\")\n                COUNTERS.bump(\"evidence_gate_stood_down_degenerate_graph\")\n                required_tools = frozenset()\n            parent_middleware += (EvidenceGate(\n                max_rejections=_cap_int(s2, \"require_graph_rejections\", 2),\n                counter=\"s2_evidence_gate_rejected\",\n                required_tools=required_tools,\n                require_tool_call=require_tool_call,\n                ignored_tools=frozenset({\"write_todos\", ThreatModel.__name__}),\n            ),)\n            gate_installed = True\n    if not gate_installed and require_tool_call and via == \"deepagents\":\n        parent_middleware += (EvidenceGate(\n            max_rejections=_cap_int(s2, \"require_graph_rejections\", 2),\n            counter=\"s2_evidence_gate_rejected\",\n            required_tools=frozenset(),\n            require_tool_call=True,\n            ignored_tools=frozenset({\"write_todos\", ThreatModel.__name__}),\n        ),)\n    max_turns = _cap_int(s2, \"max_turns\", 12)\n    # RESPONSE_MODEL_VIAS, not a local set: s2/s4/s6 must agree on the same route or a scan splits\n    threat_model_arg = (\n        ThreatModel if via in RESPONSE_MODEL_VIAS\n        else None\n    )\n    system_prompt = (SYSTEM + _AGENTIC_SYSTEM_LINE + graph_tools_line\n                     + (_SHELL_SYSTEM_LINE if getattr(s2, \"bash\", False) else \"\"))\n    session_id = session_id_for(\"s2\", \"threatmodel\")\n    transcript = Transcript()\n    parent_middleware += (RecordTranscript(transcript),)\n    budget = _call_budget(s2)\n    if budget is not None:\n        parent_middleware += (budget,)\n    deadline = _cap_int(s2, \"deadline\", 0)\n    effort = None if drop_thinking else (getattr(s2, \"effort\", None) or None)\n    try:\n        return run_with_deadline(\n            lambda: _agentic_leg(user, cfg, repo_root, system_prompt, parent_middleware,\n                                 tool_builder, fact_tools, max_turns, threat_model_arg,\n                                 session_id=session_id, drop_thinking=drop_thinking),\n            seconds=deadline, stage=_DISPATCH_TAG, effort=effort)\n    except CallTimeoutError:\n        console.write(f\"  [s2] deadline {deadline}s hit — resuming the session (or re-asking \"\n                      f\"from the transcript) for the threat model\")\n        return resume_or_replay(\n            session_id,\n            lambda: _replay_leg(user, cfg, repo_root, system_prompt, transcript),\n            model=cfg.models.threatmodel, cfg=cfg, instruction=S2_REPLAY_INSTRUCTION,\n            stage=\"s2\", tag=_DISPATCH_TAG,\n            timeout=_cap_int(s2, \"resume_timeout\", 300))\n    finally:\n        release_pinned_session(session_id)\n\n\ndef _replay_leg(user: str, cfg: object, repo_root: str, system_prompt: str,\n                transcript: Transcript) -> str:\n    \"\"\"Re-asks for the threat model with no tools, from the transcript the killed session reached.\"\"\"\n    # LOWEST effort: the reasoning already happened in the killed session and is IN the transcript,\n    # so a high budget pays for the same reasoning twice.\n    s2 = getattr(cfg, \"step2\", None)\n    COUNTERS.bump(\"s2_deadline_replay\")\n    started = time.monotonic()\n    out = _deepagents.dispatch_prompt(\n        replay_prompt(transcript, user, instruction=S2_REPLAY_INSTRUCTION,\n                      stage=\"s2\"),\n        model=cfg.models.threatmodel,\n        cfg=cfg,\n        cwd=repo_root,\n        system_prompt=system_prompt,\n        max_tokens=_cap_int(s2, \"replay_max_tokens\", 16000),\n        timeout=_cap_int(s2, \"replay_timeout\", 300),\n        response_model=(ThreatModel\n                        if resolve(cfg.models.threatmodel).via in RESPONSE_MODEL_VIAS else None),\n        tag=f\"{_DISPATCH_TAG} replay\",\n        graph_name=_GRAPH_NAME,\n        effort=_REPLAY_EFFORT,\n    )\n    console.write(f\"  [s2] replay returned in {time.monotonic() - started:.1f}s\")\n    return out\n\n\ndef _agentic_leg(user: str, cfg: object, repo_root: str, system_prompt: str,\n                 parent_middleware: tuple, tool_builder: object, fact_tools: tuple[str, ...],\n                 max_turns: int, threat_model_arg: object, *, session_id: str,\n                 drop_thinking: bool) -> str:\n    \"\"\"The unbounded agentic threat-model call that the stage deadline wraps.\"\"\"\n    s2 = getattr(cfg, \"step2\", None)\n    return _deepagents.dispatch_agentic(\n        user,\n        model=cfg.models.threatmodel,\n        cfg=cfg,\n        system_prompt=system_prompt,\n        # via:cli honours it verbatim; else read-only, so graph names go via fact_tools/tool_builder\n        allowed_tools=validate_detection_tools(\n            getattr(s2, \"allowed_tools\", None),\n            config_key=\"step2.allowed_tools\",\n            via=resolve(cfg.models.threatmodel).via),\n        cwd=repo_root,\n        max_turns=max_turns,\n        # step2.timeout binds via:cli and via:deepagents; sdk/openai rely on max_turns alone\n        timeout=deadline_bound(_cap_int(s2, \"timeout\", 1800), _cap_int(s2, \"deadline\", 0),\n                               None if drop_thinking else (getattr(s2, \"effort\", None) or None),\n                               via=resolve(cfg.models.threatmodel).via),\n        # knob() not getattr: a null overlay must give 64000, not None -> internal 16000\n        max_output_tokens=int(knob(cfg, \"step2.max_tokens\", 64000)),\n        tag=_DISPATCH_TAG,\n        graph_name=_GRAPH_NAME,\n        tool_builder=tool_builder,\n        fact_tools=fact_tools,\n        response_model=threat_model_arg,\n        parent_middleware=parent_middleware,\n        effort=None if drop_thinking else (getattr(s2, \"effort\", None) or None),\n        skill_root=inject_skills(Path(repo_root)) if getattr(s2, \"skills\", True) else None,\n        allow_shell=bool(getattr(s2, \"bash\", False)),\n        session_id=session_id,\n    )\n\n\ndef _snapshot_leg(user: str, cfg: object, repo_root: str) -> str:\n    \"\"\"Re-asks for the threat model from the structural snapshot alone, with no tools.\n\n    The hollow reply came from a session that had the schema AND the graph tools on every\n    turn, and chose the schema exit without reading anything (a forced tool call cannot\n    withdraw an exit the model keeps taking). This leg has no tool policy to withdraw from: it\n    is the one-shot seam s2 already owns for its deadline replay and its json-repair retry, so\n    the only exit left is the schema, filled from the same FILE INVENTORY/MODULES/ENTRY POINTS\n    snapshot the primary call already read.\n    \"\"\"\n    s2 = getattr(cfg, \"step2\", None)\n    via = resolve(cfg.models.threatmodel).via\n    return _deepagents.dispatch_prompt(\n        user,\n        model=cfg.models.threatmodel,\n        cfg=cfg,\n        cwd=repo_root,\n        system_prompt=SYSTEM,\n        max_tokens=int(knob(cfg, \"step2.max_tokens\", 64000)),\n        timeout=_cap_int(s2, \"timeout\", 1800),\n        response_model=(ThreatModel if via in RESPONSE_MODEL_VIAS else None),\n        tag=f\"{_DISPATCH_TAG} snapshot\",\n        graph_name=_GRAPH_NAME,\n        effort=getattr(s2, \"effort\", None) or None,\n    )\n\n\ndef _hollow_reason(tm: ThreatModel, resolved: bool) -> str:\n    \"\"\"Why s3 would mint nothing from *tm*, or \"\" when at least one threat is actionable.\"\"\"\n    if not tm.threats:\n        return \"no_threats\"\n    if resolved and not any(t.surface_files for t in tm.threats):\n        return \"no_validated_surface\"\n    return \"\"\n\n\ndef _retry_if_hollow(tm: ThreatModel, ev: ThreatEvidence,\n                     user: str, cfg, repo_root: str,\n                     ctx: ContextPackage | None) -> ThreatModel:\n    \"\"\"Re-asks once, with no tools, when a non-empty repo yielded nothing s3 could mint a unit for.\"\"\"\n    s2 = getattr(cfg, \"step2\", None)\n    if not getattr(s2, \"empty_retry\", True):\n        return tm\n    reason = _hollow_reason(tm, ctx is not None)\n    if not reason:\n        return tm\n    # Zero threats on a zero-file repo is honest: a retry carries the same empty inventory\n    if not ev.file_count:\n        return tm\n    COUNTERS.bump(\"s2_empty_retry_attempted\")\n    COUNTERS.bump(f\"s2_hollow_{reason}\")\n    log.warning(Event.S2_HOLLOW_RETRY_ATTEMPTED, reason=reason, threats=len(tm.threats))\n    try:\n        retry_tm = _parse_threat_model(_snapshot_leg(\n            user + \"\\n\\n\" + _HOLLOW_RETRY_DIRECTIVES[reason], cfg, repo_root))\n    except Exception as e:\n        if is_halt_error(e):\n            raise\n        # Keep the first model; run() logs the loss once, so no errlog (one hollow != 2 failures)\n        log.warning(Event.S2_HOLLOW_RETRY_FAILED, detail=str(e))\n        return tm\n    _finalize_threats(retry_tm, ctx)\n    retry_reason = _hollow_reason(retry_tm, ctx is not None)\n    if not retry_reason:\n        COUNTERS.bump(\"s2_empty_retry_recovered\")\n        log.warning(Event.S2_RETRY_RECOVERED, threats=len(retry_tm.threats))\n        return retry_tm\n    COUNTERS.bump(\"s2_hollow_after_retry\")\n    log.error(Event.S2_HOLLOW_RETRY_EMPTY, reason=retry_reason,\n              remedy=\"check the s2 transcript: the model returned no threat naming a file from \"\n                     \"the inventory, twice. Re-run, or route models.threatmodel elsewhere\")\n    raise S2HollowAfterRetry(retry_reason)\n",
+  "literals": {
+    "source_literal_16_0": {
+      "source": "vvaharness/pipeline/stages/s2/session.py",
+      "line_start": 16,
+      "line_end": 16,
+      "value": "Step 2's dispatch: the agentic threat-model call, its graph gate and its hollow retry.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_89_8": {
+      "source": "vvaharness/pipeline/stages/s2/session.py",
+      "line_start": 89,
+      "line_end": 90,
+      "value": "A previous attempt returned a threat model with zero threats. This call has no tools: model the system from the snapshot above, naming surface_files only from FILE INVENTORY.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_92_8": {
+      "source": "vvaharness/pipeline/stages/s2/session.py",
+      "line_start": 92,
+      "line_end": 95,
+      "value": "A previous attempt returned threats, but not one named a surface_files path that exists in the FILE INVENTORY, so every threat was unusable and no later stage could act on any of them. This call has no tools: model the system from the snapshot above, and give each threat at least one surface_files path copied EXACTLY from FILE INVENTORY.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_100_4": {
+      "source": "vvaharness/pipeline/stages/s2/session.py",
+      "line_start": 100,
+      "line_end": 100,
+      "value": "s2's in-session cut: on the last permitted call every tool but ThreatModel is withdrawn.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_113_4": {
+      "source": "vvaharness/pipeline/stages/s2/session.py",
+      "line_start": 113,
+      "line_end": 113,
+      "value": "Whether the resolved threatmodel route can actually run the graph tools, warning once if not.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_119_32": {
+      "source": "vvaharness/pipeline/stages/s2/session.py",
+      "line_start": 119,
+      "line_end": 119,
+      "source_expression": "f\"{via}:{agentic}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_120_8": {
+      "source": "vvaharness/pipeline/stages/s2/session.py",
+      "line_start": 120,
+      "line_end": 123,
+      "source_expression": "f\"WARN [s2]: step2.graph_tools is on and a code graph exists, but \"\n        f\"{reason} — running S2 without the graph tools, and NOT telling the \"\n        f\"model about tools it cannot call. To use them: route models.threatmodel \"\n        f\"via: deepagents.\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_131_4": {
+      "source": "vvaharness/pipeline/stages/s2/session.py",
+      "line_start": 131,
+      "line_end": 131,
+      "value": "Issues the primary agentic threat-model completion, with graph tools when the route can carry them.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_163_20": {
+      "source": "vvaharness/pipeline/stages/s2/session.py",
+      "line_start": 163,
+      "line_end": 166,
+      "value": "WARN [s2]: step2.require_graph is on but the code graph is absent or degenerate (zero edges, or fewer nodes than step0.min_graph_nodes_for_gate) — standing the graph-tool requirement down; the todo-list gate still applies.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_208_22": {
+      "source": "vvaharness/pipeline/stages/s2/session.py",
+      "line_start": 208,
+      "line_end": 209,
+      "source_expression": "f\"  [s2] deadline {deadline}s hit — resuming the session (or re-asking \"\n                      f\"from the transcript) for the threat model\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_222_4": {
+      "source": "vvaharness/pipeline/stages/s2/session.py",
+      "line_start": 222,
+      "line_end": 222,
+      "value": "Re-asks for the threat model with no tools, from the transcript the killed session reached.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_239_12": {
+      "source": "vvaharness/pipeline/stages/s2/session.py",
+      "line_start": 239,
+      "line_end": 239,
+      "source_expression": "f\"{_DISPATCH_TAG} replay\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_243_18": {
+      "source": "vvaharness/pipeline/stages/s2/session.py",
+      "line_start": 243,
+      "line_end": 243,
+      "source_expression": "f\"  [s2] replay returned in {time.monotonic() - started:.1f}s\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_251_4": {
+      "source": "vvaharness/pipeline/stages/s2/session.py",
+      "line_start": 251,
+      "line_end": 251,
+      "value": "The unbounded agentic threat-model call that the stage deadline wraps.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_285_4": {
+      "source": "vvaharness/pipeline/stages/s2/session.py",
+      "line_start": 285,
+      "line_end": 293,
+      "value": "Re-asks for the threat model from the structural snapshot alone, with no tools.\n\n    The hollow reply came from a session that had the schema AND the graph tools on every\n    turn, and chose the schema exit without reading anything (a forced tool call cannot\n    withdraw an exit the model keeps taking). This leg has no tool policy to withdraw from: it\n    is the one-shot seam s2 already owns for its deadline replay and its json-repair retry, so\n    the only exit left is the schema, filled from the same FILE INVENTORY/MODULES/ENTRY POINTS\n    snapshot the primary call already read.\n    ",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_305_12": {
+      "source": "vvaharness/pipeline/stages/s2/session.py",
+      "line_start": 305,
+      "line_end": 305,
+      "source_expression": "f\"{_DISPATCH_TAG} snapshot\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_312_4": {
+      "source": "vvaharness/pipeline/stages/s2/session.py",
+      "line_start": 312,
+      "line_end": 312,
+      "value": "Why s3 would mint nothing from *tm*, or \"\" when at least one threat is actionable.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_323_4": {
+      "source": "vvaharness/pipeline/stages/s2/session.py",
+      "line_start": 323,
+      "line_end": 323,
+      "value": "Re-asks once, with no tools, when a non-empty repo yielded nothing s3 could mint a unit for.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_334_18": {
+      "source": "vvaharness/pipeline/stages/s2/session.py",
+      "line_start": 334,
+      "line_end": 334,
+      "source_expression": "f\"s2_hollow_{reason}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_338_19": {
+      "source": "vvaharness/pipeline/stages/s2/session.py",
+      "line_start": 338,
+      "line_end": 338,
+      "value": "\n\n",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_353_21": {
+      "source": "vvaharness/pipeline/stages/s2/session.py",
+      "line_start": 353,
+      "line_end": 354,
+      "value": "check the s2 transcript: the model returned no threat naming a file from the inventory, twice. Re-run, or route models.threatmodel elsewhere",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "value": "Step 2's dispatch: the agentic threat-model call, its graph gate and its hollow retry.",
+      "context": "literal"
+    },
+    {
+      "line_start": 75,
+      "line_end": 75,
+      "column": 16,
+      "value": "s2 threatmodel",
+      "context": "literal"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 14,
+      "value": "s2-threatmodel",
+      "context": "literal"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 17,
+      "value": "low",
+      "context": "literal"
+    },
+    {
+      "line_start": 88,
+      "line_end": 88,
+      "column": 4,
+      "value": "no_threats",
+      "context": "literal"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 4,
+      "value": "no_validated_surface",
+      "context": "literal"
+    },
+    {
+      "line_start": 89,
+      "line_end": 90,
+      "column": 8,
+      "value": "A previous attempt returned a threat model with zero threats. This call has no tools: model the system from the snapshot above, naming surface_files only from FILE INVENTORY.",
+      "context": "literal"
+    },
+    {
+      "line_start": 92,
+      "line_end": 95,
+      "column": 8,
+      "value": "A previous attempt returned threats, but not one named a surface_files path that exists in the FILE INVENTORY, so every threat was unusable and no later stage could act on any of them. This call has no tools: model the system from the snapshot above, and give each threat at least one surface_files path copied EXACTLY from FILE INVENTORY.",
+      "context": "literal"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 4,
+      "value": "s2's in-session cut: on the last permitted call every tool but ThreatModel is withdrawn.",
+      "context": "literal"
+    },
+    {
+      "line_start": 113,
+      "line_end": 113,
+      "column": 4,
+      "value": "Whether the resolved threatmodel route can actually run the graph tools, warning once if not.",
+      "context": "literal"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 4,
+      "value": "Issues the primary agentic threat-model completion, with graph tools when the route can carry them.",
+      "context": "literal"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 23,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 222,
+      "line_end": 222,
+      "column": 4,
+      "value": "Re-asks for the threat model with no tools, from the transcript the killed session reached.",
+      "context": "literal"
+    },
+    {
+      "line_start": 251,
+      "line_end": 251,
+      "column": 4,
+      "value": "The unbounded agentic threat-model call that the stage deadline wraps.",
+      "context": "literal"
+    },
+    {
+      "line_start": 285,
+      "line_end": 293,
+      "column": 4,
+      "value": "Re-asks for the threat model from the structural snapshot alone, with no tools.\n\n    The hollow reply came from a session that had the schema AND the graph tools on every\n    turn, and chose the schema exit without reading anything (a forced tool call cannot\n    withdraw an exit the model keeps taking). This leg has no tool policy to withdraw from: it\n    is the one-shot seam s2 already owns for its deadline replay and its json-repair retry, so\n    the only exit left is the schema, filled from the same FILE INVENTORY/MODULES/ENTRY POINTS\n    snapshot the primary call already read.\n    ",
+      "context": "literal"
+    },
+    {
+      "line_start": 312,
+      "line_end": 312,
+      "column": 4,
+      "value": "Why s3 would mint nothing from *tm*, or \"\" when at least one threat is actionable.",
+      "context": "literal"
+    },
+    {
+      "line_start": 317,
+      "line_end": 317,
+      "column": 11,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 323,
+      "line_end": 323,
+      "column": 4,
+      "value": "Re-asks once, with no tools, when a non-empty repo yielded nothing s3 could mint a unit for.",
+      "context": "literal"
+    },
+    {
+      "line_start": 104,
+      "line_end": 104,
+      "column": 25,
+      "value": "max_model_calls",
+      "context": "literal"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 22,
+      "value": "step2",
+      "context": "literal"
+    },
+    {
+      "line_start": 185,
+      "line_end": 185,
+      "column": 29,
+      "value": "max_turns",
+      "context": "literal"
+    },
+    {
+      "line_start": 193,
+      "line_end": 193,
+      "column": 32,
+      "value": "s2",
+      "context": "literal"
+    },
+    {
+      "line_start": 193,
+      "line_end": 193,
+      "column": 38,
+      "value": "threatmodel",
+      "context": "literal"
+    },
+    {
+      "line_start": 199,
+      "line_end": 199,
+      "column": 28,
+      "value": "deadline",
+      "context": "literal"
+    },
+    {
+      "line_start": 225,
+      "line_end": 225,
+      "column": 22,
+      "value": "step2",
+      "context": "literal"
+    },
+    {
+      "line_start": 226,
+      "line_end": 226,
+      "column": 18,
+      "value": "s2_deadline_replay",
+      "context": "literal"
+    },
+    {
+      "line_start": 252,
+      "line_end": 252,
+      "column": 22,
+      "value": "step2",
+      "context": "literal"
+    },
+    {
+      "line_start": 294,
+      "line_end": 294,
+      "column": 22,
+      "value": "step2",
+      "context": "literal"
+    },
+    {
+      "line_start": 314,
+      "line_end": 314,
+      "column": 15,
+      "value": "no_threats",
+      "context": "literal"
+    },
+    {
+      "line_start": 316,
+      "line_end": 316,
+      "column": 15,
+      "value": "no_validated_surface",
+      "context": "literal"
+    },
+    {
+      "line_start": 324,
+      "line_end": 324,
+      "column": 22,
+      "value": "step2",
+      "context": "literal"
+    },
+    {
+      "line_start": 333,
+      "line_end": 333,
+      "column": 18,
+      "value": "s2_empty_retry_attempted",
+      "context": "literal"
+    },
+    {
+      "line_start": 351,
+      "line_end": 351,
+      "column": 18,
+      "value": "s2_hollow_after_retry",
+      "context": "literal"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 35,
+      "value": "s2_model_call_budget_final_turn",
+      "context": "literal"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 39,
+      "value": ":",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 120,
+      "line_end": 120,
+      "column": 10,
+      "value": "WARN [s2]: step2.graph_tools is on and a code graph exists, but ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 121,
+      "line_end": 123,
+      "column": 18,
+      "value": " — running S2 without the graph tools, and NOT telling the model about tools it cannot call. To use them: route models.threatmodel via: deepagents.",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 28,
+      "value": "graph_tools",
+      "context": "literal"
+    },
+    {
+      "line_start": 146,
+      "line_end": 146,
+      "column": 27,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 152,
+      "line_end": 152,
+      "column": 23,
+      "value": "planning",
+      "context": "literal"
+    },
+    {
+      "line_start": 157,
+      "line_end": 157,
+      "column": 23,
+      "value": "require_graph",
+      "context": "literal"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 59,
+      "value": "deepagents",
+      "context": "literal"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 78,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 243,
+      "line_end": 243,
+      "column": 20,
+      "value": "  [s2] replay returned in ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 243,
+      "line_end": 243,
+      "column": 78,
+      "value": "s",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 325,
+      "line_end": 325,
+      "column": 23,
+      "value": "empty_retry",
+      "context": "literal"
+    },
+    {
+      "line_start": 334,
+      "line_end": 334,
+      "column": 20,
+      "value": "s2_hollow_",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 348,
+      "line_end": 348,
+      "column": 22,
+      "value": "s2_empty_retry_recovered",
+      "context": "literal"
+    },
+    {
+      "line_start": 353,
+      "line_end": 354,
+      "column": 21,
+      "value": "check the s2 transcript: the model returned no threat naming a file from the inventory, twice. Re-run, or route models.threatmodel elsewhere",
+      "context": "literal"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 41,
+      "value": "graph_handle",
+      "context": "literal"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 58,
+      "value": "bash",
+      "context": "literal"
+    },
+    {
+      "line_start": 200,
+      "line_end": 200,
+      "column": 53,
+      "value": "effort",
+      "context": "literal"
+    },
+    {
+      "line_start": 230,
+      "line_end": 230,
+      "column": 28,
+      "value": "s2",
+      "context": "literal"
+    },
+    {
+      "line_start": 235,
+      "line_end": 235,
+      "column": 32,
+      "value": "replay_max_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 236,
+      "line_end": 236,
+      "column": 29,
+      "value": "replay_timeout",
+      "context": "literal"
+    },
+    {
+      "line_start": 239,
+      "line_end": 239,
+      "column": 29,
+      "value": " replay",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 303,
+      "line_end": 303,
+      "column": 29,
+      "value": "timeout",
+      "context": "literal"
+    },
+    {
+      "line_start": 305,
+      "line_end": 305,
+      "column": 29,
+      "value": " snapshot",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 20,
+      "value": "s2_graph_tool_budget_exhausted",
+      "context": "literal"
+    },
+    {
+      "line_start": 162,
+      "line_end": 162,
+      "column": 46,
+      "value": "s2-require-graph",
+      "context": "literal"
+    },
+    {
+      "line_start": 163,
+      "line_end": 166,
+      "column": 20,
+      "value": "WARN [s2]: step2.require_graph is on but the code graph is absent or degenerate (zero edges, or fewer nodes than step0.min_graph_nodes_for_gate) — standing the graph-tool requirement down; the todo-list gate still applies.",
+      "context": "literal"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 30,
+      "value": "evidence_gate_stood_down_degenerate_graph",
+      "context": "literal"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 20,
+      "value": "s2_evidence_gate_rejected",
+      "context": "literal"
+    },
+    {
+      "line_start": 208,
+      "line_end": 208,
+      "column": 24,
+      "value": "  [s2] deadline ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 208,
+      "line_end": 209,
+      "column": 50,
+      "value": "s hit — resuming the session (or re-asking from the transcript) for the threat model",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 214,
+      "line_end": 214,
+      "column": 18,
+      "value": "s2",
+      "context": "literal"
+    },
+    {
+      "line_start": 243,
+      "line_end": 243,
+      "column": 74,
+      "value": ".1f",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 260,
+      "line_end": 260,
+      "column": 24,
+      "value": "allowed_tools",
+      "context": "literal"
+    },
+    {
+      "line_start": 261,
+      "line_end": 261,
+      "column": 23,
+      "value": "step2.allowed_tools",
+      "context": "literal"
+    },
+    {
+      "line_start": 266,
+      "line_end": 266,
+      "column": 44,
+      "value": "timeout",
+      "context": "literal"
+    },
+    {
+      "line_start": 266,
+      "line_end": 266,
+      "column": 75,
+      "value": "deadline",
+      "context": "literal"
+    },
+    {
+      "line_start": 270,
+      "line_end": 270,
+      "column": 40,
+      "value": "step2.max_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 278,
+      "line_end": 278,
+      "column": 65,
+      "value": "skills",
+      "context": "literal"
+    },
+    {
+      "line_start": 279,
+      "line_end": 279,
+      "column": 37,
+      "value": "bash",
+      "context": "literal"
+    },
+    {
+      "line_start": 302,
+      "line_end": 302,
+      "column": 33,
+      "value": "step2.max_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 307,
+      "line_end": 307,
+      "column": 27,
+      "value": "effort",
+      "context": "literal"
+    },
+    {
+      "line_start": 149,
+      "line_end": 149,
+      "column": 31,
+      "value": "graph_tool_budget",
+      "context": "literal"
+    },
+    {
+      "line_start": 171,
+      "line_end": 171,
+      "column": 24,
+      "value": "s2_evidence_gate_rejected",
+      "context": "literal"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 40,
+      "value": "require_graph_rejections",
+      "context": "literal"
+    },
+    {
+      "line_start": 215,
+      "line_end": 215,
+      "column": 33,
+      "value": "resume_timeout",
+      "context": "literal"
+    },
+    {
+      "line_start": 277,
+      "line_end": 277,
+      "column": 55,
+      "value": "effort",
+      "context": "literal"
+    },
+    {
+      "line_start": 338,
+      "line_end": 338,
+      "column": 19,
+      "value": "\n\n",
+      "context": "literal"
+    },
+    {
+      "line_start": 170,
+      "line_end": 170,
+      "column": 44,
+      "value": "require_graph_rejections",
+      "context": "literal"
+    },
+    {
+      "line_start": 183,
+      "line_end": 183,
+      "column": 37,
+      "value": "write_todos",
+      "context": "literal"
+    },
+    {
+      "line_start": 267,
+      "line_end": 267,
+      "column": 71,
+      "value": "effort",
+      "context": "literal"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 41,
+      "value": "write_todos",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 23,
+      "text": "# Module import keeps the monkeypatch seam for tests."
+    },
+    {
+      "line": 79,
+      "text": "#: The replay restates a transcript; it needs the smallest reasoning budget, not the stage's."
+    },
+    {
+      "line": 83,
+      "text": "#: Routes already warned that require_graph stood down for a degenerate graph."
+    },
+    {
+      "line": 86,
+      "text": "#: Appended to the retry prompt: the fresh call has no memory of the hollow one, and no tools."
+    },
+    {
+      "line": 101,
+      "text": "# This is the cut-and-report that step2.deadline approximated from OUTSIDE the session. The"
+    },
+    {
+      "line": 102,
+      "text": "# budget does it from INSIDE: same conversation, same message objects, prompt cache intact,"
+    },
+    {
+      "line": 103,
+      "text": "# no second API call. A wall clock cannot do that -- it can only kill and re-ask."
+    },
+    {
+      "line": 144,
+      "text": "# Tools stay registered on a degenerate graph; the prompt stops selling them as reliable"
+    },
+    {
+      "line": 158,
+      "text": "# Standing down drops only the tool half: EvidenceGate._premature still checks the todos"
+    },
+    {
+      "line": 186,
+      "text": "# RESPONSE_MODEL_VIAS, not a local set: s2/s4/s6 must agree on the same route or a scan splits"
+    },
+    {
+      "line": 223,
+      "text": "# LOWEST effort: the reasoning already happened in the killed session and is IN the transcript,"
+    },
+    {
+      "line": 224,
+      "text": "# so a high budget pays for the same reasoning twice."
+    },
+    {
+      "line": 258,
+      "text": "# via:cli honours it verbatim; else read-only, so graph names go via fact_tools/tool_builder"
+    },
+    {
+      "line": 265,
+      "text": "# step2.timeout binds via:cli and via:deepagents; sdk/openai rely on max_turns alone"
+    },
+    {
+      "line": 269,
+      "text": "# knob() not getattr: a null overlay must give 64000, not None -> internal 16000"
+    },
+    {
+      "line": 330,
+      "text": "# Zero threats on a zero-file repo is honest: a retry carries the same empty inventory"
+    },
+    {
+      "line": 342,
+      "text": "# Keep the first model; run() logs the loss once, so no errlog (one hollow != 2 failures)"
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 18,
+      "line_end": 18,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 26,
+      "line_end": 26,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 27,
+      "line_end": 27,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 28,
+      "line_end": 28,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 29,
+      "line_end": 29,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 30,
+      "line_end": 30,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 31,
+      "line_end": 31,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 32,
+      "line_end": 32,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 33,
+      "line_end": 33,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 34,
+      "line_end": 38,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 39,
+      "line_end": 39,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 40,
+      "line_end": 40,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 41,
+      "line_end": 51,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 52,
+      "line_end": 52,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 53,
+      "line_end": 58,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 59,
+      "line_end": 61,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 10
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 62,
+      "line_end": 64,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 10
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 65,
+      "line_end": 65,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 10
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 66,
+      "line_end": 66,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 10
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 67,
+      "line_end": 67,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 10
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 68,
+      "line_end": 68,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 12
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 69,
+      "line_end": 69,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 12
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 70,
+      "line_end": 70,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 12
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 71,
+      "line_end": 71,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 12
+    },
+    {
+      "kind": "Assign",
+      "line_start": 73,
+      "line_end": 73,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 12
+    },
+    {
+      "kind": "Assign",
+      "line_start": 75,
+      "line_end": 75,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 14
+    },
+    {
+      "kind": "Assign",
+      "line_start": 77,
+      "line_end": 77,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 14
+    },
+    {
+      "kind": "Assign",
+      "line_start": 80,
+      "line_end": 80,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 14
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 81,
+      "line_end": 81,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 14
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 84,
+      "line_end": 84,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 14
+    },
+    {
+      "kind": "Assign",
+      "line_start": 87,
+      "line_end": 96,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 16
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 99,
+      "line_end": 109,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 17
+    },
+    {
+      "kind": "Expr",
+      "line_start": 100,
+      "line_end": 100,
+      "column": 4,
+      "owner": "_call_budget",
+      "representation_line": 23
+    },
+    {
+      "kind": "Assign",
+      "line_start": 104,
+      "line_end": 104,
+      "column": 4,
+      "owner": "_call_budget",
+      "representation_line": 23
+    },
+    {
+      "kind": "If",
+      "line_start": 105,
+      "line_end": 106,
+      "column": 4,
+      "owner": "_call_budget",
+      "representation_line": 24
+    },
+    {
+      "kind": "Return",
+      "line_start": 106,
+      "line_end": 106,
+      "column": 8,
+      "owner": "_call_budget",
+      "representation_line": 26
+    },
+    {
+      "kind": "Return",
+      "line_start": 107,
+      "line_end": 109,
+      "column": 4,
+      "owner": "_call_budget",
+      "representation_line": 29
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 112,
+      "line_end": 124,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 33
+    },
+    {
+      "kind": "Expr",
+      "line_start": 113,
+      "line_end": 113,
+      "column": 4,
+      "owner": "_graph_tool_route_ok",
+      "representation_line": 39
+    },
+    {
+      "kind": "Assign",
+      "line_start": 114,
+      "line_end": 114,
+      "column": 4,
+      "owner": "_graph_tool_route_ok",
+      "representation_line": 39
+    },
+    {
+      "kind": "Assign",
+      "line_start": 115,
+      "line_end": 115,
+      "column": 4,
+      "owner": "_graph_tool_route_ok",
+      "representation_line": 39
+    },
+    {
+      "kind": "If",
+      "line_start": 116,
+      "line_end": 117,
+      "column": 4,
+      "owner": "_graph_tool_route_ok",
+      "representation_line": 40
+    },
+    {
+      "kind": "Return",
+      "line_start": 117,
+      "line_end": 117,
+      "column": 8,
+      "owner": "_graph_tool_route_ok",
+      "representation_line": 42
+    },
+    {
+      "kind": "Expr",
+      "line_start": 118,
+      "line_end": 123,
+      "column": 4,
+      "owner": "_graph_tool_route_ok",
+      "representation_line": 46
+    },
+    {
+      "kind": "Return",
+      "line_start": 124,
+      "line_end": 124,
+      "column": 4,
+      "owner": "_graph_tool_route_ok",
+      "representation_line": 47
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 127,
+      "line_end": 217,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 51
+    },
+    {
+      "kind": "Expr",
+      "line_start": 131,
+      "line_end": 131,
+      "column": 4,
+      "owner": "_threatmodel_call",
+      "representation_line": 57
+    },
+    {
+      "kind": "Assign",
+      "line_start": 132,
+      "line_end": 132,
+      "column": 4,
+      "owner": "_threatmodel_call",
+      "representation_line": 57
+    },
+    {
+      "kind": "Assign",
+      "line_start": 133,
+      "line_end": 133,
+      "column": 4,
+      "owner": "_threatmodel_call",
+      "representation_line": 57
+    },
+    {
+      "kind": "Assign",
+      "line_start": 134,
+      "line_end": 134,
+      "column": 4,
+      "owner": "_threatmodel_call",
+      "representation_line": 57
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 135,
+      "line_end": 135,
+      "column": 4,
+      "owner": "_threatmodel_call",
+      "representation_line": 57
+    },
+    {
+      "kind": "Assign",
+      "line_start": 136,
+      "line_end": 136,
+      "column": 4,
+      "owner": "_threatmodel_call",
+      "representation_line": 59
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 137,
+      "line_end": 137,
+      "column": 4,
+      "owner": "_threatmodel_call",
+      "representation_line": 59
+    },
+    {
+      "kind": "Assign",
+      "line_start": 138,
+      "line_end": 138,
+      "column": 4,
+      "owner": "_threatmodel_call",
+      "representation_line": 59
+    },
+    {
+      "kind": "If",
+      "line_start": 139,
+      "line_end": 176,
+      "column": 4,
+      "owner": "_threatmodel_call",
+      "representation_line": 60
+    },
+    {
+      "kind": "Assign",
+      "line_start": 142,
+      "line_end": 142,
+      "column": 8,
+      "owner": "_threatmodel_call",
+      "representation_line": 63
+    },
+    {
+      "kind": "Assign",
+      "line_start": 143,
+      "line_end": 143,
+      "column": 8,
+      "owner": "_threatmodel_call",
+      "representation_line": 63
+    },
+    {
+      "kind": "Assign",
+      "line_start": 145,
+      "line_end": 145,
+      "column": 8,
+      "owner": "_threatmodel_call",
+      "representation_line": 63
+    },
+    {
+      "kind": "Assign",
+      "line_start": 146,
+      "line_end": 146,
+      "column": 8,
+      "owner": "_threatmodel_call",
+      "representation_line": 63
+    },
+    {
+      "kind": "Assign",
+      "line_start": 147,
+      "line_end": 151,
+      "column": 8,
+      "owner": "_threatmodel_call",
+      "representation_line": 63
+    },
+    {
+      "kind": "If",
+      "line_start": 152,
+      "line_end": 156,
+      "column": 8,
+      "owner": "_threatmodel_call",
+      "representation_line": 64
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 153,
+      "line_end": 156,
+      "column": 12,
+      "owner": "_threatmodel_call",
+      "representation_line": 67
+    },
+    {
+      "kind": "If",
+      "line_start": 157,
+      "line_end": 176,
+      "column": 8,
+      "owner": "_threatmodel_call",
+      "representation_line": 69
+    },
+    {
+      "kind": "Assign",
+      "line_start": 159,
+      "line_end": 159,
+      "column": 12,
+      "owner": "_threatmodel_call",
+      "representation_line": 72
+    },
+    {
+      "kind": "If",
+      "line_start": 160,
+      "line_end": 168,
+      "column": 12,
+      "owner": "_threatmodel_call",
+      "representation_line": 73
+    },
+    {
+      "kind": "Expr",
+      "line_start": 161,
+      "line_end": 166,
+      "column": 16,
+      "owner": "_threatmodel_call",
+      "representation_line": 76
+    },
+    {
+      "kind": "Expr",
+      "line_start": 167,
+      "line_end": 167,
+      "column": 16,
+      "owner": "_threatmodel_call",
+      "representation_line": 76
+    },
+    {
+      "kind": "Assign",
+      "line_start": 168,
+      "line_end": 168,
+      "column": 16,
+      "owner": "_threatmodel_call",
+      "representation_line": 76
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 169,
+      "line_end": 175,
+      "column": 12,
+      "owner": "_threatmodel_call",
+      "representation_line": 79
+    },
+    {
+      "kind": "Assign",
+      "line_start": 176,
+      "line_end": 176,
+      "column": 12,
+      "owner": "_threatmodel_call",
+      "representation_line": 79
+    },
+    {
+      "kind": "If",
+      "line_start": 177,
+      "line_end": 184,
+      "column": 4,
+      "owner": "_threatmodel_call",
+      "representation_line": 82
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 178,
+      "line_end": 184,
+      "column": 8,
+      "owner": "_threatmodel_call",
+      "representation_line": 85
+    },
+    {
+      "kind": "Assign",
+      "line_start": 185,
+      "line_end": 185,
+      "column": 4,
+      "owner": "_threatmodel_call",
+      "representation_line": 88
+    },
+    {
+      "kind": "Assign",
+      "line_start": 187,
+      "line_end": 190,
+      "column": 4,
+      "owner": "_threatmodel_call",
+      "representation_line": 88
+    },
+    {
+      "kind": "Assign",
+      "line_start": 191,
+      "line_end": 192,
+      "column": 4,
+      "owner": "_threatmodel_call",
+      "representation_line": 88
+    },
+    {
+      "kind": "Assign",
+      "line_start": 193,
+      "line_end": 193,
+      "column": 4,
+      "owner": "_threatmodel_call",
+      "representation_line": 88
+    },
+    {
+      "kind": "Assign",
+      "line_start": 194,
+      "line_end": 194,
+      "column": 4,
+      "owner": "_threatmodel_call",
+      "representation_line": 88
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 195,
+      "line_end": 195,
+      "column": 4,
+      "owner": "_threatmodel_call",
+      "representation_line": 90
+    },
+    {
+      "kind": "Assign",
+      "line_start": 196,
+      "line_end": 196,
+      "column": 4,
+      "owner": "_threatmodel_call",
+      "representation_line": 90
+    },
+    {
+      "kind": "If",
+      "line_start": 197,
+      "line_end": 198,
+      "column": 4,
+      "owner": "_threatmodel_call",
+      "representation_line": 91
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 198,
+      "line_end": 198,
+      "column": 8,
+      "owner": "_threatmodel_call",
+      "representation_line": 94
+    },
+    {
+      "kind": "Assign",
+      "line_start": 199,
+      "line_end": 199,
+      "column": 4,
+      "owner": "_threatmodel_call",
+      "representation_line": 97
+    },
+    {
+      "kind": "Assign",
+      "line_start": 200,
+      "line_end": 200,
+      "column": 4,
+      "owner": "_threatmodel_call",
+      "representation_line": 97
+    },
+    {
+      "kind": "Try",
+      "line_start": 201,
+      "line_end": 217,
+      "column": 4,
+      "owner": "_threatmodel_call",
+      "representation_line": 98
+    },
+    {
+      "kind": "Return",
+      "line_start": 202,
+      "line_end": 206,
+      "column": 8,
+      "owner": "_threatmodel_call",
+      "representation_line": 100
+    },
+    {
+      "kind": "Expr",
+      "line_start": 208,
+      "line_end": 209,
+      "column": 8,
+      "owner": "_threatmodel_call",
+      "representation_line": 106
+    },
+    {
+      "kind": "Return",
+      "line_start": 210,
+      "line_end": 215,
+      "column": 8,
+      "owner": "_threatmodel_call",
+      "representation_line": 107
+    },
+    {
+      "kind": "Expr",
+      "line_start": 217,
+      "line_end": 217,
+      "column": 8,
+      "owner": "_threatmodel_call",
+      "representation_line": 112
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 220,
+      "line_end": 244,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 116
+    },
+    {
+      "kind": "Expr",
+      "line_start": 222,
+      "line_end": 222,
+      "column": 4,
+      "owner": "_replay_leg",
+      "representation_line": 122
+    },
+    {
+      "kind": "Assign",
+      "line_start": 225,
+      "line_end": 225,
+      "column": 4,
+      "owner": "_replay_leg",
+      "representation_line": 122
+    },
+    {
+      "kind": "Expr",
+      "line_start": 226,
+      "line_end": 226,
+      "column": 4,
+      "owner": "_replay_leg",
+      "representation_line": 122
+    },
+    {
+      "kind": "Assign",
+      "line_start": 227,
+      "line_end": 227,
+      "column": 4,
+      "owner": "_replay_leg",
+      "representation_line": 122
+    },
+    {
+      "kind": "Assign",
+      "line_start": 228,
+      "line_end": 242,
+      "column": 4,
+      "owner": "_replay_leg",
+      "representation_line": 122
+    },
+    {
+      "kind": "Expr",
+      "line_start": 243,
+      "line_end": 243,
+      "column": 4,
+      "owner": "_replay_leg",
+      "representation_line": 124
+    },
+    {
+      "kind": "Return",
+      "line_start": 244,
+      "line_end": 244,
+      "column": 4,
+      "owner": "_replay_leg",
+      "representation_line": 125
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 247,
+      "line_end": 281,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 129
+    },
+    {
+      "kind": "Expr",
+      "line_start": 251,
+      "line_end": 251,
+      "column": 4,
+      "owner": "_agentic_leg",
+      "representation_line": 135
+    },
+    {
+      "kind": "Assign",
+      "line_start": 252,
+      "line_end": 252,
+      "column": 4,
+      "owner": "_agentic_leg",
+      "representation_line": 135
+    },
+    {
+      "kind": "Return",
+      "line_start": 253,
+      "line_end": 281,
+      "column": 4,
+      "owner": "_agentic_leg",
+      "representation_line": 136
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 284,
+      "line_end": 308,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 140
+    },
+    {
+      "kind": "Expr",
+      "line_start": 285,
+      "line_end": 293,
+      "column": 4,
+      "owner": "_snapshot_leg",
+      "representation_line": 146
+    },
+    {
+      "kind": "Assign",
+      "line_start": 294,
+      "line_end": 294,
+      "column": 4,
+      "owner": "_snapshot_leg",
+      "representation_line": 146
+    },
+    {
+      "kind": "Assign",
+      "line_start": 295,
+      "line_end": 295,
+      "column": 4,
+      "owner": "_snapshot_leg",
+      "representation_line": 146
+    },
+    {
+      "kind": "Return",
+      "line_start": 296,
+      "line_end": 308,
+      "column": 4,
+      "owner": "_snapshot_leg",
+      "representation_line": 147
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 311,
+      "line_end": 317,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 151
+    },
+    {
+      "kind": "Expr",
+      "line_start": 312,
+      "line_end": 312,
+      "column": 4,
+      "owner": "_hollow_reason",
+      "representation_line": 157
+    },
+    {
+      "kind": "If",
+      "line_start": 313,
+      "line_end": 314,
+      "column": 4,
+      "owner": "_hollow_reason",
+      "representation_line": 158
+    },
+    {
+      "kind": "Return",
+      "line_start": 314,
+      "line_end": 314,
+      "column": 8,
+      "owner": "_hollow_reason",
+      "representation_line": 160
+    },
+    {
+      "kind": "If",
+      "line_start": 315,
+      "line_end": 316,
+      "column": 4,
+      "owner": "_hollow_reason",
+      "representation_line": 163
+    },
+    {
+      "kind": "Return",
+      "line_start": 316,
+      "line_end": 316,
+      "column": 8,
+      "owner": "_hollow_reason",
+      "representation_line": 165
+    },
+    {
+      "kind": "Return",
+      "line_start": 317,
+      "line_end": 317,
+      "column": 4,
+      "owner": "_hollow_reason",
+      "representation_line": 168
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 320,
+      "line_end": 355,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 172
+    },
+    {
+      "kind": "Expr",
+      "line_start": 323,
+      "line_end": 323,
+      "column": 4,
+      "owner": "_retry_if_hollow",
+      "representation_line": 178
+    },
+    {
+      "kind": "Assign",
+      "line_start": 324,
+      "line_end": 324,
+      "column": 4,
+      "owner": "_retry_if_hollow",
+      "representation_line": 178
+    },
+    {
+      "kind": "If",
+      "line_start": 325,
+      "line_end": 326,
+      "column": 4,
+      "owner": "_retry_if_hollow",
+      "representation_line": 179
+    },
+    {
+      "kind": "Return",
+      "line_start": 326,
+      "line_end": 326,
+      "column": 8,
+      "owner": "_retry_if_hollow",
+      "representation_line": 181
+    },
+    {
+      "kind": "Assign",
+      "line_start": 327,
+      "line_end": 327,
+      "column": 4,
+      "owner": "_retry_if_hollow",
+      "representation_line": 185
+    },
+    {
+      "kind": "If",
+      "line_start": 328,
+      "line_end": 329,
+      "column": 4,
+      "owner": "_retry_if_hollow",
+      "representation_line": 186
+    },
+    {
+      "kind": "Return",
+      "line_start": 329,
+      "line_end": 329,
+      "column": 8,
+      "owner": "_retry_if_hollow",
+      "representation_line": 188
+    },
+    {
+      "kind": "If",
+      "line_start": 331,
+      "line_end": 332,
+      "column": 4,
+      "owner": "_retry_if_hollow",
+      "representation_line": 191
+    },
+    {
+      "kind": "Return",
+      "line_start": 332,
+      "line_end": 332,
+      "column": 8,
+      "owner": "_retry_if_hollow",
+      "representation_line": 193
+    },
+    {
+      "kind": "Expr",
+      "line_start": 333,
+      "line_end": 333,
+      "column": 4,
+      "owner": "_retry_if_hollow",
+      "representation_line": 197
+    },
+    {
+      "kind": "Expr",
+      "line_start": 334,
+      "line_end": 334,
+      "column": 4,
+      "owner": "_retry_if_hollow",
+      "representation_line": 197
+    },
+    {
+      "kind": "Expr",
+      "line_start": 335,
+      "line_end": 335,
+      "column": 4,
+      "owner": "_retry_if_hollow",
+      "representation_line": 197
+    },
+    {
+      "kind": "Try",
+      "line_start": 336,
+      "line_end": 344,
+      "column": 4,
+      "owner": "_retry_if_hollow",
+      "representation_line": 198
+    },
+    {
+      "kind": "Assign",
+      "line_start": 337,
+      "line_end": 338,
+      "column": 8,
+      "owner": "_retry_if_hollow",
+      "representation_line": 201
+    },
+    {
+      "kind": "If",
+      "line_start": 340,
+      "line_end": 341,
+      "column": 8,
+      "owner": "_retry_if_hollow",
+      "representation_line": 205
+    },
+    {
+      "kind": "Raise",
+      "line_start": 341,
+      "line_end": 341,
+      "column": 12,
+      "owner": "_retry_if_hollow",
+      "representation_line": 207
+    },
+    {
+      "kind": "Expr",
+      "line_start": 343,
+      "line_end": 343,
+      "column": 8,
+      "owner": "_retry_if_hollow",
+      "representation_line": 211
+    },
+    {
+      "kind": "Return",
+      "line_start": 344,
+      "line_end": 344,
+      "column": 8,
+      "owner": "_retry_if_hollow",
+      "representation_line": 212
+    },
+    {
+      "kind": "Expr",
+      "line_start": 345,
+      "line_end": 345,
+      "column": 4,
+      "owner": "_retry_if_hollow",
+      "representation_line": 216
+    },
+    {
+      "kind": "Assign",
+      "line_start": 346,
+      "line_end": 346,
+      "column": 4,
+      "owner": "_retry_if_hollow",
+      "representation_line": 216
+    },
+    {
+      "kind": "If",
+      "line_start": 347,
+      "line_end": 350,
+      "column": 4,
+      "owner": "_retry_if_hollow",
+      "representation_line": 217
+    },
+    {
+      "kind": "Expr",
+      "line_start": 348,
+      "line_end": 348,
+      "column": 8,
+      "owner": "_retry_if_hollow",
+      "representation_line": 220
+    },
+    {
+      "kind": "Expr",
+      "line_start": 349,
+      "line_end": 349,
+      "column": 8,
+      "owner": "_retry_if_hollow",
+      "representation_line": 220
+    },
+    {
+      "kind": "Return",
+      "line_start": 350,
+      "line_end": 350,
+      "column": 8,
+      "owner": "_retry_if_hollow",
+      "representation_line": 221
+    },
+    {
+      "kind": "Expr",
+      "line_start": 351,
+      "line_end": 351,
+      "column": 4,
+      "owner": "_retry_if_hollow",
+      "representation_line": 225
+    },
+    {
+      "kind": "Expr",
+      "line_start": 352,
+      "line_end": 354,
+      "column": 4,
+      "owner": "_retry_if_hollow",
+      "representation_line": 225
+    },
+    {
+      "kind": "Raise",
+      "line_start": 355,
+      "line_end": 355,
+      "column": 4,
+      "owner": "_retry_if_hollow",
+      "representation_line": 226
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 73,
+      "line_end": 73,
+      "column": 6,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='logs', ctx=Load()), attr='get_logger', ctx=Load()), args=[Name(id='__name__', ctx=Load())], keywords=[])",
+      "rendered": "logs.get_logger(__name__)"
+    },
+    {
+      "line_start": 75,
+      "line_end": 75,
+      "column": 16,
+      "kind": "Constant",
+      "original_ast": "Constant(value='s2 threatmodel')",
+      "rendered": "'s2 threatmodel'"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 14,
+      "kind": "Constant",
+      "original_ast": "Constant(value='s2-threatmodel')",
+      "rendered": "'s2-threatmodel'"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 17,
+      "kind": "Constant",
+      "original_ast": "Constant(value='low')",
+      "rendered": "'low'"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 35,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 84,
+      "line_end": 84,
+      "column": 37,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 87,
+      "line_end": 96,
+      "column": 27,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='no_threats'), Constant(value='no_validated_surface')], values=[Constant(value='A previous attempt returned a threat model with zero threats. This call has no tools: model the system from the snapshot above, naming surface_files only from FILE INVENTORY.'), Constant(value='A previous attempt returned threats, but not one named a surface_files path that exists in the FILE INVENTORY, so every threat was unusable and no later stage could act on any of them. This call has no tools: model the system from the snapshot above, and give each threat at least one surface_files path copied EXACTLY from FILE INVENTORY.')])",
+      "rendered": "{'no_threats': source_literal_89_8, 'no_validated_surface': source_literal_92_8}"
+    },
+    {
+      "line_start": 104,
+      "line_end": 104,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='max_model_calls'), Constant(value=0)], keywords=[])",
+      "rendered": "_cap_int(s2, 'max_model_calls', 0)"
+    },
+    {
+      "line_start": 105,
+      "line_end": 105,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='limit', ctx=Load()), ops=[LtE()], comparators=[Constant(value=0)])",
+      "rendered": "limit <= 0"
+    },
+    {
+      "line_start": 106,
+      "line_end": 106,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 107,
+      "line_end": 109,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ModelCallBudget', ctx=Load()), args=[], keywords=[keyword(arg='limit', value=Name(id='limit', ctx=Load())), keyword(arg='outcome_tools', value=Call(func=Name(id='frozenset', ctx=Load()), args=[Set(elts=[Attribute(value=Name(id='ThreatModel', ctx=Load()), attr='__name__', ctx=Load())])], keywords=[])), keyword(arg='counter', value=Constant(value='s2_model_call_budget_final_turn'))])",
+      "rendered": "ModelCallBudget(limit=limit, outcome_tools=frozenset({ThreatModel.__name__}), counter='s2_model_call_budget_final_turn')"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 10,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Call(func=Name(id='resolve', ctx=Load()), args=[Attribute(value=Attribute(value=Name(id='cfg', ctx=Load()), attr='models', ctx=Load()), attr='threatmodel', ctx=Load())], keywords=[]), attr='via', ctx=Load())",
+      "rendered": "resolve(cfg.models.threatmodel).via"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_deepagents', ctx=Load()), attr='route_carries_tools', ctx=Load()), args=[Name(id='cfg', ctx=Load()), Name(id='via', ctx=Load())], keywords=[])",
+      "rendered": "_deepagents.route_carries_tools(cfg, via)"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='ok', ctx=Load())",
+      "rendered": "ok"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 118,
+      "line_end": 123,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='warn_once', ctx=Load()), args=[Name(id='_WARNED_NO_GRAPH_TOOLS', ctx=Load()), JoinedStr(values=[FormattedValue(value=Name(id='via', ctx=Load()), conversion=-1), Constant(value=':'), FormattedValue(value=Name(id='agentic', ctx=Load()), conversion=-1)]), JoinedStr(values=[Constant(value='WARN [s2]: step2.graph_tools is on and a code graph exists, but '), FormattedValue(value=Name(id='reason', ctx=Load()), conversion=-1), Constant(value=' — running S2 without the graph tools, and NOT telling the model about tools it cannot call. To use them: route models.threatmodel via: deepagents.')])], keywords=[])",
+      "rendered": "warn_once(_WARNED_NO_GRAPH_TOOLS, source_template_119_32, source_template_120_8)"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 11,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='cfg', ctx=Load()), Constant(value='step2'), Constant(value=None)], keywords=[])",
+      "rendered": "getattr(cfg, 'step2', None)"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 10,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Call(func=Name(id='resolve', ctx=Load()), args=[Attribute(value=Attribute(value=Name(id='cfg', ctx=Load()), attr='models', ctx=Load()), attr='threatmodel', ctx=Load())], keywords=[]), attr='via', ctx=Load())",
+      "rendered": "resolve(cfg.models.threatmodel).via"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 34,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[], ctx=Load())",
+      "rendered": "()"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 23,
+      "kind": "Constant",
+      "original_ast": "Constant(value='')",
+      "rendered": "''"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 52,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[], ctx=Load())",
+      "rendered": "()"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 21,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 139,
+      "line_end": 141,
+      "column": 8,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='ctx', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), Compare(left=Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='ctx', ctx=Load()), Constant(value='graph_handle'), Constant(value=None)], keywords=[]), ops=[IsNot()], comparators=[Constant(value=None)]), Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='graph_tools'), Constant(value=True)], keywords=[]), Call(func=Name(id='_graph_tool_route_ok', ctx=Load()), args=[Name(id='cfg', ctx=Load())], keywords=[keyword(arg='agentic', value=Constant(value=True))])])",
+      "rendered": "ctx is not None and getattr(ctx, 'graph_handle', None) is not None and getattr(s2, 'graph_tools', True) and _graph_tool_route_ok(cfg, agentic=True)"
+    },
+    {
+      "line_start": 142,
+      "line_end": 142,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='build_graph_tool_builder', ctx=Load()), args=[Name(id='ctx', ctx=Load())], keywords=[])",
+      "rendered": "build_graph_tool_builder(ctx)"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='graph_tool_names', ctx=Load()), args=[], keywords=[])",
+      "rendered": "graph_tool_names()"
+    },
+    {
+      "line_start": 145,
+      "line_end": 145,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='graph_is_degenerate', ctx=Load()), args=[Name(id='ctx', ctx=Load()), Name(id='cfg', ctx=Load())], keywords=[])",
+      "rendered": "graph_is_degenerate(ctx, cfg)"
+    },
+    {
+      "line_start": 146,
+      "line_end": 146,
+      "column": 27,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='degenerate', ctx=Load()), body=Constant(value=''), orelse=Name(id='_GRAPH_TOOLS_SYSTEM_LINE', ctx=Load()))",
+      "rendered": "'' if degenerate else _GRAPH_TOOLS_SYSTEM_LINE"
+    },
+    {
+      "line_start": 147,
+      "line_end": 151,
+      "column": 28,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Call(func=Name(id='ToolCallBudget', ctx=Load()), args=[Call(func=Name(id='frozenset', ctx=Load()), args=[Call(func=Name(id='graph_tool_names', ctx=Load()), args=[], keywords=[])], keywords=[])], keywords=[keyword(arg='limit', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='graph_tool_budget'), Constant(value=6)], keywords=[])), keyword(arg='counter', value=Constant(value='s2_graph_tool_budget_exhausted'))])], ctx=Load())",
+      "rendered": "(ToolCallBudget(frozenset(graph_tool_names()), limit=_cap_int(s2, 'graph_tool_budget', 6), counter='s2_graph_tool_budget_exhausted'),)"
+    },
+    {
+      "line_start": 152,
+      "line_end": 152,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='planning'), Constant(value=True)], keywords=[])",
+      "rendered": "getattr(s2, 'planning', True)"
+    },
+    {
+      "line_start": 153,
+      "line_end": 156,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='parent_middleware', ctx=Store()), op=Add(), value=Tuple(elts=[Call(func=Name(id='TodoListMiddleware', ctx=Load()), args=[], keywords=[keyword(arg='system_prompt', value=Name(id='S2_PLAN_SYSTEM_PROMPT', ctx=Load())), keyword(arg='tool_description', value=Name(id='S2_PLAN_TOOL_DESCRIPTION', ctx=Load()))])], ctx=Load()))",
+      "rendered": "parent_middleware += (TodoListMiddleware(system_prompt=S2_PLAN_SYSTEM_PROMPT, tool_description=S2_PLAN_TOOL_DESCRIPTION),)"
+    },
+    {
+      "line_start": 157,
+      "line_end": 157,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='require_graph'), Constant(value=True)], keywords=[])",
+      "rendered": "getattr(s2, 'require_graph', True)"
+    },
+    {
+      "line_start": 159,
+      "line_end": 159,
+      "column": 29,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='frozenset', ctx=Load()), args=[Name(id='GRAPH_TOOL_NAMES', ctx=Load())], keywords=[])",
+      "rendered": "frozenset(GRAPH_TOOL_NAMES)"
+    },
+    {
+      "line_start": 160,
+      "line_end": 160,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='degenerate', ctx=Load())",
+      "rendered": "degenerate"
+    },
+    {
+      "line_start": 161,
+      "line_end": 166,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='warn_once', ctx=Load()), args=[Name(id='_WARNED_DEGENERATE_GRAPH', ctx=Load()), Constant(value='s2-require-graph'), Constant(value='WARN [s2]: step2.require_graph is on but the code graph is absent or degenerate (zero edges, or fewer nodes than step0.min_graph_nodes_for_gate) — standing the graph-tool requirement down; the todo-list gate still applies.')], keywords=[])",
+      "rendered": "warn_once(_WARNED_DEGENERATE_GRAPH, 's2-require-graph', source_literal_163_20)"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Constant(value='evidence_gate_stood_down_degenerate_graph')], keywords=[])",
+      "rendered": "COUNTERS.bump('evidence_gate_stood_down_degenerate_graph')"
+    },
+    {
+      "line_start": 168,
+      "line_end": 168,
+      "column": 33,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='frozenset', ctx=Load()), args=[], keywords=[])",
+      "rendered": "frozenset()"
+    },
+    {
+      "line_start": 169,
+      "line_end": 175,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='parent_middleware', ctx=Store()), op=Add(), value=Tuple(elts=[Call(func=Name(id='EvidenceGate', ctx=Load()), args=[], keywords=[keyword(arg='max_rejections', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='require_graph_rejections'), Constant(value=2)], keywords=[])), keyword(arg='counter', value=Constant(value='s2_evidence_gate_rejected')), keyword(arg='required_tools', value=Name(id='required_tools', ctx=Load())), keyword(arg='require_tool_call', value=Name(id='require_tool_call', ctx=Load())), keyword(arg='ignored_tools', value=Call(func=Name(id='frozenset', ctx=Load()), args=[Set(elts=[Constant(value='write_todos'), Attribute(value=Name(id='ThreatModel', ctx=Load()), attr='__name__', ctx=Load())])], keywords=[]))])], ctx=Load()))",
+      "rendered": "parent_middleware += (EvidenceGate(max_rejections=_cap_int(s2, 'require_graph_rejections', 2), counter='s2_evidence_gate_rejected', required_tools=required_tools, require_tool_call=require_tool_call, ignored_tools=frozenset({'write_todos', ThreatModel.__name__})),)"
+    },
+    {
+      "line_start": 176,
+      "line_end": 176,
+      "column": 29,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[UnaryOp(op=Not(), operand=Name(id='gate_installed', ctx=Load())), Name(id='require_tool_call', ctx=Load()), Compare(left=Name(id='via', ctx=Load()), ops=[Eq()], comparators=[Constant(value='deepagents')])])",
+      "rendered": "not gate_installed and require_tool_call and (via == 'deepagents')"
+    },
+    {
+      "line_start": 178,
+      "line_end": 184,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='parent_middleware', ctx=Store()), op=Add(), value=Tuple(elts=[Call(func=Name(id='EvidenceGate', ctx=Load()), args=[], keywords=[keyword(arg='max_rejections', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='require_graph_rejections'), Constant(value=2)], keywords=[])), keyword(arg='counter', value=Constant(value='s2_evidence_gate_rejected')), keyword(arg='required_tools', value=Call(func=Name(id='frozenset', ctx=Load()), args=[], keywords=[])), keyword(arg='require_tool_call', value=Constant(value=True)), keyword(arg='ignored_tools', value=Call(func=Name(id='frozenset', ctx=Load()), args=[Set(elts=[Constant(value='write_todos'), Attribute(value=Name(id='ThreatModel', ctx=Load()), attr='__name__', ctx=Load())])], keywords=[]))])], ctx=Load()))",
+      "rendered": "parent_middleware += (EvidenceGate(max_rejections=_cap_int(s2, 'require_graph_rejections', 2), counter='s2_evidence_gate_rejected', required_tools=frozenset(), require_tool_call=True, ignored_tools=frozenset({'write_todos', ThreatModel.__name__})),)"
+    },
+    {
+      "line_start": 185,
+      "line_end": 185,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='max_turns'), Constant(value=12)], keywords=[])",
+      "rendered": "_cap_int(s2, 'max_turns', 12)"
+    },
+    {
+      "line_start": 188,
+      "line_end": 189,
+      "column": 8,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=Name(id='via', ctx=Load()), ops=[In()], comparators=[Name(id='RESPONSE_MODEL_VIAS', ctx=Load())]), body=Name(id='ThreatModel', ctx=Load()), orelse=Constant(value=None))",
+      "rendered": "ThreatModel if via in RESPONSE_MODEL_VIAS else None"
+    },
+    {
+      "line_start": 191,
+      "line_end": 192,
+      "column": 21,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=BinOp(left=BinOp(left=Name(id='SYSTEM', ctx=Load()), op=Add(), right=Name(id='_AGENTIC_SYSTEM_LINE', ctx=Load())), op=Add(), right=Name(id='graph_tools_line', ctx=Load())), op=Add(), right=IfExp(test=Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='bash'), Constant(value=False)], keywords=[]), body=Name(id='_SHELL_SYSTEM_LINE', ctx=Load()), orelse=Constant(value='')))",
+      "rendered": "SYSTEM + _AGENTIC_SYSTEM_LINE + graph_tools_line + (_SHELL_SYSTEM_LINE if getattr(s2, 'bash', False) else '')"
+    },
+    {
+      "line_start": 193,
+      "line_end": 193,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='session_id_for', ctx=Load()), args=[Constant(value='s2'), Constant(value='threatmodel')], keywords=[])",
+      "rendered": "session_id_for('s2', 'threatmodel')"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='Transcript', ctx=Load()), args=[], keywords=[])",
+      "rendered": "Transcript()"
+    },
+    {
+      "line_start": 195,
+      "line_end": 195,
+      "column": 4,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='parent_middleware', ctx=Store()), op=Add(), value=Tuple(elts=[Call(func=Name(id='RecordTranscript', ctx=Load()), args=[Name(id='transcript', ctx=Load())], keywords=[])], ctx=Load()))",
+      "rendered": "parent_middleware += (RecordTranscript(transcript),)"
+    },
+    {
+      "line_start": 196,
+      "line_end": 196,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_call_budget', ctx=Load()), args=[Name(id='s2', ctx=Load())], keywords=[])",
+      "rendered": "_call_budget(s2)"
+    },
+    {
+      "line_start": 197,
+      "line_end": 197,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='budget', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "budget is not None"
+    },
+    {
+      "line_start": 198,
+      "line_end": 198,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='parent_middleware', ctx=Store()), op=Add(), value=Tuple(elts=[Name(id='budget', ctx=Load())], ctx=Load()))",
+      "rendered": "parent_middleware += (budget,)"
+    },
+    {
+      "line_start": 199,
+      "line_end": 199,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='deadline'), Constant(value=0)], keywords=[])",
+      "rendered": "_cap_int(s2, 'deadline', 0)"
+    },
+    {
+      "line_start": 200,
+      "line_end": 200,
+      "column": 13,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='drop_thinking', ctx=Load()), body=Constant(value=None), orelse=BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='effort'), Constant(value=None)], keywords=[]), Constant(value=None)]))",
+      "rendered": "None if drop_thinking else getattr(s2, 'effort', None) or None"
+    },
+    {
+      "line_start": 202,
+      "line_end": 206,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='run_with_deadline', ctx=Load()), args=[Lambda(args=arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]), body=Call(func=Name(id='_agentic_leg', ctx=Load()), args=[Name(id='user', ctx=Load()), Name(id='cfg', ctx=Load()), Name(id='repo_root', ctx=Load()), Name(id='system_prompt', ctx=Load()), Name(id='parent_middleware', ctx=Load()), Name(id='tool_builder', ctx=Load()), Name(id='fact_tools', ctx=Load()), Name(id='max_turns', ctx=Load()), Name(id='threat_model_arg', ctx=Load())], keywords=[keyword(arg='session_id', value=Name(id='session_id', ctx=Load())), keyword(arg='drop_thinking', value=Name(id='drop_thinking', ctx=Load()))]))], keywords=[keyword(arg='seconds', value=Name(id='deadline', ctx=Load())), keyword(arg='stage', value=Name(id='_DISPATCH_TAG', ctx=Load())), keyword(arg='effort', value=Name(id='effort', ctx=Load()))])",
+      "rendered": "run_with_deadline(lambda: _agentic_leg(user, cfg, repo_root, system_prompt, parent_middleware, tool_builder, fact_tools, max_turns, threat_model_arg, session_id=session_id, drop_thinking=drop_thinking), seconds=deadline, stage=_DISPATCH_TAG, effort=effort)"
+    },
+    {
+      "line_start": 207,
+      "line_end": 207,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='CallTimeoutError', ctx=Load())",
+      "rendered": "CallTimeoutError"
+    },
+    {
+      "line_start": 208,
+      "line_end": 209,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='  [s2] deadline '), FormattedValue(value=Name(id='deadline', ctx=Load()), conversion=-1), Constant(value='s hit — resuming the session (or re-asking from the transcript) for the threat model')])], keywords=[])",
+      "rendered": "console.write(source_template_208_22)"
+    },
+    {
+      "line_start": 210,
+      "line_end": 215,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='resume_or_replay', ctx=Load()), args=[Name(id='session_id', ctx=Load()), Lambda(args=arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]), body=Call(func=Name(id='_replay_leg', ctx=Load()), args=[Name(id='user', ctx=Load()), Name(id='cfg', ctx=Load()), Name(id='repo_root', ctx=Load()), Name(id='system_prompt', ctx=Load()), Name(id='transcript', ctx=Load())], keywords=[]))], keywords=[keyword(arg='model', value=Attribute(value=Attribute(value=Name(id='cfg', ctx=Load()), attr='models', ctx=Load()), attr='threatmodel', ctx=Load())), keyword(arg='cfg', value=Name(id='cfg', ctx=Load())), keyword(arg='instruction', value=Name(id='S2_REPLAY_INSTRUCTION', ctx=Load())), keyword(arg='stage', value=Constant(value='s2')), keyword(arg='tag', value=Name(id='_DISPATCH_TAG', ctx=Load())), keyword(arg='timeout', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='resume_timeout'), Constant(value=300)], keywords=[]))])",
+      "rendered": "resume_or_replay(session_id, lambda: _replay_leg(user, cfg, repo_root, system_prompt, transcript), model=cfg.models.threatmodel, cfg=cfg, instruction=S2_REPLAY_INSTRUCTION, stage='s2', tag=_DISPATCH_TAG, timeout=_cap_int(s2, 'resume_timeout', 300))"
+    },
+    {
+      "line_start": 217,
+      "line_end": 217,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='release_pinned_session', ctx=Load()), args=[Name(id='session_id', ctx=Load())], keywords=[])",
+      "rendered": "release_pinned_session(session_id)"
+    },
+    {
+      "line_start": 225,
+      "line_end": 225,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='cfg', ctx=Load()), Constant(value='step2'), Constant(value=None)], keywords=[])",
+      "rendered": "getattr(cfg, 'step2', None)"
+    },
+    {
+      "line_start": 226,
+      "line_end": 226,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Constant(value='s2_deadline_replay')], keywords=[])",
+      "rendered": "COUNTERS.bump('s2_deadline_replay')"
+    },
+    {
+      "line_start": 227,
+      "line_end": 227,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='time', ctx=Load()), attr='monotonic', ctx=Load()), args=[], keywords=[])",
+      "rendered": "time.monotonic()"
+    },
+    {
+      "line_start": 228,
+      "line_end": 242,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_deepagents', ctx=Load()), attr='dispatch_prompt', ctx=Load()), args=[Call(func=Name(id='replay_prompt', ctx=Load()), args=[Name(id='transcript', ctx=Load()), Name(id='user', ctx=Load())], keywords=[keyword(arg='instruction', value=Name(id='S2_REPLAY_INSTRUCTION', ctx=Load())), keyword(arg='stage', value=Constant(value='s2'))])], keywords=[keyword(arg='model', value=Attribute(value=Attribute(value=Name(id='cfg', ctx=Load()), attr='models', ctx=Load()), attr='threatmodel', ctx=Load())), keyword(arg='cfg', value=Name(id='cfg', ctx=Load())), keyword(arg='cwd', value=Name(id='repo_root', ctx=Load())), keyword(arg='system_prompt', value=Name(id='system_prompt', ctx=Load())), keyword(arg='max_tokens', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='replay_max_tokens'), Constant(value=16000)], keywords=[])), keyword(arg='timeout', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='replay_timeout'), Constant(value=300)], keywords=[])), keyword(arg='response_model', value=IfExp(test=Compare(left=Attribute(value=Call(func=Name(id='resolve', ctx=Load()), args=[Attribute(value=Attribute(value=Name(id='cfg', ctx=Load()), attr='models', ctx=Load()), attr='threatmodel', ctx=Load())], keywords=[]), attr='via', ctx=Load()), ops=[In()], comparators=[Name(id='RESPONSE_MODEL_VIAS', ctx=Load())]), body=Name(id='ThreatModel', ctx=Load()), orelse=Constant(value=None))), keyword(arg='tag', value=JoinedStr(values=[FormattedValue(value=Name(id='_DISPATCH_TAG', ctx=Load()), conversion=-1), Constant(value=' replay')])), keyword(arg='graph_name', value=Name(id='_GRAPH_NAME', ctx=Load())), keyword(arg='effort', value=Name(id='_REPLAY_EFFORT', ctx=Load()))])",
+      "rendered": "_deepagents.dispatch_prompt(replay_prompt(transcript, user, instruction=S2_REPLAY_INSTRUCTION, stage='s2'), model=cfg.models.threatmodel, cfg=cfg, cwd=repo_root, system_prompt=system_prompt, max_tokens=_cap_int(s2, 'replay_max_tokens', 16000), timeout=_cap_int(s2, 'replay_timeout', 300), response_model=ThreatModel if resolve(cfg.models.threatmodel).via in RESPONSE_MODEL_VIAS else None, tag=source_template_239_12, graph_name=_GRAPH_NAME, effort=_REPLAY_EFFORT)"
+    },
+    {
+      "line_start": 243,
+      "line_end": 243,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='  [s2] replay returned in '), FormattedValue(value=BinOp(left=Call(func=Attribute(value=Name(id='time', ctx=Load()), attr='monotonic', ctx=Load()), args=[], keywords=[]), op=Sub(), right=Name(id='started', ctx=Load())), conversion=-1, format_spec=JoinedStr(values=[Constant(value='.1f')])), Constant(value='s')])], keywords=[])",
+      "rendered": "console.write(source_template_243_18)"
+    },
+    {
+      "line_start": 244,
+      "line_end": 244,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='out', ctx=Load())",
+      "rendered": "out"
+    },
+    {
+      "line_start": 252,
+      "line_end": 252,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='cfg', ctx=Load()), Constant(value='step2'), Constant(value=None)], keywords=[])",
+      "rendered": "getattr(cfg, 'step2', None)"
+    },
+    {
+      "line_start": 253,
+      "line_end": 281,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_deepagents', ctx=Load()), attr='dispatch_agentic', ctx=Load()), args=[Name(id='user', ctx=Load())], keywords=[keyword(arg='model', value=Attribute(value=Attribute(value=Name(id='cfg', ctx=Load()), attr='models', ctx=Load()), attr='threatmodel', ctx=Load())), keyword(arg='cfg', value=Name(id='cfg', ctx=Load())), keyword(arg='system_prompt', value=Name(id='system_prompt', ctx=Load())), keyword(arg='allowed_tools', value=Call(func=Name(id='validate_detection_tools', ctx=Load()), args=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='allowed_tools'), Constant(value=None)], keywords=[])], keywords=[keyword(arg='config_key', value=Constant(value='step2.allowed_tools')), keyword(arg='via', value=Attribute(value=Call(func=Name(id='resolve', ctx=Load()), args=[Attribute(value=Attribute(value=Name(id='cfg', ctx=Load()), attr='models', ctx=Load()), attr='threatmodel', ctx=Load())], keywords=[]), attr='via', ctx=Load()))])), keyword(arg='cwd', value=Name(id='repo_root', ctx=Load())), keyword(arg='max_turns', value=Name(id='max_turns', ctx=Load())), keyword(arg='timeout', value=Call(func=Name(id='deadline_bound', ctx=Load()), args=[Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='timeout'), Constant(value=1800)], keywords=[]), Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='deadline'), Constant(value=0)], keywords=[]), IfExp(test=Name(id='drop_thinking', ctx=Load()), body=Constant(value=None), orelse=BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='effort'), Constant(value=None)], keywords=[]), Constant(value=None)]))], keywords=[keyword(arg='via', value=Attribute(value=Call(func=Name(id='resolve', ctx=Load()), args=[Attribute(value=Attribute(value=Name(id='cfg', ctx=Load()), attr='models', ctx=Load()), attr='threatmodel', ctx=Load())], keywords=[]), attr='via', ctx=Load()))])), keyword(arg='max_output_tokens', value=Call(func=Name(id='int', ctx=Load()), args=[Call(func=Name(id='knob', ctx=Load()), args=[Name(id='cfg', ctx=Load()), Constant(value='step2.max_tokens'), Constant(value=64000)], keywords=[])], keywords=[])), keyword(arg='tag', value=Name(id='_DISPATCH_TAG', ctx=Load())), keyword(arg='graph_name', value=Name(id='_GRAPH_NAME', ctx=Load())), keyword(arg='tool_builder', value=Name(id='tool_builder', ctx=Load())), keyword(arg='fact_tools', value=Name(id='fact_tools', ctx=Load())), keyword(arg='response_model', value=Name(id='threat_model_arg', ctx=Load())), keyword(arg='parent_middleware', value=Name(id='parent_middleware', ctx=Load())), keyword(arg='effort', value=IfExp(test=Name(id='drop_thinking', ctx=Load()), body=Constant(value=None), orelse=BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='effort'), Constant(value=None)], keywords=[]), Constant(value=None)]))), keyword(arg='skill_root', value=IfExp(test=Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='skills'), Constant(value=True)], keywords=[]), body=Call(func=Name(id='inject_skills', ctx=Load()), args=[Call(func=Name(id='Path', ctx=Load()), args=[Name(id='repo_root', ctx=Load())], keywords=[])], keywords=[]), orelse=Constant(value=None))), keyword(arg='allow_shell', value=Call(func=Name(id='bool', ctx=Load()), args=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='bash'), Constant(value=False)], keywords=[])], keywords=[])), keyword(arg='session_id', value=Name(id='session_id', ctx=Load()))])",
+      "rendered": "_deepagents.dispatch_agentic(user, model=cfg.models.threatmodel, cfg=cfg, system_prompt=system_prompt, allowed_tools=validate_detection_tools(getattr(s2, 'allowed_tools', None), config_key='step2.allowed_tools', via=resolve(cfg.models.threatmodel).via), cwd=repo_root, max_turns=max_turns, timeout=deadline_bound(_cap_int(s2, 'timeout', 1800), _cap_int(s2, 'deadline', 0), None if drop_thinking else getattr(s2, 'effort', None) or None, via=resolve(cfg.models.threatmodel).via), max_output_tokens=int(knob(cfg, 'step2.max_tokens', 64000)), tag=_DISPATCH_TAG, graph_name=_GRAPH_NAME, tool_builder=tool_builder, fact_tools=fact_tools, response_model=threat_model_arg, parent_middleware=parent_middleware, effort=None if drop_thinking else getattr(s2, 'effort', None) or None, skill_root=inject_skills(Path(repo_root)) if getattr(s2, 'skills', True) else None, allow_shell=bool(getattr(s2, 'bash', False)), session_id=session_id)"
+    },
+    {
+      "line_start": 294,
+      "line_end": 294,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='cfg', ctx=Load()), Constant(value='step2'), Constant(value=None)], keywords=[])",
+      "rendered": "getattr(cfg, 'step2', None)"
+    },
+    {
+      "line_start": 295,
+      "line_end": 295,
+      "column": 10,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Call(func=Name(id='resolve', ctx=Load()), args=[Attribute(value=Attribute(value=Name(id='cfg', ctx=Load()), attr='models', ctx=Load()), attr='threatmodel', ctx=Load())], keywords=[]), attr='via', ctx=Load())",
+      "rendered": "resolve(cfg.models.threatmodel).via"
+    },
+    {
+      "line_start": 296,
+      "line_end": 308,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_deepagents', ctx=Load()), attr='dispatch_prompt', ctx=Load()), args=[Name(id='user', ctx=Load())], keywords=[keyword(arg='model', value=Attribute(value=Attribute(value=Name(id='cfg', ctx=Load()), attr='models', ctx=Load()), attr='threatmodel', ctx=Load())), keyword(arg='cfg', value=Name(id='cfg', ctx=Load())), keyword(arg='cwd', value=Name(id='repo_root', ctx=Load())), keyword(arg='system_prompt', value=Name(id='SYSTEM', ctx=Load())), keyword(arg='max_tokens', value=Call(func=Name(id='int', ctx=Load()), args=[Call(func=Name(id='knob', ctx=Load()), args=[Name(id='cfg', ctx=Load()), Constant(value='step2.max_tokens'), Constant(value=64000)], keywords=[])], keywords=[])), keyword(arg='timeout', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='timeout'), Constant(value=1800)], keywords=[])), keyword(arg='response_model', value=IfExp(test=Compare(left=Name(id='via', ctx=Load()), ops=[In()], comparators=[Name(id='RESPONSE_MODEL_VIAS', ctx=Load())]), body=Name(id='ThreatModel', ctx=Load()), orelse=Constant(value=None))), keyword(arg='tag', value=JoinedStr(values=[FormattedValue(value=Name(id='_DISPATCH_TAG', ctx=Load()), conversion=-1), Constant(value=' snapshot')])), keyword(arg='graph_name', value=Name(id='_GRAPH_NAME', ctx=Load())), keyword(arg='effort', value=BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='effort'), Constant(value=None)], keywords=[]), Constant(value=None)]))])",
+      "rendered": "_deepagents.dispatch_prompt(user, model=cfg.models.threatmodel, cfg=cfg, cwd=repo_root, system_prompt=SYSTEM, max_tokens=int(knob(cfg, 'step2.max_tokens', 64000)), timeout=_cap_int(s2, 'timeout', 1800), response_model=ThreatModel if via in RESPONSE_MODEL_VIAS else None, tag=source_template_305_12, graph_name=_GRAPH_NAME, effort=getattr(s2, 'effort', None) or None)"
+    },
+    {
+      "line_start": 313,
+      "line_end": 313,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Attribute(value=Name(id='tm', ctx=Load()), attr='threats', ctx=Load()))",
+      "rendered": "not tm.threats"
+    },
+    {
+      "line_start": 314,
+      "line_end": 314,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value='no_threats')",
+      "rendered": "'no_threats'"
+    },
+    {
+      "line_start": 315,
+      "line_end": 315,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Name(id='resolved', ctx=Load()), UnaryOp(op=Not(), operand=Call(func=Name(id='any', ctx=Load()), args=[GeneratorExp(elt=Attribute(value=Name(id='t', ctx=Load()), attr='surface_files', ctx=Load()), generators=[comprehension(target=Name(id='t', ctx=Store()), iter=Attribute(value=Name(id='tm', ctx=Load()), attr='threats', ctx=Load()), ifs=[], is_async=0)])], keywords=[]))])",
+      "rendered": "resolved and (not any((t.surface_files for t in tm.threats)))"
+    },
+    {
+      "line_start": 316,
+      "line_end": 316,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value='no_validated_surface')",
+      "rendered": "'no_validated_surface'"
+    },
+    {
+      "line_start": 317,
+      "line_end": 317,
+      "column": 11,
+      "kind": "Constant",
+      "original_ast": "Constant(value='')",
+      "rendered": "''"
+    },
+    {
+      "line_start": 324,
+      "line_end": 324,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='cfg', ctx=Load()), Constant(value='step2'), Constant(value=None)], keywords=[])",
+      "rendered": "getattr(cfg, 'step2', None)"
+    },
+    {
+      "line_start": 325,
+      "line_end": 325,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='empty_retry'), Constant(value=True)], keywords=[]))",
+      "rendered": "not getattr(s2, 'empty_retry', True)"
+    },
+    {
+      "line_start": 326,
+      "line_end": 326,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='tm', ctx=Load())",
+      "rendered": "tm"
+    },
+    {
+      "line_start": 327,
+      "line_end": 327,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_hollow_reason', ctx=Load()), args=[Name(id='tm', ctx=Load()), Compare(left=Name(id='ctx', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])], keywords=[])",
+      "rendered": "_hollow_reason(tm, ctx is not None)"
+    },
+    {
+      "line_start": 328,
+      "line_end": 328,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='reason', ctx=Load()))",
+      "rendered": "not reason"
+    },
+    {
+      "line_start": 329,
+      "line_end": 329,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='tm', ctx=Load())",
+      "rendered": "tm"
+    },
+    {
+      "line_start": 331,
+      "line_end": 331,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Attribute(value=Name(id='ev', ctx=Load()), attr='file_count', ctx=Load()))",
+      "rendered": "not ev.file_count"
+    },
+    {
+      "line_start": 332,
+      "line_end": 332,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='tm', ctx=Load())",
+      "rendered": "tm"
+    },
+    {
+      "line_start": 333,
+      "line_end": 333,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Constant(value='s2_empty_retry_attempted')], keywords=[])",
+      "rendered": "COUNTERS.bump('s2_empty_retry_attempted')"
+    },
+    {
+      "line_start": 334,
+      "line_end": 334,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[JoinedStr(values=[Constant(value='s2_hollow_'), FormattedValue(value=Name(id='reason', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "COUNTERS.bump(source_template_334_18)"
+    },
+    {
+      "line_start": 335,
+      "line_end": 335,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Attribute(value=Name(id='Event', ctx=Load()), attr='S2_HOLLOW_RETRY_ATTEMPTED', ctx=Load())], keywords=[keyword(arg='reason', value=Name(id='reason', ctx=Load())), keyword(arg='threats', value=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='tm', ctx=Load()), attr='threats', ctx=Load())], keywords=[]))])",
+      "rendered": "log.warning(Event.S2_HOLLOW_RETRY_ATTEMPTED, reason=reason, threats=len(tm.threats))"
+    },
+    {
+      "line_start": 337,
+      "line_end": 338,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_parse_threat_model', ctx=Load()), args=[Call(func=Name(id='_snapshot_leg', ctx=Load()), args=[BinOp(left=BinOp(left=Name(id='user', ctx=Load()), op=Add(), right=Constant(value='\\n\\n')), op=Add(), right=Subscript(value=Name(id='_HOLLOW_RETRY_DIRECTIVES', ctx=Load()), slice=Name(id='reason', ctx=Load()), ctx=Load())), Name(id='cfg', ctx=Load()), Name(id='repo_root', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "_parse_threat_model(_snapshot_leg(user + source_literal_338_19 + _HOLLOW_RETRY_DIRECTIVES[reason], cfg, repo_root))"
+    },
+    {
+      "line_start": 339,
+      "line_end": 339,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 340,
+      "line_end": 340,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='is_halt_error', ctx=Load()), args=[Name(id='e', ctx=Load())], keywords=[])",
+      "rendered": "is_halt_error(e)"
+    },
+    {
+      "line_start": 343,
+      "line_end": 343,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Attribute(value=Name(id='Event', ctx=Load()), attr='S2_HOLLOW_RETRY_FAILED', ctx=Load())], keywords=[keyword(arg='detail', value=Call(func=Name(id='str', ctx=Load()), args=[Name(id='e', ctx=Load())], keywords=[]))])",
+      "rendered": "log.warning(Event.S2_HOLLOW_RETRY_FAILED, detail=str(e))"
+    },
+    {
+      "line_start": 344,
+      "line_end": 344,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='tm', ctx=Load())",
+      "rendered": "tm"
+    },
+    {
+      "line_start": 345,
+      "line_end": 345,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_finalize_threats', ctx=Load()), args=[Name(id='retry_tm', ctx=Load()), Name(id='ctx', ctx=Load())], keywords=[])",
+      "rendered": "_finalize_threats(retry_tm, ctx)"
+    },
+    {
+      "line_start": 346,
+      "line_end": 346,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_hollow_reason', ctx=Load()), args=[Name(id='retry_tm', ctx=Load()), Compare(left=Name(id='ctx', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])], keywords=[])",
+      "rendered": "_hollow_reason(retry_tm, ctx is not None)"
+    },
+    {
+      "line_start": 347,
+      "line_end": 347,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='retry_reason', ctx=Load()))",
+      "rendered": "not retry_reason"
+    },
+    {
+      "line_start": 348,
+      "line_end": 348,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Constant(value='s2_empty_retry_recovered')], keywords=[])",
+      "rendered": "COUNTERS.bump('s2_empty_retry_recovered')"
+    },
+    {
+      "line_start": 349,
+      "line_end": 349,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Attribute(value=Name(id='Event', ctx=Load()), attr='S2_RETRY_RECOVERED', ctx=Load())], keywords=[keyword(arg='threats', value=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='retry_tm', ctx=Load()), attr='threats', ctx=Load())], keywords=[]))])",
+      "rendered": "log.warning(Event.S2_RETRY_RECOVERED, threats=len(retry_tm.threats))"
+    },
+    {
+      "line_start": 350,
+      "line_end": 350,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='retry_tm', ctx=Load())",
+      "rendered": "retry_tm"
+    },
+    {
+      "line_start": 351,
+      "line_end": 351,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Constant(value='s2_hollow_after_retry')], keywords=[])",
+      "rendered": "COUNTERS.bump('s2_hollow_after_retry')"
+    },
+    {
+      "line_start": 352,
+      "line_end": 354,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='error', ctx=Load()), args=[Attribute(value=Name(id='Event', ctx=Load()), attr='S2_HOLLOW_RETRY_EMPTY', ctx=Load())], keywords=[keyword(arg='reason', value=Name(id='retry_reason', ctx=Load())), keyword(arg='remedy', value=Constant(value='check the s2 transcript: the model returned no threat naming a file from the inventory, twice. Re-run, or route models.threatmodel elsewhere'))])",
+      "rendered": "log.error(Event.S2_HOLLOW_RETRY_EMPTY, reason=retry_reason, remedy=source_literal_353_21)"
+    },
+    {
+      "line_start": 355,
+      "line_end": 355,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='S2HollowAfterRetry', ctx=Load()), args=[Name(id='retry_reason', ctx=Load())], keywords=[])",
+      "rendered": "S2HollowAfterRetry(retry_reason)"
+    }
+  ],
+  "calls": [
+    {
+      "line": 73,
+      "end_line": 73,
+      "callee": "logs.get_logger",
+      "enclosing": "module initialization",
+      "expression": "logs.get_logger(__name__)"
+    },
+    {
+      "line": 81,
+      "end_line": 81,
+      "callee": "set",
+      "enclosing": "module initialization",
+      "expression": "set()"
+    },
+    {
+      "line": 84,
+      "end_line": 84,
+      "callee": "set",
+      "enclosing": "module initialization",
+      "expression": "set()"
+    },
+    {
+      "line": 104,
+      "end_line": 104,
+      "callee": "_cap_int",
+      "enclosing": "_call_budget",
+      "expression": "_cap_int(s2, \"max_model_calls\", 0)"
+    },
+    {
+      "line": 107,
+      "end_line": 109,
+      "callee": "ModelCallBudget",
+      "enclosing": "_call_budget",
+      "expression": "ModelCallBudget(limit=limit,\n                           outcome_tools=frozenset({ThreatModel.__name__}),\n                           counter=\"s2_model_call_budget_final_turn\")"
+    },
+    {
+      "line": 115,
+      "end_line": 115,
+      "callee": "_deepagents.route_carries_tools",
+      "enclosing": "_graph_tool_route_ok",
+      "expression": "_deepagents.route_carries_tools(cfg, via)"
+    },
+    {
+      "line": 118,
+      "end_line": 123,
+      "callee": "warn_once",
+      "enclosing": "_graph_tool_route_ok",
+      "expression": "warn_once(\n        _WARNED_NO_GRAPH_TOOLS, f\"{via}:{agentic}\",\n        f\"WARN [s2]: step2.graph_tools is on and a code graph exists, but \"\n        f\"{reason} — running S2 without the graph tools, and NOT telling the \"\n        f\"model about tools it cannot call. To use them: route models.threatmodel \"\n        f\"via: deepagents.\")"
+    },
+    {
+      "line": 132,
+      "end_line": 132,
+      "callee": "getattr",
+      "enclosing": "_threatmodel_call",
+      "expression": "getattr(cfg, \"step2\", None)"
+    },
+    {
+      "line": 185,
+      "end_line": 185,
+      "callee": "_cap_int",
+      "enclosing": "_threatmodel_call",
+      "expression": "_cap_int(s2, \"max_turns\", 12)"
+    },
+    {
+      "line": 193,
+      "end_line": 193,
+      "callee": "session_id_for",
+      "enclosing": "_threatmodel_call",
+      "expression": "session_id_for(\"s2\", \"threatmodel\")"
+    },
+    {
+      "line": 194,
+      "end_line": 194,
+      "callee": "Transcript",
+      "enclosing": "_threatmodel_call",
+      "expression": "Transcript()"
+    },
+    {
+      "line": 196,
+      "end_line": 196,
+      "callee": "_call_budget",
+      "enclosing": "_threatmodel_call",
+      "expression": "_call_budget(s2)"
+    },
+    {
+      "line": 199,
+      "end_line": 199,
+      "callee": "_cap_int",
+      "enclosing": "_threatmodel_call",
+      "expression": "_cap_int(s2, \"deadline\", 0)"
+    },
+    {
+      "line": 225,
+      "end_line": 225,
+      "callee": "getattr",
+      "enclosing": "_replay_leg",
+      "expression": "getattr(cfg, \"step2\", None)"
+    },
+    {
+      "line": 226,
+      "end_line": 226,
+      "callee": "COUNTERS.bump",
+      "enclosing": "_replay_leg",
+      "expression": "COUNTERS.bump(\"s2_deadline_replay\")"
+    },
+    {
+      "line": 227,
+      "end_line": 227,
+      "callee": "time.monotonic",
+      "enclosing": "_replay_leg",
+      "expression": "time.monotonic()"
+    },
+    {
+      "line": 228,
+      "end_line": 242,
+      "callee": "_deepagents.dispatch_prompt",
+      "enclosing": "_replay_leg",
+      "expression": "_deepagents.dispatch_prompt(\n        replay_prompt(transcript, user, instruction=S2_REPLAY_INSTRUCTION,\n                      stage=\"s2\"),\n        model=cfg.models.threatmodel,\n        cfg=cfg,\n        cwd=repo_root,\n        system_prompt=system_prompt,\n        max_tokens=_cap_int(s2, \"replay_max_tokens\", 16000),\n        timeout=_cap_int(s2, \"replay_timeout\", 300),\n        response_model=(ThreatModel\n                        if resolve(cfg.models.threatmodel).via in RESPONSE_MODEL_VIAS else None),\n        tag=f\"{_DISPATCH_TAG} replay\",\n        graph_name=_GRAPH_NAME,\n        effort=_REPLAY_EFFORT,\n    )"
+    },
+    {
+      "line": 243,
+      "end_line": 243,
+      "callee": "console.write",
+      "enclosing": "_replay_leg",
+      "expression": "console.write(f\"  [s2] replay returned in {time.monotonic() - started:.1f}s\")"
+    },
+    {
+      "line": 252,
+      "end_line": 252,
+      "callee": "getattr",
+      "enclosing": "_agentic_leg",
+      "expression": "getattr(cfg, \"step2\", None)"
+    },
+    {
+      "line": 253,
+      "end_line": 281,
+      "callee": "_deepagents.dispatch_agentic",
+      "enclosing": "_agentic_leg",
+      "expression": "_deepagents.dispatch_agentic(\n        user,\n        model=cfg.models.threatmodel,\n        cfg=cfg,\n        system_prompt=system_prompt,\n        # via:cli honours it verbatim; else read-only, so graph names go via fact_tools/tool_builder\n        allowed_tools=validate_detection_tools(\n            getattr(s2, \"allowed_tools\", None),\n            config_key=\"step2.allowed_tools\",\n            via=resolve(cfg.models.threatmodel).via),\n        cwd=repo_root,\n        max_turns=max_turns,\n        # step2.timeout binds via:cli and via:deepagents; sdk/openai rely on max_turns alone\n        timeout=deadline_bound(_cap_int(s2, \"timeout\", 1800), _cap_int(s2, \"deadline\", 0),\n                               None if drop_thinking else (getattr(s2, \"effort\", None) or None),\n                               via=resolve(cfg.models.threatmodel).via),\n        # knob() not getattr: a null overlay must give 64000, not None -> internal 16000\n        max_output_tokens=int(knob(cfg, \"step2.max_tokens\", 64000)),\n        tag=_DISPATCH_TAG,\n        graph_name=_GRAPH_NAME,\n        tool_builder=tool_builder,\n        fact_tools=fact_tools,\n        response_model=threat_model_arg,\n        parent_middleware=parent_middleware,\n        effort=None if drop_thinking else (getattr(s2, \"effort\", None) or None),\n        skill_root=inject_skills(Path(repo_root)) if getattr(s2, \"skills\", True) else None,\n        allow_shell=bool(getattr(s2, \"bash\", False)),\n        session_id=session_id,\n    )"
+    },
+    {
+      "line": 294,
+      "end_line": 294,
+      "callee": "getattr",
+      "enclosing": "_snapshot_leg",
+      "expression": "getattr(cfg, \"step2\", None)"
+    },
+    {
+      "line": 296,
+      "end_line": 308,
+      "callee": "_deepagents.dispatch_prompt",
+      "enclosing": "_snapshot_leg",
+      "expression": "_deepagents.dispatch_prompt(\n        user,\n        model=cfg.models.threatmodel,\n        cfg=cfg,\n        cwd=repo_root,\n        system_prompt=SYSTEM,\n        max_tokens=int(knob(cfg, \"step2.max_tokens\", 64000)),\n        timeout=_cap_int(s2, \"timeout\", 1800),\n        response_model=(ThreatModel if via in RESPONSE_MODEL_VIAS else None),\n        tag=f\"{_DISPATCH_TAG} snapshot\",\n        graph_name=_GRAPH_NAME,\n        effort=getattr(s2, \"effort\", None) or None,\n    )"
+    },
+    {
+      "line": 324,
+      "end_line": 324,
+      "callee": "getattr",
+      "enclosing": "_retry_if_hollow",
+      "expression": "getattr(cfg, \"step2\", None)"
+    },
+    {
+      "line": 327,
+      "end_line": 327,
+      "callee": "_hollow_reason",
+      "enclosing": "_retry_if_hollow",
+      "expression": "_hollow_reason(tm, ctx is not None)"
+    },
+    {
+      "line": 333,
+      "end_line": 333,
+      "callee": "COUNTERS.bump",
+      "enclosing": "_retry_if_hollow",
+      "expression": "COUNTERS.bump(\"s2_empty_retry_attempted\")"
+    },
+    {
+      "line": 334,
+      "end_line": 334,
+      "callee": "COUNTERS.bump",
+      "enclosing": "_retry_if_hollow",
+      "expression": "COUNTERS.bump(f\"s2_hollow_{reason}\")"
+    },
+    {
+      "line": 335,
+      "end_line": 335,
+      "callee": "log.warning",
+      "enclosing": "_retry_if_hollow",
+      "expression": "log.warning(Event.S2_HOLLOW_RETRY_ATTEMPTED, reason=reason, threats=len(tm.threats))"
+    },
+    {
+      "line": 345,
+      "end_line": 345,
+      "callee": "_finalize_threats",
+      "enclosing": "_retry_if_hollow",
+      "expression": "_finalize_threats(retry_tm, ctx)"
+    },
+    {
+      "line": 346,
+      "end_line": 346,
+      "callee": "_hollow_reason",
+      "enclosing": "_retry_if_hollow",
+      "expression": "_hollow_reason(retry_tm, ctx is not None)"
+    },
+    {
+      "line": 351,
+      "end_line": 351,
+      "callee": "COUNTERS.bump",
+      "enclosing": "_retry_if_hollow",
+      "expression": "COUNTERS.bump(\"s2_hollow_after_retry\")"
+    },
+    {
+      "line": 352,
+      "end_line": 354,
+      "callee": "log.error",
+      "enclosing": "_retry_if_hollow",
+      "expression": "log.error(Event.S2_HOLLOW_RETRY_EMPTY, reason=retry_reason,\n              remedy=\"check the s2 transcript: the model returned no threat naming a file from \"\n                     \"the inventory, twice. Re-run, or route models.threatmodel elsewhere\")"
+    },
+    {
+      "line": 355,
+      "end_line": 355,
+      "callee": "S2HollowAfterRetry",
+      "enclosing": "_retry_if_hollow",
+      "expression": "S2HollowAfterRetry(retry_reason)"
+    },
+    {
+      "line": 114,
+      "end_line": 114,
+      "callee": "resolve",
+      "enclosing": "_graph_tool_route_ok",
+      "expression": "resolve(cfg.models.threatmodel)"
+    },
+    {
+      "line": 133,
+      "end_line": 133,
+      "callee": "resolve",
+      "enclosing": "_threatmodel_call",
+      "expression": "resolve(cfg.models.threatmodel)"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "getattr",
+      "enclosing": "_threatmodel_call",
+      "expression": "getattr(s2, \"graph_tools\", True)"
+    },
+    {
+      "line": 141,
+      "end_line": 141,
+      "callee": "_graph_tool_route_ok",
+      "enclosing": "_threatmodel_call",
+      "expression": "_graph_tool_route_ok(cfg, agentic=True)"
+    },
+    {
+      "line": 142,
+      "end_line": 142,
+      "callee": "build_graph_tool_builder",
+      "enclosing": "_threatmodel_call",
+      "expression": "build_graph_tool_builder(ctx)"
+    },
+    {
+      "line": 143,
+      "end_line": 143,
+      "callee": "graph_tool_names",
+      "enclosing": "_threatmodel_call",
+      "expression": "graph_tool_names()"
+    },
+    {
+      "line": 145,
+      "end_line": 145,
+      "callee": "graph_is_degenerate",
+      "enclosing": "_threatmodel_call",
+      "expression": "graph_is_degenerate(ctx, cfg)"
+    },
+    {
+      "line": 152,
+      "end_line": 152,
+      "callee": "getattr",
+      "enclosing": "_threatmodel_call",
+      "expression": "getattr(s2, \"planning\", True)"
+    },
+    {
+      "line": 157,
+      "end_line": 157,
+      "callee": "getattr",
+      "enclosing": "_threatmodel_call",
+      "expression": "getattr(s2, \"require_graph\", True)"
+    },
+    {
+      "line": 195,
+      "end_line": 195,
+      "callee": "RecordTranscript",
+      "enclosing": "_threatmodel_call",
+      "expression": "RecordTranscript(transcript)"
+    },
+    {
+      "line": 202,
+      "end_line": 206,
+      "callee": "run_with_deadline",
+      "enclosing": "_threatmodel_call",
+      "expression": "run_with_deadline(\n            lambda: _agentic_leg(user, cfg, repo_root, system_prompt, parent_middleware,\n                                 tool_builder, fact_tools, max_turns, threat_model_arg,\n                                 session_id=session_id, drop_thinking=drop_thinking),\n            seconds=deadline, stage=_DISPATCH_TAG, effort=effort)"
+    },
+    {
+      "line": 217,
+      "end_line": 217,
+      "callee": "release_pinned_session",
+      "enclosing": "_threatmodel_call",
+      "expression": "release_pinned_session(session_id)"
+    },
+    {
+      "line": 229,
+      "end_line": 230,
+      "callee": "replay_prompt",
+      "enclosing": "_replay_leg",
+      "expression": "replay_prompt(transcript, user, instruction=S2_REPLAY_INSTRUCTION,\n                      stage=\"s2\")"
+    },
+    {
+      "line": 295,
+      "end_line": 295,
+      "callee": "resolve",
+      "enclosing": "_snapshot_leg",
+      "expression": "resolve(cfg.models.threatmodel)"
+    },
+    {
+      "line": 325,
+      "end_line": 325,
+      "callee": "getattr",
+      "enclosing": "_retry_if_hollow",
+      "expression": "getattr(s2, \"empty_retry\", True)"
+    },
+    {
+      "line": 337,
+      "end_line": 338,
+      "callee": "_parse_threat_model",
+      "enclosing": "_retry_if_hollow",
+      "expression": "_parse_threat_model(_snapshot_leg(\n            user + \"\\n\\n\" + _HOLLOW_RETRY_DIRECTIVES[reason], cfg, repo_root))"
+    },
+    {
+      "line": 348,
+      "end_line": 348,
+      "callee": "COUNTERS.bump",
+      "enclosing": "_retry_if_hollow",
+      "expression": "COUNTERS.bump(\"s2_empty_retry_recovered\")"
+    },
+    {
+      "line": 349,
+      "end_line": 349,
+      "callee": "log.warning",
+      "enclosing": "_retry_if_hollow",
+      "expression": "log.warning(Event.S2_RETRY_RECOVERED, threats=len(retry_tm.threats))"
+    },
+    {
+      "line": 108,
+      "end_line": 108,
+      "callee": "frozenset",
+      "enclosing": "_call_budget",
+      "expression": "frozenset({ThreatModel.__name__})"
+    },
+    {
+      "line": 139,
+      "end_line": 139,
+      "callee": "getattr",
+      "enclosing": "_threatmodel_call",
+      "expression": "getattr(ctx, \"graph_handle\", None)"
+    },
+    {
+      "line": 147,
+      "end_line": 151,
+      "callee": "ToolCallBudget",
+      "enclosing": "_threatmodel_call",
+      "expression": "ToolCallBudget(\n            frozenset(graph_tool_names()),\n            limit=_cap_int(s2, \"graph_tool_budget\", 6),\n            counter=\"s2_graph_tool_budget_exhausted\",\n        )"
+    },
+    {
+      "line": 159,
+      "end_line": 159,
+      "callee": "frozenset",
+      "enclosing": "_threatmodel_call",
+      "expression": "frozenset(GRAPH_TOOL_NAMES)"
+    },
+    {
+      "line": 178,
+      "end_line": 184,
+      "callee": "EvidenceGate",
+      "enclosing": "_threatmodel_call",
+      "expression": "EvidenceGate(\n            max_rejections=_cap_int(s2, \"require_graph_rejections\", 2),\n            counter=\"s2_evidence_gate_rejected\",\n            required_tools=frozenset(),\n            require_tool_call=True,\n            ignored_tools=frozenset({\"write_todos\", ThreatModel.__name__}),\n        )"
+    },
+    {
+      "line": 192,
+      "end_line": 192,
+      "callee": "getattr",
+      "enclosing": "_threatmodel_call",
+      "expression": "getattr(s2, \"bash\", False)"
+    },
+    {
+      "line": 200,
+      "end_line": 200,
+      "callee": "getattr",
+      "enclosing": "_threatmodel_call",
+      "expression": "getattr(s2, \"effort\", None)"
+    },
+    {
+      "line": 208,
+      "end_line": 209,
+      "callee": "console.write",
+      "enclosing": "_threatmodel_call",
+      "expression": "console.write(f\"  [s2] deadline {deadline}s hit — resuming the session (or re-asking \"\n                      f\"from the transcript) for the threat model\")"
+    },
+    {
+      "line": 210,
+      "end_line": 215,
+      "callee": "resume_or_replay",
+      "enclosing": "_threatmodel_call",
+      "expression": "resume_or_replay(\n            session_id,\n            lambda: _replay_leg(user, cfg, repo_root, system_prompt, transcript),\n            model=cfg.models.threatmodel, cfg=cfg, instruction=S2_REPLAY_INSTRUCTION,\n            stage=\"s2\", tag=_DISPATCH_TAG,\n            timeout=_cap_int(s2, \"resume_timeout\", 300))"
+    },
+    {
+      "line": 235,
+      "end_line": 235,
+      "callee": "_cap_int",
+      "enclosing": "_replay_leg",
+      "expression": "_cap_int(s2, \"replay_max_tokens\", 16000)"
+    },
+    {
+      "line": 236,
+      "end_line": 236,
+      "callee": "_cap_int",
+      "enclosing": "_replay_leg",
+      "expression": "_cap_int(s2, \"replay_timeout\", 300)"
+    },
+    {
+      "line": 259,
+      "end_line": 262,
+      "callee": "validate_detection_tools",
+      "enclosing": "_agentic_leg",
+      "expression": "validate_detection_tools(\n            getattr(s2, \"allowed_tools\", None),\n            config_key=\"step2.allowed_tools\",\n            via=resolve(cfg.models.threatmodel).via)"
+    },
+    {
+      "line": 266,
+      "end_line": 268,
+      "callee": "deadline_bound",
+      "enclosing": "_agentic_leg",
+      "expression": "deadline_bound(_cap_int(s2, \"timeout\", 1800), _cap_int(s2, \"deadline\", 0),\n                               None if drop_thinking else (getattr(s2, \"effort\", None) or None),\n                               via=resolve(cfg.models.threatmodel).via)"
+    },
+    {
+      "line": 270,
+      "end_line": 270,
+      "callee": "int",
+      "enclosing": "_agentic_leg",
+      "expression": "int(knob(cfg, \"step2.max_tokens\", 64000))"
+    },
+    {
+      "line": 279,
+      "end_line": 279,
+      "callee": "bool",
+      "enclosing": "_agentic_leg",
+      "expression": "bool(getattr(s2, \"bash\", False))"
+    },
+    {
+      "line": 302,
+      "end_line": 302,
+      "callee": "int",
+      "enclosing": "_snapshot_leg",
+      "expression": "int(knob(cfg, \"step2.max_tokens\", 64000))"
+    },
+    {
+      "line": 303,
+      "end_line": 303,
+      "callee": "_cap_int",
+      "enclosing": "_snapshot_leg",
+      "expression": "_cap_int(s2, \"timeout\", 1800)"
+    },
+    {
+      "line": 315,
+      "end_line": 315,
+      "callee": "any",
+      "enclosing": "_hollow_reason",
+      "expression": "any(t.surface_files for t in tm.threats)"
+    },
+    {
+      "line": 335,
+      "end_line": 335,
+      "callee": "len",
+      "enclosing": "_retry_if_hollow",
+      "expression": "len(tm.threats)"
+    },
+    {
+      "line": 337,
+      "end_line": 338,
+      "callee": "_snapshot_leg",
+      "enclosing": "_retry_if_hollow",
+      "expression": "_snapshot_leg(\n            user + \"\\n\\n\" + _HOLLOW_RETRY_DIRECTIVES[reason], cfg, repo_root)"
+    },
+    {
+      "line": 340,
+      "end_line": 340,
+      "callee": "is_halt_error",
+      "enclosing": "_retry_if_hollow",
+      "expression": "is_halt_error(e)"
+    },
+    {
+      "line": 343,
+      "end_line": 343,
+      "callee": "log.warning",
+      "enclosing": "_retry_if_hollow",
+      "expression": "log.warning(Event.S2_HOLLOW_RETRY_FAILED, detail=str(e))"
+    },
+    {
+      "line": 148,
+      "end_line": 148,
+      "callee": "frozenset",
+      "enclosing": "_threatmodel_call",
+      "expression": "frozenset(graph_tool_names())"
+    },
+    {
+      "line": 153,
+      "end_line": 156,
+      "callee": "TodoListMiddleware",
+      "enclosing": "_threatmodel_call",
+      "expression": "TodoListMiddleware(\n                system_prompt=S2_PLAN_SYSTEM_PROMPT,\n                tool_description=S2_PLAN_TOOL_DESCRIPTION,\n            )"
+    },
+    {
+      "line": 161,
+      "end_line": 166,
+      "callee": "warn_once",
+      "enclosing": "_threatmodel_call",
+      "expression": "warn_once(\n                    _WARNED_DEGENERATE_GRAPH, \"s2-require-graph\",\n                    \"WARN [s2]: step2.require_graph is on but the code graph is \"\n                    \"absent or degenerate (zero edges, or fewer nodes than \"\n                    \"step0.min_graph_nodes_for_gate) — standing the graph-tool \"\n                    \"requirement down; the todo-list gate still applies.\")"
+    },
+    {
+      "line": 167,
+      "end_line": 167,
+      "callee": "COUNTERS.bump",
+      "enclosing": "_threatmodel_call",
+      "expression": "COUNTERS.bump(\"evidence_gate_stood_down_degenerate_graph\")"
+    },
+    {
+      "line": 168,
+      "end_line": 168,
+      "callee": "frozenset",
+      "enclosing": "_threatmodel_call",
+      "expression": "frozenset()"
+    },
+    {
+      "line": 169,
+      "end_line": 175,
+      "callee": "EvidenceGate",
+      "enclosing": "_threatmodel_call",
+      "expression": "EvidenceGate(\n                max_rejections=_cap_int(s2, \"require_graph_rejections\", 2),\n                counter=\"s2_evidence_gate_rejected\",\n                required_tools=required_tools,\n                require_tool_call=require_tool_call,\n                ignored_tools=frozenset({\"write_todos\", ThreatModel.__name__}),\n            )"
+    },
+    {
+      "line": 203,
+      "end_line": 205,
+      "callee": "_agentic_leg",
+      "enclosing": "_threatmodel_call",
+      "expression": "_agentic_leg(user, cfg, repo_root, system_prompt, parent_middleware,\n                                 tool_builder, fact_tools, max_turns, threat_model_arg,\n                                 session_id=session_id, drop_thinking=drop_thinking)"
+    },
+    {
+      "line": 260,
+      "end_line": 260,
+      "callee": "getattr",
+      "enclosing": "_agentic_leg",
+      "expression": "getattr(s2, \"allowed_tools\", None)"
+    },
+    {
+      "line": 266,
+      "end_line": 266,
+      "callee": "_cap_int",
+      "enclosing": "_agentic_leg",
+      "expression": "_cap_int(s2, \"timeout\", 1800)"
+    },
+    {
+      "line": 266,
+      "end_line": 266,
+      "callee": "_cap_int",
+      "enclosing": "_agentic_leg",
+      "expression": "_cap_int(s2, \"deadline\", 0)"
+    },
+    {
+      "line": 270,
+      "end_line": 270,
+      "callee": "knob",
+      "enclosing": "_agentic_leg",
+      "expression": "knob(cfg, \"step2.max_tokens\", 64000)"
+    },
+    {
+      "line": 278,
+      "end_line": 278,
+      "callee": "getattr",
+      "enclosing": "_agentic_leg",
+      "expression": "getattr(s2, \"skills\", True)"
+    },
+    {
+      "line": 278,
+      "end_line": 278,
+      "callee": "inject_skills",
+      "enclosing": "_agentic_leg",
+      "expression": "inject_skills(Path(repo_root))"
+    },
+    {
+      "line": 279,
+      "end_line": 279,
+      "callee": "getattr",
+      "enclosing": "_agentic_leg",
+      "expression": "getattr(s2, \"bash\", False)"
+    },
+    {
+      "line": 302,
+      "end_line": 302,
+      "callee": "knob",
+      "enclosing": "_snapshot_leg",
+      "expression": "knob(cfg, \"step2.max_tokens\", 64000)"
+    },
+    {
+      "line": 307,
+      "end_line": 307,
+      "callee": "getattr",
+      "enclosing": "_snapshot_leg",
+      "expression": "getattr(s2, \"effort\", None)"
+    },
+    {
+      "line": 349,
+      "end_line": 349,
+      "callee": "len",
+      "enclosing": "_retry_if_hollow",
+      "expression": "len(retry_tm.threats)"
+    },
+    {
+      "line": 148,
+      "end_line": 148,
+      "callee": "graph_tool_names",
+      "enclosing": "_threatmodel_call",
+      "expression": "graph_tool_names()"
+    },
+    {
+      "line": 149,
+      "end_line": 149,
+      "callee": "_cap_int",
+      "enclosing": "_threatmodel_call",
+      "expression": "_cap_int(s2, \"graph_tool_budget\", 6)"
+    },
+    {
+      "line": 179,
+      "end_line": 179,
+      "callee": "_cap_int",
+      "enclosing": "_threatmodel_call",
+      "expression": "_cap_int(s2, \"require_graph_rejections\", 2)"
+    },
+    {
+      "line": 181,
+      "end_line": 181,
+      "callee": "frozenset",
+      "enclosing": "_threatmodel_call",
+      "expression": "frozenset()"
+    },
+    {
+      "line": 183,
+      "end_line": 183,
+      "callee": "frozenset",
+      "enclosing": "_threatmodel_call",
+      "expression": "frozenset({\"write_todos\", ThreatModel.__name__})"
+    },
+    {
+      "line": 212,
+      "end_line": 212,
+      "callee": "_replay_leg",
+      "enclosing": "_threatmodel_call",
+      "expression": "_replay_leg(user, cfg, repo_root, system_prompt, transcript)"
+    },
+    {
+      "line": 215,
+      "end_line": 215,
+      "callee": "_cap_int",
+      "enclosing": "_threatmodel_call",
+      "expression": "_cap_int(s2, \"resume_timeout\", 300)"
+    },
+    {
+      "line": 243,
+      "end_line": 243,
+      "callee": "time.monotonic",
+      "enclosing": "_replay_leg",
+      "expression": "time.monotonic()"
+    },
+    {
+      "line": 277,
+      "end_line": 277,
+      "callee": "getattr",
+      "enclosing": "_agentic_leg",
+      "expression": "getattr(s2, \"effort\", None)"
+    },
+    {
+      "line": 278,
+      "end_line": 278,
+      "callee": "Path",
+      "enclosing": "_agentic_leg",
+      "expression": "Path(repo_root)"
+    },
+    {
+      "line": 343,
+      "end_line": 343,
+      "callee": "str",
+      "enclosing": "_retry_if_hollow",
+      "expression": "str(e)"
+    },
+    {
+      "line": 170,
+      "end_line": 170,
+      "callee": "_cap_int",
+      "enclosing": "_threatmodel_call",
+      "expression": "_cap_int(s2, \"require_graph_rejections\", 2)"
+    },
+    {
+      "line": 174,
+      "end_line": 174,
+      "callee": "frozenset",
+      "enclosing": "_threatmodel_call",
+      "expression": "frozenset({\"write_todos\", ThreatModel.__name__})"
+    },
+    {
+      "line": 238,
+      "end_line": 238,
+      "callee": "resolve",
+      "enclosing": "_replay_leg",
+      "expression": "resolve(cfg.models.threatmodel)"
+    },
+    {
+      "line": 262,
+      "end_line": 262,
+      "callee": "resolve",
+      "enclosing": "_agentic_leg",
+      "expression": "resolve(cfg.models.threatmodel)"
+    },
+    {
+      "line": 267,
+      "end_line": 267,
+      "callee": "getattr",
+      "enclosing": "_agentic_leg",
+      "expression": "getattr(s2, \"effort\", None)"
+    },
+    {
+      "line": 268,
+      "end_line": 268,
+      "callee": "resolve",
+      "enclosing": "_agentic_leg",
+      "expression": "resolve(cfg.models.threatmodel)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 17,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 18,
+      "source_expression": "from vvaharness.util import logs",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.logs"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/logs.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 20,
+      "source_expression": "import time",
+      "targets": [
+        "time"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "from pathlib import Path",
+      "targets": [
+        "pathlib",
+        "pathlib.Path"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 24,
+      "source_expression": "from langchain.agents.middleware import TodoListMiddleware",
+      "targets": [
+        "langchain.agents.middleware",
+        "langchain.agents.middleware.TodoListMiddleware"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 26,
+      "source_expression": "from vvaharness.backends.harness.deepagents.evidence_gate import EvidenceGate",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.evidence_gate",
+        "vvaharness.backends.harness.deepagents.evidence_gate.EvidenceGate"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/evidence_gate.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 27,
+      "source_expression": "from vvaharness.backends.harness.deepagents.model_call_budget import ModelCallBudget",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.model_call_budget",
+        "vvaharness.backends.harness.deepagents.model_call_budget.ModelCallBudget"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/model_call_budget.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 28,
+      "source_expression": "from vvaharness.backends.harness.deepagents.tool_budget import ToolCallBudget",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.tool_budget",
+        "vvaharness.backends.harness.deepagents.tool_budget.ToolCallBudget"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/tool_budget.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 29,
+      "source_expression": "from vvaharness.backends.harness.models import CallTimeoutError, is_halt_error",
+      "targets": [
+        "vvaharness.backends.harness.models",
+        "vvaharness.backends.harness.models.CallTimeoutError",
+        "vvaharness.backends.harness.models.is_halt_error"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/models.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 30,
+      "source_expression": "from vvaharness.backends.llm import deepagents as _deepagents",
+      "targets": [
+        "vvaharness.backends.llm",
+        "vvaharness.backends.llm.deepagents"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/llm/__init__.py",
+        "vvaharness/backends/llm/deepagents.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 31,
+      "source_expression": "from vvaharness.backends.llm.models import RESPONSE_MODEL_VIAS, validate_detection_tools",
+      "targets": [
+        "vvaharness.backends.llm.models",
+        "vvaharness.backends.llm.models.RESPONSE_MODEL_VIAS",
+        "vvaharness.backends.llm.models.validate_detection_tools"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/llm/models.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 32,
+      "source_expression": "from vvaharness.backends.llm.registry import resolve",
+      "targets": [
+        "vvaharness.backends.llm.registry",
+        "vvaharness.backends.llm.registry.resolve"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/llm/registry.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 33,
+      "source_expression": "from vvaharness.codegraph.build import graph_is_degenerate",
+      "targets": [
+        "vvaharness.codegraph.build",
+        "vvaharness.codegraph.build.graph_is_degenerate"
+      ],
+      "local_source_paths": [
+        "vvaharness/codegraph/build.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 34,
+      "source_expression": "from vvaharness.codegraph.tools import GRAPH_TOOL_NAMES, build_graph_tool_builder, graph_tool_names",
+      "targets": [
+        "vvaharness.codegraph.tools",
+        "vvaharness.codegraph.tools.GRAPH_TOOL_NAMES",
+        "vvaharness.codegraph.tools.build_graph_tool_builder",
+        "vvaharness.codegraph.tools.graph_tool_names"
+      ],
+      "local_source_paths": [
+        "vvaharness/codegraph/tools.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 39,
+      "source_expression": "from vvaharness.evidence import ThreatEvidence, _cap_int",
+      "targets": [
+        "vvaharness.evidence",
+        "vvaharness.evidence.ThreatEvidence",
+        "vvaharness.evidence._cap_int"
+      ],
+      "local_source_paths": [
+        "vvaharness/evidence/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 40,
+      "source_expression": "from vvaharness.models import ContextPackage, ThreatModel",
+      "targets": [
+        "vvaharness.models",
+        "vvaharness.models.ContextPackage",
+        "vvaharness.models.ThreatModel"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 41,
+      "source_expression": "from vvaharness.pipeline.stages.replay import S2_REPLAY_INSTRUCTION, RecordTranscript, Transcript, deadline_bound, release_pinned_session, replay_prompt, resume_or_replay, run_with_deadline, session_id_for",
+      "targets": [
+        "vvaharness.pipeline.stages.replay",
+        "vvaharness.pipeline.stages.replay.S2_REPLAY_INSTRUCTION",
+        "vvaharness.pipeline.stages.replay.RecordTranscript",
+        "vvaharness.pipeline.stages.replay.Transcript",
+        "vvaharness.pipeline.stages.replay.deadline_bound",
+        "vvaharness.pipeline.stages.replay.release_pinned_session",
+        "vvaharness.pipeline.stages.replay.replay_prompt",
+        "vvaharness.pipeline.stages.replay.resume_or_replay",
+        "vvaharness.pipeline.stages.replay.run_with_deadline",
+        "vvaharness.pipeline.stages.replay.session_id_for"
+      ],
+      "local_source_paths": [
+        "vvaharness/pipeline/stages/replay.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 52,
+      "source_expression": "from vvaharness.pipeline.stages.s2.outcomes import _finalize_threats, _parse_threat_model",
+      "targets": [
+        "vvaharness.pipeline.stages.s2.outcomes",
+        "vvaharness.pipeline.stages.s2.outcomes._finalize_threats",
+        "vvaharness.pipeline.stages.s2.outcomes._parse_threat_model"
+      ],
+      "local_source_paths": [
+        "vvaharness/pipeline/stages/s2/outcomes.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 53,
+      "source_expression": "from vvaharness.pipeline.stages.s2.prompts import _AGENTIC_SYSTEM_LINE, _GRAPH_TOOLS_SYSTEM_LINE, _SHELL_SYSTEM_LINE, SYSTEM",
+      "targets": [
+        "vvaharness.pipeline.stages.s2.prompts",
+        "vvaharness.pipeline.stages.s2.prompts._AGENTIC_SYSTEM_LINE",
+        "vvaharness.pipeline.stages.s2.prompts._GRAPH_TOOLS_SYSTEM_LINE",
+        "vvaharness.pipeline.stages.s2.prompts._SHELL_SYSTEM_LINE",
+        "vvaharness.pipeline.stages.s2.prompts.SYSTEM"
+      ],
+      "local_source_paths": [
+        "vvaharness/pipeline/stages/s2/prompts.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 59,
+      "source_expression": "from vvaharness.pipeline.stages.s2_planning import PLAN_SYSTEM_PROMPT as S2_PLAN_SYSTEM_PROMPT",
+      "targets": [
+        "vvaharness.pipeline.stages.s2_planning",
+        "vvaharness.pipeline.stages.s2_planning.PLAN_SYSTEM_PROMPT"
+      ],
+      "local_source_paths": [
+        "vvaharness/pipeline/stages/s2_planning.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 62,
+      "source_expression": "from vvaharness.pipeline.stages.s2_planning import PLAN_TOOL_DESCRIPTION as S2_PLAN_TOOL_DESCRIPTION",
+      "targets": [
+        "vvaharness.pipeline.stages.s2_planning",
+        "vvaharness.pipeline.stages.s2_planning.PLAN_TOOL_DESCRIPTION"
+      ],
+      "local_source_paths": [
+        "vvaharness/pipeline/stages/s2_planning.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 65,
+      "source_expression": "from vvaharness.skills import inject_skills",
+      "targets": [
+        "vvaharness.skills",
+        "vvaharness.skills.inject_skills"
+      ],
+      "local_source_paths": [
+        "vvaharness/skills/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 66,
+      "source_expression": "from vvaharness.util import console",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.console"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/console.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 67,
+      "source_expression": "from vvaharness.util.config import knob",
+      "targets": [
+        "vvaharness.util.config",
+        "vvaharness.util.config.knob"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/config.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 68,
+      "source_expression": "from vvaharness.util.counters import COUNTERS",
+      "targets": [
+        "vvaharness.util.counters",
+        "vvaharness.util.counters.COUNTERS"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/counters.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 69,
+      "source_expression": "from vvaharness.util.exceptions import S2HollowAfterRetry",
+      "targets": [
+        "vvaharness.util.exceptions",
+        "vvaharness.util.exceptions.S2HollowAfterRetry"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/exceptions.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 70,
+      "source_expression": "from vvaharness.util.warn_once import warn_once",
+      "targets": [
+        "vvaharness.util.warn_once",
+        "vvaharness.util.warn_once.warn_once"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/warn_once.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 71,
+      "source_expression": "from vvaharness.util.events import Event",
+      "targets": [
+        "vvaharness.util.events",
+        "vvaharness.util.events.Event"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/events.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

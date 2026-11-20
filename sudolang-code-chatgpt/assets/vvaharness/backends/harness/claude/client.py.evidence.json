@@ -1,0 +1,3438 @@
+{
+  "source": "vvaharness/backends/harness/claude/client.py",
+  "sha256": "04be1f27a29f76e86eb707a6266490865d4cb3eca8fbbaba16d345854ed65441",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"ClaudeHarness: Claude Agent SDK concrete implementation of Harness.\"\"\"\n\nfrom __future__ import annotations\n\nimport asyncio\nimport contextlib\nimport json\nfrom collections.abc import AsyncIterator\nfrom typing import cast\n\nfrom claude_agent_sdk import (\n    ClaudeSDKClient,\n    CLIConnectionError,\n    CLIJSONDecodeError,\n    CLINotFoundError,\n    ProcessError,\n    ResultMessage,\n)\nfrom claude_agent_sdk._errors import MessageParseError\nfrom pydantic import BaseModel\n\nfrom vvaharness.backends.harness.claude.facts import build_fact_mcp\nfrom vvaharness.backends.harness.claude.models import SDK_ERROR_MAP\nfrom vvaharness.backends.harness.claude.options import (\n    build_oneshot_sdk_options,\n    build_streaming_sdk_options,\n)\nfrom vvaharness.backends.harness.claude.translate import translate, validate_structured\nfrom vvaharness.backends.harness.harness import Harness\nfrom vvaharness.backends.harness.models import (\n    HarnessCLINotFoundError,\n    HarnessMessage,\n    HarnessProcessError,\n    HarnessResult,\n    OneShotOptions,\n    OneShotResult,\n    StreamingOptions,\n)\nfrom vvaharness.backends.llm.models import TIMEOUT_STOP_GRACE_SECONDS, call_timeout_error\nfrom vvaharness.util.tokens import TOKENS, TokenUsage\n\n\ndef _persona_report_model() -> type | None:\n    \"\"\"``PersonaReport``, for the validated submission tool; None when unavailable.\"\"\"\n    # Lazy and defensive: the harness backend must not hard-depend on the validation package.\n    try:\n        from vvaharness.validation.models.persona_report import (  # noqa: PLC0415 — lazy\n            PersonaReport,\n        )\n    except Exception:\n        return None\n    return PersonaReport\n\n\ndef _extract_sdk_persona_reports(session_id: str, cwd: object) -> list[dict]:\n    \"\"\"Read PersonaReport dicts from the last assistant message's JSON block in each transcript.\"\"\"\n    try:\n        from claude_agent_sdk import (  # noqa: PLC0415 — optional SDK; absent build returns []\n            get_subagent_messages,\n            list_subagents,\n        )\n    except ImportError:\n        return []\n    try:\n        agent_ids = list_subagents(session_id, directory=str(cwd))\n        reports: list[dict] = []\n        seen: set[tuple] = set()\n        for agent_id in agent_ids:\n            messages = get_subagent_messages(session_id, agent_id, directory=str(cwd))\n            if not messages:\n                continue\n            for msg in reversed(messages):\n                raw = getattr(msg, \"message\", {}) or {}\n                content = raw.get(\"content\", []) if isinstance(raw, dict) else []\n                text = next(\n                    (b.get(\"text\", \"\") for b in content\n                     if isinstance(b, dict) and b.get(\"type\") == \"text\"),\n                    \"\",\n                )\n                start = text.find(\"```json\")\n                end = text.find(\"```\", start + 7) if start >= 0 else -1\n                if start < 0 or end <= start:\n                    continue\n                try:\n                    data = json.loads(text[start + 7:end].strip())\n                    if isinstance(data, dict) and \"persona\" in data and \"gates\" in data:\n                        key = (data.get(\"persona\"), data.get(\"tracking_id\"))\n                        if key not in seen:\n                            seen.add(key)\n                            reports.append(data)\n                except (ValueError, json.JSONDecodeError):\n                    pass\n                break\n    except Exception:\n        return []\n    else:\n        return reports\n\n\ndef _merge_persona_reports(submitted: list[dict], scraped: list[dict]) -> list[dict]:\n    \"\"\"Submitted reports plus scraped ones for personas that did not submit.\"\"\"\n    def key(report: dict) -> tuple:\n        return (report.get(\"persona\"), report.get(\"tracking_id\"))\n\n    have = {key(r) for r in submitted}\n    return [*submitted, *(r for r in scraped if key(r) not in have)]\n\n\ndef _wrap_sdk_error(e: Exception) -> Exception:\n    \"\"\"Map an SDK exception to the appropriate HarnessError subclass.\"\"\"\n    if isinstance(e, ProcessError):\n        return HarnessProcessError(\n            str(e),\n            exit_code=getattr(e, \"exit_code\", None),\n            stderr=getattr(e, \"stderr\", None),\n        )\n    for sdk_type, harness_type in SDK_ERROR_MAP:\n        if isinstance(e, sdk_type):\n            return harness_type(str(e))\n    return e\n\n\nclass ClaudeHarness(Harness):\n    \"\"\"Claude Agent SDK implementation of the Harness interface.\"\"\"\n\n    async def run_oneshot(\n        self, prompt: str, options: OneShotOptions\n    ) -> OneShotResult:\n        \"\"\"Run a single-turn invocation and return the structured result.\"\"\"\n        if options.cache_prefix:\n            # No marker seam on the Agent SDK query path; the prefix is content.\n            prompt = options.cache_prefix + prompt\n        sdk_opts = build_oneshot_sdk_options(options)\n        result_text: str | None = None\n        structured: BaseModel | None = None\n        subtype = \"\"\n        is_error = False\n        usage: TokenUsage | None = None\n        total_cost_usd: float | None = None\n        try:\n            async with ClaudeSDKClient(options=sdk_opts) as client:\n                await client.query(prompt)\n                async for message in client.receive_response():\n                    if isinstance(message, ResultMessage):\n                        subtype = message.subtype\n                        is_error = bool(message.is_error)\n                        result_text = message.result\n                        structured = validate_structured(\n                            message.structured_output, options.response_model\n                        )\n                        usage = cast(\"TokenUsage | None\", message.usage)\n                        total_cost_usd = message.total_cost_usd\n                        # Usage is cumulative per session, so add it exactly once.\n                        TOKENS.add(usage, usd=total_cost_usd)\n                        break\n        except CLINotFoundError:\n            raise HarnessCLINotFoundError(\n                \"Claude CLI binary not found\"\n            ) from None\n        except (ProcessError, CLIConnectionError, CLIJSONDecodeError, MessageParseError) as e:\n            raise _wrap_sdk_error(e) from e\n\n        return OneShotResult(\n            is_error=is_error,\n            subtype=subtype,\n            result_text=result_text,\n            structured=structured,\n            usage=usage,\n            total_cost_usd=total_cost_usd,\n        )\n\n    def run_streaming(\n        self, prompt: str, options: StreamingOptions\n    ) -> AsyncIterator[HarnessMessage]:\n        \"\"\"Return an async iterator of typed harness messages for a streaming session.\"\"\"\n        # Built here, not in the options translator: the collector must be readable at the result\n        fact_server = None\n        fact_tool_names: list[str] = []\n        collector = None\n        if options.fact_tool_specs:\n            fact_server, fact_tool_names, collector = build_fact_mcp(\n                options.fact_tool_specs, report_model=_persona_report_model())\n        sdk_opts = build_streaming_sdk_options(\n            options, fact_server=fact_server, fact_tool_names=fact_tool_names)\n        if options.cache_prefix:\n            # No marker seam on the Agent SDK query path; the prefix is content.\n            prompt = options.cache_prefix + prompt\n\n        def _translate_message(message: object) -> list[HarnessMessage]:\n            \"\"\"Translate one SDK message, attaching persona reports to a terminal result.\"\"\"\n            translated_list: list[HarnessMessage] = []\n            for translated in translate(message, options.response_model):\n                if isinstance(translated, HarnessResult):\n                    # Collector FIRST (validated at submit); scraper is only a fallback\n                    persona_dicts = collector.reports if collector else []\n                    expected = len(options.agents) if options.agents else 1\n                    if len(persona_dicts) < expected and translated.session_id:\n                        persona_dicts = _merge_persona_reports(\n                            persona_dicts,\n                            _extract_sdk_persona_reports(\n                                translated.session_id, options.cwd),\n                        )\n                    if persona_dicts:\n                        translated.state = {\"sdk_persona_reports\": persona_dicts}\n                translated_list.append(translated)\n            return translated_list\n\n        async def _gen() -> AsyncIterator[HarnessMessage]:\n            # expired: set when OUR deadline (not an inner TimeoutError) fires; checked\n            # AFTER the client context closes, so the raise never reaches __aexit__ while\n            # a cancellation is in flight (see agent_sdk.drain_until_result).\n            expired = False\n            try:\n                async with ClaudeSDKClient(options=sdk_opts) as client:\n                    await client.query(prompt)\n                    if options.timeout:\n                        loop = asyncio.get_running_loop()\n                        deadline = loop.time() + options.timeout\n                        iterator = client.receive_response().__aiter__()\n                        while True:\n                            # A fresh Timeout cm per anext(): the deadline is one shared\n                            # instant, but bounding only the await (never the yield below)\n                            # means the clock never spans control handed back to the caller.\n                            cm = asyncio.timeout_at(deadline)\n                            try:\n                                async with cm:\n                                    message = await iterator.__anext__()\n                            except StopAsyncIteration:\n                                break\n                            except TimeoutError:\n                                # .expired() tells OUR deadline apart from a TimeoutError\n                                # raised inside the session itself.\n                                if not cm.expired():\n                                    raise\n                                expired = True\n                                break\n                            for translated in _translate_message(message):\n                                yield translated\n                        if expired:\n                            with contextlib.suppress(Exception):\n                                await client.interrupt()\n                            # Grace drain: give the interrupted session a chance to\n                            # settle before __aexit__ runs with no cancellation pending.\n                            with contextlib.suppress(TimeoutError):\n                                async with asyncio.timeout(TIMEOUT_STOP_GRACE_SECONDS):\n                                    async for _ in client.receive_response():\n                                        pass\n                    else:\n                        async for message in client.receive_response():\n                            for translated in _translate_message(message):\n                                yield translated\n            except CLINotFoundError:\n                raise HarnessCLINotFoundError(\n                    \"Claude CLI binary not found\"\n                ) from None\n            except (ProcessError, CLIConnectionError, CLIJSONDecodeError, MessageParseError) as e:\n                raise _wrap_sdk_error(e) from e\n            if expired:\n                # Raised OUTSIDE the client's `async with`: __aexit__ already ran clean.\n                raise call_timeout_error(\n                    stage=options.graph_name, route=\"claude\", budget_s=options.timeout,\n                    effort=options.effort,\n                    cause_text=f\"claude session exceeded {options.timeout:g}s\")\n\n        return _gen()\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/backends/harness/claude/client.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "ClaudeHarness: Claude Agent SDK concrete implementation of Harness.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_58_4": {
+      "source": "vvaharness/backends/harness/claude/client.py",
+      "line_start": 58,
+      "line_end": 58,
+      "value": "``PersonaReport``, for the validated submission tool; None when unavailable.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_70_4": {
+      "source": "vvaharness/backends/harness/claude/client.py",
+      "line_start": 70,
+      "line_end": 70,
+      "value": "Read PersonaReport dicts from the last assistant message's JSON block in each transcript.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_115_4": {
+      "source": "vvaharness/backends/harness/claude/client.py",
+      "line_start": 115,
+      "line_end": 115,
+      "value": "Submitted reports plus scraped ones for personas that did not submit.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_124_4": {
+      "source": "vvaharness/backends/harness/claude/client.py",
+      "line_start": 124,
+      "line_end": 124,
+      "value": "Map an SDK exception to the appropriate HarnessError subclass.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_138_4": {
+      "source": "vvaharness/backends/harness/claude/client.py",
+      "line_start": 138,
+      "line_end": 138,
+      "value": "Claude Agent SDK implementation of the Harness interface.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_143_8": {
+      "source": "vvaharness/backends/harness/claude/client.py",
+      "line_start": 143,
+      "line_end": 143,
+      "value": "Run a single-turn invocation and return the structured result.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_189_8": {
+      "source": "vvaharness/backends/harness/claude/client.py",
+      "line_start": 189,
+      "line_end": 189,
+      "value": "Return an async iterator of typed harness messages for a streaming session.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_204_12": {
+      "source": "vvaharness/backends/harness/claude/client.py",
+      "line_start": 204,
+      "line_end": 204,
+      "value": "Translate one SDK message, attaching persona reports to a terminal result.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_277_31": {
+      "source": "vvaharness/backends/harness/claude/client.py",
+      "line_start": 277,
+      "line_end": 277,
+      "source_expression": "f\"claude session exceeded {options.timeout:g}s\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "ClaudeHarness: Claude Agent SDK concrete implementation of Harness.",
+      "context": "literal"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 4,
+      "value": "``PersonaReport``, for the validated submission tool; None when unavailable.",
+      "context": "literal"
+    },
+    {
+      "line_start": 70,
+      "line_end": 70,
+      "column": 4,
+      "value": "Read PersonaReport dicts from the last assistant message's JSON block in each transcript.",
+      "context": "literal"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 4,
+      "value": "Submitted reports plus scraped ones for personas that did not submit.",
+      "context": "literal"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 4,
+      "value": "Map an SDK exception to the appropriate HarnessError subclass.",
+      "context": "literal"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 4,
+      "value": "Claude Agent SDK implementation of the Harness interface.",
+      "context": "literal"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 8,
+      "value": "Run a single-turn invocation and return the structured result.",
+      "context": "literal"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 18,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 8,
+      "value": "Return an async iterator of typed harness messages for a streaming session.",
+      "context": "literal"
+    },
+    {
+      "line_start": 204,
+      "line_end": 204,
+      "column": 12,
+      "value": "Translate one SDK message, attaching persona reports to a terminal result.",
+      "context": "literal"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 27,
+      "value": "persona",
+      "context": "literal"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 50,
+      "value": "tracking_id",
+      "context": "literal"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 20,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 34,
+      "value": "```json",
+      "context": "literal"
+    },
+    {
+      "line_start": 128,
+      "line_end": 128,
+      "column": 33,
+      "value": "exit_code",
+      "context": "literal"
+    },
+    {
+      "line_start": 129,
+      "line_end": 129,
+      "column": 30,
+      "value": "stderr",
+      "context": "literal"
+    },
+    {
+      "line_start": 172,
+      "line_end": 172,
+      "column": 16,
+      "value": "Claude CLI binary not found",
+      "context": "literal"
+    },
+    {
+      "line_start": 87,
+      "line_end": 87,
+      "column": 35,
+      "value": "message",
+      "context": "literal"
+    },
+    {
+      "line_start": 88,
+      "line_end": 88,
+      "column": 34,
+      "value": "content",
+      "context": "literal"
+    },
+    {
+      "line_start": 95,
+      "line_end": 95,
+      "column": 32,
+      "value": "```",
+      "context": "literal"
+    },
+    {
+      "line_start": 268,
+      "line_end": 268,
+      "column": 20,
+      "value": "Claude CLI binary not found",
+      "context": "literal"
+    },
+    {
+      "line_start": 275,
+      "line_end": 275,
+      "column": 52,
+      "value": "claude",
+      "context": "literal"
+    },
+    {
+      "line_start": 90,
+      "line_end": 90,
+      "column": 27,
+      "value": "text",
+      "context": "literal"
+    },
+    {
+      "line_start": 90,
+      "line_end": 90,
+      "column": 35,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 50,
+      "value": "persona",
+      "context": "literal"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 72,
+      "value": "gates",
+      "context": "literal"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 37,
+      "value": "TokenUsage | None",
+      "context": "literal"
+    },
+    {
+      "line_start": 218,
+      "line_end": 218,
+      "column": 44,
+      "value": "sdk_persona_reports",
+      "context": "literal"
+    },
+    {
+      "line_start": 277,
+      "line_end": 277,
+      "column": 33,
+      "value": "claude session exceeded ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 277,
+      "line_end": 277,
+      "column": 76,
+      "value": "s",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 40,
+      "value": "persona",
+      "context": "literal"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 61,
+      "value": "tracking_id",
+      "context": "literal"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 65,
+      "value": "text",
+      "context": "literal"
+    },
+    {
+      "line_start": 277,
+      "line_end": 277,
+      "column": 74,
+      "value": "g",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 54,
+      "value": "type",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 59,
+      "text": "# Lazy and defensive: the harness backend must not hard-depend on the validation package."
+    },
+    {
+      "line": 61,
+      "text": "# noqa: PLC0415 — lazy"
+    },
+    {
+      "line": 72,
+      "text": "# noqa: PLC0415 — optional SDK; absent build returns []"
+    },
+    {
+      "line": 145,
+      "text": "# No marker seam on the Agent SDK query path; the prefix is content."
+    },
+    {
+      "line": 167,
+      "text": "# Usage is cumulative per session, so add it exactly once."
+    },
+    {
+      "line": 190,
+      "text": "# Built here, not in the options translator: the collector must be readable at the result"
+    },
+    {
+      "line": 200,
+      "text": "# No marker seam on the Agent SDK query path; the prefix is content."
+    },
+    {
+      "line": 208,
+      "text": "# Collector FIRST (validated at submit); scraper is only a fallback"
+    },
+    {
+      "line": 223,
+      "text": "# expired: set when OUR deadline (not an inner TimeoutError) fires; checked"
+    },
+    {
+      "line": 224,
+      "text": "# AFTER the client context closes, so the raise never reaches __aexit__ while"
+    },
+    {
+      "line": 225,
+      "text": "# a cancellation is in flight (see agent_sdk.drain_until_result)."
+    },
+    {
+      "line": 235,
+      "text": "# A fresh Timeout cm per anext(): the deadline is one shared"
+    },
+    {
+      "line": 236,
+      "text": "# instant, but bounding only the await (never the yield below)"
+    },
+    {
+      "line": 237,
+      "text": "# means the clock never spans control handed back to the caller."
+    },
+    {
+      "line": 245,
+      "text": "# .expired() tells OUR deadline apart from a TimeoutError"
+    },
+    {
+      "line": 246,
+      "text": "# raised inside the session itself."
+    },
+    {
+      "line": 256,
+      "text": "# Grace drain: give the interrupted session a chance to"
+    },
+    {
+      "line": 257,
+      "text": "# settle before __aexit__ runs with no cancellation pending."
+    },
+    {
+      "line": 273,
+      "text": "# Raised OUTSIDE the client's `async with`: __aexit__ already ran clean."
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 23,
+      "line_end": 23,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 32,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 33,
+      "line_end": 33,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 34,
+      "line_end": 34,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 36,
+      "line_end": 36,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 37,
+      "line_end": 37,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 38,
+      "line_end": 41,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 42,
+      "line_end": 42,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 43,
+      "line_end": 43,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 44,
+      "line_end": 52,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 53,
+      "line_end": 53,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 54,
+      "line_end": 54,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 57,
+      "line_end": 66,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 9
+    },
+    {
+      "kind": "Expr",
+      "line_start": 58,
+      "line_end": 58,
+      "column": 4,
+      "owner": "_persona_report_model",
+      "representation_line": 15
+    },
+    {
+      "kind": "Try",
+      "line_start": 60,
+      "line_end": 65,
+      "column": 4,
+      "owner": "_persona_report_model",
+      "representation_line": 16
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 61,
+      "line_end": 63,
+      "column": 8,
+      "owner": "_persona_report_model",
+      "representation_line": 19
+    },
+    {
+      "kind": "Return",
+      "line_start": 65,
+      "line_end": 65,
+      "column": 8,
+      "owner": "_persona_report_model",
+      "representation_line": 23
+    },
+    {
+      "kind": "Return",
+      "line_start": 66,
+      "line_end": 66,
+      "column": 4,
+      "owner": "_persona_report_model",
+      "representation_line": 26
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 69,
+      "line_end": 111,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 30
+    },
+    {
+      "kind": "Expr",
+      "line_start": 70,
+      "line_end": 70,
+      "column": 4,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 36
+    },
+    {
+      "kind": "Try",
+      "line_start": 71,
+      "line_end": 77,
+      "column": 4,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 37
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 72,
+      "line_end": 75,
+      "column": 8,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 40
+    },
+    {
+      "kind": "Return",
+      "line_start": 77,
+      "line_end": 77,
+      "column": 8,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 44
+    },
+    {
+      "kind": "Try",
+      "line_start": 78,
+      "line_end": 111,
+      "column": 4,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 47
+    },
+    {
+      "kind": "Assign",
+      "line_start": 79,
+      "line_end": 79,
+      "column": 8,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 50
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 80,
+      "line_end": 80,
+      "column": 8,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 50
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 81,
+      "line_end": 81,
+      "column": 8,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 50
+    },
+    {
+      "kind": "For",
+      "line_start": 82,
+      "line_end": 107,
+      "column": 8,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 51
+    },
+    {
+      "kind": "Assign",
+      "line_start": 83,
+      "line_end": 83,
+      "column": 12,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 54
+    },
+    {
+      "kind": "If",
+      "line_start": 84,
+      "line_end": 85,
+      "column": 12,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 55
+    },
+    {
+      "kind": "Continue",
+      "line_start": 85,
+      "line_end": 85,
+      "column": 16,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 57
+    },
+    {
+      "kind": "For",
+      "line_start": 86,
+      "line_end": 107,
+      "column": 12,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 60
+    },
+    {
+      "kind": "Assign",
+      "line_start": 87,
+      "line_end": 87,
+      "column": 16,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 63
+    },
+    {
+      "kind": "Assign",
+      "line_start": 88,
+      "line_end": 88,
+      "column": 16,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 63
+    },
+    {
+      "kind": "Assign",
+      "line_start": 89,
+      "line_end": 93,
+      "column": 16,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 63
+    },
+    {
+      "kind": "Assign",
+      "line_start": 94,
+      "line_end": 94,
+      "column": 16,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 63
+    },
+    {
+      "kind": "Assign",
+      "line_start": 95,
+      "line_end": 95,
+      "column": 16,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 63
+    },
+    {
+      "kind": "If",
+      "line_start": 96,
+      "line_end": 97,
+      "column": 16,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 64
+    },
+    {
+      "kind": "Continue",
+      "line_start": 97,
+      "line_end": 97,
+      "column": 20,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 66
+    },
+    {
+      "kind": "Try",
+      "line_start": 98,
+      "line_end": 106,
+      "column": 16,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 69
+    },
+    {
+      "kind": "Assign",
+      "line_start": 99,
+      "line_end": 99,
+      "column": 20,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 72
+    },
+    {
+      "kind": "If",
+      "line_start": 100,
+      "line_end": 104,
+      "column": 20,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 73
+    },
+    {
+      "kind": "Assign",
+      "line_start": 101,
+      "line_end": 101,
+      "column": 24,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 76
+    },
+    {
+      "kind": "If",
+      "line_start": 102,
+      "line_end": 104,
+      "column": 24,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 77
+    },
+    {
+      "kind": "Expr",
+      "line_start": 103,
+      "line_end": 103,
+      "column": 28,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 80
+    },
+    {
+      "kind": "Expr",
+      "line_start": 104,
+      "line_end": 104,
+      "column": 28,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 80
+    },
+    {
+      "kind": "Pass",
+      "line_start": 106,
+      "line_end": 106,
+      "column": 20,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 87
+    },
+    {
+      "kind": "Break",
+      "line_start": 107,
+      "line_end": 107,
+      "column": 16,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 89
+    },
+    {
+      "kind": "Return",
+      "line_start": 109,
+      "line_end": 109,
+      "column": 8,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 96
+    },
+    {
+      "kind": "Return",
+      "line_start": 111,
+      "line_end": 111,
+      "column": 8,
+      "owner": "_extract_sdk_persona_reports",
+      "representation_line": 100
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 114,
+      "line_end": 120,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 105
+    },
+    {
+      "kind": "Expr",
+      "line_start": 115,
+      "line_end": 115,
+      "column": 4,
+      "owner": "_merge_persona_reports",
+      "representation_line": 111
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 116,
+      "line_end": 117,
+      "column": 4,
+      "owner": "_merge_persona_reports",
+      "representation_line": 112
+    },
+    {
+      "kind": "Return",
+      "line_start": 117,
+      "line_end": 117,
+      "column": 8,
+      "owner": "_merge_persona_reports.key",
+      "representation_line": 117
+    },
+    {
+      "kind": "Assign",
+      "line_start": 119,
+      "line_end": 119,
+      "column": 4,
+      "owner": "_merge_persona_reports",
+      "representation_line": 122
+    },
+    {
+      "kind": "Return",
+      "line_start": 120,
+      "line_end": 120,
+      "column": 4,
+      "owner": "_merge_persona_reports",
+      "representation_line": 123
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 123,
+      "line_end": 134,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 127
+    },
+    {
+      "kind": "Expr",
+      "line_start": 124,
+      "line_end": 124,
+      "column": 4,
+      "owner": "_wrap_sdk_error",
+      "representation_line": 133
+    },
+    {
+      "kind": "If",
+      "line_start": 125,
+      "line_end": 130,
+      "column": 4,
+      "owner": "_wrap_sdk_error",
+      "representation_line": 134
+    },
+    {
+      "kind": "Return",
+      "line_start": 126,
+      "line_end": 130,
+      "column": 8,
+      "owner": "_wrap_sdk_error",
+      "representation_line": 136
+    },
+    {
+      "kind": "For",
+      "line_start": 131,
+      "line_end": 133,
+      "column": 4,
+      "owner": "_wrap_sdk_error",
+      "representation_line": 139
+    },
+    {
+      "kind": "If",
+      "line_start": 132,
+      "line_end": 133,
+      "column": 8,
+      "owner": "_wrap_sdk_error",
+      "representation_line": 141
+    },
+    {
+      "kind": "Return",
+      "line_start": 133,
+      "line_end": 133,
+      "column": 12,
+      "owner": "_wrap_sdk_error",
+      "representation_line": 143
+    },
+    {
+      "kind": "Return",
+      "line_start": 134,
+      "line_end": 134,
+      "column": 4,
+      "owner": "_wrap_sdk_error",
+      "representation_line": 147
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 137,
+      "line_end": 279,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 151
+    },
+    {
+      "kind": "Expr",
+      "line_start": 138,
+      "line_end": 138,
+      "column": 4,
+      "owner": "ClaudeHarness",
+      "representation_line": 156
+    },
+    {
+      "kind": "AsyncFunctionDef",
+      "line_start": 140,
+      "line_end": 184,
+      "column": 4,
+      "owner": "ClaudeHarness",
+      "representation_line": 157
+    },
+    {
+      "kind": "Expr",
+      "line_start": 143,
+      "line_end": 143,
+      "column": 8,
+      "owner": "ClaudeHarness.run_oneshot",
+      "representation_line": 164
+    },
+    {
+      "kind": "If",
+      "line_start": 144,
+      "line_end": 146,
+      "column": 8,
+      "owner": "ClaudeHarness.run_oneshot",
+      "representation_line": 165
+    },
+    {
+      "kind": "Assign",
+      "line_start": 146,
+      "line_end": 146,
+      "column": 12,
+      "owner": "ClaudeHarness.run_oneshot",
+      "representation_line": 168
+    },
+    {
+      "kind": "Assign",
+      "line_start": 147,
+      "line_end": 147,
+      "column": 8,
+      "owner": "ClaudeHarness.run_oneshot",
+      "representation_line": 171
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 148,
+      "line_end": 148,
+      "column": 8,
+      "owner": "ClaudeHarness.run_oneshot",
+      "representation_line": 171
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 149,
+      "line_end": 149,
+      "column": 8,
+      "owner": "ClaudeHarness.run_oneshot",
+      "representation_line": 171
+    },
+    {
+      "kind": "Assign",
+      "line_start": 150,
+      "line_end": 150,
+      "column": 8,
+      "owner": "ClaudeHarness.run_oneshot",
+      "representation_line": 171
+    },
+    {
+      "kind": "Assign",
+      "line_start": 151,
+      "line_end": 151,
+      "column": 8,
+      "owner": "ClaudeHarness.run_oneshot",
+      "representation_line": 171
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 152,
+      "line_end": 152,
+      "column": 8,
+      "owner": "ClaudeHarness.run_oneshot",
+      "representation_line": 173
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 153,
+      "line_end": 153,
+      "column": 8,
+      "owner": "ClaudeHarness.run_oneshot",
+      "representation_line": 173
+    },
+    {
+      "kind": "Try",
+      "line_start": 154,
+      "line_end": 175,
+      "column": 8,
+      "owner": "ClaudeHarness.run_oneshot",
+      "representation_line": 174
+    },
+    {
+      "kind": "AsyncWith",
+      "line_start": 155,
+      "line_end": 169,
+      "column": 12,
+      "owner": "ClaudeHarness.run_oneshot",
+      "representation_line": 176
+    },
+    {
+      "kind": "Expr",
+      "line_start": 156,
+      "line_end": 156,
+      "column": 16,
+      "owner": "ClaudeHarness.run_oneshot",
+      "representation_line": 179
+    },
+    {
+      "kind": "AsyncFor",
+      "line_start": 157,
+      "line_end": 169,
+      "column": 16,
+      "owner": "ClaudeHarness.run_oneshot",
+      "representation_line": 180
+    },
+    {
+      "kind": "If",
+      "line_start": 158,
+      "line_end": 169,
+      "column": 20,
+      "owner": "ClaudeHarness.run_oneshot",
+      "representation_line": 183
+    },
+    {
+      "kind": "Assign",
+      "line_start": 159,
+      "line_end": 159,
+      "column": 24,
+      "owner": "ClaudeHarness.run_oneshot",
+      "representation_line": 186
+    },
+    {
+      "kind": "Assign",
+      "line_start": 160,
+      "line_end": 160,
+      "column": 24,
+      "owner": "ClaudeHarness.run_oneshot",
+      "representation_line": 186
+    },
+    {
+      "kind": "Assign",
+      "line_start": 161,
+      "line_end": 161,
+      "column": 24,
+      "owner": "ClaudeHarness.run_oneshot",
+      "representation_line": 186
+    },
+    {
+      "kind": "Assign",
+      "line_start": 162,
+      "line_end": 164,
+      "column": 24,
+      "owner": "ClaudeHarness.run_oneshot",
+      "representation_line": 186
+    },
+    {
+      "kind": "Assign",
+      "line_start": 165,
+      "line_end": 165,
+      "column": 24,
+      "owner": "ClaudeHarness.run_oneshot",
+      "representation_line": 186
+    },
+    {
+      "kind": "Assign",
+      "line_start": 166,
+      "line_end": 166,
+      "column": 24,
+      "owner": "ClaudeHarness.run_oneshot",
+      "representation_line": 188
+    },
+    {
+      "kind": "Expr",
+      "line_start": 168,
+      "line_end": 168,
+      "column": 24,
+      "owner": "ClaudeHarness.run_oneshot",
+      "representation_line": 188
+    },
+    {
+      "kind": "Break",
+      "line_start": 169,
+      "line_end": 169,
+      "column": 24,
+      "owner": "ClaudeHarness.run_oneshot",
+      "representation_line": 189
+    },
+    {
+      "kind": "Raise",
+      "line_start": 171,
+      "line_end": 173,
+      "column": 12,
+      "owner": "ClaudeHarness.run_oneshot",
+      "representation_line": 198
+    },
+    {
+      "kind": "Raise",
+      "line_start": 175,
+      "line_end": 175,
+      "column": 12,
+      "owner": "ClaudeHarness.run_oneshot",
+      "representation_line": 203
+    },
+    {
+      "kind": "Return",
+      "line_start": 177,
+      "line_end": 184,
+      "column": 8,
+      "owner": "ClaudeHarness.run_oneshot",
+      "representation_line": 206
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 186,
+      "line_end": 279,
+      "column": 4,
+      "owner": "ClaudeHarness",
+      "representation_line": 210
+    },
+    {
+      "kind": "Expr",
+      "line_start": 189,
+      "line_end": 189,
+      "column": 8,
+      "owner": "ClaudeHarness.run_streaming",
+      "representation_line": 216
+    },
+    {
+      "kind": "Assign",
+      "line_start": 191,
+      "line_end": 191,
+      "column": 8,
+      "owner": "ClaudeHarness.run_streaming",
+      "representation_line": 216
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 192,
+      "line_end": 192,
+      "column": 8,
+      "owner": "ClaudeHarness.run_streaming",
+      "representation_line": 216
+    },
+    {
+      "kind": "Assign",
+      "line_start": 193,
+      "line_end": 193,
+      "column": 8,
+      "owner": "ClaudeHarness.run_streaming",
+      "representation_line": 216
+    },
+    {
+      "kind": "If",
+      "line_start": 194,
+      "line_end": 196,
+      "column": 8,
+      "owner": "ClaudeHarness.run_streaming",
+      "representation_line": 217
+    },
+    {
+      "kind": "Assign",
+      "line_start": 195,
+      "line_end": 196,
+      "column": 12,
+      "owner": "ClaudeHarness.run_streaming",
+      "representation_line": 220
+    },
+    {
+      "kind": "Assign",
+      "line_start": 197,
+      "line_end": 198,
+      "column": 8,
+      "owner": "ClaudeHarness.run_streaming",
+      "representation_line": 223
+    },
+    {
+      "kind": "If",
+      "line_start": 199,
+      "line_end": 201,
+      "column": 8,
+      "owner": "ClaudeHarness.run_streaming",
+      "representation_line": 224
+    },
+    {
+      "kind": "Assign",
+      "line_start": 201,
+      "line_end": 201,
+      "column": 12,
+      "owner": "ClaudeHarness.run_streaming",
+      "representation_line": 227
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 203,
+      "line_end": 220,
+      "column": 8,
+      "owner": "ClaudeHarness.run_streaming",
+      "representation_line": 229
+    },
+    {
+      "kind": "Expr",
+      "line_start": 204,
+      "line_end": 204,
+      "column": 12,
+      "owner": "ClaudeHarness.run_streaming._translate_message",
+      "representation_line": 235
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 205,
+      "line_end": 205,
+      "column": 12,
+      "owner": "ClaudeHarness.run_streaming._translate_message",
+      "representation_line": 235
+    },
+    {
+      "kind": "For",
+      "line_start": 206,
+      "line_end": 219,
+      "column": 12,
+      "owner": "ClaudeHarness.run_streaming._translate_message",
+      "representation_line": 236
+    },
+    {
+      "kind": "If",
+      "line_start": 207,
+      "line_end": 218,
+      "column": 16,
+      "owner": "ClaudeHarness.run_streaming._translate_message",
+      "representation_line": 238
+    },
+    {
+      "kind": "Assign",
+      "line_start": 209,
+      "line_end": 209,
+      "column": 20,
+      "owner": "ClaudeHarness.run_streaming._translate_message",
+      "representation_line": 241
+    },
+    {
+      "kind": "Assign",
+      "line_start": 210,
+      "line_end": 210,
+      "column": 20,
+      "owner": "ClaudeHarness.run_streaming._translate_message",
+      "representation_line": 241
+    },
+    {
+      "kind": "If",
+      "line_start": 211,
+      "line_end": 216,
+      "column": 20,
+      "owner": "ClaudeHarness.run_streaming._translate_message",
+      "representation_line": 242
+    },
+    {
+      "kind": "Assign",
+      "line_start": 212,
+      "line_end": 216,
+      "column": 24,
+      "owner": "ClaudeHarness.run_streaming._translate_message",
+      "representation_line": 245
+    },
+    {
+      "kind": "If",
+      "line_start": 217,
+      "line_end": 218,
+      "column": 20,
+      "owner": "ClaudeHarness.run_streaming._translate_message",
+      "representation_line": 247
+    },
+    {
+      "kind": "Assign",
+      "line_start": 218,
+      "line_end": 218,
+      "column": 24,
+      "owner": "ClaudeHarness.run_streaming._translate_message",
+      "representation_line": 250
+    },
+    {
+      "kind": "Expr",
+      "line_start": 219,
+      "line_end": 219,
+      "column": 16,
+      "owner": "ClaudeHarness.run_streaming._translate_message",
+      "representation_line": 254
+    },
+    {
+      "kind": "Return",
+      "line_start": 220,
+      "line_end": 220,
+      "column": 12,
+      "owner": "ClaudeHarness.run_streaming._translate_message",
+      "representation_line": 256
+    },
+    {
+      "kind": "AsyncFunctionDef",
+      "line_start": 222,
+      "line_end": 277,
+      "column": 8,
+      "owner": "ClaudeHarness.run_streaming",
+      "representation_line": 260
+    },
+    {
+      "kind": "Assign",
+      "line_start": 226,
+      "line_end": 226,
+      "column": 12,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 267
+    },
+    {
+      "kind": "Try",
+      "line_start": 227,
+      "line_end": 271,
+      "column": 12,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 268
+    },
+    {
+      "kind": "AsyncWith",
+      "line_start": 228,
+      "line_end": 265,
+      "column": 16,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 270
+    },
+    {
+      "kind": "Expr",
+      "line_start": 229,
+      "line_end": 229,
+      "column": 20,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 273
+    },
+    {
+      "kind": "If",
+      "line_start": 230,
+      "line_end": 265,
+      "column": 20,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 274
+    },
+    {
+      "kind": "Assign",
+      "line_start": 231,
+      "line_end": 231,
+      "column": 24,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 277
+    },
+    {
+      "kind": "Assign",
+      "line_start": 232,
+      "line_end": 232,
+      "column": 24,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 277
+    },
+    {
+      "kind": "Assign",
+      "line_start": 233,
+      "line_end": 233,
+      "column": 24,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 277
+    },
+    {
+      "kind": "While",
+      "line_start": 234,
+      "line_end": 252,
+      "column": 24,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 278
+    },
+    {
+      "kind": "Assign",
+      "line_start": 238,
+      "line_end": 238,
+      "column": 28,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 281
+    },
+    {
+      "kind": "Try",
+      "line_start": 239,
+      "line_end": 250,
+      "column": 28,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 282
+    },
+    {
+      "kind": "AsyncWith",
+      "line_start": 240,
+      "line_end": 241,
+      "column": 32,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 284
+    },
+    {
+      "kind": "Assign",
+      "line_start": 241,
+      "line_end": 241,
+      "column": 36,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 287
+    },
+    {
+      "kind": "Break",
+      "line_start": 243,
+      "line_end": 243,
+      "column": 32,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 293
+    },
+    {
+      "kind": "If",
+      "line_start": 247,
+      "line_end": 248,
+      "column": 32,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 298
+    },
+    {
+      "kind": "Raise",
+      "line_start": 248,
+      "line_end": 248,
+      "column": 36,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 300
+    },
+    {
+      "kind": "Assign",
+      "line_start": 249,
+      "line_end": 249,
+      "column": 32,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 304
+    },
+    {
+      "kind": "Break",
+      "line_start": 250,
+      "line_end": 250,
+      "column": 32,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 305
+    },
+    {
+      "kind": "For",
+      "line_start": 251,
+      "line_end": 252,
+      "column": 28,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 308
+    },
+    {
+      "kind": "Expr",
+      "line_start": 252,
+      "line_end": 252,
+      "column": 32,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 311
+    },
+    {
+      "kind": "If",
+      "line_start": 253,
+      "line_end": 261,
+      "column": 24,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 314
+    },
+    {
+      "kind": "With",
+      "line_start": 254,
+      "line_end": 255,
+      "column": 28,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 316
+    },
+    {
+      "kind": "Expr",
+      "line_start": 255,
+      "line_end": 255,
+      "column": 32,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 319
+    },
+    {
+      "kind": "With",
+      "line_start": 258,
+      "line_end": 261,
+      "column": 28,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 322
+    },
+    {
+      "kind": "AsyncWith",
+      "line_start": 259,
+      "line_end": 261,
+      "column": 32,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 324
+    },
+    {
+      "kind": "AsyncFor",
+      "line_start": 260,
+      "line_end": 261,
+      "column": 36,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 326
+    },
+    {
+      "kind": "Pass",
+      "line_start": 261,
+      "line_end": 261,
+      "column": 40,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 330
+    },
+    {
+      "kind": "AsyncFor",
+      "line_start": 263,
+      "line_end": 265,
+      "column": 24,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 339
+    },
+    {
+      "kind": "For",
+      "line_start": 264,
+      "line_end": 265,
+      "column": 28,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 342
+    },
+    {
+      "kind": "Expr",
+      "line_start": 265,
+      "line_end": 265,
+      "column": 32,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 345
+    },
+    {
+      "kind": "Raise",
+      "line_start": 267,
+      "line_end": 269,
+      "column": 16,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 354
+    },
+    {
+      "kind": "Raise",
+      "line_start": 271,
+      "line_end": 271,
+      "column": 16,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 359
+    },
+    {
+      "kind": "If",
+      "line_start": 272,
+      "line_end": 277,
+      "column": 12,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 362
+    },
+    {
+      "kind": "Raise",
+      "line_start": 274,
+      "line_end": 277,
+      "column": 16,
+      "owner": "ClaudeHarness.run_streaming._gen",
+      "representation_line": 364
+    },
+    {
+      "kind": "Return",
+      "line_start": 279,
+      "line_end": 279,
+      "column": 8,
+      "owner": "ClaudeHarness.run_streaming",
+      "representation_line": 369
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='PersonaReport', ctx=Load())",
+      "rendered": "PersonaReport"
+    },
+    {
+      "line_start": 76,
+      "line_end": 76,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='ImportError', ctx=Load())",
+      "rendered": "ImportError"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 15,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 79,
+      "line_end": 79,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='list_subagents', ctx=Load()), args=[Name(id='session_id', ctx=Load())], keywords=[keyword(arg='directory', value=Call(func=Name(id='str', ctx=Load()), args=[Name(id='cwd', ctx=Load())], keywords=[]))])",
+      "rendered": "list_subagents(session_id, directory=str(cwd))"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 30,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 27,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 24,
+      "kind": "Name",
+      "original_ast": "Name(id='agent_ids', ctx=Load())",
+      "rendered": "agent_ids"
+    },
+    {
+      "line_start": 83,
+      "line_end": 83,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='get_subagent_messages', ctx=Load()), args=[Name(id='session_id', ctx=Load()), Name(id='agent_id', ctx=Load())], keywords=[keyword(arg='directory', value=Call(func=Name(id='str', ctx=Load()), args=[Name(id='cwd', ctx=Load())], keywords=[]))])",
+      "rendered": "get_subagent_messages(session_id, agent_id, directory=str(cwd))"
+    },
+    {
+      "line_start": 84,
+      "line_end": 84,
+      "column": 15,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='messages', ctx=Load()))",
+      "rendered": "not messages"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='reversed', ctx=Load()), args=[Name(id='messages', ctx=Load())], keywords=[])",
+      "rendered": "reversed(messages)"
+    },
+    {
+      "line_start": 87,
+      "line_end": 87,
+      "column": 22,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='msg', ctx=Load()), Constant(value='message'), Dict(keys=[], values=[])], keywords=[]), Dict(keys=[], values=[])])",
+      "rendered": "getattr(msg, 'message', {}) or {}"
+    },
+    {
+      "line_start": 88,
+      "line_end": 88,
+      "column": 26,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='raw', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[]), body=Call(func=Attribute(value=Name(id='raw', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='content'), List(elts=[], ctx=Load())], keywords=[]), orelse=List(elts=[], ctx=Load()))",
+      "rendered": "raw.get('content', []) if isinstance(raw, dict) else []"
+    },
+    {
+      "line_start": 89,
+      "line_end": 93,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='next', ctx=Load()), args=[GeneratorExp(elt=Call(func=Attribute(value=Name(id='b', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='text'), Constant(value='')], keywords=[]), generators=[comprehension(target=Name(id='b', ctx=Store()), iter=Name(id='content', ctx=Load()), ifs=[BoolOp(op=And(), values=[Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='b', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[]), Compare(left=Call(func=Attribute(value=Name(id='b', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='type')], keywords=[]), ops=[Eq()], comparators=[Constant(value='text')])])], is_async=0)]), Constant(value='')], keywords=[])",
+      "rendered": "next((b.get('text', '') for b in content if isinstance(b, dict) and b.get('type') == 'text'), '')"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 24,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='text', ctx=Load()), attr='find', ctx=Load()), args=[Constant(value='```json')], keywords=[])",
+      "rendered": "text.find('```json')"
+    },
+    {
+      "line_start": 95,
+      "line_end": 95,
+      "column": 22,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=Name(id='start', ctx=Load()), ops=[GtE()], comparators=[Constant(value=0)]), body=Call(func=Attribute(value=Name(id='text', ctx=Load()), attr='find', ctx=Load()), args=[Constant(value='```'), BinOp(left=Name(id='start', ctx=Load()), op=Add(), right=Constant(value=7))], keywords=[]), orelse=UnaryOp(op=USub(), operand=Constant(value=1)))",
+      "rendered": "text.find('```', start + 7) if start >= 0 else -1"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 19,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Compare(left=Name(id='start', ctx=Load()), ops=[Lt()], comparators=[Constant(value=0)]), Compare(left=Name(id='end', ctx=Load()), ops=[LtE()], comparators=[Name(id='start', ctx=Load())])])",
+      "rendered": "start < 0 or end <= start"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 27,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='json', ctx=Load()), attr='loads', ctx=Load()), args=[Call(func=Attribute(value=Subscript(value=Name(id='text', ctx=Load()), slice=Slice(lower=BinOp(left=Name(id='start', ctx=Load()), op=Add(), right=Constant(value=7)), upper=Name(id='end', ctx=Load())), ctx=Load()), attr='strip', ctx=Load()), args=[], keywords=[])], keywords=[])",
+      "rendered": "json.loads(text[start + 7:end].strip())"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 23,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='data', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[]), Compare(left=Constant(value='persona'), ops=[In()], comparators=[Name(id='data', ctx=Load())]), Compare(left=Constant(value='gates'), ops=[In()], comparators=[Name(id='data', ctx=Load())])])",
+      "rendered": "isinstance(data, dict) and 'persona' in data and ('gates' in data)"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 30,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Call(func=Attribute(value=Name(id='data', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='persona')], keywords=[]), Call(func=Attribute(value=Name(id='data', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='tracking_id')], keywords=[])], ctx=Load())",
+      "rendered": "(data.get('persona'), data.get('tracking_id'))"
+    },
+    {
+      "line_start": 102,
+      "line_end": 102,
+      "column": 27,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='key', ctx=Load()), ops=[NotIn()], comparators=[Name(id='seen', ctx=Load())])",
+      "rendered": "key not in seen"
+    },
+    {
+      "line_start": 103,
+      "line_end": 103,
+      "column": 28,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='seen', ctx=Load()), attr='add', ctx=Load()), args=[Name(id='key', ctx=Load())], keywords=[])",
+      "rendered": "seen.add(key)"
+    },
+    {
+      "line_start": 104,
+      "line_end": 104,
+      "column": 28,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='reports', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='data', ctx=Load())], keywords=[])",
+      "rendered": "reports.append(data)"
+    },
+    {
+      "line_start": 105,
+      "line_end": 105,
+      "column": 23,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='ValueError', ctx=Load()), Attribute(value=Name(id='json', ctx=Load()), attr='JSONDecodeError', ctx=Load())], ctx=Load())",
+      "rendered": "(ValueError, json.JSONDecodeError)"
+    },
+    {
+      "line_start": 108,
+      "line_end": 108,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 15,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 111,
+      "line_end": 111,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='reports', ctx=Load())",
+      "rendered": "reports"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Call(func=Attribute(value=Name(id='report', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='persona')], keywords=[]), Call(func=Attribute(value=Name(id='report', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='tracking_id')], keywords=[])], ctx=Load())",
+      "rendered": "(report.get('persona'), report.get('tracking_id'))"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 11,
+      "kind": "SetComp",
+      "original_ast": "SetComp(elt=Call(func=Name(id='key', ctx=Load()), args=[Name(id='r', ctx=Load())], keywords=[]), generators=[comprehension(target=Name(id='r', ctx=Store()), iter=Name(id='submitted', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "{key(r) for r in submitted}"
+    },
+    {
+      "line_start": 120,
+      "line_end": 120,
+      "column": 11,
+      "kind": "List",
+      "original_ast": "List(elts=[Starred(value=Name(id='submitted', ctx=Load()), ctx=Load()), Starred(value=GeneratorExp(elt=Name(id='r', ctx=Load()), generators=[comprehension(target=Name(id='r', ctx=Store()), iter=Name(id='scraped', ctx=Load()), ifs=[Compare(left=Call(func=Name(id='key', ctx=Load()), args=[Name(id='r', ctx=Load())], keywords=[]), ops=[NotIn()], comparators=[Name(id='have', ctx=Load())])], is_async=0)]), ctx=Load())], ctx=Load())",
+      "rendered": "[*submitted, *(r for r in scraped if key(r) not in have)]"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='e', ctx=Load()), Name(id='ProcessError', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(e, ProcessError)"
+    },
+    {
+      "line_start": 126,
+      "line_end": 130,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='HarnessProcessError', ctx=Load()), args=[Call(func=Name(id='str', ctx=Load()), args=[Name(id='e', ctx=Load())], keywords=[])], keywords=[keyword(arg='exit_code', value=Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='e', ctx=Load()), Constant(value='exit_code'), Constant(value=None)], keywords=[])), keyword(arg='stderr', value=Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='e', ctx=Load()), Constant(value='stderr'), Constant(value=None)], keywords=[]))])",
+      "rendered": "HarnessProcessError(str(e), exit_code=getattr(e, 'exit_code', None), stderr=getattr(e, 'stderr', None))"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 34,
+      "kind": "Name",
+      "original_ast": "Name(id='SDK_ERROR_MAP', ctx=Load())",
+      "rendered": "SDK_ERROR_MAP"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='e', ctx=Load()), Name(id='sdk_type', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(e, sdk_type)"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='harness_type', ctx=Load()), args=[Call(func=Name(id='str', ctx=Load()), args=[Name(id='e', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "harness_type(str(e))"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='e', ctx=Load())",
+      "rendered": "e"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 20,
+      "kind": "Name",
+      "original_ast": "Name(id='Harness', ctx=Load())",
+      "rendered": "Harness"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 11,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='options', ctx=Load()), attr='cache_prefix', ctx=Load())",
+      "rendered": "options.cache_prefix"
+    },
+    {
+      "line_start": 146,
+      "line_end": 146,
+      "column": 21,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Attribute(value=Name(id='options', ctx=Load()), attr='cache_prefix', ctx=Load()), op=Add(), right=Name(id='prompt', ctx=Load()))",
+      "rendered": "options.cache_prefix + prompt"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='build_oneshot_sdk_options', ctx=Load()), args=[Name(id='options', ctx=Load())], keywords=[])",
+      "rendered": "build_oneshot_sdk_options(options)"
+    },
+    {
+      "line_start": 148,
+      "line_end": 148,
+      "column": 34,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 149,
+      "line_end": 149,
+      "column": 39,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 18,
+      "kind": "Constant",
+      "original_ast": "Constant(value='')",
+      "rendered": "''"
+    },
+    {
+      "line_start": 151,
+      "line_end": 151,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 152,
+      "line_end": 152,
+      "column": 35,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 153,
+      "line_end": 153,
+      "column": 39,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ClaudeSDKClient', ctx=Load()), args=[], keywords=[keyword(arg='options', value=Name(id='sdk_opts', ctx=Load()))])",
+      "rendered": "ClaudeSDKClient(options=sdk_opts)"
+    },
+    {
+      "line_start": 156,
+      "line_end": 156,
+      "column": 16,
+      "kind": "Await",
+      "original_ast": "Await(value=Call(func=Attribute(value=Name(id='client', ctx=Load()), attr='query', ctx=Load()), args=[Name(id='prompt', ctx=Load())], keywords=[]))",
+      "rendered": "await client.query(prompt)"
+    },
+    {
+      "line_start": 157,
+      "line_end": 157,
+      "column": 37,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='client', ctx=Load()), attr='receive_response', ctx=Load()), args=[], keywords=[])",
+      "rendered": "client.receive_response()"
+    },
+    {
+      "line_start": 158,
+      "line_end": 158,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='message', ctx=Load()), Name(id='ResultMessage', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(message, ResultMessage)"
+    },
+    {
+      "line_start": 159,
+      "line_end": 159,
+      "column": 34,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='message', ctx=Load()), attr='subtype', ctx=Load())",
+      "rendered": "message.subtype"
+    },
+    {
+      "line_start": 160,
+      "line_end": 160,
+      "column": 35,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='bool', ctx=Load()), args=[Attribute(value=Name(id='message', ctx=Load()), attr='is_error', ctx=Load())], keywords=[])",
+      "rendered": "bool(message.is_error)"
+    },
+    {
+      "line_start": 161,
+      "line_end": 161,
+      "column": 38,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='message', ctx=Load()), attr='result', ctx=Load())",
+      "rendered": "message.result"
+    },
+    {
+      "line_start": 162,
+      "line_end": 164,
+      "column": 37,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='validate_structured', ctx=Load()), args=[Attribute(value=Name(id='message', ctx=Load()), attr='structured_output', ctx=Load()), Attribute(value=Name(id='options', ctx=Load()), attr='response_model', ctx=Load())], keywords=[])",
+      "rendered": "validate_structured(message.structured_output, options.response_model)"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 32,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='cast', ctx=Load()), args=[Constant(value='TokenUsage | None'), Attribute(value=Name(id='message', ctx=Load()), attr='usage', ctx=Load())], keywords=[])",
+      "rendered": "cast('TokenUsage | None', message.usage)"
+    },
+    {
+      "line_start": 166,
+      "line_end": 166,
+      "column": 41,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='message', ctx=Load()), attr='total_cost_usd', ctx=Load())",
+      "rendered": "message.total_cost_usd"
+    },
+    {
+      "line_start": 168,
+      "line_end": 168,
+      "column": 24,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='TOKENS', ctx=Load()), attr='add', ctx=Load()), args=[Name(id='usage', ctx=Load())], keywords=[keyword(arg='usd', value=Name(id='total_cost_usd', ctx=Load()))])",
+      "rendered": "TOKENS.add(usage, usd=total_cost_usd)"
+    },
+    {
+      "line_start": 170,
+      "line_end": 170,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='CLINotFoundError', ctx=Load())",
+      "rendered": "CLINotFoundError"
+    },
+    {
+      "line_start": 171,
+      "line_end": 173,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='HarnessCLINotFoundError', ctx=Load()), args=[Constant(value='Claude CLI binary not found')], keywords=[])",
+      "rendered": "HarnessCLINotFoundError('Claude CLI binary not found')"
+    },
+    {
+      "line_start": 173,
+      "line_end": 173,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='ProcessError', ctx=Load()), Name(id='CLIConnectionError', ctx=Load()), Name(id='CLIJSONDecodeError', ctx=Load()), Name(id='MessageParseError', ctx=Load())], ctx=Load())",
+      "rendered": "(ProcessError, CLIConnectionError, CLIJSONDecodeError, MessageParseError)"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_wrap_sdk_error', ctx=Load()), args=[Name(id='e', ctx=Load())], keywords=[])",
+      "rendered": "_wrap_sdk_error(e)"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 42,
+      "kind": "Name",
+      "original_ast": "Name(id='e', ctx=Load())",
+      "rendered": "e"
+    },
+    {
+      "line_start": 177,
+      "line_end": 184,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='OneShotResult', ctx=Load()), args=[], keywords=[keyword(arg='is_error', value=Name(id='is_error', ctx=Load())), keyword(arg='subtype', value=Name(id='subtype', ctx=Load())), keyword(arg='result_text', value=Name(id='result_text', ctx=Load())), keyword(arg='structured', value=Name(id='structured', ctx=Load())), keyword(arg='usage', value=Name(id='usage', ctx=Load())), keyword(arg='total_cost_usd', value=Name(id='total_cost_usd', ctx=Load()))])",
+      "rendered": "OneShotResult(is_error=is_error, subtype=subtype, result_text=result_text, structured=structured, usage=usage, total_cost_usd=total_cost_usd)"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 22,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 37,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 193,
+      "line_end": 193,
+      "column": 20,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 11,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='options', ctx=Load()), attr='fact_tool_specs', ctx=Load())",
+      "rendered": "options.fact_tool_specs"
+    },
+    {
+      "line_start": 195,
+      "line_end": 196,
+      "column": 54,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='build_fact_mcp', ctx=Load()), args=[Attribute(value=Name(id='options', ctx=Load()), attr='fact_tool_specs', ctx=Load())], keywords=[keyword(arg='report_model', value=Call(func=Name(id='_persona_report_model', ctx=Load()), args=[], keywords=[]))])",
+      "rendered": "build_fact_mcp(options.fact_tool_specs, report_model=_persona_report_model())"
+    },
+    {
+      "line_start": 197,
+      "line_end": 198,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='build_streaming_sdk_options', ctx=Load()), args=[Name(id='options', ctx=Load())], keywords=[keyword(arg='fact_server', value=Name(id='fact_server', ctx=Load())), keyword(arg='fact_tool_names', value=Name(id='fact_tool_names', ctx=Load()))])",
+      "rendered": "build_streaming_sdk_options(options, fact_server=fact_server, fact_tool_names=fact_tool_names)"
+    },
+    {
+      "line_start": 199,
+      "line_end": 199,
+      "column": 11,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='options', ctx=Load()), attr='cache_prefix', ctx=Load())",
+      "rendered": "options.cache_prefix"
+    },
+    {
+      "line_start": 201,
+      "line_end": 201,
+      "column": 21,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Attribute(value=Name(id='options', ctx=Load()), attr='cache_prefix', ctx=Load()), op=Add(), right=Name(id='prompt', ctx=Load()))",
+      "rendered": "options.cache_prefix + prompt"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 52,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 30,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='translate', ctx=Load()), args=[Name(id='message', ctx=Load()), Attribute(value=Name(id='options', ctx=Load()), attr='response_model', ctx=Load())], keywords=[])",
+      "rendered": "translate(message, options.response_model)"
+    },
+    {
+      "line_start": 207,
+      "line_end": 207,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='translated', ctx=Load()), Name(id='HarnessResult', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(translated, HarnessResult)"
+    },
+    {
+      "line_start": 209,
+      "line_end": 209,
+      "column": 36,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='collector', ctx=Load()), body=Attribute(value=Name(id='collector', ctx=Load()), attr='reports', ctx=Load()), orelse=List(elts=[], ctx=Load()))",
+      "rendered": "collector.reports if collector else []"
+    },
+    {
+      "line_start": 210,
+      "line_end": 210,
+      "column": 31,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Attribute(value=Name(id='options', ctx=Load()), attr='agents', ctx=Load()), body=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='options', ctx=Load()), attr='agents', ctx=Load())], keywords=[]), orelse=Constant(value=1))",
+      "rendered": "len(options.agents) if options.agents else 1"
+    },
+    {
+      "line_start": 211,
+      "line_end": 211,
+      "column": 23,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='persona_dicts', ctx=Load())], keywords=[]), ops=[Lt()], comparators=[Name(id='expected', ctx=Load())]), Attribute(value=Name(id='translated', ctx=Load()), attr='session_id', ctx=Load())])",
+      "rendered": "len(persona_dicts) < expected and translated.session_id"
+    },
+    {
+      "line_start": 212,
+      "line_end": 216,
+      "column": 40,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_merge_persona_reports', ctx=Load()), args=[Name(id='persona_dicts', ctx=Load()), Call(func=Name(id='_extract_sdk_persona_reports', ctx=Load()), args=[Attribute(value=Name(id='translated', ctx=Load()), attr='session_id', ctx=Load()), Attribute(value=Name(id='options', ctx=Load()), attr='cwd', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "_merge_persona_reports(persona_dicts, _extract_sdk_persona_reports(translated.session_id, options.cwd))"
+    },
+    {
+      "line_start": 217,
+      "line_end": 217,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='persona_dicts', ctx=Load())",
+      "rendered": "persona_dicts"
+    },
+    {
+      "line_start": 218,
+      "line_end": 218,
+      "column": 43,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='sdk_persona_reports')], values=[Name(id='persona_dicts', ctx=Load())])",
+      "rendered": "{'sdk_persona_reports': persona_dicts}"
+    },
+    {
+      "line_start": 219,
+      "line_end": 219,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='translated_list', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='translated', ctx=Load())], keywords=[])",
+      "rendered": "translated_list.append(translated)"
+    },
+    {
+      "line_start": 220,
+      "line_end": 220,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='translated_list', ctx=Load())",
+      "rendered": "translated_list"
+    },
+    {
+      "line_start": 226,
+      "line_end": 226,
+      "column": 22,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 228,
+      "line_end": 228,
+      "column": 27,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ClaudeSDKClient', ctx=Load()), args=[], keywords=[keyword(arg='options', value=Name(id='sdk_opts', ctx=Load()))])",
+      "rendered": "ClaudeSDKClient(options=sdk_opts)"
+    },
+    {
+      "line_start": 229,
+      "line_end": 229,
+      "column": 20,
+      "kind": "Await",
+      "original_ast": "Await(value=Call(func=Attribute(value=Name(id='client', ctx=Load()), attr='query', ctx=Load()), args=[Name(id='prompt', ctx=Load())], keywords=[]))",
+      "rendered": "await client.query(prompt)"
+    },
+    {
+      "line_start": 230,
+      "line_end": 230,
+      "column": 23,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='options', ctx=Load()), attr='timeout', ctx=Load())",
+      "rendered": "options.timeout"
+    },
+    {
+      "line_start": 231,
+      "line_end": 231,
+      "column": 31,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='asyncio', ctx=Load()), attr='get_running_loop', ctx=Load()), args=[], keywords=[])",
+      "rendered": "asyncio.get_running_loop()"
+    },
+    {
+      "line_start": 232,
+      "line_end": 232,
+      "column": 35,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Attribute(value=Name(id='loop', ctx=Load()), attr='time', ctx=Load()), args=[], keywords=[]), op=Add(), right=Attribute(value=Name(id='options', ctx=Load()), attr='timeout', ctx=Load()))",
+      "rendered": "loop.time() + options.timeout"
+    },
+    {
+      "line_start": 233,
+      "line_end": 233,
+      "column": 35,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Name(id='client', ctx=Load()), attr='receive_response', ctx=Load()), args=[], keywords=[]), attr='__aiter__', ctx=Load()), args=[], keywords=[])",
+      "rendered": "client.receive_response().__aiter__()"
+    },
+    {
+      "line_start": 234,
+      "line_end": 234,
+      "column": 30,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 238,
+      "line_end": 238,
+      "column": 33,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='asyncio', ctx=Load()), attr='timeout_at', ctx=Load()), args=[Name(id='deadline', ctx=Load())], keywords=[])",
+      "rendered": "asyncio.timeout_at(deadline)"
+    },
+    {
+      "line_start": 240,
+      "line_end": 240,
+      "column": 43,
+      "kind": "Name",
+      "original_ast": "Name(id='cm', ctx=Load())",
+      "rendered": "cm"
+    },
+    {
+      "line_start": 241,
+      "line_end": 241,
+      "column": 46,
+      "kind": "Await",
+      "original_ast": "Await(value=Call(func=Attribute(value=Name(id='iterator', ctx=Load()), attr='__anext__', ctx=Load()), args=[], keywords=[]))",
+      "rendered": "await iterator.__anext__()"
+    },
+    {
+      "line_start": 242,
+      "line_end": 242,
+      "column": 35,
+      "kind": "Name",
+      "original_ast": "Name(id='StopAsyncIteration', ctx=Load())",
+      "rendered": "StopAsyncIteration"
+    },
+    {
+      "line_start": 244,
+      "line_end": 244,
+      "column": 35,
+      "kind": "Name",
+      "original_ast": "Name(id='TimeoutError', ctx=Load())",
+      "rendered": "TimeoutError"
+    },
+    {
+      "line_start": 247,
+      "line_end": 247,
+      "column": 35,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='cm', ctx=Load()), attr='expired', ctx=Load()), args=[], keywords=[]))",
+      "rendered": "not cm.expired()"
+    },
+    {
+      "line_start": 249,
+      "line_end": 249,
+      "column": 42,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 251,
+      "line_end": 251,
+      "column": 46,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_translate_message', ctx=Load()), args=[Name(id='message', ctx=Load())], keywords=[])",
+      "rendered": "_translate_message(message)"
+    },
+    {
+      "line_start": 252,
+      "line_end": 252,
+      "column": 38,
+      "kind": "Name",
+      "original_ast": "Name(id='translated', ctx=Load())",
+      "rendered": "translated"
+    },
+    {
+      "line_start": 253,
+      "line_end": 253,
+      "column": 27,
+      "kind": "Name",
+      "original_ast": "Name(id='expired', ctx=Load())",
+      "rendered": "expired"
+    },
+    {
+      "line_start": 254,
+      "line_end": 254,
+      "column": 33,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='contextlib', ctx=Load()), attr='suppress', ctx=Load()), args=[Name(id='Exception', ctx=Load())], keywords=[])",
+      "rendered": "contextlib.suppress(Exception)"
+    },
+    {
+      "line_start": 255,
+      "line_end": 255,
+      "column": 32,
+      "kind": "Await",
+      "original_ast": "Await(value=Call(func=Attribute(value=Name(id='client', ctx=Load()), attr='interrupt', ctx=Load()), args=[], keywords=[]))",
+      "rendered": "await client.interrupt()"
+    },
+    {
+      "line_start": 258,
+      "line_end": 258,
+      "column": 33,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='contextlib', ctx=Load()), attr='suppress', ctx=Load()), args=[Name(id='TimeoutError', ctx=Load())], keywords=[])",
+      "rendered": "contextlib.suppress(TimeoutError)"
+    },
+    {
+      "line_start": 259,
+      "line_end": 259,
+      "column": 43,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='asyncio', ctx=Load()), attr='timeout', ctx=Load()), args=[Name(id='TIMEOUT_STOP_GRACE_SECONDS', ctx=Load())], keywords=[])",
+      "rendered": "asyncio.timeout(TIMEOUT_STOP_GRACE_SECONDS)"
+    },
+    {
+      "line_start": 260,
+      "line_end": 260,
+      "column": 51,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='client', ctx=Load()), attr='receive_response', ctx=Load()), args=[], keywords=[])",
+      "rendered": "client.receive_response()"
+    },
+    {
+      "line_start": 263,
+      "line_end": 263,
+      "column": 45,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='client', ctx=Load()), attr='receive_response', ctx=Load()), args=[], keywords=[])",
+      "rendered": "client.receive_response()"
+    },
+    {
+      "line_start": 264,
+      "line_end": 264,
+      "column": 46,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_translate_message', ctx=Load()), args=[Name(id='message', ctx=Load())], keywords=[])",
+      "rendered": "_translate_message(message)"
+    },
+    {
+      "line_start": 265,
+      "line_end": 265,
+      "column": 38,
+      "kind": "Name",
+      "original_ast": "Name(id='translated', ctx=Load())",
+      "rendered": "translated"
+    },
+    {
+      "line_start": 266,
+      "line_end": 266,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='CLINotFoundError', ctx=Load())",
+      "rendered": "CLINotFoundError"
+    },
+    {
+      "line_start": 267,
+      "line_end": 269,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='HarnessCLINotFoundError', ctx=Load()), args=[Constant(value='Claude CLI binary not found')], keywords=[])",
+      "rendered": "HarnessCLINotFoundError('Claude CLI binary not found')"
+    },
+    {
+      "line_start": 269,
+      "line_end": 269,
+      "column": 23,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 270,
+      "line_end": 270,
+      "column": 19,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='ProcessError', ctx=Load()), Name(id='CLIConnectionError', ctx=Load()), Name(id='CLIJSONDecodeError', ctx=Load()), Name(id='MessageParseError', ctx=Load())], ctx=Load())",
+      "rendered": "(ProcessError, CLIConnectionError, CLIJSONDecodeError, MessageParseError)"
+    },
+    {
+      "line_start": 271,
+      "line_end": 271,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_wrap_sdk_error', ctx=Load()), args=[Name(id='e', ctx=Load())], keywords=[])",
+      "rendered": "_wrap_sdk_error(e)"
+    },
+    {
+      "line_start": 271,
+      "line_end": 271,
+      "column": 46,
+      "kind": "Name",
+      "original_ast": "Name(id='e', ctx=Load())",
+      "rendered": "e"
+    },
+    {
+      "line_start": 272,
+      "line_end": 272,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='expired', ctx=Load())",
+      "rendered": "expired"
+    },
+    {
+      "line_start": 274,
+      "line_end": 277,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='call_timeout_error', ctx=Load()), args=[], keywords=[keyword(arg='stage', value=Attribute(value=Name(id='options', ctx=Load()), attr='graph_name', ctx=Load())), keyword(arg='route', value=Constant(value='claude')), keyword(arg='budget_s', value=Attribute(value=Name(id='options', ctx=Load()), attr='timeout', ctx=Load())), keyword(arg='effort', value=Attribute(value=Name(id='options', ctx=Load()), attr='effort', ctx=Load())), keyword(arg='cause_text', value=JoinedStr(values=[Constant(value='claude session exceeded '), FormattedValue(value=Attribute(value=Name(id='options', ctx=Load()), attr='timeout', ctx=Load()), conversion=-1, format_spec=JoinedStr(values=[Constant(value='g')])), Constant(value='s')]))])",
+      "rendered": "call_timeout_error(stage=options.graph_name, route='claude', budget_s=options.timeout, effort=options.effort, cause_text=source_template_277_31)"
+    },
+    {
+      "line_start": 279,
+      "line_end": 279,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_gen', ctx=Load()), args=[], keywords=[])",
+      "rendered": "_gen()"
+    }
+  ],
+  "calls": [
+    {
+      "line": 125,
+      "end_line": 125,
+      "callee": "isinstance",
+      "enclosing": "_wrap_sdk_error",
+      "expression": "isinstance(e, ProcessError)"
+    },
+    {
+      "line": 79,
+      "end_line": 79,
+      "callee": "list_subagents",
+      "enclosing": "_extract_sdk_persona_reports",
+      "expression": "list_subagents(session_id, directory=str(cwd))"
+    },
+    {
+      "line": 81,
+      "end_line": 81,
+      "callee": "set",
+      "enclosing": "_extract_sdk_persona_reports",
+      "expression": "set()"
+    },
+    {
+      "line": 119,
+      "end_line": 119,
+      "callee": "key",
+      "enclosing": "_merge_persona_reports",
+      "expression": "key(r)"
+    },
+    {
+      "line": 126,
+      "end_line": 130,
+      "callee": "HarnessProcessError",
+      "enclosing": "_wrap_sdk_error",
+      "expression": "HarnessProcessError(\n            str(e),\n            exit_code=getattr(e, \"exit_code\", None),\n            stderr=getattr(e, \"stderr\", None),\n        )"
+    },
+    {
+      "line": 132,
+      "end_line": 132,
+      "callee": "isinstance",
+      "enclosing": "_wrap_sdk_error",
+      "expression": "isinstance(e, sdk_type)"
+    },
+    {
+      "line": 147,
+      "end_line": 147,
+      "callee": "build_oneshot_sdk_options",
+      "enclosing": "ClaudeHarness.run_oneshot",
+      "expression": "build_oneshot_sdk_options(options)"
+    },
+    {
+      "line": 177,
+      "end_line": 184,
+      "callee": "OneShotResult",
+      "enclosing": "ClaudeHarness.run_oneshot",
+      "expression": "OneShotResult(\n            is_error=is_error,\n            subtype=subtype,\n            result_text=result_text,\n            structured=structured,\n            usage=usage,\n            total_cost_usd=total_cost_usd,\n        )"
+    },
+    {
+      "line": 197,
+      "end_line": 198,
+      "callee": "build_streaming_sdk_options",
+      "enclosing": "ClaudeHarness.run_streaming",
+      "expression": "build_streaming_sdk_options(\n            options, fact_server=fact_server, fact_tool_names=fact_tool_names)"
+    },
+    {
+      "line": 279,
+      "end_line": 279,
+      "callee": "_gen",
+      "enclosing": "ClaudeHarness.run_streaming",
+      "expression": "_gen()"
+    },
+    {
+      "line": 83,
+      "end_line": 83,
+      "callee": "get_subagent_messages",
+      "enclosing": "_extract_sdk_persona_reports",
+      "expression": "get_subagent_messages(session_id, agent_id, directory=str(cwd))"
+    },
+    {
+      "line": 86,
+      "end_line": 86,
+      "callee": "reversed",
+      "enclosing": "_extract_sdk_persona_reports",
+      "expression": "reversed(messages)"
+    },
+    {
+      "line": 117,
+      "end_line": 117,
+      "callee": "report.get",
+      "enclosing": "_merge_persona_reports.key",
+      "expression": "report.get(\"persona\")"
+    },
+    {
+      "line": 117,
+      "end_line": 117,
+      "callee": "report.get",
+      "enclosing": "_merge_persona_reports.key",
+      "expression": "report.get(\"tracking_id\")"
+    },
+    {
+      "line": 127,
+      "end_line": 127,
+      "callee": "str",
+      "enclosing": "_wrap_sdk_error",
+      "expression": "str(e)"
+    },
+    {
+      "line": 133,
+      "end_line": 133,
+      "callee": "harness_type",
+      "enclosing": "_wrap_sdk_error",
+      "expression": "harness_type(str(e))"
+    },
+    {
+      "line": 195,
+      "end_line": 196,
+      "callee": "build_fact_mcp",
+      "enclosing": "ClaudeHarness.run_streaming",
+      "expression": "build_fact_mcp(\n                options.fact_tool_specs, report_model=_persona_report_model())"
+    },
+    {
+      "line": 206,
+      "end_line": 206,
+      "callee": "translate",
+      "enclosing": "ClaudeHarness.run_streaming._translate_message",
+      "expression": "translate(message, options.response_model)"
+    },
+    {
+      "line": 79,
+      "end_line": 79,
+      "callee": "str",
+      "enclosing": "_extract_sdk_persona_reports",
+      "expression": "str(cwd)"
+    },
+    {
+      "line": 89,
+      "end_line": 93,
+      "callee": "next",
+      "enclosing": "_extract_sdk_persona_reports",
+      "expression": "next(\n                    (b.get(\"text\", \"\") for b in content\n                     if isinstance(b, dict) and b.get(\"type\") == \"text\"),\n                    \"\",\n                )"
+    },
+    {
+      "line": 94,
+      "end_line": 94,
+      "callee": "text.find",
+      "enclosing": "_extract_sdk_persona_reports",
+      "expression": "text.find(\"```json\")"
+    },
+    {
+      "line": 128,
+      "end_line": 128,
+      "callee": "getattr",
+      "enclosing": "_wrap_sdk_error",
+      "expression": "getattr(e, \"exit_code\", None)"
+    },
+    {
+      "line": 129,
+      "end_line": 129,
+      "callee": "getattr",
+      "enclosing": "_wrap_sdk_error",
+      "expression": "getattr(e, \"stderr\", None)"
+    },
+    {
+      "line": 133,
+      "end_line": 133,
+      "callee": "str",
+      "enclosing": "_wrap_sdk_error",
+      "expression": "str(e)"
+    },
+    {
+      "line": 155,
+      "end_line": 155,
+      "callee": "ClaudeSDKClient",
+      "enclosing": "ClaudeHarness.run_oneshot",
+      "expression": "ClaudeSDKClient(options=sdk_opts)"
+    },
+    {
+      "line": 157,
+      "end_line": 157,
+      "callee": "client.receive_response",
+      "enclosing": "ClaudeHarness.run_oneshot",
+      "expression": "client.receive_response()"
+    },
+    {
+      "line": 171,
+      "end_line": 173,
+      "callee": "HarnessCLINotFoundError",
+      "enclosing": "ClaudeHarness.run_oneshot",
+      "expression": "HarnessCLINotFoundError(\n                \"Claude CLI binary not found\"\n            )"
+    },
+    {
+      "line": 175,
+      "end_line": 175,
+      "callee": "_wrap_sdk_error",
+      "enclosing": "ClaudeHarness.run_oneshot",
+      "expression": "_wrap_sdk_error(e)"
+    },
+    {
+      "line": 207,
+      "end_line": 207,
+      "callee": "isinstance",
+      "enclosing": "ClaudeHarness.run_streaming._translate_message",
+      "expression": "isinstance(translated, HarnessResult)"
+    },
+    {
+      "line": 219,
+      "end_line": 219,
+      "callee": "translated_list.append",
+      "enclosing": "ClaudeHarness.run_streaming._translate_message",
+      "expression": "translated_list.append(translated)"
+    },
+    {
+      "line": 274,
+      "end_line": 277,
+      "callee": "call_timeout_error",
+      "enclosing": "ClaudeHarness.run_streaming._gen",
+      "expression": "call_timeout_error(\n                    stage=options.graph_name, route=\"claude\", budget_s=options.timeout,\n                    effort=options.effort,\n                    cause_text=f\"claude session exceeded {options.timeout:g}s\")"
+    },
+    {
+      "line": 83,
+      "end_line": 83,
+      "callee": "str",
+      "enclosing": "_extract_sdk_persona_reports",
+      "expression": "str(cwd)"
+    },
+    {
+      "line": 87,
+      "end_line": 87,
+      "callee": "getattr",
+      "enclosing": "_extract_sdk_persona_reports",
+      "expression": "getattr(msg, \"message\", {})"
+    },
+    {
+      "line": 88,
+      "end_line": 88,
+      "callee": "isinstance",
+      "enclosing": "_extract_sdk_persona_reports",
+      "expression": "isinstance(raw, dict)"
+    },
+    {
+      "line": 88,
+      "end_line": 88,
+      "callee": "raw.get",
+      "enclosing": "_extract_sdk_persona_reports",
+      "expression": "raw.get(\"content\", [])"
+    },
+    {
+      "line": 95,
+      "end_line": 95,
+      "callee": "text.find",
+      "enclosing": "_extract_sdk_persona_reports",
+      "expression": "text.find(\"```\", start + 7)"
+    },
+    {
+      "line": 99,
+      "end_line": 99,
+      "callee": "json.loads",
+      "enclosing": "_extract_sdk_persona_reports",
+      "expression": "json.loads(text[start + 7:end].strip())"
+    },
+    {
+      "line": 156,
+      "end_line": 156,
+      "callee": "client.query",
+      "enclosing": "ClaudeHarness.run_oneshot",
+      "expression": "client.query(prompt)"
+    },
+    {
+      "line": 158,
+      "end_line": 158,
+      "callee": "isinstance",
+      "enclosing": "ClaudeHarness.run_oneshot",
+      "expression": "isinstance(message, ResultMessage)"
+    },
+    {
+      "line": 196,
+      "end_line": 196,
+      "callee": "_persona_report_model",
+      "enclosing": "ClaudeHarness.run_streaming",
+      "expression": "_persona_report_model()"
+    },
+    {
+      "line": 228,
+      "end_line": 228,
+      "callee": "ClaudeSDKClient",
+      "enclosing": "ClaudeHarness.run_streaming._gen",
+      "expression": "ClaudeSDKClient(options=sdk_opts)"
+    },
+    {
+      "line": 267,
+      "end_line": 269,
+      "callee": "HarnessCLINotFoundError",
+      "enclosing": "ClaudeHarness.run_streaming._gen",
+      "expression": "HarnessCLINotFoundError(\n                    \"Claude CLI binary not found\"\n                )"
+    },
+    {
+      "line": 271,
+      "end_line": 271,
+      "callee": "_wrap_sdk_error",
+      "enclosing": "ClaudeHarness.run_streaming._gen",
+      "expression": "_wrap_sdk_error(e)"
+    },
+    {
+      "line": 90,
+      "end_line": 90,
+      "callee": "b.get",
+      "enclosing": "_extract_sdk_persona_reports",
+      "expression": "b.get(\"text\", \"\")"
+    },
+    {
+      "line": 99,
+      "end_line": 99,
+      "callee": "text[start + 7:end].strip",
+      "enclosing": "_extract_sdk_persona_reports",
+      "expression": "text[start + 7:end].strip()"
+    },
+    {
+      "line": 100,
+      "end_line": 100,
+      "callee": "isinstance",
+      "enclosing": "_extract_sdk_persona_reports",
+      "expression": "isinstance(data, dict)"
+    },
+    {
+      "line": 120,
+      "end_line": 120,
+      "callee": "key",
+      "enclosing": "_merge_persona_reports",
+      "expression": "key(r)"
+    },
+    {
+      "line": 160,
+      "end_line": 160,
+      "callee": "bool",
+      "enclosing": "ClaudeHarness.run_oneshot",
+      "expression": "bool(message.is_error)"
+    },
+    {
+      "line": 162,
+      "end_line": 164,
+      "callee": "validate_structured",
+      "enclosing": "ClaudeHarness.run_oneshot",
+      "expression": "validate_structured(\n                            message.structured_output, options.response_model\n                        )"
+    },
+    {
+      "line": 165,
+      "end_line": 165,
+      "callee": "cast",
+      "enclosing": "ClaudeHarness.run_oneshot",
+      "expression": "cast(\"TokenUsage | None\", message.usage)"
+    },
+    {
+      "line": 168,
+      "end_line": 168,
+      "callee": "TOKENS.add",
+      "enclosing": "ClaudeHarness.run_oneshot",
+      "expression": "TOKENS.add(usage, usd=total_cost_usd)"
+    },
+    {
+      "line": 210,
+      "end_line": 210,
+      "callee": "len",
+      "enclosing": "ClaudeHarness.run_streaming._translate_message",
+      "expression": "len(options.agents)"
+    },
+    {
+      "line": 212,
+      "end_line": 216,
+      "callee": "_merge_persona_reports",
+      "enclosing": "ClaudeHarness.run_streaming._translate_message",
+      "expression": "_merge_persona_reports(\n                            persona_dicts,\n                            _extract_sdk_persona_reports(\n                                translated.session_id, options.cwd),\n                        )"
+    },
+    {
+      "line": 229,
+      "end_line": 229,
+      "callee": "client.query",
+      "enclosing": "ClaudeHarness.run_streaming._gen",
+      "expression": "client.query(prompt)"
+    },
+    {
+      "line": 231,
+      "end_line": 231,
+      "callee": "asyncio.get_running_loop",
+      "enclosing": "ClaudeHarness.run_streaming._gen",
+      "expression": "asyncio.get_running_loop()"
+    },
+    {
+      "line": 233,
+      "end_line": 233,
+      "callee": "client.receive_response().__aiter__",
+      "enclosing": "ClaudeHarness.run_streaming._gen",
+      "expression": "client.receive_response().__aiter__()"
+    },
+    {
+      "line": 263,
+      "end_line": 263,
+      "callee": "client.receive_response",
+      "enclosing": "ClaudeHarness.run_streaming._gen",
+      "expression": "client.receive_response()"
+    },
+    {
+      "line": 101,
+      "end_line": 101,
+      "callee": "data.get",
+      "enclosing": "_extract_sdk_persona_reports",
+      "expression": "data.get(\"persona\")"
+    },
+    {
+      "line": 101,
+      "end_line": 101,
+      "callee": "data.get",
+      "enclosing": "_extract_sdk_persona_reports",
+      "expression": "data.get(\"tracking_id\")"
+    },
+    {
+      "line": 103,
+      "end_line": 103,
+      "callee": "seen.add",
+      "enclosing": "_extract_sdk_persona_reports",
+      "expression": "seen.add(key)"
+    },
+    {
+      "line": 104,
+      "end_line": 104,
+      "callee": "reports.append",
+      "enclosing": "_extract_sdk_persona_reports",
+      "expression": "reports.append(data)"
+    },
+    {
+      "line": 211,
+      "end_line": 211,
+      "callee": "len",
+      "enclosing": "ClaudeHarness.run_streaming._translate_message",
+      "expression": "len(persona_dicts)"
+    },
+    {
+      "line": 214,
+      "end_line": 215,
+      "callee": "_extract_sdk_persona_reports",
+      "enclosing": "ClaudeHarness.run_streaming._translate_message",
+      "expression": "_extract_sdk_persona_reports(\n                                translated.session_id, options.cwd)"
+    },
+    {
+      "line": 232,
+      "end_line": 232,
+      "callee": "loop.time",
+      "enclosing": "ClaudeHarness.run_streaming._gen",
+      "expression": "loop.time()"
+    },
+    {
+      "line": 238,
+      "end_line": 238,
+      "callee": "asyncio.timeout_at",
+      "enclosing": "ClaudeHarness.run_streaming._gen",
+      "expression": "asyncio.timeout_at(deadline)"
+    },
+    {
+      "line": 251,
+      "end_line": 251,
+      "callee": "_translate_message",
+      "enclosing": "ClaudeHarness.run_streaming._gen",
+      "expression": "_translate_message(message)"
+    },
+    {
+      "line": 264,
+      "end_line": 264,
+      "callee": "_translate_message",
+      "enclosing": "ClaudeHarness.run_streaming._gen",
+      "expression": "_translate_message(message)"
+    },
+    {
+      "line": 91,
+      "end_line": 91,
+      "callee": "isinstance",
+      "enclosing": "_extract_sdk_persona_reports",
+      "expression": "isinstance(b, dict)"
+    },
+    {
+      "line": 233,
+      "end_line": 233,
+      "callee": "client.receive_response",
+      "enclosing": "ClaudeHarness.run_streaming._gen",
+      "expression": "client.receive_response()"
+    },
+    {
+      "line": 254,
+      "end_line": 254,
+      "callee": "contextlib.suppress",
+      "enclosing": "ClaudeHarness.run_streaming._gen",
+      "expression": "contextlib.suppress(Exception)"
+    },
+    {
+      "line": 258,
+      "end_line": 258,
+      "callee": "contextlib.suppress",
+      "enclosing": "ClaudeHarness.run_streaming._gen",
+      "expression": "contextlib.suppress(TimeoutError)"
+    },
+    {
+      "line": 91,
+      "end_line": 91,
+      "callee": "b.get",
+      "enclosing": "_extract_sdk_persona_reports",
+      "expression": "b.get(\"type\")"
+    },
+    {
+      "line": 255,
+      "end_line": 255,
+      "callee": "client.interrupt",
+      "enclosing": "ClaudeHarness.run_streaming._gen",
+      "expression": "client.interrupt()"
+    },
+    {
+      "line": 259,
+      "end_line": 259,
+      "callee": "asyncio.timeout",
+      "enclosing": "ClaudeHarness.run_streaming._gen",
+      "expression": "asyncio.timeout(TIMEOUT_STOP_GRACE_SECONDS)"
+    },
+    {
+      "line": 260,
+      "end_line": 260,
+      "callee": "client.receive_response",
+      "enclosing": "ClaudeHarness.run_streaming._gen",
+      "expression": "client.receive_response()"
+    },
+    {
+      "line": 241,
+      "end_line": 241,
+      "callee": "iterator.__anext__",
+      "enclosing": "ClaudeHarness.run_streaming._gen",
+      "expression": "iterator.__anext__()"
+    },
+    {
+      "line": 247,
+      "end_line": 247,
+      "callee": "cm.expired",
+      "enclosing": "ClaudeHarness.run_streaming._gen",
+      "expression": "cm.expired()"
+    }
+  ],
+  "imports": [
+    {
+      "line": 17,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "import asyncio",
+      "targets": [
+        "asyncio"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "import contextlib",
+      "targets": [
+        "contextlib"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "import json",
+      "targets": [
+        "json"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "from collections.abc import AsyncIterator",
+      "targets": [
+        "collections.abc",
+        "collections.abc.AsyncIterator"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 23,
+      "source_expression": "from typing import cast",
+      "targets": [
+        "typing",
+        "typing.cast"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 25,
+      "source_expression": "from claude_agent_sdk import ClaudeSDKClient, CLIConnectionError, CLIJSONDecodeError, CLINotFoundError, ProcessError, ResultMessage",
+      "targets": [
+        "claude_agent_sdk",
+        "claude_agent_sdk.ClaudeSDKClient",
+        "claude_agent_sdk.CLIConnectionError",
+        "claude_agent_sdk.CLIJSONDecodeError",
+        "claude_agent_sdk.CLINotFoundError",
+        "claude_agent_sdk.ProcessError",
+        "claude_agent_sdk.ResultMessage"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 33,
+      "source_expression": "from claude_agent_sdk._errors import MessageParseError",
+      "targets": [
+        "claude_agent_sdk._errors",
+        "claude_agent_sdk._errors.MessageParseError"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 34,
+      "source_expression": "from pydantic import BaseModel",
+      "targets": [
+        "pydantic",
+        "pydantic.BaseModel"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 36,
+      "source_expression": "from vvaharness.backends.harness.claude.facts import build_fact_mcp",
+      "targets": [
+        "vvaharness.backends.harness.claude.facts",
+        "vvaharness.backends.harness.claude.facts.build_fact_mcp"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/claude/facts.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 37,
+      "source_expression": "from vvaharness.backends.harness.claude.models import SDK_ERROR_MAP",
+      "targets": [
+        "vvaharness.backends.harness.claude.models",
+        "vvaharness.backends.harness.claude.models.SDK_ERROR_MAP"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/claude/models.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 38,
+      "source_expression": "from vvaharness.backends.harness.claude.options import build_oneshot_sdk_options, build_streaming_sdk_options",
+      "targets": [
+        "vvaharness.backends.harness.claude.options",
+        "vvaharness.backends.harness.claude.options.build_oneshot_sdk_options",
+        "vvaharness.backends.harness.claude.options.build_streaming_sdk_options"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/claude/options.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 42,
+      "source_expression": "from vvaharness.backends.harness.claude.translate import translate, validate_structured",
+      "targets": [
+        "vvaharness.backends.harness.claude.translate",
+        "vvaharness.backends.harness.claude.translate.translate",
+        "vvaharness.backends.harness.claude.translate.validate_structured"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/claude/translate.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 43,
+      "source_expression": "from vvaharness.backends.harness.harness import Harness",
+      "targets": [
+        "vvaharness.backends.harness.harness",
+        "vvaharness.backends.harness.harness.Harness"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/harness.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 44,
+      "source_expression": "from vvaharness.backends.harness.models import HarnessCLINotFoundError, HarnessMessage, HarnessProcessError, HarnessResult, OneShotOptions, OneShotResult, StreamingOptions",
+      "targets": [
+        "vvaharness.backends.harness.models",
+        "vvaharness.backends.harness.models.HarnessCLINotFoundError",
+        "vvaharness.backends.harness.models.HarnessMessage",
+        "vvaharness.backends.harness.models.HarnessProcessError",
+        "vvaharness.backends.harness.models.HarnessResult",
+        "vvaharness.backends.harness.models.OneShotOptions",
+        "vvaharness.backends.harness.models.OneShotResult",
+        "vvaharness.backends.harness.models.StreamingOptions"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/models.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 53,
+      "source_expression": "from vvaharness.backends.llm.models import TIMEOUT_STOP_GRACE_SECONDS, call_timeout_error",
+      "targets": [
+        "vvaharness.backends.llm.models",
+        "vvaharness.backends.llm.models.TIMEOUT_STOP_GRACE_SECONDS",
+        "vvaharness.backends.llm.models.call_timeout_error"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/llm/models.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 54,
+      "source_expression": "from vvaharness.util.tokens import TOKENS, TokenUsage",
+      "targets": [
+        "vvaharness.util.tokens",
+        "vvaharness.util.tokens.TOKENS",
+        "vvaharness.util.tokens.TokenUsage"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/tokens.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 61,
+      "source_expression": "from vvaharness.validation.models.persona_report import PersonaReport",
+      "targets": [
+        "vvaharness.validation.models.persona_report",
+        "vvaharness.validation.models.persona_report.PersonaReport"
+      ],
+      "local_source_paths": [
+        "vvaharness/validation/models/persona_report.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 72,
+      "source_expression": "from claude_agent_sdk import get_subagent_messages, list_subagents",
+      "targets": [
+        "claude_agent_sdk",
+        "claude_agent_sdk.get_subagent_messages",
+        "claude_agent_sdk.list_subagents"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    }
+  ]
+}

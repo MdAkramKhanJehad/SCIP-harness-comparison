@@ -1,0 +1,178 @@
+# vvaharness/pipeline/stages/s2/session.py
+
+Stage 2 dispatch. Builds the agentic threat-model call (graph tools, tool budget, todo-list planning, evidence gate, transcript recording, model-call budget), bounds it with a wall-clock deadline that falls back to resuming or replaying the session, and owns the single tool-less retry for a hollow threat model.
+
+Source: `vvaharness/pipeline/stages/s2/session.py` (lines 1-355)
+Executor: mixed
+Called from: `vvaharness/pipeline/stages/s2/__init__.py` run
+
+// src: vvaharness/pipeline/stages/s2/session.py:75-96
+_DISPATCH_TAG = "s2 threatmodel"
+_GRAPH_NAME = "s2-threatmodel"
+_REPLAY_EFFORT = "low"   // the replay restates a transcript; it needs the smallest reasoning budget
+
+// prompt-src: vvaharness/pipeline/stages/s2/session.py:87-96
+_HOLLOW_RETRY_DIRECTIVES {
+  Constraints {
+    case "no_threats" => "A previous attempt returned a threat model with zero threats. This call has no tools: model the system from the snapshot above, naming surface_files only from FILE INVENTORY."
+    case "no_validated_surface" => "A previous attempt returned threats, but not one named a surface_files path that exists in the FILE INVENTORY, so every threat was unusable and no later stage could act on any of them. This call has no tools: model the system from the snapshot above, and give each threat at least one surface_files path copied EXACTLY from FILE INVENTORY."
+  }
+}
+
+// src: vvaharness/pipeline/stages/s2/session.py:127-217
+fn _threatmodel_call(user, cfg, repo_root, ctx?, drop_thinking=false, require_tool_call=false):executor=mixed {
+  via = resolve_model(knob("models.threatmodel")).via
+  tool_builder = null; fact_tools = []; graph_tools_line = ""; parent_middleware = []; gate_installed = false
+
+  // src: s2/session.py:139-176 — graph tools only when a graph exists, the setting is on, and the route can carry tools
+  if (ctx != null && ctx.graph_handle != null && knob("step2.graph_tools", default=true) && _graph_tool_route_ok(cfg, agentic=true)) {
+    tool_builder = codegraph.tools.build_graph_tool_builder(ctx)
+    fact_tools = codegraph.tools.graph_tool_names()
+    degenerate = codegraph.build.graph_is_degenerate(ctx, cfg)
+    graph_tools_line = if (degenerate) "" else s2.prompts._GRAPH_TOOLS_SYSTEM_LINE   // tools stay registered on a degenerate graph; the prompt stops advertising them
+    parent_middleware += ToolCallBudget(graph tool names, limit=knob("step2.graph_tool_budget", default=6), counter="s2_graph_tool_budget_exhausted")
+    if (knob("step2.planning", default=true)) {
+      parent_middleware += TodoListMiddleware(system_prompt=s2_planning.PLAN_SYSTEM_PROMPT, tool_description=s2_planning.PLAN_TOOL_DESCRIPTION)
+    }
+    if (knob("step2.require_graph", default=true)) {
+      required_tools = GRAPH_TOOL_NAMES
+      if (degenerate) {
+        warn "WARN [s2]: step2.require_graph is on but the code graph is absent or degenerate (zero edges, or fewer nodes than step0.min_graph_nodes_for_gate) — standing the graph-tool requirement down; the todo-list gate still applies."   // once per process
+        COUNTERS.bump("evidence_gate_stood_down_degenerate_graph")
+        required_tools = []
+      }
+      parent_middleware += EvidenceGate(max_rejections=knob("step2.require_graph_rejections", default=2), counter="s2_evidence_gate_rejected", required_tools, require_tool_call, ignored_tools=["write_todos", "ThreatModel"])
+      gate_installed = true
+    }
+  }
+  // src: s2/session.py:177-184 — without graph tools, a deepagents route still gets a tool-call gate when the inventory is non-empty
+  if (!gate_installed && require_tool_call && via == "deepagents") {
+    parent_middleware += EvidenceGate(max_rejections=knob("step2.require_graph_rejections", default=2), counter="s2_evidence_gate_rejected", required_tools=[], require_tool_call=true, ignored_tools=["write_todos", "ThreatModel"])
+  }
+  // external: vvaharness/backends/harness/deepagents/evidence_gate.py — EvidenceGate rejects a premature final answer up to max_rejections times; ToolCallBudget caps graph-tool calls
+
+  // src: s2/session.py:185-200
+  max_turns = knob("step2.max_turns", default=12)
+  threat_model_arg = if (via in RESPONSE_MODEL_VIAS) ThreatModel else null   // shared route list so Stages 2, 4 and 6 agree
+  system_prompt = s2.prompts.SYSTEM + s2.prompts._AGENTIC_SYSTEM_LINE + graph_tools_line + (if (knob("step2.bash", default=false)) s2.prompts._SHELL_SYSTEM_LINE else "")
+  session_id = replay.session_id_for("s2", "threatmodel")
+  transcript = replay.Transcript()
+  parent_middleware += replay.RecordTranscript(transcript)
+  budget = _call_budget(knob step2)
+  if (budget != null) parent_middleware += budget
+  deadline = knob("step2.deadline", default=0)   // 0 means no wall clock
+  effort = if (drop_thinking) null else (knob("step2.effort", default=null) || null)
+
+  // src: s2/session.py:216-217
+  constraint OnEveryExit {
+    release_pinned_session(session_id)
+  }
+
+  // src: s2/session.py:201-215
+  try {
+    return replay.run_with_deadline(() => _agentic_leg(user, cfg, repo_root, system_prompt, parent_middleware, tool_builder, fact_tools, max_turns, threat_model_arg, session_id, drop_thinking), seconds=deadline, stage=_DISPATCH_TAG, effort)
+  } catch CallTimeoutError => {
+    return replay.resume_or_replay(session_id, () => _replay_leg(user, cfg, repo_root, system_prompt, transcript),
+      model=knob("models.threatmodel"), cfg, instruction=replay.S2_REPLAY_INSTRUCTION, stage="s2", tag=_DISPATCH_TAG,
+      timeout=knob("step2.resume_timeout", default=300))
+  }
+}
+
+// src: vvaharness/pipeline/stages/s2/session.py:247-281
+fn _agentic_leg(user, cfg, repo_root, system_prompt, parent_middleware, tool_builder, fact_tools, max_turns, threat_model_arg, session_id, drop_thinking):executor=model {
+  via = resolve_model(knob("models.threatmodel")).via
+  return callModel({
+    role: "threatmodel",
+    route: via,   // deepagents.dispatch_agentic
+    system: system_prompt,   // SYSTEM + _AGENTIC_SYSTEM_LINE (+ _GRAPH_TOOLS_SYSTEM_LINE) (+ _SHELL_SYSTEM_LINE); PLAN_SYSTEM_PROMPT is added by TodoListMiddleware when planning is on
+    prompt: user,   // s2.prompts._build_user_prompt
+    tools: [
+      route read-only file tools (allowed_tools = validate_detection_tools(knob("step2.allowed_tools", default=null), config_key="step2.allowed_tools", via)),
+      graph tools when tool_builder is set: GraphContext, GraphImpact, GraphNeighbors, GraphCommunityOf, GraphImporters, GraphSinksInCommunity,
+      write_todos when planning middleware is installed,
+      execute (read-only shell) only when knob("step2.bash", default=false),
+      skills from inject_skills(repo_root) when knob("step2.skills", default=true),
+      ThreatModel structured output when threat_model_arg is set
+    ],
+    limits: {
+      max_turns,
+      timeout: replay.deadline_bound(knob("step2.timeout", default=1800), knob("step2.deadline", default=0), effort, via),   // binds via cli and deepagents; sdk and openai rely on max_turns
+      max_output_tokens: Integer(knob("step2.max_tokens", default=64000)),
+      effort: if (drop_thinking) null else knob("step2.effort", default=null),
+      session_id, middleware: parent_middleware
+    },
+    output: ThreatModel (structured on RESPONSE_MODEL_VIAS routes, else JSON text)
+  })
+  require allowed_tools pass validate_detection_tools for the route   // via cli honors the list verbatim; other routes are read-only
+}
+
+// src: vvaharness/pipeline/stages/s2/session.py:220-244
+fn _replay_leg(user, cfg, repo_root, system_prompt, transcript):executor=model {
+  COUNTERS.bump("s2_deadline_replay")
+  return callModel({
+    role: "threatmodel", route: resolve_model(knob("models.threatmodel")).via,
+    system: system_prompt,
+    prompt: replay.replay_prompt(transcript, user, instruction=replay.S2_REPLAY_INSTRUCTION, stage="s2"),
+    tools: [],
+    limits: { max_tokens: knob("step2.replay_max_tokens", default=16000), timeout: knob("step2.replay_timeout", default=300), effort: _REPLAY_EFFORT, tag: "s2 threatmodel replay" },
+    output: ThreatModel if route in RESPONSE_MODEL_VIAS else JSON text
+  })
+}
+
+// src: vvaharness/pipeline/stages/s2/session.py:99-109
+fn _call_budget(s2):executor=code {
+  limit = knob("step2.max_model_calls", default=0)
+  if (limit <= 0) return null
+  return ModelCallBudget(limit, outcome_tools=["ThreatModel"], counter="s2_model_call_budget_final_turn")   // on the last permitted call every tool except ThreatModel is withdrawn
+}
+
+// src: vvaharness/pipeline/stages/s2/session.py:112-124
+fn _graph_tool_route_ok(cfg, agentic=true):executor=code {
+  via = resolve_model(knob("models.threatmodel")).via
+  [ok, reason] = deepagents.route_carries_tools(cfg, via)
+  if (ok) return true
+  warn "WARN [s2]: step2.graph_tools is on and a code graph exists, but $reason — running S2 without the graph tools, and NOT telling the model about tools it cannot call. To use them: route models.threatmodel via: deepagents."   // once per route
+  return false
+}
+
+// src: vvaharness/pipeline/stages/s2/session.py:311-317
+fn _hollow_reason(tm, resolved):executor=code {
+  if (!tm.threats) return "no_threats"
+  if (resolved && no threat has surface_files) return "no_validated_surface"
+  return ""
+}
+
+// src: vvaharness/pipeline/stages/s2/session.py:320-355
+fn _retry_if_hollow(tm, ev, user, cfg, repo_root, ctx?):executor=mixed {
+  if (!knob("step2.empty_retry", default=true)) return tm
+  reason = _hollow_reason(tm, ctx != null)
+  if (!reason) return tm
+  if (ev.file_count == 0) return tm   // zero threats on a zero-file repository is honest
+  COUNTERS.bump("s2_empty_retry_attempted"); COUNTERS.bump("s2_hollow_$reason")
+  try {
+    retry_tm = s2.outcomes._parse_threat_model(_snapshot_leg(user + "\n\n" + _HOLLOW_RETRY_DIRECTIVES[reason], cfg, repo_root))
+  } catch error => {
+    if (is_halt_error(error)) throw error
+    warn S2_HOLLOW_RETRY_FAILED
+    return tm   // keep the first model
+  }
+  s2.outcomes._finalize_threats(retry_tm, ctx)
+  retry_reason = _hollow_reason(retry_tm, ctx != null)
+  if (!retry_reason) { COUNTERS.bump("s2_empty_retry_recovered"); return retry_tm }
+  COUNTERS.bump("s2_hollow_after_retry")
+  log S2_HOLLOW_RETRY_EMPTY   // remedy: "check the s2 transcript: the model returned no threat naming a file from the inventory, twice. Re-run, or route models.threatmodel elsewhere"
+  throw S2HollowAfterRetry(retry_reason)   // external: handling is in the caller, not this file
+}
+
+// src: vvaharness/pipeline/stages/s2/session.py:284-308
+fn _snapshot_leg(user, cfg, repo_root):executor=model {
+  // one-shot, no tools: the only exit left is the schema, filled from the same snapshot
+  return callModel({
+    role: "threatmodel", route: resolve_model(knob("models.threatmodel")).via,
+    system: s2.prompts.SYSTEM,   // without the agentic, graph or shell lines
+    prompt: user,   // the caller has already appended _HOLLOW_RETRY_DIRECTIVES[reason]
+    tools: [],
+    limits: { max_tokens: Integer(knob("step2.max_tokens", default=64000)), timeout: knob("step2.timeout", default=1800), effort: knob("step2.effort", default=null), tag: "s2 threatmodel snapshot" },
+    output: ThreatModel if route in RESPONSE_MODEL_VIAS else JSON text
+  })
+}

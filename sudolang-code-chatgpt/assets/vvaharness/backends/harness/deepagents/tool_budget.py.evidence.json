@@ -1,0 +1,2193 @@
+{
+  "source": "vvaharness/backends/harness/deepagents/tool_budget.py",
+  "sha256": "7c07cf7099b04582e07c3414f60a24451ccf9e694e6fe9ffe989a44584383b16",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Middleware that caps how many times a session may call a named set of tools.\"\"\"\n\n# Nothing else bounds tool-call VOLUME: turn and token ceilings bound the conversation, not calls\n\nfrom __future__ import annotations\n\nimport threading\nfrom collections.abc import Awaitable, Callable\nfrom typing import Any\n\nfrom langchain.agents.middleware.types import (\n    AgentMiddleware,\n    ModelRequest,\n    ModelResponse,\n    ToolCallRequest,\n)\nfrom langchain_core.messages import HumanMessage, ToolCall, ToolMessage\nfrom langgraph.types import Command\n\nfrom vvaharness.util.counters import COUNTERS\nfrom vvaharness.util.warn_once import stage_label, warn_once\n\n_BUDGET_MESSAGE = (\n    \"Your tool-call budget for this session is exhausted. Do not call any \"\n    \"further tool in the metered set; finish from the evidence you already have. \"\n    \"Calling one again will not run and only spends a turn.\"\n)\n\n_DEFAULT_COUNTER = \"tool_call_budget_exhausted\"\n\n#: counter name -> the scan-config key an operator would raise; unlisted counters get a\n#: generic phrase so a future stage's budget still warns without a new table row.\n_KNOB_NAMES: dict[str, str] = {\n    \"s2_graph_tool_budget_exhausted\": \"step2.graph_tool_budget\",\n    \"s4_graph_tool_budget_exhausted\": \"step4.graph_tool_budget\",\n    \"s4_cwe_tool_budget_exhausted\": \"step4.cwe_tool_budget\",\n    \"s6_graph_tool_budget_exhausted\": \"step6_verify.graph_tool_budget\",\n}\n\n_WARNED_EXHAUSTED: set[str] = set()\n\n\ndef _calls_counter_name(counter: str, tool: str) -> str:\n    \"\"\"The usage-tally key for *tool*, derived from the exhaustion counter's own name.\"\"\"\n    if counter == _DEFAULT_COUNTER:\n        return f\"tool_calls_{tool}\"\n    return f\"{counter.removesuffix('_budget_exhausted')}_calls_{tool}\"\n\n\ndef _exhaustion_warning(counter: str, limit: int, tool_names: frozenset[str]) -> str:\n    \"\"\"The once-per-(stage, family)-per-run WARN line for the first refusal on *counter*.\"\"\"\n    knob = _KNOB_NAMES.get(counter, \"its scan-config budget knob\")\n    names = \", \".join(sorted(tool_names))\n    return (\n        f\"WARN {stage_label(counter)}: tool-call budget ({knob}={limit} per session) \"\n        f\"exhausted in at least one session for {names} -- further calls there are refused \"\n        \"now, and the tool family is withdrawn once the model calls again; it finishes from \"\n        f\"the evidence it already has. Count in the run manifest under {counter}. Raise the \"\n        \"knob in the scan config if this recurs.\"\n    )\n\n\ndef _refuse(tool_call: ToolCall, content: str) -> ToolMessage:\n    \"\"\"A synthetic error ToolMessage explaining why a call was not executed.\"\"\"\n    return ToolMessage(content=content, name=tool_call[\"name\"],\n                       tool_call_id=tool_call[\"id\"], status=\"error\")\n\n\ndef _withdrawn_notice(tool_names: frozenset[str]) -> HumanMessage:\n    \"\"\"The one-time turn appended when a metered tool is removed from availability.\"\"\"\n    return HumanMessage(content=(\n        f\"Your budget for {', '.join(sorted(tool_names))} is exhausted; it/they have been \"\n        \"withdrawn from your available tools for the rest of this session -- finish from \"\n        \"the evidence you already have rather than asking for it/them again.\"\n    ))\n\n\nclass ToolCallBudget(AgentMiddleware):\n    \"\"\"Refuse any metered tool call once one session has spent its total allowance.\"\"\"\n    # NEVER meter every tool: a structured-output call is a tool call, and blocking it strands\n\n    def __init__(self, tool_names: frozenset[str], *, limit: int,\n                 counter: str = \"tool_call_budget_exhausted\") -> None:\n        \"\"\"Allow *limit* calls across *tool_names* in this session, then refuse the rest.\"\"\"\n        super().__init__()\n        self._tool_names = tool_names\n        self._limit = limit\n        self._counter = counter\n        self._spent = 0\n        self._lock = threading.Lock()\n        self._withdrawal_announced = False\n\n    @property\n    def name(self) -> str:\n        \"\"\"Per-instance name; langchain asserts middleware names are unique per agent.\"\"\"\n        # name defaults to the CLASS name: two budgets per session trip factory.py's unique assert\n        return f\"{self.__class__.__name__}[{self._counter}]\"\n\n    def _claim(self) -> bool:\n        \"\"\"Take one unit of budget, returning whether there was any left.\"\"\"\n        with self._lock:\n            if self._spent >= self._limit:\n                return False\n            self._spent += 1\n            return True\n\n    def _gate(self, tool_call: ToolCall) -> ToolMessage | None:\n        \"\"\"The refusal to return when the budget is gone, else None to proceed.\"\"\"\n        if tool_call[\"name\"] not in self._tool_names:\n            return None\n        if self._claim():\n            COUNTERS.bump(_calls_counter_name(self._counter, tool_call[\"name\"]))\n            return None\n        COUNTERS.bump(self._counter)\n        warn_once(_WARNED_EXHAUSTED, self._counter,\n                  _exhaustion_warning(self._counter, self._limit, self._tool_names))\n        return _refuse(tool_call, _BUDGET_MESSAGE)\n\n    def exhausted_tools(self) -> frozenset[str]:\n        \"\"\"The metered tool name(s) with no allowance left, or ``frozenset()`` while any remains.\"\"\"\n        with self._lock:\n            return self._tool_names if self._spent >= self._limit else frozenset()\n\n    def refusal_for(self, tool_name: str) -> str | None:\n        \"\"\"Claim one unit for *tool_name*, returning the refusal text when none is left.\"\"\"\n        # OUT-OF-LOOP wrap_tool_call for non-langchain backends; shares this instance's counters\n        refusal = self._gate({\"name\": tool_name, \"id\": \"out-of-loop\", \"args\": {}})\n        return None if refusal is None else str(refusal.content)\n\n    def wrap_tool_call(\n        self,\n        request: ToolCallRequest,\n        handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],\n    ) -> ToolMessage | Command[Any]:\n        \"\"\"Execute while budget remains; otherwise refuse without running the tool.\"\"\"\n        return self._gate(request.tool_call) or handler(request)\n\n    async def awrap_tool_call(\n        self,\n        request: ToolCallRequest,\n        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],\n    ) -> ToolMessage | Command[Any]:\n        \"\"\"Async counterpart of :meth:`wrap_tool_call`.\"\"\"\n        refusal = self._gate(request.tool_call)\n        return refusal if refusal is not None else await handler(request)\n\n    def _withdraw(self, request: ModelRequest) -> ModelRequest:\n        \"\"\"*request* with this budget's exhausted tool(s) removed from the tool list.\"\"\"\n        kept = [t for t in (request.tools or [])\n               if getattr(t, \"name\", None) not in self._tool_names]\n        messages = request.messages\n        if not self._withdrawal_announced:\n            self._withdrawal_announced = True\n            messages = [*messages, _withdrawn_notice(self._tool_names)]\n        return request.override(tools=kept, messages=messages)\n\n    def wrap_model_call(\n        self,\n        request: ModelRequest,\n        handler: Callable[[ModelRequest], ModelResponse],\n    ) -> ModelResponse:\n        \"\"\"Withdraw this budget's tool(s) from the request once its pool is spent.\"\"\"\n        if self.exhausted_tools():\n            request = self._withdraw(request)\n        return handler(request)\n\n    async def awrap_model_call(\n        self,\n        request: ModelRequest,\n        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],\n    ) -> ModelResponse:\n        \"\"\"Async counterpart of :meth:`wrap_model_call`.\"\"\"\n        if self.exhausted_tools():\n            request = self._withdraw(request)\n        return await handler(request)\n\n\n__all__ = [\"ToolCallBudget\"]\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/backends/harness/deepagents/tool_budget.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "Middleware that caps how many times a session may call a named set of tools.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_38_4": {
+      "source": "vvaharness/backends/harness/deepagents/tool_budget.py",
+      "line_start": 38,
+      "line_end": 40,
+      "value": "Your tool-call budget for this session is exhausted. Do not call any further tool in the metered set; finish from the evidence you already have. Calling one again will not run and only spends a turn.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_58_4": {
+      "source": "vvaharness/backends/harness/deepagents/tool_budget.py",
+      "line_start": 58,
+      "line_end": 58,
+      "value": "The usage-tally key for *tool*, derived from the exhaustion counter's own name.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_60_15": {
+      "source": "vvaharness/backends/harness/deepagents/tool_budget.py",
+      "line_start": 60,
+      "line_end": 60,
+      "source_expression": "f\"tool_calls_{tool}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_61_11": {
+      "source": "vvaharness/backends/harness/deepagents/tool_budget.py",
+      "line_start": 61,
+      "line_end": 61,
+      "source_expression": "f\"{counter.removesuffix('_budget_exhausted')}_calls_{tool}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_65_4": {
+      "source": "vvaharness/backends/harness/deepagents/tool_budget.py",
+      "line_start": 65,
+      "line_end": 65,
+      "value": "The once-per-(stage, family)-per-run WARN line for the first refusal on *counter*.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_69_8": {
+      "source": "vvaharness/backends/harness/deepagents/tool_budget.py",
+      "line_start": 69,
+      "line_end": 73,
+      "source_expression": "f\"WARN {stage_label(counter)}: tool-call budget ({knob}={limit} per session) \"\n        f\"exhausted in at least one session for {names} -- further calls there are refused \"\n        \"now, and the tool family is withdrawn once the model calls again; it finishes from \"\n        f\"the evidence it already has. Count in the run manifest under {counter}. Raise the \"\n        \"knob in the scan config if this recurs.\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_78_4": {
+      "source": "vvaharness/backends/harness/deepagents/tool_budget.py",
+      "line_start": 78,
+      "line_end": 78,
+      "value": "A synthetic error ToolMessage explaining why a call was not executed.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_84_4": {
+      "source": "vvaharness/backends/harness/deepagents/tool_budget.py",
+      "line_start": 84,
+      "line_end": 84,
+      "value": "The one-time turn appended when a metered tool is removed from availability.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_86_8": {
+      "source": "vvaharness/backends/harness/deepagents/tool_budget.py",
+      "line_start": 86,
+      "line_end": 88,
+      "source_expression": "f\"Your budget for {', '.join(sorted(tool_names))} is exhausted; it/they have been \"\n        \"withdrawn from your available tools for the rest of this session -- finish from \"\n        \"the evidence you already have rather than asking for it/them again.\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_93_4": {
+      "source": "vvaharness/backends/harness/deepagents/tool_budget.py",
+      "line_start": 93,
+      "line_end": 93,
+      "value": "Refuse any metered tool call once one session has spent its total allowance.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_98_8": {
+      "source": "vvaharness/backends/harness/deepagents/tool_budget.py",
+      "line_start": 98,
+      "line_end": 98,
+      "value": "Allow *limit* calls across *tool_names* in this session, then refuse the rest.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_109_8": {
+      "source": "vvaharness/backends/harness/deepagents/tool_budget.py",
+      "line_start": 109,
+      "line_end": 109,
+      "value": "Per-instance name; langchain asserts middleware names are unique per agent.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_111_15": {
+      "source": "vvaharness/backends/harness/deepagents/tool_budget.py",
+      "line_start": 111,
+      "line_end": 111,
+      "source_expression": "f\"{self.__class__.__name__}[{self._counter}]\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_114_8": {
+      "source": "vvaharness/backends/harness/deepagents/tool_budget.py",
+      "line_start": 114,
+      "line_end": 114,
+      "value": "Take one unit of budget, returning whether there was any left.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_122_8": {
+      "source": "vvaharness/backends/harness/deepagents/tool_budget.py",
+      "line_start": 122,
+      "line_end": 122,
+      "value": "The refusal to return when the budget is gone, else None to proceed.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_134_8": {
+      "source": "vvaharness/backends/harness/deepagents/tool_budget.py",
+      "line_start": 134,
+      "line_end": 134,
+      "value": "The metered tool name(s) with no allowance left, or ``frozenset()`` while any remains.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_139_8": {
+      "source": "vvaharness/backends/harness/deepagents/tool_budget.py",
+      "line_start": 139,
+      "line_end": 139,
+      "value": "Claim one unit for *tool_name*, returning the refusal text when none is left.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_149_8": {
+      "source": "vvaharness/backends/harness/deepagents/tool_budget.py",
+      "line_start": 149,
+      "line_end": 149,
+      "value": "Execute while budget remains; otherwise refuse without running the tool.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_157_8": {
+      "source": "vvaharness/backends/harness/deepagents/tool_budget.py",
+      "line_start": 157,
+      "line_end": 157,
+      "value": "Async counterpart of :meth:`wrap_tool_call`.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_162_8": {
+      "source": "vvaharness/backends/harness/deepagents/tool_budget.py",
+      "line_start": 162,
+      "line_end": 162,
+      "value": "*request* with this budget's exhausted tool(s) removed from the tool list.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_176_8": {
+      "source": "vvaharness/backends/harness/deepagents/tool_budget.py",
+      "line_start": 176,
+      "line_end": 176,
+      "value": "Withdraw this budget's tool(s) from the request once its pool is spent.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_186_8": {
+      "source": "vvaharness/backends/harness/deepagents/tool_budget.py",
+      "line_start": 186,
+      "line_end": 186,
+      "value": "Async counterpart of :meth:`wrap_model_call`.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "Middleware that caps how many times a session may call a named set of tools.",
+      "context": "literal"
+    },
+    {
+      "line_start": 38,
+      "line_end": 40,
+      "column": 4,
+      "value": "Your tool-call budget for this session is exhausted. Do not call any further tool in the metered set; finish from the evidence you already have. Calling one again will not run and only spends a turn.",
+      "context": "literal"
+    },
+    {
+      "line_start": 43,
+      "line_end": 43,
+      "column": 19,
+      "value": "tool_call_budget_exhausted",
+      "context": "literal"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 4,
+      "value": "s2_graph_tool_budget_exhausted",
+      "context": "literal"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 4,
+      "value": "s4_graph_tool_budget_exhausted",
+      "context": "literal"
+    },
+    {
+      "line_start": 50,
+      "line_end": 50,
+      "column": 4,
+      "value": "s4_cwe_tool_budget_exhausted",
+      "context": "literal"
+    },
+    {
+      "line_start": 51,
+      "line_end": 51,
+      "column": 4,
+      "value": "s6_graph_tool_budget_exhausted",
+      "context": "literal"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 38,
+      "value": "step2.graph_tool_budget",
+      "context": "literal"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 38,
+      "value": "step4.graph_tool_budget",
+      "context": "literal"
+    },
+    {
+      "line_start": 50,
+      "line_end": 50,
+      "column": 36,
+      "value": "step4.cwe_tool_budget",
+      "context": "literal"
+    },
+    {
+      "line_start": 51,
+      "line_end": 51,
+      "column": 38,
+      "value": "step6_verify.graph_tool_budget",
+      "context": "literal"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 4,
+      "value": "The usage-tally key for *tool*, derived from the exhaustion counter's own name.",
+      "context": "literal"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 4,
+      "value": "The once-per-(stage, family)-per-run WARN line for the first refusal on *counter*.",
+      "context": "literal"
+    },
+    {
+      "line_start": 78,
+      "line_end": 78,
+      "column": 4,
+      "value": "A synthetic error ToolMessage explaining why a call was not executed.",
+      "context": "literal"
+    },
+    {
+      "line_start": 84,
+      "line_end": 84,
+      "column": 4,
+      "value": "The one-time turn appended when a metered tool is removed from availability.",
+      "context": "literal"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 4,
+      "value": "Refuse any metered tool call once one session has spent its total allowance.",
+      "context": "literal"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 11,
+      "value": "ToolCallBudget",
+      "context": "literal"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 56,
+      "value": "_calls_",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 36,
+      "value": "its scan-config budget knob",
+      "context": "literal"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 10,
+      "value": "WARN ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 37,
+      "value": ": tool-call budget (",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 63,
+      "value": "=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 69,
+      "line_end": 70,
+      "column": 71,
+      "value": " per session) exhausted in at least one session for ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 70,
+      "line_end": 72,
+      "column": 55,
+      "value": " -- further calls there are refused now, and the tool family is withdrawn once the model calls again; it finishes from the evidence it already has. Count in the run manifest under ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 72,
+      "line_end": 73,
+      "column": 80,
+      "value": ". Raise the knob in the scan config if this recurs.",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 97,
+      "line_end": 97,
+      "column": 32,
+      "value": "tool_call_budget_exhausted",
+      "context": "literal"
+    },
+    {
+      "line_start": 98,
+      "line_end": 98,
+      "column": 8,
+      "value": "Allow *limit* calls across *tool_names* in this session, then refuse the rest.",
+      "context": "literal"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 8,
+      "value": "Per-instance name; langchain asserts middleware names are unique per agent.",
+      "context": "literal"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 8,
+      "value": "Take one unit of budget, returning whether there was any left.",
+      "context": "literal"
+    },
+    {
+      "line_start": 122,
+      "line_end": 122,
+      "column": 8,
+      "value": "The refusal to return when the budget is gone, else None to proceed.",
+      "context": "literal"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 8,
+      "value": "The metered tool name(s) with no allowance left, or ``frozenset()`` while any remains.",
+      "context": "literal"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 8,
+      "value": "Claim one unit for *tool_name*, returning the refusal text when none is left.",
+      "context": "literal"
+    },
+    {
+      "line_start": 149,
+      "line_end": 149,
+      "column": 8,
+      "value": "Execute while budget remains; otherwise refuse without running the tool.",
+      "context": "literal"
+    },
+    {
+      "line_start": 157,
+      "line_end": 157,
+      "column": 8,
+      "value": "Async counterpart of :meth:`wrap_tool_call`.",
+      "context": "literal"
+    },
+    {
+      "line_start": 162,
+      "line_end": 162,
+      "column": 8,
+      "value": "*request* with this budget's exhausted tool(s) removed from the tool list.",
+      "context": "literal"
+    },
+    {
+      "line_start": 176,
+      "line_end": 176,
+      "column": 8,
+      "value": "Withdraw this budget's tool(s) from the request once its pool is spent.",
+      "context": "literal"
+    },
+    {
+      "line_start": 186,
+      "line_end": 186,
+      "column": 8,
+      "value": "Async counterpart of :meth:`wrap_model_call`.",
+      "context": "literal"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 17,
+      "value": "tool_calls_",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 12,
+      "value": ", ",
+      "context": "literal"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 60,
+      "value": "error",
+      "context": "literal"
+    },
+    {
+      "line_start": 111,
+      "line_end": 111,
+      "column": 42,
+      "value": "[",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 111,
+      "line_end": 111,
+      "column": 58,
+      "value": "]",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 35,
+      "value": "_budget_exhausted",
+      "context": "literal"
+    },
+    {
+      "line_start": 79,
+      "line_end": 79,
+      "column": 55,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 46,
+      "value": "id",
+      "context": "literal"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 10,
+      "value": "Your budget for ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 86,
+      "line_end": 88,
+      "column": 57,
+      "value": " is exhausted; it/they have been withdrawn from your available tools for the rest of this session -- finish from the evidence you already have rather than asking for it/them again.",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 21,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 30,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 49,
+      "value": "id",
+      "context": "literal"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 70,
+      "value": "args",
+      "context": "literal"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 55,
+      "value": "out-of-loop",
+      "context": "literal"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 71,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 29,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 27,
+      "value": ", ",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 17,
+      "text": "# Nothing else bounds tool-call VOLUME: turn and token ceilings bound the conversation, not calls"
+    },
+    {
+      "line": 45,
+      "text": "#: counter name -> the scan-config key an operator would raise; unlisted counters get a"
+    },
+    {
+      "line": 46,
+      "text": "#: generic phrase so a future stage's budget still warns without a new table row."
+    },
+    {
+      "line": 94,
+      "text": "# NEVER meter every tool: a structured-output call is a tool call, and blocking it strands"
+    },
+    {
+      "line": 110,
+      "text": "# name defaults to the CLASS name: two budgets per session trip factory.py's unique assert"
+    },
+    {
+      "line": 140,
+      "text": "# OUT-OF-LOOP wrap_tool_call for non-langchain backends; shares this instance's counters"
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 23,
+      "line_end": 23,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 30,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 31,
+      "line_end": 31,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 32,
+      "line_end": 32,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 34,
+      "line_end": 34,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 35,
+      "line_end": 35,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "Assign",
+      "line_start": 37,
+      "line_end": 41,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 43,
+      "line_end": 43,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 47,
+      "line_end": 52,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 54,
+      "line_end": 54,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 57,
+      "line_end": 61,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 7
+    },
+    {
+      "kind": "Expr",
+      "line_start": 58,
+      "line_end": 58,
+      "column": 4,
+      "owner": "_calls_counter_name",
+      "representation_line": 13
+    },
+    {
+      "kind": "If",
+      "line_start": 59,
+      "line_end": 60,
+      "column": 4,
+      "owner": "_calls_counter_name",
+      "representation_line": 14
+    },
+    {
+      "kind": "Return",
+      "line_start": 60,
+      "line_end": 60,
+      "column": 8,
+      "owner": "_calls_counter_name",
+      "representation_line": 16
+    },
+    {
+      "kind": "Return",
+      "line_start": 61,
+      "line_end": 61,
+      "column": 4,
+      "owner": "_calls_counter_name",
+      "representation_line": 19
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 64,
+      "line_end": 74,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 23
+    },
+    {
+      "kind": "Expr",
+      "line_start": 65,
+      "line_end": 65,
+      "column": 4,
+      "owner": "_exhaustion_warning",
+      "representation_line": 29
+    },
+    {
+      "kind": "Assign",
+      "line_start": 66,
+      "line_end": 66,
+      "column": 4,
+      "owner": "_exhaustion_warning",
+      "representation_line": 29
+    },
+    {
+      "kind": "Assign",
+      "line_start": 67,
+      "line_end": 67,
+      "column": 4,
+      "owner": "_exhaustion_warning",
+      "representation_line": 29
+    },
+    {
+      "kind": "Return",
+      "line_start": 68,
+      "line_end": 74,
+      "column": 4,
+      "owner": "_exhaustion_warning",
+      "representation_line": 30
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 77,
+      "line_end": 80,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 34
+    },
+    {
+      "kind": "Expr",
+      "line_start": 78,
+      "line_end": 78,
+      "column": 4,
+      "owner": "_refuse",
+      "representation_line": 40
+    },
+    {
+      "kind": "Return",
+      "line_start": 79,
+      "line_end": 80,
+      "column": 4,
+      "owner": "_refuse",
+      "representation_line": 41
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 83,
+      "line_end": 89,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 45
+    },
+    {
+      "kind": "Expr",
+      "line_start": 84,
+      "line_end": 84,
+      "column": 4,
+      "owner": "_withdrawn_notice",
+      "representation_line": 51
+    },
+    {
+      "kind": "Return",
+      "line_start": 85,
+      "line_end": 89,
+      "column": 4,
+      "owner": "_withdrawn_notice",
+      "representation_line": 52
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 92,
+      "line_end": 189,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 56
+    },
+    {
+      "kind": "Expr",
+      "line_start": 93,
+      "line_end": 93,
+      "column": 4,
+      "owner": "ToolCallBudget",
+      "representation_line": 61
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 96,
+      "line_end": 105,
+      "column": 4,
+      "owner": "ToolCallBudget",
+      "representation_line": 62
+    },
+    {
+      "kind": "Expr",
+      "line_start": 98,
+      "line_end": 98,
+      "column": 8,
+      "owner": "ToolCallBudget.__init__",
+      "representation_line": 68
+    },
+    {
+      "kind": "Expr",
+      "line_start": 99,
+      "line_end": 99,
+      "column": 8,
+      "owner": "ToolCallBudget.__init__",
+      "representation_line": 68
+    },
+    {
+      "kind": "Assign",
+      "line_start": 100,
+      "line_end": 100,
+      "column": 8,
+      "owner": "ToolCallBudget.__init__",
+      "representation_line": 68
+    },
+    {
+      "kind": "Assign",
+      "line_start": 101,
+      "line_end": 101,
+      "column": 8,
+      "owner": "ToolCallBudget.__init__",
+      "representation_line": 68
+    },
+    {
+      "kind": "Assign",
+      "line_start": 102,
+      "line_end": 102,
+      "column": 8,
+      "owner": "ToolCallBudget.__init__",
+      "representation_line": 68
+    },
+    {
+      "kind": "Assign",
+      "line_start": 103,
+      "line_end": 103,
+      "column": 8,
+      "owner": "ToolCallBudget.__init__",
+      "representation_line": 70
+    },
+    {
+      "kind": "Assign",
+      "line_start": 104,
+      "line_end": 104,
+      "column": 8,
+      "owner": "ToolCallBudget.__init__",
+      "representation_line": 70
+    },
+    {
+      "kind": "Assign",
+      "line_start": 105,
+      "line_end": 105,
+      "column": 8,
+      "owner": "ToolCallBudget.__init__",
+      "representation_line": 70
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 108,
+      "line_end": 111,
+      "column": 4,
+      "owner": "ToolCallBudget",
+      "representation_line": 73
+    },
+    {
+      "kind": "Expr",
+      "line_start": 109,
+      "line_end": 109,
+      "column": 8,
+      "owner": "ToolCallBudget.name",
+      "representation_line": 82
+    },
+    {
+      "kind": "Return",
+      "line_start": 111,
+      "line_end": 111,
+      "column": 8,
+      "owner": "ToolCallBudget.name",
+      "representation_line": 83
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 113,
+      "line_end": 119,
+      "column": 4,
+      "owner": "ToolCallBudget",
+      "representation_line": 88
+    },
+    {
+      "kind": "Expr",
+      "line_start": 114,
+      "line_end": 114,
+      "column": 8,
+      "owner": "ToolCallBudget._claim",
+      "representation_line": 94
+    },
+    {
+      "kind": "With",
+      "line_start": 115,
+      "line_end": 119,
+      "column": 8,
+      "owner": "ToolCallBudget._claim",
+      "representation_line": 95
+    },
+    {
+      "kind": "If",
+      "line_start": 116,
+      "line_end": 117,
+      "column": 12,
+      "owner": "ToolCallBudget._claim",
+      "representation_line": 97
+    },
+    {
+      "kind": "Return",
+      "line_start": 117,
+      "line_end": 117,
+      "column": 16,
+      "owner": "ToolCallBudget._claim",
+      "representation_line": 99
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 118,
+      "line_end": 118,
+      "column": 12,
+      "owner": "ToolCallBudget._claim",
+      "representation_line": 103
+    },
+    {
+      "kind": "Return",
+      "line_start": 119,
+      "line_end": 119,
+      "column": 12,
+      "owner": "ToolCallBudget._claim",
+      "representation_line": 104
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 121,
+      "line_end": 131,
+      "column": 4,
+      "owner": "ToolCallBudget",
+      "representation_line": 110
+    },
+    {
+      "kind": "Expr",
+      "line_start": 122,
+      "line_end": 122,
+      "column": 8,
+      "owner": "ToolCallBudget._gate",
+      "representation_line": 116
+    },
+    {
+      "kind": "If",
+      "line_start": 123,
+      "line_end": 124,
+      "column": 8,
+      "owner": "ToolCallBudget._gate",
+      "representation_line": 117
+    },
+    {
+      "kind": "Return",
+      "line_start": 124,
+      "line_end": 124,
+      "column": 12,
+      "owner": "ToolCallBudget._gate",
+      "representation_line": 119
+    },
+    {
+      "kind": "If",
+      "line_start": 125,
+      "line_end": 127,
+      "column": 8,
+      "owner": "ToolCallBudget._gate",
+      "representation_line": 122
+    },
+    {
+      "kind": "Expr",
+      "line_start": 126,
+      "line_end": 126,
+      "column": 12,
+      "owner": "ToolCallBudget._gate",
+      "representation_line": 125
+    },
+    {
+      "kind": "Return",
+      "line_start": 127,
+      "line_end": 127,
+      "column": 12,
+      "owner": "ToolCallBudget._gate",
+      "representation_line": 126
+    },
+    {
+      "kind": "Expr",
+      "line_start": 128,
+      "line_end": 128,
+      "column": 8,
+      "owner": "ToolCallBudget._gate",
+      "representation_line": 130
+    },
+    {
+      "kind": "Expr",
+      "line_start": 129,
+      "line_end": 130,
+      "column": 8,
+      "owner": "ToolCallBudget._gate",
+      "representation_line": 130
+    },
+    {
+      "kind": "Return",
+      "line_start": 131,
+      "line_end": 131,
+      "column": 8,
+      "owner": "ToolCallBudget._gate",
+      "representation_line": 131
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 133,
+      "line_end": 136,
+      "column": 4,
+      "owner": "ToolCallBudget",
+      "representation_line": 135
+    },
+    {
+      "kind": "Expr",
+      "line_start": 134,
+      "line_end": 134,
+      "column": 8,
+      "owner": "ToolCallBudget.exhausted_tools",
+      "representation_line": 141
+    },
+    {
+      "kind": "With",
+      "line_start": 135,
+      "line_end": 136,
+      "column": 8,
+      "owner": "ToolCallBudget.exhausted_tools",
+      "representation_line": 142
+    },
+    {
+      "kind": "Return",
+      "line_start": 136,
+      "line_end": 136,
+      "column": 12,
+      "owner": "ToolCallBudget.exhausted_tools",
+      "representation_line": 144
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 138,
+      "line_end": 142,
+      "column": 4,
+      "owner": "ToolCallBudget",
+      "representation_line": 150
+    },
+    {
+      "kind": "Expr",
+      "line_start": 139,
+      "line_end": 139,
+      "column": 8,
+      "owner": "ToolCallBudget.refusal_for",
+      "representation_line": 156
+    },
+    {
+      "kind": "Assign",
+      "line_start": 141,
+      "line_end": 141,
+      "column": 8,
+      "owner": "ToolCallBudget.refusal_for",
+      "representation_line": 156
+    },
+    {
+      "kind": "Return",
+      "line_start": 142,
+      "line_end": 142,
+      "column": 8,
+      "owner": "ToolCallBudget.refusal_for",
+      "representation_line": 157
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 144,
+      "line_end": 150,
+      "column": 4,
+      "owner": "ToolCallBudget",
+      "representation_line": 161
+    },
+    {
+      "kind": "Expr",
+      "line_start": 149,
+      "line_end": 149,
+      "column": 8,
+      "owner": "ToolCallBudget.wrap_tool_call",
+      "representation_line": 167
+    },
+    {
+      "kind": "Return",
+      "line_start": 150,
+      "line_end": 150,
+      "column": 8,
+      "owner": "ToolCallBudget.wrap_tool_call",
+      "representation_line": 168
+    },
+    {
+      "kind": "AsyncFunctionDef",
+      "line_start": 152,
+      "line_end": 159,
+      "column": 4,
+      "owner": "ToolCallBudget",
+      "representation_line": 172
+    },
+    {
+      "kind": "Expr",
+      "line_start": 157,
+      "line_end": 157,
+      "column": 8,
+      "owner": "ToolCallBudget.awrap_tool_call",
+      "representation_line": 179
+    },
+    {
+      "kind": "Assign",
+      "line_start": 158,
+      "line_end": 158,
+      "column": 8,
+      "owner": "ToolCallBudget.awrap_tool_call",
+      "representation_line": 179
+    },
+    {
+      "kind": "Return",
+      "line_start": 159,
+      "line_end": 159,
+      "column": 8,
+      "owner": "ToolCallBudget.awrap_tool_call",
+      "representation_line": 180
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 161,
+      "line_end": 169,
+      "column": 4,
+      "owner": "ToolCallBudget",
+      "representation_line": 184
+    },
+    {
+      "kind": "Expr",
+      "line_start": 162,
+      "line_end": 162,
+      "column": 8,
+      "owner": "ToolCallBudget._withdraw",
+      "representation_line": 190
+    },
+    {
+      "kind": "Assign",
+      "line_start": 163,
+      "line_end": 164,
+      "column": 8,
+      "owner": "ToolCallBudget._withdraw",
+      "representation_line": 190
+    },
+    {
+      "kind": "Assign",
+      "line_start": 165,
+      "line_end": 165,
+      "column": 8,
+      "owner": "ToolCallBudget._withdraw",
+      "representation_line": 190
+    },
+    {
+      "kind": "If",
+      "line_start": 166,
+      "line_end": 168,
+      "column": 8,
+      "owner": "ToolCallBudget._withdraw",
+      "representation_line": 191
+    },
+    {
+      "kind": "Assign",
+      "line_start": 167,
+      "line_end": 167,
+      "column": 12,
+      "owner": "ToolCallBudget._withdraw",
+      "representation_line": 194
+    },
+    {
+      "kind": "Assign",
+      "line_start": 168,
+      "line_end": 168,
+      "column": 12,
+      "owner": "ToolCallBudget._withdraw",
+      "representation_line": 194
+    },
+    {
+      "kind": "Return",
+      "line_start": 169,
+      "line_end": 169,
+      "column": 8,
+      "owner": "ToolCallBudget._withdraw",
+      "representation_line": 196
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 171,
+      "line_end": 179,
+      "column": 4,
+      "owner": "ToolCallBudget",
+      "representation_line": 200
+    },
+    {
+      "kind": "Expr",
+      "line_start": 176,
+      "line_end": 176,
+      "column": 8,
+      "owner": "ToolCallBudget.wrap_model_call",
+      "representation_line": 206
+    },
+    {
+      "kind": "If",
+      "line_start": 177,
+      "line_end": 178,
+      "column": 8,
+      "owner": "ToolCallBudget.wrap_model_call",
+      "representation_line": 207
+    },
+    {
+      "kind": "Assign",
+      "line_start": 178,
+      "line_end": 178,
+      "column": 12,
+      "owner": "ToolCallBudget.wrap_model_call",
+      "representation_line": 210
+    },
+    {
+      "kind": "Return",
+      "line_start": 179,
+      "line_end": 179,
+      "column": 8,
+      "owner": "ToolCallBudget.wrap_model_call",
+      "representation_line": 212
+    },
+    {
+      "kind": "AsyncFunctionDef",
+      "line_start": 181,
+      "line_end": 189,
+      "column": 4,
+      "owner": "ToolCallBudget",
+      "representation_line": 216
+    },
+    {
+      "kind": "Expr",
+      "line_start": 186,
+      "line_end": 186,
+      "column": 8,
+      "owner": "ToolCallBudget.awrap_model_call",
+      "representation_line": 223
+    },
+    {
+      "kind": "If",
+      "line_start": 187,
+      "line_end": 188,
+      "column": 8,
+      "owner": "ToolCallBudget.awrap_model_call",
+      "representation_line": 224
+    },
+    {
+      "kind": "Assign",
+      "line_start": 188,
+      "line_end": 188,
+      "column": 12,
+      "owner": "ToolCallBudget.awrap_model_call",
+      "representation_line": 227
+    },
+    {
+      "kind": "Return",
+      "line_start": 189,
+      "line_end": 189,
+      "column": 8,
+      "owner": "ToolCallBudget.awrap_model_call",
+      "representation_line": 229
+    },
+    {
+      "kind": "Assign",
+      "line_start": 192,
+      "line_end": 192,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 235
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 38,
+      "line_end": 40,
+      "column": 4,
+      "kind": "Constant",
+      "original_ast": "Constant(value='Your tool-call budget for this session is exhausted. Do not call any further tool in the metered set; finish from the evidence you already have. Calling one again will not run and only spends a turn.')",
+      "rendered": "source_literal_38_4"
+    },
+    {
+      "line_start": 43,
+      "line_end": 43,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value='tool_call_budget_exhausted')",
+      "rendered": "'tool_call_budget_exhausted'"
+    },
+    {
+      "line_start": 47,
+      "line_end": 52,
+      "column": 30,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='s2_graph_tool_budget_exhausted'), Constant(value='s4_graph_tool_budget_exhausted'), Constant(value='s4_cwe_tool_budget_exhausted'), Constant(value='s6_graph_tool_budget_exhausted')], values=[Constant(value='step2.graph_tool_budget'), Constant(value='step4.graph_tool_budget'), Constant(value='step4.cwe_tool_budget'), Constant(value='step6_verify.graph_tool_budget')])",
+      "rendered": "{'s2_graph_tool_budget_exhausted': 'step2.graph_tool_budget', 's4_graph_tool_budget_exhausted': 'step4.graph_tool_budget', 's4_cwe_tool_budget_exhausted': 'step4.cwe_tool_budget', 's6_graph_tool_budget_exhausted': 'step6_verify.graph_tool_budget'}"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 30,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='counter', ctx=Load()), ops=[Eq()], comparators=[Name(id='_DEFAULT_COUNTER', ctx=Load())])",
+      "rendered": "counter == _DEFAULT_COUNTER"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 15,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[Constant(value='tool_calls_'), FormattedValue(value=Name(id='tool', ctx=Load()), conversion=-1)])",
+      "rendered": "source_template_60_15"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 11,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[FormattedValue(value=Call(func=Attribute(value=Name(id='counter', ctx=Load()), attr='removesuffix', ctx=Load()), args=[Constant(value='_budget_exhausted')], keywords=[]), conversion=-1), Constant(value='_calls_'), FormattedValue(value=Name(id='tool', ctx=Load()), conversion=-1)])",
+      "rendered": "source_template_61_11"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_KNOB_NAMES', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='counter', ctx=Load()), Constant(value='its scan-config budget knob')], keywords=[])",
+      "rendered": "_KNOB_NAMES.get(counter, 'its scan-config budget knob')"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Constant(value=', '), attr='join', ctx=Load()), args=[Call(func=Name(id='sorted', ctx=Load()), args=[Name(id='tool_names', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "', '.join(sorted(tool_names))"
+    },
+    {
+      "line_start": 69,
+      "line_end": 73,
+      "column": 8,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[Constant(value='WARN '), FormattedValue(value=Call(func=Name(id='stage_label', ctx=Load()), args=[Name(id='counter', ctx=Load())], keywords=[]), conversion=-1), Constant(value=': tool-call budget ('), FormattedValue(value=Name(id='knob', ctx=Load()), conversion=-1), Constant(value='='), FormattedValue(value=Name(id='limit', ctx=Load()), conversion=-1), Constant(value=' per session) exhausted in at least one session for '), FormattedValue(value=Name(id='names', ctx=Load()), conversion=-1), Constant(value=' -- further calls there are refused now, and the tool family is withdrawn once the model calls again; it finishes from the evidence it already has. Count in the run manifest under '), FormattedValue(value=Name(id='counter', ctx=Load()), conversion=-1), Constant(value='. Raise the knob in the scan config if this recurs.')])",
+      "rendered": "source_template_69_8"
+    },
+    {
+      "line_start": 79,
+      "line_end": 80,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='ToolMessage', ctx=Load()), args=[], keywords=[keyword(arg='content', value=Name(id='content', ctx=Load())), keyword(arg='name', value=Subscript(value=Name(id='tool_call', ctx=Load()), slice=Constant(value='name'), ctx=Load())), keyword(arg='tool_call_id', value=Subscript(value=Name(id='tool_call', ctx=Load()), slice=Constant(value='id'), ctx=Load())), keyword(arg='status', value=Constant(value='error'))])",
+      "rendered": "ToolMessage(content=content, name=tool_call['name'], tool_call_id=tool_call['id'], status='error')"
+    },
+    {
+      "line_start": 85,
+      "line_end": 89,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='HumanMessage', ctx=Load()), args=[], keywords=[keyword(arg='content', value=JoinedStr(values=[Constant(value='Your budget for '), FormattedValue(value=Call(func=Attribute(value=Constant(value=', '), attr='join', ctx=Load()), args=[Call(func=Name(id='sorted', ctx=Load()), args=[Name(id='tool_names', ctx=Load())], keywords=[])], keywords=[]), conversion=-1), Constant(value=' is exhausted; it/they have been withdrawn from your available tools for the rest of this session -- finish from the evidence you already have rather than asking for it/them again.')]))])",
+      "rendered": "HumanMessage(content=source_template_86_8)"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 21,
+      "kind": "Name",
+      "original_ast": "Name(id='AgentMiddleware', ctx=Load())",
+      "rendered": "AgentMiddleware"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Name(id='super', ctx=Load()), args=[], keywords=[]), attr='__init__', ctx=Load()), args=[], keywords=[])",
+      "rendered": "super().__init__()"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 27,
+      "kind": "Name",
+      "original_ast": "Name(id='tool_names', ctx=Load())",
+      "rendered": "tool_names"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 22,
+      "kind": "Name",
+      "original_ast": "Name(id='limit', ctx=Load())",
+      "rendered": "limit"
+    },
+    {
+      "line_start": 102,
+      "line_end": 102,
+      "column": 24,
+      "kind": "Name",
+      "original_ast": "Name(id='counter', ctx=Load())",
+      "rendered": "counter"
+    },
+    {
+      "line_start": 103,
+      "line_end": 103,
+      "column": 22,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 104,
+      "line_end": 104,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='threading', ctx=Load()), attr='Lock', ctx=Load()), args=[], keywords=[])",
+      "rendered": "threading.Lock()"
+    },
+    {
+      "line_start": 105,
+      "line_end": 105,
+      "column": 37,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 107,
+      "line_end": 107,
+      "column": 5,
+      "kind": "Name",
+      "original_ast": "Name(id='property', ctx=Load())",
+      "rendered": "property"
+    },
+    {
+      "line_start": 111,
+      "line_end": 111,
+      "column": 15,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[FormattedValue(value=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='__class__', ctx=Load()), attr='__name__', ctx=Load()), conversion=-1), Constant(value='['), FormattedValue(value=Attribute(value=Name(id='self', ctx=Load()), attr='_counter', ctx=Load()), conversion=-1), Constant(value=']')])",
+      "rendered": "source_template_111_15"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_lock', ctx=Load())",
+      "rendered": "self._lock"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='self', ctx=Load()), attr='_spent', ctx=Load()), ops=[GtE()], comparators=[Attribute(value=Name(id='self', ctx=Load()), attr='_limit', ctx=Load())])",
+      "rendered": "self._spent >= self._limit"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 23,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 118,
+      "line_end": 118,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Attribute(value=Name(id='self', ctx=Load()), attr='_spent', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "self._spent += 1"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Subscript(value=Name(id='tool_call', ctx=Load()), slice=Constant(value='name'), ctx=Load()), ops=[NotIn()], comparators=[Attribute(value=Name(id='self', ctx=Load()), attr='_tool_names', ctx=Load())])",
+      "rendered": "tool_call['name'] not in self._tool_names"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_claim', ctx=Load()), args=[], keywords=[])",
+      "rendered": "self._claim()"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Call(func=Name(id='_calls_counter_name', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='_counter', ctx=Load()), Subscript(value=Name(id='tool_call', ctx=Load()), slice=Constant(value='name'), ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "COUNTERS.bump(_calls_counter_name(self._counter, tool_call['name']))"
+    },
+    {
+      "line_start": 127,
+      "line_end": 127,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 128,
+      "line_end": 128,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='_counter', ctx=Load())], keywords=[])",
+      "rendered": "COUNTERS.bump(self._counter)"
+    },
+    {
+      "line_start": 129,
+      "line_end": 130,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='warn_once', ctx=Load()), args=[Name(id='_WARNED_EXHAUSTED', ctx=Load()), Attribute(value=Name(id='self', ctx=Load()), attr='_counter', ctx=Load()), Call(func=Name(id='_exhaustion_warning', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='_counter', ctx=Load()), Attribute(value=Name(id='self', ctx=Load()), attr='_limit', ctx=Load()), Attribute(value=Name(id='self', ctx=Load()), attr='_tool_names', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "warn_once(_WARNED_EXHAUSTED, self._counter, _exhaustion_warning(self._counter, self._limit, self._tool_names))"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_refuse', ctx=Load()), args=[Name(id='tool_call', ctx=Load()), Name(id='_BUDGET_MESSAGE', ctx=Load())], keywords=[])",
+      "rendered": "_refuse(tool_call, _BUDGET_MESSAGE)"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_lock', ctx=Load())",
+      "rendered": "self._lock"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 19,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=Attribute(value=Name(id='self', ctx=Load()), attr='_spent', ctx=Load()), ops=[GtE()], comparators=[Attribute(value=Name(id='self', ctx=Load()), attr='_limit', ctx=Load())]), body=Attribute(value=Name(id='self', ctx=Load()), attr='_tool_names', ctx=Load()), orelse=Call(func=Name(id='frozenset', ctx=Load()), args=[], keywords=[]))",
+      "rendered": "self._tool_names if self._spent >= self._limit else frozenset()"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_gate', ctx=Load()), args=[Dict(keys=[Constant(value='name'), Constant(value='id'), Constant(value='args')], values=[Name(id='tool_name', ctx=Load()), Constant(value='out-of-loop'), Dict(keys=[], values=[])])], keywords=[])",
+      "rendered": "self._gate({'name': tool_name, 'id': 'out-of-loop', 'args': {}})"
+    },
+    {
+      "line_start": 142,
+      "line_end": 142,
+      "column": 15,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=Name(id='refusal', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)]), body=Constant(value=None), orelse=Call(func=Name(id='str', ctx=Load()), args=[Attribute(value=Name(id='refusal', ctx=Load()), attr='content', ctx=Load())], keywords=[]))",
+      "rendered": "None if refusal is None else str(refusal.content)"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 15,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_gate', ctx=Load()), args=[Attribute(value=Name(id='request', ctx=Load()), attr='tool_call', ctx=Load())], keywords=[]), Call(func=Name(id='handler', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[])])",
+      "rendered": "self._gate(request.tool_call) or handler(request)"
+    },
+    {
+      "line_start": 158,
+      "line_end": 158,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_gate', ctx=Load()), args=[Attribute(value=Name(id='request', ctx=Load()), attr='tool_call', ctx=Load())], keywords=[])",
+      "rendered": "self._gate(request.tool_call)"
+    },
+    {
+      "line_start": 159,
+      "line_end": 159,
+      "column": 15,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=Name(id='refusal', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), body=Name(id='refusal', ctx=Load()), orelse=Await(value=Call(func=Name(id='handler', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[])))",
+      "rendered": "refusal if refusal is not None else await handler(request)"
+    },
+    {
+      "line_start": 163,
+      "line_end": 164,
+      "column": 15,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='t', ctx=Load()), generators=[comprehension(target=Name(id='t', ctx=Store()), iter=BoolOp(op=Or(), values=[Attribute(value=Name(id='request', ctx=Load()), attr='tools', ctx=Load()), List(elts=[], ctx=Load())]), ifs=[Compare(left=Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='t', ctx=Load()), Constant(value='name'), Constant(value=None)], keywords=[]), ops=[NotIn()], comparators=[Attribute(value=Name(id='self', ctx=Load()), attr='_tool_names', ctx=Load())])], is_async=0)])",
+      "rendered": "[t for t in request.tools or [] if getattr(t, 'name', None) not in self._tool_names]"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 19,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='request', ctx=Load()), attr='messages', ctx=Load())",
+      "rendered": "request.messages"
+    },
+    {
+      "line_start": 166,
+      "line_end": 166,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Attribute(value=Name(id='self', ctx=Load()), attr='_withdrawal_announced', ctx=Load()))",
+      "rendered": "not self._withdrawal_announced"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 41,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 168,
+      "line_end": 168,
+      "column": 23,
+      "kind": "List",
+      "original_ast": "List(elts=[Starred(value=Name(id='messages', ctx=Load()), ctx=Load()), Call(func=Name(id='_withdrawn_notice', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='_tool_names', ctx=Load())], keywords=[])], ctx=Load())",
+      "rendered": "[*messages, _withdrawn_notice(self._tool_names)]"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='request', ctx=Load()), attr='override', ctx=Load()), args=[], keywords=[keyword(arg='tools', value=Name(id='kept', ctx=Load())), keyword(arg='messages', value=Name(id='messages', ctx=Load()))])",
+      "rendered": "request.override(tools=kept, messages=messages)"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='exhausted_tools', ctx=Load()), args=[], keywords=[])",
+      "rendered": "self.exhausted_tools()"
+    },
+    {
+      "line_start": 178,
+      "line_end": 178,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_withdraw', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[])",
+      "rendered": "self._withdraw(request)"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='handler', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[])",
+      "rendered": "handler(request)"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='exhausted_tools', ctx=Load()), args=[], keywords=[])",
+      "rendered": "self.exhausted_tools()"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='self', ctx=Load()), attr='_withdraw', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[])",
+      "rendered": "self._withdraw(request)"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 15,
+      "kind": "Await",
+      "original_ast": "Await(value=Call(func=Name(id='handler', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[]))",
+      "rendered": "await handler(request)"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 10,
+      "kind": "List",
+      "original_ast": "List(elts=[Constant(value='ToolCallBudget')], ctx=Load())",
+      "rendered": "['ToolCallBudget']"
+    }
+  ],
+  "calls": [
+    {
+      "line": 54,
+      "end_line": 54,
+      "callee": "set",
+      "enclosing": "module initialization",
+      "expression": "set()"
+    },
+    {
+      "line": 66,
+      "end_line": 66,
+      "callee": "_KNOB_NAMES.get",
+      "enclosing": "_exhaustion_warning",
+      "expression": "_KNOB_NAMES.get(counter, \"its scan-config budget knob\")"
+    },
+    {
+      "line": 67,
+      "end_line": 67,
+      "callee": "', '.join",
+      "enclosing": "_exhaustion_warning",
+      "expression": "\", \".join(sorted(tool_names))"
+    },
+    {
+      "line": 79,
+      "end_line": 80,
+      "callee": "ToolMessage",
+      "enclosing": "_refuse",
+      "expression": "ToolMessage(content=content, name=tool_call[\"name\"],\n                       tool_call_id=tool_call[\"id\"], status=\"error\")"
+    },
+    {
+      "line": 85,
+      "end_line": 89,
+      "callee": "HumanMessage",
+      "enclosing": "_withdrawn_notice",
+      "expression": "HumanMessage(content=(\n        f\"Your budget for {', '.join(sorted(tool_names))} is exhausted; it/they have been \"\n        \"withdrawn from your available tools for the rest of this session -- finish from \"\n        \"the evidence you already have rather than asking for it/them again.\"\n    ))"
+    },
+    {
+      "line": 67,
+      "end_line": 67,
+      "callee": "sorted",
+      "enclosing": "_exhaustion_warning",
+      "expression": "sorted(tool_names)"
+    },
+    {
+      "line": 99,
+      "end_line": 99,
+      "callee": "super().__init__",
+      "enclosing": "ToolCallBudget.__init__",
+      "expression": "super().__init__()"
+    },
+    {
+      "line": 104,
+      "end_line": 104,
+      "callee": "threading.Lock",
+      "enclosing": "ToolCallBudget.__init__",
+      "expression": "threading.Lock()"
+    },
+    {
+      "line": 125,
+      "end_line": 125,
+      "callee": "self._claim",
+      "enclosing": "ToolCallBudget._gate",
+      "expression": "self._claim()"
+    },
+    {
+      "line": 128,
+      "end_line": 128,
+      "callee": "COUNTERS.bump",
+      "enclosing": "ToolCallBudget._gate",
+      "expression": "COUNTERS.bump(self._counter)"
+    },
+    {
+      "line": 129,
+      "end_line": 130,
+      "callee": "warn_once",
+      "enclosing": "ToolCallBudget._gate",
+      "expression": "warn_once(_WARNED_EXHAUSTED, self._counter,\n                  _exhaustion_warning(self._counter, self._limit, self._tool_names))"
+    },
+    {
+      "line": 131,
+      "end_line": 131,
+      "callee": "_refuse",
+      "enclosing": "ToolCallBudget._gate",
+      "expression": "_refuse(tool_call, _BUDGET_MESSAGE)"
+    },
+    {
+      "line": 141,
+      "end_line": 141,
+      "callee": "self._gate",
+      "enclosing": "ToolCallBudget.refusal_for",
+      "expression": "self._gate({\"name\": tool_name, \"id\": \"out-of-loop\", \"args\": {}})"
+    },
+    {
+      "line": 158,
+      "end_line": 158,
+      "callee": "self._gate",
+      "enclosing": "ToolCallBudget.awrap_tool_call",
+      "expression": "self._gate(request.tool_call)"
+    },
+    {
+      "line": 169,
+      "end_line": 169,
+      "callee": "request.override",
+      "enclosing": "ToolCallBudget._withdraw",
+      "expression": "request.override(tools=kept, messages=messages)"
+    },
+    {
+      "line": 177,
+      "end_line": 177,
+      "callee": "self.exhausted_tools",
+      "enclosing": "ToolCallBudget.wrap_model_call",
+      "expression": "self.exhausted_tools()"
+    },
+    {
+      "line": 179,
+      "end_line": 179,
+      "callee": "handler",
+      "enclosing": "ToolCallBudget.wrap_model_call",
+      "expression": "handler(request)"
+    },
+    {
+      "line": 187,
+      "end_line": 187,
+      "callee": "self.exhausted_tools",
+      "enclosing": "ToolCallBudget.awrap_model_call",
+      "expression": "self.exhausted_tools()"
+    },
+    {
+      "line": 61,
+      "end_line": 61,
+      "callee": "counter.removesuffix",
+      "enclosing": "_calls_counter_name",
+      "expression": "counter.removesuffix('_budget_exhausted')"
+    },
+    {
+      "line": 69,
+      "end_line": 69,
+      "callee": "stage_label",
+      "enclosing": "_exhaustion_warning",
+      "expression": "stage_label(counter)"
+    },
+    {
+      "line": 126,
+      "end_line": 126,
+      "callee": "COUNTERS.bump",
+      "enclosing": "ToolCallBudget._gate",
+      "expression": "COUNTERS.bump(_calls_counter_name(self._counter, tool_call[\"name\"]))"
+    },
+    {
+      "line": 130,
+      "end_line": 130,
+      "callee": "_exhaustion_warning",
+      "enclosing": "ToolCallBudget._gate",
+      "expression": "_exhaustion_warning(self._counter, self._limit, self._tool_names)"
+    },
+    {
+      "line": 142,
+      "end_line": 142,
+      "callee": "str",
+      "enclosing": "ToolCallBudget.refusal_for",
+      "expression": "str(refusal.content)"
+    },
+    {
+      "line": 150,
+      "end_line": 150,
+      "callee": "self._gate",
+      "enclosing": "ToolCallBudget.wrap_tool_call",
+      "expression": "self._gate(request.tool_call)"
+    },
+    {
+      "line": 150,
+      "end_line": 150,
+      "callee": "handler",
+      "enclosing": "ToolCallBudget.wrap_tool_call",
+      "expression": "handler(request)"
+    },
+    {
+      "line": 178,
+      "end_line": 178,
+      "callee": "self._withdraw",
+      "enclosing": "ToolCallBudget.wrap_model_call",
+      "expression": "self._withdraw(request)"
+    },
+    {
+      "line": 188,
+      "end_line": 188,
+      "callee": "self._withdraw",
+      "enclosing": "ToolCallBudget.awrap_model_call",
+      "expression": "self._withdraw(request)"
+    },
+    {
+      "line": 189,
+      "end_line": 189,
+      "callee": "handler",
+      "enclosing": "ToolCallBudget.awrap_model_call",
+      "expression": "handler(request)"
+    },
+    {
+      "line": 99,
+      "end_line": 99,
+      "callee": "super",
+      "enclosing": "ToolCallBudget.__init__",
+      "expression": "super()"
+    },
+    {
+      "line": 126,
+      "end_line": 126,
+      "callee": "_calls_counter_name",
+      "enclosing": "ToolCallBudget._gate",
+      "expression": "_calls_counter_name(self._counter, tool_call[\"name\"])"
+    },
+    {
+      "line": 136,
+      "end_line": 136,
+      "callee": "frozenset",
+      "enclosing": "ToolCallBudget.exhausted_tools",
+      "expression": "frozenset()"
+    },
+    {
+      "line": 159,
+      "end_line": 159,
+      "callee": "handler",
+      "enclosing": "ToolCallBudget.awrap_tool_call",
+      "expression": "handler(request)"
+    },
+    {
+      "line": 168,
+      "end_line": 168,
+      "callee": "_withdrawn_notice",
+      "enclosing": "ToolCallBudget._withdraw",
+      "expression": "_withdrawn_notice(self._tool_names)"
+    },
+    {
+      "line": 86,
+      "end_line": 86,
+      "callee": "', '.join",
+      "enclosing": "_withdrawn_notice",
+      "expression": "', '.join(sorted(tool_names))"
+    },
+    {
+      "line": 164,
+      "end_line": 164,
+      "callee": "getattr",
+      "enclosing": "ToolCallBudget._withdraw",
+      "expression": "getattr(t, \"name\", None)"
+    },
+    {
+      "line": 86,
+      "end_line": 86,
+      "callee": "sorted",
+      "enclosing": "_withdrawn_notice",
+      "expression": "sorted(tool_names)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 19,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "import threading",
+      "targets": [
+        "threading"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "from collections.abc import Awaitable, Callable",
+      "targets": [
+        "collections.abc",
+        "collections.abc.Awaitable",
+        "collections.abc.Callable"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 23,
+      "source_expression": "from typing import Any",
+      "targets": [
+        "typing",
+        "typing.Any"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 25,
+      "source_expression": "from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, ModelResponse, ToolCallRequest",
+      "targets": [
+        "langchain.agents.middleware.types",
+        "langchain.agents.middleware.types.AgentMiddleware",
+        "langchain.agents.middleware.types.ModelRequest",
+        "langchain.agents.middleware.types.ModelResponse",
+        "langchain.agents.middleware.types.ToolCallRequest"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 31,
+      "source_expression": "from langchain_core.messages import HumanMessage, ToolCall, ToolMessage",
+      "targets": [
+        "langchain_core.messages",
+        "langchain_core.messages.HumanMessage",
+        "langchain_core.messages.ToolCall",
+        "langchain_core.messages.ToolMessage"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 32,
+      "source_expression": "from langgraph.types import Command",
+      "targets": [
+        "langgraph.types",
+        "langgraph.types.Command"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 34,
+      "source_expression": "from vvaharness.util.counters import COUNTERS",
+      "targets": [
+        "vvaharness.util.counters",
+        "vvaharness.util.counters.COUNTERS"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/counters.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 35,
+      "source_expression": "from vvaharness.util.warn_once import stage_label, warn_once",
+      "targets": [
+        "vvaharness.util.warn_once",
+        "vvaharness.util.warn_once.stage_label",
+        "vvaharness.util.warn_once.warn_once"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/warn_once.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

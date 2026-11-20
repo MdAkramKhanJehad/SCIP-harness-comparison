@@ -1,0 +1,5275 @@
+{
+  "source": "vvaharness/util/stage_telemetry.py",
+  "sha256": "dae3ac168c4de01957afec846870594e24539f9fe55cd2b542c378e0e29be035",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Process-wide per-stage telemetry: what each pipeline stage did, and for how long.\"\"\"\n# PHASE_MAP is the COSTING key; an absent phase rolls to totals.unattributed; s11, and s6 when\n# exploit verification ran, are cost_estimated\nfrom __future__ import annotations\n\nimport threading\nfrom collections.abc import Mapping, Sequence\nfrom typing import TYPE_CHECKING, TypedDict, cast\n\nfrom vvaharness.util.pricing import (\n    ModelPricing,\n    PricingTable,\n    TokenBucket,\n    bucket_cost_usd,\n)\n\nif TYPE_CHECKING:  # avoid a runtime util -> orchestrator import; hints only\n    from vvaharness.orchestrator.checkpoints import StageProvenance\n\nSTAGE_IDS: tuple[str, ...] = (\"s0\", \"s1\", \"s2\", \"s3\", \"s4\", \"s5\", \"s6\", \"s7\",\n                              \"s8\", \"s9\", \"s10\", \"s11\")\n\nPHASE_MAP: dict[str, tuple[str, str | None]] = {\n    \"s0-seed\": (\"s0\", None),\n    \"s1-autoexclude\": (\"s1\", \"autoexclude\"),\n    \"s1-preprocess\": (\"s1\", \"preprocess\"),\n    \"s2-threatmodel\": (\"s2\", \"threatmodel\"),\n    \"s3-decompose\": (\"s3\", \"decompose\"),\n    \"s4-deepdive\": (\"s4\", \"deepdive\"),\n    \"s5-prefilter\": (\"s5\", \"dedup\"),\n    \"s6-verify\": (\"s6\", \"verify\"),\n    # One phase for all four EV roles, costed at the attacker's model (else judge, mapper,\n    # classify: the attacker is optional); ev-replay has no manifest\n    \"s6-ev\": (\"s6\", \"exploit_verification.attacker\"),\n    \"s7-dedup\": (\"s7\", \"dedup\"),\n    \"s8-chain\": (\"s8\", \"chain\"),\n    \"s10-remediate\": (\"s10\", \"remediate\"),\n    \"remediation-agent-remediate\": (\"s10\", \"remediate\"),\n    \"s11-validate\": (\"s11\", \"validate\"),\n}\n\nSTAGE_ROLES: dict[str, str | None] = {\n    \"s0\": None,\n    \"s1\": \"preprocess\",\n    \"s2\": \"threatmodel\",\n    \"s3\": \"decompose\",\n    \"s4\": \"deepdive\",\n    \"s5\": \"dedup\",\n    \"s6\": \"verify\",\n    \"s7\": \"dedup\",\n    \"s8\": \"chain\",\n    \"s9\": None,\n    \"s10\": \"remediate\",\n    \"s11\": \"validate\",\n}\n\nESTIMATED_COST_STAGES: frozenset[str] = frozenset({\"s11\"})\n# Roles costed at one model while their phase also carries other models' calls\nESTIMATED_COST_ROLES: frozenset[str] = frozenset({\"exploit_verification.attacker\"})\n# The attacker is optional, but EV's other roles still spend under its phase: price at the next\n_ROLE_FALLBACKS: dict[str, tuple[str, ...]] = {\n    \"exploit_verification.attacker\": (\"exploit_verification.judge\",\n                                      \"exploit_verification.mapper\",\n                                      \"exploit_verification.classify\"),\n}\n\n_NOT_RUN = \"not_run\"\n_RUNNING = \"running\"\n\n\nclass StageRecord(TypedDict):\n    \"\"\"One stage's recorded label, terminal outcome and wall-clock duration.\"\"\"\n\n    label: str\n    outcome: str\n    duration_sec: float | None\n\n\nclass TokenSnapshot(TypedDict, total=False):\n    \"\"\"The shape of ``TOKENS.snapshot()``.\"\"\"\n\n    prompt: int\n    completion: int\n    total: int\n    calls: int\n    calls_with_usage: int\n    # Explicit-null completions coerced to 0; missing it here is how the composer once lost it\n    completion_absent: int\n    by_phase: dict[str, TokenBucket]\n\n\nclass UnattributedTokens(TypedDict):\n    \"\"\"Tokens from phases that map to no stage.\n\n    Key parity with the per-stage token rows is deliberate and load-bearing:\n    the manifest's reconciliation identity is ``Σ stages + unattributed =\n    totals`` for EVERY token key. An unmapped phase with cache traffic (the\n    preflight cache probe) must land here under every key, or the manifest\n    cannot reconcile with itself.\n    \"\"\"\n\n    prompt: int\n    completion: int\n    cache_read: int\n    cache_write: int\n    calls: int\n\n\nclass StageEntry(TypedDict):\n    \"\"\"One ``stages.<id>`` object in the run manifest.\"\"\"\n\n    label: str\n    outcome: str\n    duration_sec: float | None\n    tokens: TokenBucket\n    model: str | None\n    cost_usd: float | None\n    cost_estimated: bool\n    # A CACHED stage's origin config_sha256 (None when fresh); compare to spot stale-config reuse\n    cached_from_config_sha: str | None\n\n\nclass Totals(TypedDict):\n    \"\"\"The manifest's ``totals`` object.\"\"\"\n\n    prompt_tokens: int\n    completion_tokens: int\n    total_tokens: int\n    cache_read_tokens: int\n    cache_write_tokens: int\n    calls: int\n    calls_with_usage: int\n    # Anomaly counters, persisted because stderr is reclaimed and only the manifest survives\n    completion_absent: int\n    cache_unparsed_calls: int\n    cost_usd: float | None\n    unattributed: UnattributedTokens\n    # Already in the five columns, so Σ stages + unattributed = totals holds across a cached run\n    cached_carryover: TokenBucket\n\n\nclass PricingProvenance(TypedDict):\n    \"\"\"Which price table produced the costs, for reproducibility.\"\"\"\n\n    file: str\n    sha256: str\n    source: str\n\n\nclass PricingStatus(TypedDict):\n    \"\"\"Why manifest costs are available, estimated, or unknown.\"\"\"\n\n    status: str\n    reason: str\n\n\nclass StageSection(TypedDict):\n    \"\"\"The manifest fields this module owns.\"\"\"\n\n    stages: dict[str, StageEntry]\n    totals: Totals\n    pricing: PricingProvenance | None\n    pricing_status: PricingStatus\n\n\ndef _copy(record: StageRecord) -> StageRecord:\n    return StageRecord(label=record[\"label\"], outcome=record[\"outcome\"],\n                       duration_sec=record[\"duration_sec\"])\n\n\nclass _StageRecorder:\n    \"\"\"Process-wide recorder of per-stage outcome and duration.\"\"\"\n    # Locked: stages never overlap, but a stage body can touch the recorder off the main thread.\n\n    def __init__(self) -> None:\n        self._lock = threading.Lock()\n        self._stages: dict[str, StageRecord] = {}\n\n    def start(self, stage_id: str, label: str = \"\") -> None:\n        \"\"\"Open *stage_id*; it stays ``running`` until ``done``/``mark``.\"\"\"\n        with self._lock:\n            self._stages[stage_id] = StageRecord(label=label, outcome=_RUNNING,\n                                                 duration_sec=None)\n\n    def done(self, stage_id: str, *, outcome: str = \"completed\",\n             duration_sec: float | None = None) -> None:\n        \"\"\"Close *stage_id* with its terminal outcome and measured duration.\"\"\"\n        with self._lock:\n            record = self._stages.get(stage_id)\n            if record is None:\n                record = StageRecord(label=\"\", outcome=outcome,\n                                     duration_sec=None)\n                self._stages[stage_id] = record\n            record[\"outcome\"] = outcome\n            record[\"duration_sec\"] = duration_sec\n\n    def mark(self, stage_id: str, outcome: str, label: str = \"\") -> None:\n        \"\"\"Record a stage that ran no timed body (cached/skipped/disabled).\"\"\"\n        with self._lock:\n            self._stages[stage_id] = StageRecord(label=label, outcome=outcome,\n                                                 duration_sec=None)\n\n    def reset(self) -> None:\n        \"\"\"Drop every record — one scan's telemetry per manifest.\"\"\"\n        with self._lock:\n            self._stages = {}\n\n    def snapshot(self) -> dict[str, StageRecord]:\n        \"\"\"Copy the records, ordered s0-first with unknown ids appended.\"\"\"\n        with self._lock:\n            known = [s for s in STAGE_IDS if s in self._stages]\n            extra = [s for s in self._stages if s not in STAGE_IDS]\n            return {s: _copy(self._stages[s]) for s in known + extra}\n\n\nSTAGES = _StageRecorder()\n\n\nclass _CachedProvenanceRecorder:\n    \"\"\"Process-wide record of a ``--resume``'d stage's ACTUAL model/via/config/token provenance.\"\"\"\n\n    def __init__(self) -> None:\n        self._lock = threading.Lock()\n        self._entries: dict[str, Mapping[str, object]] = {}\n\n    def record(self, stage_id: str, provenance: Mapping[str, object]) -> None:\n        with self._lock:\n            self._entries[stage_id] = provenance\n\n    def reset(self) -> None:\n        with self._lock:\n            self._entries = {}\n\n    def snapshot(self) -> dict[str, Mapping[str, object]]:\n        with self._lock:\n            return dict(self._entries)\n\n\nCACHED_PROVENANCE = _CachedProvenanceRecorder()\n\n\ndef _sum_buckets(buckets: Sequence[TokenBucket]) -> TokenBucket:\n    return TokenBucket(\n        prompt=sum(b.get(\"prompt\", 0) for b in buckets),\n        completion=sum(b.get(\"completion\", 0) for b in buckets),\n        cache_read=sum(b.get(\"cache_read\", 0) for b in buckets),\n        cache_write=sum(b.get(\"cache_write\", 0) for b in buckets),\n        calls=sum(b.get(\"calls\", 0) for b in buckets),\n    )\n\n\ndef _has_tokens(bucket: TokenBucket) -> bool:\n    return (bucket.get(\"prompt\", 0) + bucket.get(\"completion\", 0)\n            + bucket.get(\"cache_read\", 0)) > 0\n\n\ndef _group_phases(\n    token_snap: TokenSnapshot,\n) -> tuple[dict[str, list[tuple[str | None, TokenBucket]]], UnattributedTokens]:\n    by_stage: dict[str, list[tuple[str | None, TokenBucket]]] = {}\n    unattributed = UnattributedTokens(prompt=0, completion=0, cache_read=0,\n                                      cache_write=0, calls=0)\n    for phase, bucket in token_snap.get(\"by_phase\", {}).items():\n        mapped = PHASE_MAP.get(phase)\n        if mapped is None:\n            # Copy EVERY key `_sum_buckets` reads; dropping cache fields desynced _totals\n            unattributed[\"prompt\"] += bucket.get(\"prompt\", 0)\n            unattributed[\"completion\"] += bucket.get(\"completion\", 0)\n            unattributed[\"cache_read\"] += bucket.get(\"cache_read\", 0)\n            unattributed[\"cache_write\"] += bucket.get(\"cache_write\", 0)\n            unattributed[\"calls\"] += bucket.get(\"calls\", 0)\n            continue\n        stage_id, role = mapped\n        by_stage.setdefault(stage_id, []).append((role, bucket))\n    return by_stage, unattributed\n\n\ndef stage_token_bucket(step_id: str, token_snap: TokenSnapshot) -> TokenBucket:\n    \"\"\"Every phase ``PHASE_MAP`` attributes to *step_id*, summed into one bucket.\"\"\"\n    by_stage, _ = _group_phases(token_snap)\n    return _sum_buckets([bucket for _, bucket in by_stage.get(step_id, [])])\n\n\ndef _resolve_model(role: str | None,\n                   role_models: Mapping[str, str]) -> str | None:\n    \"\"\"The model id a stage's role resolves to.\"\"\"\n    if role is None:\n        return None\n    for r in (role, *_ROLE_FALLBACKS.get(role, ())):\n        if role_models.get(r):\n            return role_models[r]\n    return None\n\n\ndef _rate_for(role: str | None, role_models: Mapping[str, str],\n              pricing: PricingTable) -> ModelPricing | None:\n    model_id = _resolve_model(role, role_models)\n    if model_id is None:\n        return None\n    return pricing.models.get(model_id)\n\n\ndef _stage_cost(phases: Sequence[tuple[str | None, TokenBucket]],\n                role_models: Mapping[str, str],\n                pricing: PricingTable | None) -> float | None:\n    \"\"\"Sum a stage's per-phase costs, or ``None`` when it cannot be priced.\"\"\"\n    if pricing is None:\n        return None\n    total = 0.0\n    for role, bucket in phases:\n        rate = _rate_for(role, role_models, pricing)\n        if rate is not None:\n            # The table's own multipliers, so OpenAI models are not costed at Anthropic's ratios.\n            total += bucket_cost_usd(bucket, rate, pricing.cache_defaults)\n        elif _has_tokens(bucket):\n            return None\n    return total\n\n\ndef _provenance_cost(model_id: str | None, bucket: TokenBucket,\n                     pricing: PricingTable | None) -> float | None:\n    \"\"\"Cost a cached stage's OWN historical bucket against its OWN recorded model id.\"\"\"\n    if pricing is None:\n        return None\n    rate = pricing.models.get(model_id) if model_id else None\n    if rate is not None:\n        return bucket_cost_usd(bucket, rate, pricing.cache_defaults)\n    return None if _has_tokens(bucket) else 0.0\n\n\ndef _stage_entry(stage_id: str, record: StageRecord | None,\n                 phases: Sequence[tuple[str | None, TokenBucket]],\n                 role_models: Mapping[str, str],\n                 pricing: PricingTable | None,\n                 provenance: StageProvenance | None = None) -> StageEntry:\n    role = STAGE_ROLES.get(stage_id)\n    if provenance is not None:\n        # A cached stage reports what it was ACTUALLY produced under, not this run's role_models\n        model = provenance.get(\"model\")\n        # cast: a JSON-round-tripped dict, safe because _sum_buckets uses .get() for every key\n        raw_tokens = cast(TokenBucket, provenance.get(\"tokens\") or {})\n        # A stage can be cached AND partly live (s1 autoexclude): ADD, never replace, or totals skew\n        live_tokens = _sum_buckets([bucket for _, bucket in phases])\n        tokens = _sum_buckets([raw_tokens, live_tokens])\n        cached_cost = _provenance_cost(model, raw_tokens, pricing)\n        live_cost = _stage_cost(phases, role_models, pricing)\n        cost = (None if cached_cost is None or live_cost is None\n                else cached_cost + live_cost)\n        cached_from_config_sha = provenance.get(\"config_sha256\")\n    else:\n        model = _resolve_model(role, role_models)\n        tokens = _sum_buckets([bucket for _, bucket in phases])\n        cost = _stage_cost(phases, role_models, pricing)\n        cached_from_config_sha = None\n    return StageEntry(\n        label=record[\"label\"] if record else \"\",\n        outcome=record[\"outcome\"] if record else _NOT_RUN,\n        duration_sec=record[\"duration_sec\"] if record else None,\n        tokens=tokens,\n        model=model,\n        cost_usd=cost,\n        cost_estimated=(stage_id in ESTIMATED_COST_STAGES\n                        or any(r in ESTIMATED_COST_ROLES and _has_tokens(b)\n                               for r, b in phases)),\n        cached_from_config_sha=cached_from_config_sha,\n    )\n\n\ndef _total_cost(stages: Mapping[str, StageEntry]) -> float | None:\n    costs = [entry[\"cost_usd\"] for entry in stages.values()]\n    priced = [c for c in costs if c is not None]\n    if len(priced) != len(costs):\n        return None\n    return sum(priced)\n\n\ndef _totals(token_snap: TokenSnapshot, stages: Mapping[str, StageEntry],\n            unattributed: UnattributedTokens,\n            cached_provenance: Mapping[str, StageProvenance]) -> Totals:\n    by_phase = token_snap.get(\"by_phase\", {})\n    combined = _sum_buckets(list(by_phase.values()))\n    # cache_unparsed is NOT in TokenBucket: it counts CALLS, and pricing must never read it\n    cache_unparsed_calls = sum(\n        b.get(\"cache_unparsed\", 0) for b in by_phase.values()\n        if isinstance(b.get(\"cache_unparsed\"), int))\n    # Read the envelope, NOT stages[id][\"tokens\"]: a partly-cached stage would double-count\n    cached_carryover = _sum_buckets([\n        cast(TokenBucket, prov.get(\"tokens\") or {})\n        for prov in cached_provenance.values()\n    ])\n    return Totals(\n        prompt_tokens=token_snap.get(\"prompt\", 0) + cached_carryover[\"prompt\"],\n        completion_tokens=(token_snap.get(\"completion\", 0)\n                           + cached_carryover[\"completion\"]),\n        total_tokens=(token_snap.get(\"total\", 0) + cached_carryover[\"prompt\"]\n                     + cached_carryover[\"completion\"]),\n        cache_read_tokens=(combined.get(\"cache_read\", 0)\n                          + cached_carryover[\"cache_read\"]),\n        cache_write_tokens=(combined.get(\"cache_write\", 0)\n                           + cached_carryover[\"cache_write\"]),\n        calls=token_snap.get(\"calls\", 0) + cached_carryover[\"calls\"],\n        calls_with_usage=token_snap.get(\"calls_with_usage\", 0),\n        completion_absent=token_snap.get(\"completion_absent\", 0),\n        cache_unparsed_calls=cache_unparsed_calls,\n        cost_usd=_total_cost(stages),\n        unattributed=unattributed,\n        cached_carryover=cached_carryover,\n    )\n\n\ndef _provenance(pricing: PricingTable | None) -> PricingProvenance | None:\n    if pricing is None:\n        return None\n    return PricingProvenance(file=pricing.path, sha256=pricing.sha256,\n                             source=pricing.source)\n\n\ndef _pricing_status(stages: Mapping[str, StageEntry],\n                    pricing: PricingTable | None) -> PricingStatus:\n    if pricing is None:\n        return {\"status\": \"unavailable\", \"reason\": \"no pricing table configured\"}\n    unpriced = sorted({entry[\"model\"] for entry in stages.values()\n                       if entry[\"cost_usd\"] is None and entry[\"model\"]})\n    if unpriced:\n        return {\n            \"status\": \"incomplete\",\n            \"reason\": \"pricing missing for model(s): \" + \", \".join(unpriced),\n        }\n    return {\"status\": \"available\", \"reason\": \"pricing table applied\"}\n\n\ndef _ordered_stage_ids(stage_snap: Mapping[str, StageRecord],\n                       by_stage: Mapping[str, object]) -> list[str]:\n    present = set(stage_snap) | set(by_stage)\n    known = [s for s in STAGE_IDS if s in present]\n    extra = [s for s in stage_snap if s not in STAGE_IDS]\n    return known + extra\n\n\ndef compose_stage_section(stage_snap: Mapping[str, StageRecord],\n                          token_snap: TokenSnapshot,\n                          role_models: Mapping[str, str],\n                          pricing: PricingTable | None,\n                          cached_provenance: Mapping[str, StageProvenance] | None = None,\n                          ) -> StageSection:\n    \"\"\"Build the manifest's ``stages``/``totals``/``pricing`` fields.\"\"\"\n    # Pure: every input is a snapshot; cost_usd is null for an unpriced model, and so are totals\n    by_stage, unattributed = _group_phases(token_snap)\n    cached_provenance = cached_provenance or {}\n    stages = {\n        stage_id: _stage_entry(stage_id, stage_snap.get(stage_id),\n                               by_stage.get(stage_id, []), role_models, pricing,\n                               cached_provenance.get(stage_id))\n        for stage_id in _ordered_stage_ids(stage_snap, by_stage)\n    }\n    return StageSection(stages=stages,\n                        totals=_totals(token_snap, stages, unattributed,\n                                       cached_provenance),\n                        pricing=_provenance(pricing),\n                        pricing_status=_pricing_status(stages, pricing))\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/util/stage_telemetry.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "Process-wide per-stage telemetry: what each pipeline stage did, and for how long.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_86_4": {
+      "source": "vvaharness/util/stage_telemetry.py",
+      "line_start": 86,
+      "line_end": 86,
+      "value": "One stage's recorded label, terminal outcome and wall-clock duration.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_94_4": {
+      "source": "vvaharness/util/stage_telemetry.py",
+      "line_start": 94,
+      "line_end": 94,
+      "value": "The shape of ``TOKENS.snapshot()``.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_107_4": {
+      "source": "vvaharness/util/stage_telemetry.py",
+      "line_start": 107,
+      "line_end": 114,
+      "value": "Tokens from phases that map to no stage.\n\n    Key parity with the per-stage token rows is deliberate and load-bearing:\n    the manifest's reconciliation identity is ``Σ stages + unattributed =\n    totals`` for EVERY token key. An unmapped phase with cache traffic (the\n    preflight cache probe) must land here under every key, or the manifest\n    cannot reconcile with itself.\n    ",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_124_4": {
+      "source": "vvaharness/util/stage_telemetry.py",
+      "line_start": 124,
+      "line_end": 124,
+      "value": "One ``stages.<id>`` object in the run manifest.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_138_4": {
+      "source": "vvaharness/util/stage_telemetry.py",
+      "line_start": 138,
+      "line_end": 138,
+      "value": "The manifest's ``totals`` object.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_157_4": {
+      "source": "vvaharness/util/stage_telemetry.py",
+      "line_start": 157,
+      "line_end": 157,
+      "value": "Which price table produced the costs, for reproducibility.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_165_4": {
+      "source": "vvaharness/util/stage_telemetry.py",
+      "line_start": 165,
+      "line_end": 165,
+      "value": "Why manifest costs are available, estimated, or unknown.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_172_4": {
+      "source": "vvaharness/util/stage_telemetry.py",
+      "line_start": 172,
+      "line_end": 172,
+      "value": "The manifest fields this module owns.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_186_4": {
+      "source": "vvaharness/util/stage_telemetry.py",
+      "line_start": 186,
+      "line_end": 186,
+      "value": "Process-wide recorder of per-stage outcome and duration.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_194_8": {
+      "source": "vvaharness/util/stage_telemetry.py",
+      "line_start": 194,
+      "line_end": 194,
+      "value": "Open *stage_id*; it stays ``running`` until ``done``/``mark``.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_201_8": {
+      "source": "vvaharness/util/stage_telemetry.py",
+      "line_start": 201,
+      "line_end": 201,
+      "value": "Close *stage_id* with its terminal outcome and measured duration.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_212_8": {
+      "source": "vvaharness/util/stage_telemetry.py",
+      "line_start": 212,
+      "line_end": 212,
+      "value": "Record a stage that ran no timed body (cached/skipped/disabled).",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_218_8": {
+      "source": "vvaharness/util/stage_telemetry.py",
+      "line_start": 218,
+      "line_end": 218,
+      "value": "Drop every record — one scan's telemetry per manifest.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_223_8": {
+      "source": "vvaharness/util/stage_telemetry.py",
+      "line_start": 223,
+      "line_end": 223,
+      "value": "Copy the records, ordered s0-first with unknown ids appended.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_234_4": {
+      "source": "vvaharness/util/stage_telemetry.py",
+      "line_start": 234,
+      "line_end": 234,
+      "value": "Process-wide record of a ``--resume``'d stage's ACTUAL model/via/config/token provenance.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_293_4": {
+      "source": "vvaharness/util/stage_telemetry.py",
+      "line_start": 293,
+      "line_end": 293,
+      "value": "Every phase ``PHASE_MAP`` attributes to *step_id*, summed into one bucket.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_300_4": {
+      "source": "vvaharness/util/stage_telemetry.py",
+      "line_start": 300,
+      "line_end": 300,
+      "value": "The model id a stage's role resolves to.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_320_4": {
+      "source": "vvaharness/util/stage_telemetry.py",
+      "line_start": 320,
+      "line_end": 320,
+      "value": "Sum a stage's per-phase costs, or ``None`` when it cannot be priced.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_336_4": {
+      "source": "vvaharness/util/stage_telemetry.py",
+      "line_start": 336,
+      "line_end": 336,
+      "value": "Cost a cached stage's OWN historical bucket against its OWN recorded model id.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_460_4": {
+      "source": "vvaharness/util/stage_telemetry.py",
+      "line_start": 460,
+      "line_end": 460,
+      "value": "Build the manifest's ``stages``/``totals``/``pricing`` fields.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "Process-wide per-stage telemetry: what each pipeline stage did, and for how long.",
+      "context": "literal"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 11,
+      "value": "not_run",
+      "context": "literal"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 11,
+      "value": "running",
+      "context": "literal"
+    },
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 30,
+      "value": "s0",
+      "context": "literal"
+    },
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 36,
+      "value": "s1",
+      "context": "literal"
+    },
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 42,
+      "value": "s2",
+      "context": "literal"
+    },
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 48,
+      "value": "s3",
+      "context": "literal"
+    },
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 54,
+      "value": "s4",
+      "context": "literal"
+    },
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 60,
+      "value": "s5",
+      "context": "literal"
+    },
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 66,
+      "value": "s6",
+      "context": "literal"
+    },
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 72,
+      "value": "s7",
+      "context": "literal"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 30,
+      "value": "s8",
+      "context": "literal"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 36,
+      "value": "s9",
+      "context": "literal"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 42,
+      "value": "s10",
+      "context": "literal"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 49,
+      "value": "s11",
+      "context": "literal"
+    },
+    {
+      "line_start": 38,
+      "line_end": 38,
+      "column": 4,
+      "value": "s0-seed",
+      "context": "literal"
+    },
+    {
+      "line_start": 39,
+      "line_end": 39,
+      "column": 4,
+      "value": "s1-autoexclude",
+      "context": "literal"
+    },
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 4,
+      "value": "s1-preprocess",
+      "context": "literal"
+    },
+    {
+      "line_start": 41,
+      "line_end": 41,
+      "column": 4,
+      "value": "s2-threatmodel",
+      "context": "literal"
+    },
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 4,
+      "value": "s3-decompose",
+      "context": "literal"
+    },
+    {
+      "line_start": 43,
+      "line_end": 43,
+      "column": 4,
+      "value": "s4-deepdive",
+      "context": "literal"
+    },
+    {
+      "line_start": 44,
+      "line_end": 44,
+      "column": 4,
+      "value": "s5-prefilter",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 4,
+      "value": "s6-verify",
+      "context": "literal"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 4,
+      "value": "s6-ev",
+      "context": "literal"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 4,
+      "value": "s7-dedup",
+      "context": "literal"
+    },
+    {
+      "line_start": 50,
+      "line_end": 50,
+      "column": 4,
+      "value": "s8-chain",
+      "context": "literal"
+    },
+    {
+      "line_start": 51,
+      "line_end": 51,
+      "column": 4,
+      "value": "s10-remediate",
+      "context": "literal"
+    },
+    {
+      "line_start": 52,
+      "line_end": 52,
+      "column": 4,
+      "value": "remediation-agent-remediate",
+      "context": "literal"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 4,
+      "value": "s11-validate",
+      "context": "literal"
+    },
+    {
+      "line_start": 57,
+      "line_end": 57,
+      "column": 4,
+      "value": "s0",
+      "context": "literal"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 4,
+      "value": "s1",
+      "context": "literal"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 4,
+      "value": "s2",
+      "context": "literal"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 4,
+      "value": "s3",
+      "context": "literal"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 4,
+      "value": "s4",
+      "context": "literal"
+    },
+    {
+      "line_start": 62,
+      "line_end": 62,
+      "column": 4,
+      "value": "s5",
+      "context": "literal"
+    },
+    {
+      "line_start": 63,
+      "line_end": 63,
+      "column": 4,
+      "value": "s6",
+      "context": "literal"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 4,
+      "value": "s7",
+      "context": "literal"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 4,
+      "value": "s8",
+      "context": "literal"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 4,
+      "value": "s9",
+      "context": "literal"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 4,
+      "value": "s10",
+      "context": "literal"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 4,
+      "value": "s11",
+      "context": "literal"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 10,
+      "value": "preprocess",
+      "context": "literal"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 10,
+      "value": "threatmodel",
+      "context": "literal"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 10,
+      "value": "decompose",
+      "context": "literal"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 10,
+      "value": "deepdive",
+      "context": "literal"
+    },
+    {
+      "line_start": 62,
+      "line_end": 62,
+      "column": 10,
+      "value": "dedup",
+      "context": "literal"
+    },
+    {
+      "line_start": 63,
+      "line_end": 63,
+      "column": 10,
+      "value": "verify",
+      "context": "literal"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 10,
+      "value": "dedup",
+      "context": "literal"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 10,
+      "value": "chain",
+      "context": "literal"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 11,
+      "value": "remediate",
+      "context": "literal"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 11,
+      "value": "validate",
+      "context": "literal"
+    },
+    {
+      "line_start": 76,
+      "line_end": 76,
+      "column": 4,
+      "value": "exploit_verification.attacker",
+      "context": "literal"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 4,
+      "value": "One stage's recorded label, terminal outcome and wall-clock duration.",
+      "context": "literal"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 4,
+      "value": "The shape of ``TOKENS.snapshot()``.",
+      "context": "literal"
+    },
+    {
+      "line_start": 107,
+      "line_end": 114,
+      "column": 4,
+      "value": "Tokens from phases that map to no stage.\n\n    Key parity with the per-stage token rows is deliberate and load-bearing:\n    the manifest's reconciliation identity is ``Σ stages + unattributed =\n    totals`` for EVERY token key. An unmapped phase with cache traffic (the\n    preflight cache probe) must land here under every key, or the manifest\n    cannot reconcile with itself.\n    ",
+      "context": "literal"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 4,
+      "value": "One ``stages.<id>`` object in the run manifest.",
+      "context": "literal"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 4,
+      "value": "The manifest's ``totals`` object.",
+      "context": "literal"
+    },
+    {
+      "line_start": 157,
+      "line_end": 157,
+      "column": 4,
+      "value": "Which price table produced the costs, for reproducibility.",
+      "context": "literal"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 4,
+      "value": "Why manifest costs are available, estimated, or unknown.",
+      "context": "literal"
+    },
+    {
+      "line_start": 172,
+      "line_end": 172,
+      "column": 4,
+      "value": "The manifest fields this module owns.",
+      "context": "literal"
+    },
+    {
+      "line_start": 186,
+      "line_end": 186,
+      "column": 4,
+      "value": "Process-wide recorder of per-stage outcome and duration.",
+      "context": "literal"
+    },
+    {
+      "line_start": 234,
+      "line_end": 234,
+      "column": 4,
+      "value": "Process-wide record of a ``--resume``'d stage's ACTUAL model/via/config/token provenance.",
+      "context": "literal"
+    },
+    {
+      "line_start": 293,
+      "line_end": 293,
+      "column": 4,
+      "value": "Every phase ``PHASE_MAP`` attributes to *step_id*, summed into one bucket.",
+      "context": "literal"
+    },
+    {
+      "line_start": 300,
+      "line_end": 300,
+      "column": 4,
+      "value": "The model id a stage's role resolves to.",
+      "context": "literal"
+    },
+    {
+      "line_start": 320,
+      "line_end": 320,
+      "column": 4,
+      "value": "Sum a stage's per-phase costs, or ``None`` when it cannot be priced.",
+      "context": "literal"
+    },
+    {
+      "line_start": 336,
+      "line_end": 336,
+      "column": 4,
+      "value": "Cost a cached stage's OWN historical bucket against its OWN recorded model id.",
+      "context": "literal"
+    },
+    {
+      "line_start": 460,
+      "line_end": 460,
+      "column": 4,
+      "value": "Build the manifest's ``stages``/``totals``/``pricing`` fields.",
+      "context": "literal"
+    },
+    {
+      "line_start": 38,
+      "line_end": 38,
+      "column": 16,
+      "value": "s0",
+      "context": "literal"
+    },
+    {
+      "line_start": 39,
+      "line_end": 39,
+      "column": 23,
+      "value": "s1",
+      "context": "literal"
+    },
+    {
+      "line_start": 39,
+      "line_end": 39,
+      "column": 29,
+      "value": "autoexclude",
+      "context": "literal"
+    },
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 22,
+      "value": "s1",
+      "context": "literal"
+    },
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 28,
+      "value": "preprocess",
+      "context": "literal"
+    },
+    {
+      "line_start": 41,
+      "line_end": 41,
+      "column": 23,
+      "value": "s2",
+      "context": "literal"
+    },
+    {
+      "line_start": 41,
+      "line_end": 41,
+      "column": 29,
+      "value": "threatmodel",
+      "context": "literal"
+    },
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 21,
+      "value": "s3",
+      "context": "literal"
+    },
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 27,
+      "value": "decompose",
+      "context": "literal"
+    },
+    {
+      "line_start": 43,
+      "line_end": 43,
+      "column": 20,
+      "value": "s4",
+      "context": "literal"
+    },
+    {
+      "line_start": 43,
+      "line_end": 43,
+      "column": 26,
+      "value": "deepdive",
+      "context": "literal"
+    },
+    {
+      "line_start": 44,
+      "line_end": 44,
+      "column": 21,
+      "value": "s5",
+      "context": "literal"
+    },
+    {
+      "line_start": 44,
+      "line_end": 44,
+      "column": 27,
+      "value": "dedup",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 18,
+      "value": "s6",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 24,
+      "value": "verify",
+      "context": "literal"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 14,
+      "value": "s6",
+      "context": "literal"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 20,
+      "value": "exploit_verification.attacker",
+      "context": "literal"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 17,
+      "value": "s7",
+      "context": "literal"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 23,
+      "value": "dedup",
+      "context": "literal"
+    },
+    {
+      "line_start": 50,
+      "line_end": 50,
+      "column": 17,
+      "value": "s8",
+      "context": "literal"
+    },
+    {
+      "line_start": 50,
+      "line_end": 50,
+      "column": 23,
+      "value": "chain",
+      "context": "literal"
+    },
+    {
+      "line_start": 51,
+      "line_end": 51,
+      "column": 22,
+      "value": "s10",
+      "context": "literal"
+    },
+    {
+      "line_start": 51,
+      "line_end": 51,
+      "column": 29,
+      "value": "remediate",
+      "context": "literal"
+    },
+    {
+      "line_start": 52,
+      "line_end": 52,
+      "column": 36,
+      "value": "s10",
+      "context": "literal"
+    },
+    {
+      "line_start": 52,
+      "line_end": 52,
+      "column": 43,
+      "value": "remediate",
+      "context": "literal"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 21,
+      "value": "s11",
+      "context": "literal"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 28,
+      "value": "validate",
+      "context": "literal"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 51,
+      "value": "s11",
+      "context": "literal"
+    },
+    {
+      "line_start": 73,
+      "line_end": 73,
+      "column": 50,
+      "value": "exploit_verification.attacker",
+      "context": "literal"
+    },
+    {
+      "line_start": 76,
+      "line_end": 76,
+      "column": 38,
+      "value": "exploit_verification.judge",
+      "context": "literal"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 38,
+      "value": "exploit_verification.mapper",
+      "context": "literal"
+    },
+    {
+      "line_start": 78,
+      "line_end": 78,
+      "column": 38,
+      "value": "exploit_verification.classify",
+      "context": "literal"
+    },
+    {
+      "line_start": 193,
+      "line_end": 193,
+      "column": 48,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 8,
+      "value": "Open *stage_id*; it stays ``running`` until ``done``/``mark``.",
+      "context": "literal"
+    },
+    {
+      "line_start": 199,
+      "line_end": 199,
+      "column": 52,
+      "value": "completed",
+      "context": "literal"
+    },
+    {
+      "line_start": 201,
+      "line_end": 201,
+      "column": 8,
+      "value": "Close *stage_id* with its terminal outcome and measured duration.",
+      "context": "literal"
+    },
+    {
+      "line_start": 211,
+      "line_end": 211,
+      "column": 61,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 8,
+      "value": "Record a stage that ran no timed body (cached/skipped/disabled).",
+      "context": "literal"
+    },
+    {
+      "line_start": 218,
+      "line_end": 218,
+      "column": 8,
+      "value": "Drop every record — one scan's telemetry per manifest.",
+      "context": "literal"
+    },
+    {
+      "line_start": 223,
+      "line_end": 223,
+      "column": 8,
+      "value": "Copy the records, ordered s0-first with unknown ids appended.",
+      "context": "literal"
+    },
+    {
+      "line_start": 394,
+      "line_end": 394,
+      "column": 30,
+      "value": "by_phase",
+      "context": "literal"
+    },
+    {
+      "line_start": 443,
+      "line_end": 443,
+      "column": 12,
+      "value": "status",
+      "context": "literal"
+    },
+    {
+      "line_start": 443,
+      "line_end": 443,
+      "column": 35,
+      "value": "reason",
+      "context": "literal"
+    },
+    {
+      "line_start": 443,
+      "line_end": 443,
+      "column": 22,
+      "value": "available",
+      "context": "literal"
+    },
+    {
+      "line_start": 443,
+      "line_end": 443,
+      "column": 45,
+      "value": "pricing table applied",
+      "context": "literal"
+    },
+    {
+      "line_start": 353,
+      "line_end": 353,
+      "column": 31,
+      "value": "model",
+      "context": "literal"
+    },
+    {
+      "line_start": 363,
+      "line_end": 363,
+      "column": 48,
+      "value": "config_sha256",
+      "context": "literal"
+    },
+    {
+      "line_start": 384,
+      "line_end": 384,
+      "column": 19,
+      "value": "cost_usd",
+      "context": "literal"
+    },
+    {
+      "line_start": 435,
+      "line_end": 435,
+      "column": 16,
+      "value": "status",
+      "context": "literal"
+    },
+    {
+      "line_start": 435,
+      "line_end": 435,
+      "column": 41,
+      "value": "reason",
+      "context": "literal"
+    },
+    {
+      "line_start": 435,
+      "line_end": 435,
+      "column": 26,
+      "value": "unavailable",
+      "context": "literal"
+    },
+    {
+      "line_start": 435,
+      "line_end": 435,
+      "column": 51,
+      "value": "no pricing table configured",
+      "context": "literal"
+    },
+    {
+      "line_start": 440,
+      "line_end": 440,
+      "column": 12,
+      "value": "status",
+      "context": "literal"
+    },
+    {
+      "line_start": 441,
+      "line_end": 441,
+      "column": 12,
+      "value": "reason",
+      "context": "literal"
+    },
+    {
+      "line_start": 440,
+      "line_end": 440,
+      "column": 22,
+      "value": "incomplete",
+      "context": "literal"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 36,
+      "value": "label",
+      "context": "literal"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 61,
+      "value": "outcome",
+      "context": "literal"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 43,
+      "value": "duration_sec",
+      "context": "literal"
+    },
+    {
+      "line_start": 208,
+      "line_end": 208,
+      "column": 19,
+      "value": "outcome",
+      "context": "literal"
+    },
+    {
+      "line_start": 209,
+      "line_end": 209,
+      "column": 19,
+      "value": "duration_sec",
+      "context": "literal"
+    },
+    {
+      "line_start": 268,
+      "line_end": 268,
+      "column": 25,
+      "value": "cache_read",
+      "context": "literal"
+    },
+    {
+      "line_start": 277,
+      "line_end": 277,
+      "column": 40,
+      "value": "by_phase",
+      "context": "literal"
+    },
+    {
+      "line_start": 281,
+      "line_end": 281,
+      "column": 25,
+      "value": "prompt",
+      "context": "literal"
+    },
+    {
+      "line_start": 281,
+      "line_end": 281,
+      "column": 49,
+      "value": "prompt",
+      "context": "literal"
+    },
+    {
+      "line_start": 282,
+      "line_end": 282,
+      "column": 25,
+      "value": "completion",
+      "context": "literal"
+    },
+    {
+      "line_start": 282,
+      "line_end": 282,
+      "column": 53,
+      "value": "completion",
+      "context": "literal"
+    },
+    {
+      "line_start": 283,
+      "line_end": 283,
+      "column": 25,
+      "value": "cache_read",
+      "context": "literal"
+    },
+    {
+      "line_start": 283,
+      "line_end": 283,
+      "column": 53,
+      "value": "cache_read",
+      "context": "literal"
+    },
+    {
+      "line_start": 284,
+      "line_end": 284,
+      "column": 25,
+      "value": "cache_write",
+      "context": "literal"
+    },
+    {
+      "line_start": 284,
+      "line_end": 284,
+      "column": 54,
+      "value": "cache_write",
+      "context": "literal"
+    },
+    {
+      "line_start": 285,
+      "line_end": 285,
+      "column": 25,
+      "value": "calls",
+      "context": "literal"
+    },
+    {
+      "line_start": 285,
+      "line_end": 285,
+      "column": 48,
+      "value": "calls",
+      "context": "literal"
+    },
+    {
+      "line_start": 370,
+      "line_end": 370,
+      "column": 45,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 398,
+      "line_end": 398,
+      "column": 14,
+      "value": "cache_unparsed",
+      "context": "literal"
+    },
+    {
+      "line_start": 416,
+      "line_end": 416,
+      "column": 40,
+      "value": "calls_with_usage",
+      "context": "literal"
+    },
+    {
+      "line_start": 417,
+      "line_end": 417,
+      "column": 41,
+      "value": "completion_absent",
+      "context": "literal"
+    },
+    {
+      "line_start": 436,
+      "line_end": 436,
+      "column": 29,
+      "value": "model",
+      "context": "literal"
+    },
+    {
+      "line_start": 441,
+      "line_end": 441,
+      "column": 22,
+      "value": "pricing missing for model(s): ",
+      "context": "literal"
+    },
+    {
+      "line_start": 267,
+      "line_end": 267,
+      "column": 23,
+      "value": "prompt",
+      "context": "literal"
+    },
+    {
+      "line_start": 267,
+      "line_end": 267,
+      "column": 49,
+      "value": "completion",
+      "context": "literal"
+    },
+    {
+      "line_start": 355,
+      "line_end": 355,
+      "column": 54,
+      "value": "tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 370,
+      "line_end": 370,
+      "column": 21,
+      "value": "label",
+      "context": "literal"
+    },
+    {
+      "line_start": 371,
+      "line_end": 371,
+      "column": 23,
+      "value": "outcome",
+      "context": "literal"
+    },
+    {
+      "line_start": 372,
+      "line_end": 372,
+      "column": 28,
+      "value": "duration_sec",
+      "context": "literal"
+    },
+    {
+      "line_start": 406,
+      "line_end": 406,
+      "column": 37,
+      "value": "prompt",
+      "context": "literal"
+    },
+    {
+      "line_start": 406,
+      "line_end": 406,
+      "column": 69,
+      "value": "prompt",
+      "context": "literal"
+    },
+    {
+      "line_start": 407,
+      "line_end": 407,
+      "column": 42,
+      "value": "completion",
+      "context": "literal"
+    },
+    {
+      "line_start": 408,
+      "line_end": 408,
+      "column": 46,
+      "value": "completion",
+      "context": "literal"
+    },
+    {
+      "line_start": 410,
+      "line_end": 410,
+      "column": 40,
+      "value": "completion",
+      "context": "literal"
+    },
+    {
+      "line_start": 411,
+      "line_end": 411,
+      "column": 40,
+      "value": "cache_read",
+      "context": "literal"
+    },
+    {
+      "line_start": 412,
+      "line_end": 412,
+      "column": 45,
+      "value": "cache_read",
+      "context": "literal"
+    },
+    {
+      "line_start": 413,
+      "line_end": 413,
+      "column": 41,
+      "value": "cache_write",
+      "context": "literal"
+    },
+    {
+      "line_start": 414,
+      "line_end": 414,
+      "column": 46,
+      "value": "cache_write",
+      "context": "literal"
+    },
+    {
+      "line_start": 415,
+      "line_end": 415,
+      "column": 29,
+      "value": "calls",
+      "context": "literal"
+    },
+    {
+      "line_start": 415,
+      "line_end": 415,
+      "column": 60,
+      "value": "calls",
+      "context": "literal"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 43,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 258,
+      "line_end": 258,
+      "column": 25,
+      "value": "prompt",
+      "context": "literal"
+    },
+    {
+      "line_start": 259,
+      "line_end": 259,
+      "column": 29,
+      "value": "completion",
+      "context": "literal"
+    },
+    {
+      "line_start": 260,
+      "line_end": 260,
+      "column": 29,
+      "value": "cache_read",
+      "context": "literal"
+    },
+    {
+      "line_start": 261,
+      "line_end": 261,
+      "column": 30,
+      "value": "cache_write",
+      "context": "literal"
+    },
+    {
+      "line_start": 262,
+      "line_end": 262,
+      "column": 24,
+      "value": "calls",
+      "context": "literal"
+    },
+    {
+      "line_start": 399,
+      "line_end": 399,
+      "column": 28,
+      "value": "cache_unparsed",
+      "context": "literal"
+    },
+    {
+      "line_start": 402,
+      "line_end": 402,
+      "column": 35,
+      "value": "tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 409,
+      "line_end": 409,
+      "column": 37,
+      "value": "total",
+      "context": "literal"
+    },
+    {
+      "line_start": 409,
+      "line_end": 409,
+      "column": 68,
+      "value": "prompt",
+      "context": "literal"
+    },
+    {
+      "line_start": 437,
+      "line_end": 437,
+      "column": 62,
+      "value": "model",
+      "context": "literal"
+    },
+    {
+      "line_start": 441,
+      "line_end": 441,
+      "column": 57,
+      "value": ", ",
+      "context": "literal"
+    },
+    {
+      "line_start": 437,
+      "line_end": 437,
+      "column": 32,
+      "value": "cost_usd",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 16,
+      "text": "# PHASE_MAP is the COSTING key; an absent phase rolls to totals.unattributed; s11, and s6 when"
+    },
+    {
+      "line": 17,
+      "text": "# exploit verification ran, are cost_estimated"
+    },
+    {
+      "line": 31,
+      "text": "# avoid a runtime util -> orchestrator import; hints only"
+    },
+    {
+      "line": 46,
+      "text": "# One phase for all four EV roles, costed at the attacker's model (else judge, mapper,"
+    },
+    {
+      "line": 47,
+      "text": "# classify: the attacker is optional); ev-replay has no manifest"
+    },
+    {
+      "line": 72,
+      "text": "# Roles costed at one model while their phase also carries other models' calls"
+    },
+    {
+      "line": 74,
+      "text": "# The attacker is optional, but EV's other roles still spend under its phase: price at the next"
+    },
+    {
+      "line": 101,
+      "text": "# Explicit-null completions coerced to 0; missing it here is how the composer once lost it"
+    },
+    {
+      "line": 133,
+      "text": "# A CACHED stage's origin config_sha256 (None when fresh); compare to spot stale-config reuse"
+    },
+    {
+      "line": 147,
+      "text": "# Anomaly counters, persisted because stderr is reclaimed and only the manifest survives"
+    },
+    {
+      "line": 152,
+      "text": "# Already in the five columns, so Σ stages + unattributed = totals holds across a cached run"
+    },
+    {
+      "line": 187,
+      "text": "# Locked: stages never overlap, but a stage body can touch the recorder off the main thread."
+    },
+    {
+      "line": 280,
+      "text": "# Copy EVERY key `_sum_buckets` reads; dropping cache fields desynced _totals"
+    },
+    {
+      "line": 327,
+      "text": "# The table's own multipliers, so OpenAI models are not costed at Anthropic's ratios."
+    },
+    {
+      "line": 352,
+      "text": "# A cached stage reports what it was ACTUALLY produced under, not this run's role_models"
+    },
+    {
+      "line": 354,
+      "text": "# cast: a JSON-round-tripped dict, safe because _sum_buckets uses .get() for every key"
+    },
+    {
+      "line": 356,
+      "text": "# A stage can be cached AND partly live (s1 autoexclude): ADD, never replace, or totals skew"
+    },
+    {
+      "line": 396,
+      "text": "# cache_unparsed is NOT in TokenBucket: it counts CALLS, and pricing must never read it"
+    },
+    {
+      "line": 400,
+      "text": "# Read the envelope, NOT stages[id][\"tokens\"]: a partly-cached stage would double-count"
+    },
+    {
+      "line": 461,
+      "text": "# Pure: every input is a snapshot; cost_usd is null for an unpriced model, and so are totals"
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 18,
+      "line_end": 18,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 29,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "If",
+      "line_start": 31,
+      "line_end": 32,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 5
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 32,
+      "line_end": 32,
+      "column": 4,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 34,
+      "line_end": 35,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 11
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 37,
+      "line_end": 54,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 11
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 56,
+      "line_end": 69,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 11
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 71,
+      "line_end": 71,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 11
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 73,
+      "line_end": 73,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 11
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 75,
+      "line_end": 79,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 13
+    },
+    {
+      "kind": "Assign",
+      "line_start": 81,
+      "line_end": 81,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 13
+    },
+    {
+      "kind": "Assign",
+      "line_start": 82,
+      "line_end": 82,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 13
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 85,
+      "line_end": 90,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 14
+    },
+    {
+      "kind": "Expr",
+      "line_start": 86,
+      "line_end": 86,
+      "column": 4,
+      "owner": "StageRecord",
+      "representation_line": 19
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 88,
+      "line_end": 88,
+      "column": 4,
+      "owner": "StageRecord",
+      "representation_line": 19
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 89,
+      "line_end": 89,
+      "column": 4,
+      "owner": "StageRecord",
+      "representation_line": 19
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 90,
+      "line_end": 90,
+      "column": 4,
+      "owner": "StageRecord",
+      "representation_line": 19
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 93,
+      "line_end": 103,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 21
+    },
+    {
+      "kind": "Expr",
+      "line_start": 94,
+      "line_end": 94,
+      "column": 4,
+      "owner": "TokenSnapshot",
+      "representation_line": 26
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 96,
+      "line_end": 96,
+      "column": 4,
+      "owner": "TokenSnapshot",
+      "representation_line": 26
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 97,
+      "line_end": 97,
+      "column": 4,
+      "owner": "TokenSnapshot",
+      "representation_line": 26
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 98,
+      "line_end": 98,
+      "column": 4,
+      "owner": "TokenSnapshot",
+      "representation_line": 26
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 99,
+      "line_end": 99,
+      "column": 4,
+      "owner": "TokenSnapshot",
+      "representation_line": 26
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 100,
+      "line_end": 100,
+      "column": 4,
+      "owner": "TokenSnapshot",
+      "representation_line": 28
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 102,
+      "line_end": 102,
+      "column": 4,
+      "owner": "TokenSnapshot",
+      "representation_line": 28
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 103,
+      "line_end": 103,
+      "column": 4,
+      "owner": "TokenSnapshot",
+      "representation_line": 28
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 106,
+      "line_end": 120,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 30
+    },
+    {
+      "kind": "Expr",
+      "line_start": 107,
+      "line_end": 114,
+      "column": 4,
+      "owner": "UnattributedTokens",
+      "representation_line": 35
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 116,
+      "line_end": 116,
+      "column": 4,
+      "owner": "UnattributedTokens",
+      "representation_line": 35
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 117,
+      "line_end": 117,
+      "column": 4,
+      "owner": "UnattributedTokens",
+      "representation_line": 35
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 118,
+      "line_end": 118,
+      "column": 4,
+      "owner": "UnattributedTokens",
+      "representation_line": 35
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 119,
+      "line_end": 119,
+      "column": 4,
+      "owner": "UnattributedTokens",
+      "representation_line": 35
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 120,
+      "line_end": 120,
+      "column": 4,
+      "owner": "UnattributedTokens",
+      "representation_line": 37
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 123,
+      "line_end": 134,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 39
+    },
+    {
+      "kind": "Expr",
+      "line_start": 124,
+      "line_end": 124,
+      "column": 4,
+      "owner": "StageEntry",
+      "representation_line": 44
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 126,
+      "line_end": 126,
+      "column": 4,
+      "owner": "StageEntry",
+      "representation_line": 44
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 127,
+      "line_end": 127,
+      "column": 4,
+      "owner": "StageEntry",
+      "representation_line": 44
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 128,
+      "line_end": 128,
+      "column": 4,
+      "owner": "StageEntry",
+      "representation_line": 44
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 129,
+      "line_end": 129,
+      "column": 4,
+      "owner": "StageEntry",
+      "representation_line": 44
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 130,
+      "line_end": 130,
+      "column": 4,
+      "owner": "StageEntry",
+      "representation_line": 46
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 131,
+      "line_end": 131,
+      "column": 4,
+      "owner": "StageEntry",
+      "representation_line": 46
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 132,
+      "line_end": 132,
+      "column": 4,
+      "owner": "StageEntry",
+      "representation_line": 46
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 134,
+      "line_end": 134,
+      "column": 4,
+      "owner": "StageEntry",
+      "representation_line": 46
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 137,
+      "line_end": 153,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 48
+    },
+    {
+      "kind": "Expr",
+      "line_start": 138,
+      "line_end": 138,
+      "column": 4,
+      "owner": "Totals",
+      "representation_line": 53
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 140,
+      "line_end": 140,
+      "column": 4,
+      "owner": "Totals",
+      "representation_line": 53
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 141,
+      "line_end": 141,
+      "column": 4,
+      "owner": "Totals",
+      "representation_line": 53
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 142,
+      "line_end": 142,
+      "column": 4,
+      "owner": "Totals",
+      "representation_line": 53
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 143,
+      "line_end": 143,
+      "column": 4,
+      "owner": "Totals",
+      "representation_line": 53
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 144,
+      "line_end": 144,
+      "column": 4,
+      "owner": "Totals",
+      "representation_line": 55
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 145,
+      "line_end": 145,
+      "column": 4,
+      "owner": "Totals",
+      "representation_line": 55
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 146,
+      "line_end": 146,
+      "column": 4,
+      "owner": "Totals",
+      "representation_line": 55
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 148,
+      "line_end": 148,
+      "column": 4,
+      "owner": "Totals",
+      "representation_line": 55
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 149,
+      "line_end": 149,
+      "column": 4,
+      "owner": "Totals",
+      "representation_line": 55
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 150,
+      "line_end": 150,
+      "column": 4,
+      "owner": "Totals",
+      "representation_line": 57
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 151,
+      "line_end": 151,
+      "column": 4,
+      "owner": "Totals",
+      "representation_line": 57
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 153,
+      "line_end": 153,
+      "column": 4,
+      "owner": "Totals",
+      "representation_line": 57
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 156,
+      "line_end": 161,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 59
+    },
+    {
+      "kind": "Expr",
+      "line_start": 157,
+      "line_end": 157,
+      "column": 4,
+      "owner": "PricingProvenance",
+      "representation_line": 64
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 159,
+      "line_end": 159,
+      "column": 4,
+      "owner": "PricingProvenance",
+      "representation_line": 64
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 160,
+      "line_end": 160,
+      "column": 4,
+      "owner": "PricingProvenance",
+      "representation_line": 64
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 161,
+      "line_end": 161,
+      "column": 4,
+      "owner": "PricingProvenance",
+      "representation_line": 64
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 164,
+      "line_end": 168,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 66
+    },
+    {
+      "kind": "Expr",
+      "line_start": 165,
+      "line_end": 165,
+      "column": 4,
+      "owner": "PricingStatus",
+      "representation_line": 71
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 167,
+      "line_end": 167,
+      "column": 4,
+      "owner": "PricingStatus",
+      "representation_line": 71
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 168,
+      "line_end": 168,
+      "column": 4,
+      "owner": "PricingStatus",
+      "representation_line": 71
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 171,
+      "line_end": 177,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 73
+    },
+    {
+      "kind": "Expr",
+      "line_start": 172,
+      "line_end": 172,
+      "column": 4,
+      "owner": "StageSection",
+      "representation_line": 78
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 174,
+      "line_end": 174,
+      "column": 4,
+      "owner": "StageSection",
+      "representation_line": 78
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 175,
+      "line_end": 175,
+      "column": 4,
+      "owner": "StageSection",
+      "representation_line": 78
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 176,
+      "line_end": 176,
+      "column": 4,
+      "owner": "StageSection",
+      "representation_line": 78
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 177,
+      "line_end": 177,
+      "column": 4,
+      "owner": "StageSection",
+      "representation_line": 78
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 180,
+      "line_end": 182,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 80
+    },
+    {
+      "kind": "Return",
+      "line_start": 181,
+      "line_end": 182,
+      "column": 4,
+      "owner": "_copy",
+      "representation_line": 85
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 185,
+      "line_end": 227,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 89
+    },
+    {
+      "kind": "Expr",
+      "line_start": 186,
+      "line_end": 186,
+      "column": 4,
+      "owner": "_StageRecorder",
+      "representation_line": 94
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 189,
+      "line_end": 191,
+      "column": 4,
+      "owner": "_StageRecorder",
+      "representation_line": 95
+    },
+    {
+      "kind": "Assign",
+      "line_start": 190,
+      "line_end": 190,
+      "column": 8,
+      "owner": "_StageRecorder.__init__",
+      "representation_line": 101
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 191,
+      "line_end": 191,
+      "column": 8,
+      "owner": "_StageRecorder.__init__",
+      "representation_line": 101
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 193,
+      "line_end": 197,
+      "column": 4,
+      "owner": "_StageRecorder",
+      "representation_line": 104
+    },
+    {
+      "kind": "Expr",
+      "line_start": 194,
+      "line_end": 194,
+      "column": 8,
+      "owner": "_StageRecorder.start",
+      "representation_line": 110
+    },
+    {
+      "kind": "With",
+      "line_start": 195,
+      "line_end": 197,
+      "column": 8,
+      "owner": "_StageRecorder.start",
+      "representation_line": 111
+    },
+    {
+      "kind": "Assign",
+      "line_start": 196,
+      "line_end": 197,
+      "column": 12,
+      "owner": "_StageRecorder.start",
+      "representation_line": 114
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 199,
+      "line_end": 209,
+      "column": 4,
+      "owner": "_StageRecorder",
+      "representation_line": 119
+    },
+    {
+      "kind": "Expr",
+      "line_start": 201,
+      "line_end": 201,
+      "column": 8,
+      "owner": "_StageRecorder.done",
+      "representation_line": 125
+    },
+    {
+      "kind": "With",
+      "line_start": 202,
+      "line_end": 209,
+      "column": 8,
+      "owner": "_StageRecorder.done",
+      "representation_line": 126
+    },
+    {
+      "kind": "Assign",
+      "line_start": 203,
+      "line_end": 203,
+      "column": 12,
+      "owner": "_StageRecorder.done",
+      "representation_line": 129
+    },
+    {
+      "kind": "If",
+      "line_start": 204,
+      "line_end": 207,
+      "column": 12,
+      "owner": "_StageRecorder.done",
+      "representation_line": 130
+    },
+    {
+      "kind": "Assign",
+      "line_start": 205,
+      "line_end": 206,
+      "column": 16,
+      "owner": "_StageRecorder.done",
+      "representation_line": 133
+    },
+    {
+      "kind": "Assign",
+      "line_start": 207,
+      "line_end": 207,
+      "column": 16,
+      "owner": "_StageRecorder.done",
+      "representation_line": 133
+    },
+    {
+      "kind": "Assign",
+      "line_start": 208,
+      "line_end": 208,
+      "column": 12,
+      "owner": "_StageRecorder.done",
+      "representation_line": 136
+    },
+    {
+      "kind": "Assign",
+      "line_start": 209,
+      "line_end": 209,
+      "column": 12,
+      "owner": "_StageRecorder.done",
+      "representation_line": 136
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 211,
+      "line_end": 215,
+      "column": 4,
+      "owner": "_StageRecorder",
+      "representation_line": 141
+    },
+    {
+      "kind": "Expr",
+      "line_start": 212,
+      "line_end": 212,
+      "column": 8,
+      "owner": "_StageRecorder.mark",
+      "representation_line": 147
+    },
+    {
+      "kind": "With",
+      "line_start": 213,
+      "line_end": 215,
+      "column": 8,
+      "owner": "_StageRecorder.mark",
+      "representation_line": 148
+    },
+    {
+      "kind": "Assign",
+      "line_start": 214,
+      "line_end": 215,
+      "column": 12,
+      "owner": "_StageRecorder.mark",
+      "representation_line": 151
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 217,
+      "line_end": 220,
+      "column": 4,
+      "owner": "_StageRecorder",
+      "representation_line": 156
+    },
+    {
+      "kind": "Expr",
+      "line_start": 218,
+      "line_end": 218,
+      "column": 8,
+      "owner": "_StageRecorder.reset",
+      "representation_line": 162
+    },
+    {
+      "kind": "With",
+      "line_start": 219,
+      "line_end": 220,
+      "column": 8,
+      "owner": "_StageRecorder.reset",
+      "representation_line": 163
+    },
+    {
+      "kind": "Assign",
+      "line_start": 220,
+      "line_end": 220,
+      "column": 12,
+      "owner": "_StageRecorder.reset",
+      "representation_line": 166
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 222,
+      "line_end": 227,
+      "column": 4,
+      "owner": "_StageRecorder",
+      "representation_line": 171
+    },
+    {
+      "kind": "Expr",
+      "line_start": 223,
+      "line_end": 223,
+      "column": 8,
+      "owner": "_StageRecorder.snapshot",
+      "representation_line": 177
+    },
+    {
+      "kind": "With",
+      "line_start": 224,
+      "line_end": 227,
+      "column": 8,
+      "owner": "_StageRecorder.snapshot",
+      "representation_line": 178
+    },
+    {
+      "kind": "Assign",
+      "line_start": 225,
+      "line_end": 225,
+      "column": 12,
+      "owner": "_StageRecorder.snapshot",
+      "representation_line": 181
+    },
+    {
+      "kind": "Assign",
+      "line_start": 226,
+      "line_end": 226,
+      "column": 12,
+      "owner": "_StageRecorder.snapshot",
+      "representation_line": 181
+    },
+    {
+      "kind": "Return",
+      "line_start": 227,
+      "line_end": 227,
+      "column": 12,
+      "owner": "_StageRecorder.snapshot",
+      "representation_line": 182
+    },
+    {
+      "kind": "Assign",
+      "line_start": 230,
+      "line_end": 230,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 190
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 233,
+      "line_end": 250,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 191
+    },
+    {
+      "kind": "Expr",
+      "line_start": 234,
+      "line_end": 234,
+      "column": 4,
+      "owner": "_CachedProvenanceRecorder",
+      "representation_line": 196
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 236,
+      "line_end": 238,
+      "column": 4,
+      "owner": "_CachedProvenanceRecorder",
+      "representation_line": 197
+    },
+    {
+      "kind": "Assign",
+      "line_start": 237,
+      "line_end": 237,
+      "column": 8,
+      "owner": "_CachedProvenanceRecorder.__init__",
+      "representation_line": 203
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 238,
+      "line_end": 238,
+      "column": 8,
+      "owner": "_CachedProvenanceRecorder.__init__",
+      "representation_line": 203
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 240,
+      "line_end": 242,
+      "column": 4,
+      "owner": "_CachedProvenanceRecorder",
+      "representation_line": 206
+    },
+    {
+      "kind": "With",
+      "line_start": 241,
+      "line_end": 242,
+      "column": 8,
+      "owner": "_CachedProvenanceRecorder.record",
+      "representation_line": 211
+    },
+    {
+      "kind": "Assign",
+      "line_start": 242,
+      "line_end": 242,
+      "column": 12,
+      "owner": "_CachedProvenanceRecorder.record",
+      "representation_line": 214
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 244,
+      "line_end": 246,
+      "column": 4,
+      "owner": "_CachedProvenanceRecorder",
+      "representation_line": 219
+    },
+    {
+      "kind": "With",
+      "line_start": 245,
+      "line_end": 246,
+      "column": 8,
+      "owner": "_CachedProvenanceRecorder.reset",
+      "representation_line": 224
+    },
+    {
+      "kind": "Assign",
+      "line_start": 246,
+      "line_end": 246,
+      "column": 12,
+      "owner": "_CachedProvenanceRecorder.reset",
+      "representation_line": 227
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 248,
+      "line_end": 250,
+      "column": 4,
+      "owner": "_CachedProvenanceRecorder",
+      "representation_line": 232
+    },
+    {
+      "kind": "With",
+      "line_start": 249,
+      "line_end": 250,
+      "column": 8,
+      "owner": "_CachedProvenanceRecorder.snapshot",
+      "representation_line": 237
+    },
+    {
+      "kind": "Return",
+      "line_start": 250,
+      "line_end": 250,
+      "column": 12,
+      "owner": "_CachedProvenanceRecorder.snapshot",
+      "representation_line": 239
+    },
+    {
+      "kind": "Assign",
+      "line_start": 253,
+      "line_end": 253,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 247
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 256,
+      "line_end": 263,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 248
+    },
+    {
+      "kind": "Return",
+      "line_start": 257,
+      "line_end": 263,
+      "column": 4,
+      "owner": "_sum_buckets",
+      "representation_line": 253
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 266,
+      "line_end": 268,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 257
+    },
+    {
+      "kind": "Return",
+      "line_start": 267,
+      "line_end": 268,
+      "column": 4,
+      "owner": "_has_tokens",
+      "representation_line": 262
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 271,
+      "line_end": 289,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 266
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 274,
+      "line_end": 274,
+      "column": 4,
+      "owner": "_group_phases",
+      "representation_line": 272
+    },
+    {
+      "kind": "Assign",
+      "line_start": 275,
+      "line_end": 276,
+      "column": 4,
+      "owner": "_group_phases",
+      "representation_line": 272
+    },
+    {
+      "kind": "For",
+      "line_start": 277,
+      "line_end": 288,
+      "column": 4,
+      "owner": "_group_phases",
+      "representation_line": 273
+    },
+    {
+      "kind": "Assign",
+      "line_start": 278,
+      "line_end": 278,
+      "column": 8,
+      "owner": "_group_phases",
+      "representation_line": 276
+    },
+    {
+      "kind": "If",
+      "line_start": 279,
+      "line_end": 286,
+      "column": 8,
+      "owner": "_group_phases",
+      "representation_line": 277
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 281,
+      "line_end": 281,
+      "column": 12,
+      "owner": "_group_phases",
+      "representation_line": 280
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 282,
+      "line_end": 282,
+      "column": 12,
+      "owner": "_group_phases",
+      "representation_line": 280
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 283,
+      "line_end": 283,
+      "column": 12,
+      "owner": "_group_phases",
+      "representation_line": 280
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 284,
+      "line_end": 284,
+      "column": 12,
+      "owner": "_group_phases",
+      "representation_line": 280
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 285,
+      "line_end": 285,
+      "column": 12,
+      "owner": "_group_phases",
+      "representation_line": 280
+    },
+    {
+      "kind": "Continue",
+      "line_start": 286,
+      "line_end": 286,
+      "column": 12,
+      "owner": "_group_phases",
+      "representation_line": 281
+    },
+    {
+      "kind": "Assign",
+      "line_start": 287,
+      "line_end": 287,
+      "column": 8,
+      "owner": "_group_phases",
+      "representation_line": 285
+    },
+    {
+      "kind": "Expr",
+      "line_start": 288,
+      "line_end": 288,
+      "column": 8,
+      "owner": "_group_phases",
+      "representation_line": 285
+    },
+    {
+      "kind": "Return",
+      "line_start": 289,
+      "line_end": 289,
+      "column": 4,
+      "owner": "_group_phases",
+      "representation_line": 287
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 292,
+      "line_end": 295,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 291
+    },
+    {
+      "kind": "Expr",
+      "line_start": 293,
+      "line_end": 293,
+      "column": 4,
+      "owner": "stage_token_bucket",
+      "representation_line": 297
+    },
+    {
+      "kind": "Assign",
+      "line_start": 294,
+      "line_end": 294,
+      "column": 4,
+      "owner": "stage_token_bucket",
+      "representation_line": 297
+    },
+    {
+      "kind": "Return",
+      "line_start": 295,
+      "line_end": 295,
+      "column": 4,
+      "owner": "stage_token_bucket",
+      "representation_line": 298
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 298,
+      "line_end": 306,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 302
+    },
+    {
+      "kind": "Expr",
+      "line_start": 300,
+      "line_end": 300,
+      "column": 4,
+      "owner": "_resolve_model",
+      "representation_line": 308
+    },
+    {
+      "kind": "If",
+      "line_start": 301,
+      "line_end": 302,
+      "column": 4,
+      "owner": "_resolve_model",
+      "representation_line": 309
+    },
+    {
+      "kind": "Return",
+      "line_start": 302,
+      "line_end": 302,
+      "column": 8,
+      "owner": "_resolve_model",
+      "representation_line": 311
+    },
+    {
+      "kind": "For",
+      "line_start": 303,
+      "line_end": 305,
+      "column": 4,
+      "owner": "_resolve_model",
+      "representation_line": 314
+    },
+    {
+      "kind": "If",
+      "line_start": 304,
+      "line_end": 305,
+      "column": 8,
+      "owner": "_resolve_model",
+      "representation_line": 316
+    },
+    {
+      "kind": "Return",
+      "line_start": 305,
+      "line_end": 305,
+      "column": 12,
+      "owner": "_resolve_model",
+      "representation_line": 318
+    },
+    {
+      "kind": "Return",
+      "line_start": 306,
+      "line_end": 306,
+      "column": 4,
+      "owner": "_resolve_model",
+      "representation_line": 322
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 309,
+      "line_end": 314,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 326
+    },
+    {
+      "kind": "Assign",
+      "line_start": 311,
+      "line_end": 311,
+      "column": 4,
+      "owner": "_rate_for",
+      "representation_line": 332
+    },
+    {
+      "kind": "If",
+      "line_start": 312,
+      "line_end": 313,
+      "column": 4,
+      "owner": "_rate_for",
+      "representation_line": 333
+    },
+    {
+      "kind": "Return",
+      "line_start": 313,
+      "line_end": 313,
+      "column": 8,
+      "owner": "_rate_for",
+      "representation_line": 335
+    },
+    {
+      "kind": "Return",
+      "line_start": 314,
+      "line_end": 314,
+      "column": 4,
+      "owner": "_rate_for",
+      "representation_line": 338
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 317,
+      "line_end": 331,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 342
+    },
+    {
+      "kind": "Expr",
+      "line_start": 320,
+      "line_end": 320,
+      "column": 4,
+      "owner": "_stage_cost",
+      "representation_line": 348
+    },
+    {
+      "kind": "If",
+      "line_start": 321,
+      "line_end": 322,
+      "column": 4,
+      "owner": "_stage_cost",
+      "representation_line": 349
+    },
+    {
+      "kind": "Return",
+      "line_start": 322,
+      "line_end": 322,
+      "column": 8,
+      "owner": "_stage_cost",
+      "representation_line": 351
+    },
+    {
+      "kind": "Assign",
+      "line_start": 323,
+      "line_end": 323,
+      "column": 4,
+      "owner": "_stage_cost",
+      "representation_line": 355
+    },
+    {
+      "kind": "For",
+      "line_start": 324,
+      "line_end": 330,
+      "column": 4,
+      "owner": "_stage_cost",
+      "representation_line": 356
+    },
+    {
+      "kind": "Assign",
+      "line_start": 325,
+      "line_end": 325,
+      "column": 8,
+      "owner": "_stage_cost",
+      "representation_line": 359
+    },
+    {
+      "kind": "If",
+      "line_start": 326,
+      "line_end": 330,
+      "column": 8,
+      "owner": "_stage_cost",
+      "representation_line": 360
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 328,
+      "line_end": 328,
+      "column": 12,
+      "owner": "_stage_cost",
+      "representation_line": 363
+    },
+    {
+      "kind": "If",
+      "line_start": 329,
+      "line_end": 330,
+      "column": 8,
+      "owner": "_stage_cost",
+      "representation_line": 366
+    },
+    {
+      "kind": "Return",
+      "line_start": 330,
+      "line_end": 330,
+      "column": 12,
+      "owner": "_stage_cost",
+      "representation_line": 368
+    },
+    {
+      "kind": "Return",
+      "line_start": 331,
+      "line_end": 331,
+      "column": 4,
+      "owner": "_stage_cost",
+      "representation_line": 373
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 334,
+      "line_end": 342,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 377
+    },
+    {
+      "kind": "Expr",
+      "line_start": 336,
+      "line_end": 336,
+      "column": 4,
+      "owner": "_provenance_cost",
+      "representation_line": 383
+    },
+    {
+      "kind": "If",
+      "line_start": 337,
+      "line_end": 338,
+      "column": 4,
+      "owner": "_provenance_cost",
+      "representation_line": 384
+    },
+    {
+      "kind": "Return",
+      "line_start": 338,
+      "line_end": 338,
+      "column": 8,
+      "owner": "_provenance_cost",
+      "representation_line": 386
+    },
+    {
+      "kind": "Assign",
+      "line_start": 339,
+      "line_end": 339,
+      "column": 4,
+      "owner": "_provenance_cost",
+      "representation_line": 390
+    },
+    {
+      "kind": "If",
+      "line_start": 340,
+      "line_end": 341,
+      "column": 4,
+      "owner": "_provenance_cost",
+      "representation_line": 391
+    },
+    {
+      "kind": "Return",
+      "line_start": 341,
+      "line_end": 341,
+      "column": 8,
+      "owner": "_provenance_cost",
+      "representation_line": 393
+    },
+    {
+      "kind": "Return",
+      "line_start": 342,
+      "line_end": 342,
+      "column": 4,
+      "owner": "_provenance_cost",
+      "representation_line": 396
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 345,
+      "line_end": 380,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 400
+    },
+    {
+      "kind": "Assign",
+      "line_start": 350,
+      "line_end": 350,
+      "column": 4,
+      "owner": "_stage_entry",
+      "representation_line": 406
+    },
+    {
+      "kind": "If",
+      "line_start": 351,
+      "line_end": 368,
+      "column": 4,
+      "owner": "_stage_entry",
+      "representation_line": 407
+    },
+    {
+      "kind": "Assign",
+      "line_start": 353,
+      "line_end": 353,
+      "column": 8,
+      "owner": "_stage_entry",
+      "representation_line": 410
+    },
+    {
+      "kind": "Assign",
+      "line_start": 355,
+      "line_end": 355,
+      "column": 8,
+      "owner": "_stage_entry",
+      "representation_line": 410
+    },
+    {
+      "kind": "Assign",
+      "line_start": 357,
+      "line_end": 357,
+      "column": 8,
+      "owner": "_stage_entry",
+      "representation_line": 410
+    },
+    {
+      "kind": "Assign",
+      "line_start": 358,
+      "line_end": 358,
+      "column": 8,
+      "owner": "_stage_entry",
+      "representation_line": 410
+    },
+    {
+      "kind": "Assign",
+      "line_start": 359,
+      "line_end": 359,
+      "column": 8,
+      "owner": "_stage_entry",
+      "representation_line": 410
+    },
+    {
+      "kind": "Assign",
+      "line_start": 360,
+      "line_end": 360,
+      "column": 8,
+      "owner": "_stage_entry",
+      "representation_line": 412
+    },
+    {
+      "kind": "Assign",
+      "line_start": 361,
+      "line_end": 362,
+      "column": 8,
+      "owner": "_stage_entry",
+      "representation_line": 412
+    },
+    {
+      "kind": "Assign",
+      "line_start": 363,
+      "line_end": 363,
+      "column": 8,
+      "owner": "_stage_entry",
+      "representation_line": 412
+    },
+    {
+      "kind": "Assign",
+      "line_start": 365,
+      "line_end": 365,
+      "column": 8,
+      "owner": "_stage_entry",
+      "representation_line": 416
+    },
+    {
+      "kind": "Assign",
+      "line_start": 366,
+      "line_end": 366,
+      "column": 8,
+      "owner": "_stage_entry",
+      "representation_line": 416
+    },
+    {
+      "kind": "Assign",
+      "line_start": 367,
+      "line_end": 367,
+      "column": 8,
+      "owner": "_stage_entry",
+      "representation_line": 416
+    },
+    {
+      "kind": "Assign",
+      "line_start": 368,
+      "line_end": 368,
+      "column": 8,
+      "owner": "_stage_entry",
+      "representation_line": 416
+    },
+    {
+      "kind": "Return",
+      "line_start": 369,
+      "line_end": 380,
+      "column": 4,
+      "owner": "_stage_entry",
+      "representation_line": 418
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 383,
+      "line_end": 388,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 422
+    },
+    {
+      "kind": "Assign",
+      "line_start": 384,
+      "line_end": 384,
+      "column": 4,
+      "owner": "_total_cost",
+      "representation_line": 428
+    },
+    {
+      "kind": "Assign",
+      "line_start": 385,
+      "line_end": 385,
+      "column": 4,
+      "owner": "_total_cost",
+      "representation_line": 428
+    },
+    {
+      "kind": "If",
+      "line_start": 386,
+      "line_end": 387,
+      "column": 4,
+      "owner": "_total_cost",
+      "representation_line": 429
+    },
+    {
+      "kind": "Return",
+      "line_start": 387,
+      "line_end": 387,
+      "column": 8,
+      "owner": "_total_cost",
+      "representation_line": 431
+    },
+    {
+      "kind": "Return",
+      "line_start": 388,
+      "line_end": 388,
+      "column": 4,
+      "owner": "_total_cost",
+      "representation_line": 434
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 391,
+      "line_end": 422,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 438
+    },
+    {
+      "kind": "Assign",
+      "line_start": 394,
+      "line_end": 394,
+      "column": 4,
+      "owner": "_totals",
+      "representation_line": 444
+    },
+    {
+      "kind": "Assign",
+      "line_start": 395,
+      "line_end": 395,
+      "column": 4,
+      "owner": "_totals",
+      "representation_line": 444
+    },
+    {
+      "kind": "Assign",
+      "line_start": 397,
+      "line_end": 399,
+      "column": 4,
+      "owner": "_totals",
+      "representation_line": 444
+    },
+    {
+      "kind": "Assign",
+      "line_start": 401,
+      "line_end": 404,
+      "column": 4,
+      "owner": "_totals",
+      "representation_line": 444
+    },
+    {
+      "kind": "Return",
+      "line_start": 405,
+      "line_end": 422,
+      "column": 4,
+      "owner": "_totals",
+      "representation_line": 445
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 425,
+      "line_end": 429,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 449
+    },
+    {
+      "kind": "If",
+      "line_start": 426,
+      "line_end": 427,
+      "column": 4,
+      "owner": "_provenance",
+      "representation_line": 454
+    },
+    {
+      "kind": "Return",
+      "line_start": 427,
+      "line_end": 427,
+      "column": 8,
+      "owner": "_provenance",
+      "representation_line": 456
+    },
+    {
+      "kind": "Return",
+      "line_start": 428,
+      "line_end": 429,
+      "column": 4,
+      "owner": "_provenance",
+      "representation_line": 459
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 432,
+      "line_end": 443,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 463
+    },
+    {
+      "kind": "If",
+      "line_start": 434,
+      "line_end": 435,
+      "column": 4,
+      "owner": "_pricing_status",
+      "representation_line": 468
+    },
+    {
+      "kind": "Return",
+      "line_start": 435,
+      "line_end": 435,
+      "column": 8,
+      "owner": "_pricing_status",
+      "representation_line": 470
+    },
+    {
+      "kind": "Assign",
+      "line_start": 436,
+      "line_end": 437,
+      "column": 4,
+      "owner": "_pricing_status",
+      "representation_line": 474
+    },
+    {
+      "kind": "If",
+      "line_start": 438,
+      "line_end": 442,
+      "column": 4,
+      "owner": "_pricing_status",
+      "representation_line": 475
+    },
+    {
+      "kind": "Return",
+      "line_start": 439,
+      "line_end": 442,
+      "column": 8,
+      "owner": "_pricing_status",
+      "representation_line": 477
+    },
+    {
+      "kind": "Return",
+      "line_start": 443,
+      "line_end": 443,
+      "column": 4,
+      "owner": "_pricing_status",
+      "representation_line": 480
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 446,
+      "line_end": 451,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 484
+    },
+    {
+      "kind": "Assign",
+      "line_start": 448,
+      "line_end": 448,
+      "column": 4,
+      "owner": "_ordered_stage_ids",
+      "representation_line": 490
+    },
+    {
+      "kind": "Assign",
+      "line_start": 449,
+      "line_end": 449,
+      "column": 4,
+      "owner": "_ordered_stage_ids",
+      "representation_line": 490
+    },
+    {
+      "kind": "Assign",
+      "line_start": 450,
+      "line_end": 450,
+      "column": 4,
+      "owner": "_ordered_stage_ids",
+      "representation_line": 490
+    },
+    {
+      "kind": "Return",
+      "line_start": 451,
+      "line_end": 451,
+      "column": 4,
+      "owner": "_ordered_stage_ids",
+      "representation_line": 491
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 454,
+      "line_end": 474,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 495
+    },
+    {
+      "kind": "Expr",
+      "line_start": 460,
+      "line_end": 460,
+      "column": 4,
+      "owner": "compose_stage_section",
+      "representation_line": 501
+    },
+    {
+      "kind": "Assign",
+      "line_start": 462,
+      "line_end": 462,
+      "column": 4,
+      "owner": "compose_stage_section",
+      "representation_line": 501
+    },
+    {
+      "kind": "Assign",
+      "line_start": 463,
+      "line_end": 463,
+      "column": 4,
+      "owner": "compose_stage_section",
+      "representation_line": 501
+    },
+    {
+      "kind": "Assign",
+      "line_start": 464,
+      "line_end": 469,
+      "column": 4,
+      "owner": "compose_stage_section",
+      "representation_line": 501
+    },
+    {
+      "kind": "Return",
+      "line_start": 470,
+      "line_end": 474,
+      "column": 4,
+      "owner": "compose_stage_section",
+      "representation_line": 502
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 31,
+      "line_end": 31,
+      "column": 3,
+      "kind": "Name",
+      "original_ast": "Name(id='TYPE_CHECKING', ctx=Load())",
+      "rendered": "TYPE_CHECKING"
+    },
+    {
+      "line_start": 34,
+      "line_end": 35,
+      "column": 29,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value='s0'), Constant(value='s1'), Constant(value='s2'), Constant(value='s3'), Constant(value='s4'), Constant(value='s5'), Constant(value='s6'), Constant(value='s7'), Constant(value='s8'), Constant(value='s9'), Constant(value='s10'), Constant(value='s11')], ctx=Load())",
+      "rendered": "('s0', 's1', 's2', 's3', 's4', 's5', 's6', 's7', 's8', 's9', 's10', 's11')"
+    },
+    {
+      "line_start": 37,
+      "line_end": 54,
+      "column": 47,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='s0-seed'), Constant(value='s1-autoexclude'), Constant(value='s1-preprocess'), Constant(value='s2-threatmodel'), Constant(value='s3-decompose'), Constant(value='s4-deepdive'), Constant(value='s5-prefilter'), Constant(value='s6-verify'), Constant(value='s6-ev'), Constant(value='s7-dedup'), Constant(value='s8-chain'), Constant(value='s10-remediate'), Constant(value='remediation-agent-remediate'), Constant(value='s11-validate')], values=[Tuple(elts=[Constant(value='s0'), Constant(value=None)], ctx=Load()), Tuple(elts=[Constant(value='s1'), Constant(value='autoexclude')], ctx=Load()), Tuple(elts=[Constant(value='s1'), Constant(value='preprocess')], ctx=Load()), Tuple(elts=[Constant(value='s2'), Constant(value='threatmodel')], ctx=Load()), Tuple(elts=[Constant(value='s3'), Constant(value='decompose')], ctx=Load()), Tuple(elts=[Constant(value='s4'), Constant(value='deepdive')], ctx=Load()), Tuple(elts=[Constant(value='s5'), Constant(value='dedup')], ctx=Load()), Tuple(elts=[Constant(value='s6'), Constant(value='verify')], ctx=Load()), Tuple(elts=[Constant(value='s6'), Constant(value='exploit_verification.attacker')], ctx=Load()), Tuple(elts=[Constant(value='s7'), Constant(value='dedup')], ctx=Load()), Tuple(elts=[Constant(value='s8'), Constant(value='chain')], ctx=Load()), Tuple(elts=[Constant(value='s10'), Constant(value='remediate')], ctx=Load()), Tuple(elts=[Constant(value='s10'), Constant(value='remediate')], ctx=Load()), Tuple(elts=[Constant(value='s11'), Constant(value='validate')], ctx=Load())])",
+      "rendered": "{'s0-seed': ('s0', None), 's1-autoexclude': ('s1', 'autoexclude'), 's1-preprocess': ('s1', 'preprocess'), 's2-threatmodel': ('s2', 'threatmodel'), 's3-decompose': ('s3', 'decompose'), 's4-deepdive': ('s4', 'deepdive'), 's5-prefilter': ('s5', 'dedup'), 's6-verify': ('s6', 'verify'), 's6-ev': ('s6', 'exploit_verification.attacker'), 's7-dedup': ('s7', 'dedup'), 's8-chain': ('s8', 'chain'), 's10-remediate': ('s10', 'remediate'), 'remediation-agent-remediate': ('s10', 'remediate'), 's11-validate': ('s11', 'validate')}"
+    },
+    {
+      "line_start": 56,
+      "line_end": 69,
+      "column": 37,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='s0'), Constant(value='s1'), Constant(value='s2'), Constant(value='s3'), Constant(value='s4'), Constant(value='s5'), Constant(value='s6'), Constant(value='s7'), Constant(value='s8'), Constant(value='s9'), Constant(value='s10'), Constant(value='s11')], values=[Constant(value=None), Constant(value='preprocess'), Constant(value='threatmodel'), Constant(value='decompose'), Constant(value='deepdive'), Constant(value='dedup'), Constant(value='verify'), Constant(value='dedup'), Constant(value='chain'), Constant(value=None), Constant(value='remediate'), Constant(value='validate')])",
+      "rendered": "{'s0': None, 's1': 'preprocess', 's2': 'threatmodel', 's3': 'decompose', 's4': 'deepdive', 's5': 'dedup', 's6': 'verify', 's7': 'dedup', 's8': 'chain', 's9': None, 's10': 'remediate', 's11': 'validate'}"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 40,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='frozenset', ctx=Load()), args=[Set(elts=[Constant(value='s11')])], keywords=[])",
+      "rendered": "frozenset({'s11'})"
+    },
+    {
+      "line_start": 73,
+      "line_end": 73,
+      "column": 39,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='frozenset', ctx=Load()), args=[Set(elts=[Constant(value='exploit_verification.attacker')])], keywords=[])",
+      "rendered": "frozenset({'exploit_verification.attacker'})"
+    },
+    {
+      "line_start": 75,
+      "line_end": 79,
+      "column": 46,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='exploit_verification.attacker')], values=[Tuple(elts=[Constant(value='exploit_verification.judge'), Constant(value='exploit_verification.mapper'), Constant(value='exploit_verification.classify')], ctx=Load())])",
+      "rendered": "{'exploit_verification.attacker': ('exploit_verification.judge', 'exploit_verification.mapper', 'exploit_verification.classify')}"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 11,
+      "kind": "Constant",
+      "original_ast": "Constant(value='not_run')",
+      "rendered": "'not_run'"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 11,
+      "kind": "Constant",
+      "original_ast": "Constant(value='running')",
+      "rendered": "'running'"
+    },
+    {
+      "line_start": 85,
+      "line_end": 85,
+      "column": 18,
+      "kind": "Name",
+      "original_ast": "Name(id='TypedDict', ctx=Load())",
+      "rendered": "TypedDict"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 20,
+      "kind": "Name",
+      "original_ast": "Name(id='TypedDict', ctx=Load())",
+      "rendered": "TypedDict"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 31,
+      "kind": "keyword",
+      "original_ast": "keyword(arg='total', value=Constant(value=False))",
+      "rendered": "total=False"
+    },
+    {
+      "line_start": 106,
+      "line_end": 106,
+      "column": 25,
+      "kind": "Name",
+      "original_ast": "Name(id='TypedDict', ctx=Load())",
+      "rendered": "TypedDict"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 17,
+      "kind": "Name",
+      "original_ast": "Name(id='TypedDict', ctx=Load())",
+      "rendered": "TypedDict"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 13,
+      "kind": "Name",
+      "original_ast": "Name(id='TypedDict', ctx=Load())",
+      "rendered": "TypedDict"
+    },
+    {
+      "line_start": 156,
+      "line_end": 156,
+      "column": 24,
+      "kind": "Name",
+      "original_ast": "Name(id='TypedDict', ctx=Load())",
+      "rendered": "TypedDict"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 20,
+      "kind": "Name",
+      "original_ast": "Name(id='TypedDict', ctx=Load())",
+      "rendered": "TypedDict"
+    },
+    {
+      "line_start": 171,
+      "line_end": 171,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='TypedDict', ctx=Load())",
+      "rendered": "TypedDict"
+    },
+    {
+      "line_start": 181,
+      "line_end": 182,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='StageRecord', ctx=Load()), args=[], keywords=[keyword(arg='label', value=Subscript(value=Name(id='record', ctx=Load()), slice=Constant(value='label'), ctx=Load())), keyword(arg='outcome', value=Subscript(value=Name(id='record', ctx=Load()), slice=Constant(value='outcome'), ctx=Load())), keyword(arg='duration_sec', value=Subscript(value=Name(id='record', ctx=Load()), slice=Constant(value='duration_sec'), ctx=Load()))])",
+      "rendered": "StageRecord(label=record['label'], outcome=record['outcome'], duration_sec=record['duration_sec'])"
+    },
+    {
+      "line_start": 190,
+      "line_end": 190,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='threading', ctx=Load()), attr='Lock', ctx=Load()), args=[], keywords=[])",
+      "rendered": "threading.Lock()"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 47,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 195,
+      "line_end": 195,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_lock', ctx=Load())",
+      "rendered": "self._lock"
+    },
+    {
+      "line_start": 196,
+      "line_end": 197,
+      "column": 37,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='StageRecord', ctx=Load()), args=[], keywords=[keyword(arg='label', value=Name(id='label', ctx=Load())), keyword(arg='outcome', value=Name(id='_RUNNING', ctx=Load())), keyword(arg='duration_sec', value=Constant(value=None))])",
+      "rendered": "StageRecord(label=label, outcome=_RUNNING, duration_sec=None)"
+    },
+    {
+      "line_start": 202,
+      "line_end": 202,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_lock', ctx=Load())",
+      "rendered": "self._lock"
+    },
+    {
+      "line_start": 203,
+      "line_end": 203,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_stages', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='stage_id', ctx=Load())], keywords=[])",
+      "rendered": "self._stages.get(stage_id)"
+    },
+    {
+      "line_start": 204,
+      "line_end": 204,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='record', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "record is None"
+    },
+    {
+      "line_start": 205,
+      "line_end": 206,
+      "column": 25,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='StageRecord', ctx=Load()), args=[], keywords=[keyword(arg='label', value=Constant(value='')), keyword(arg='outcome', value=Name(id='outcome', ctx=Load())), keyword(arg='duration_sec', value=Constant(value=None))])",
+      "rendered": "StageRecord(label='', outcome=outcome, duration_sec=None)"
+    },
+    {
+      "line_start": 207,
+      "line_end": 207,
+      "column": 41,
+      "kind": "Name",
+      "original_ast": "Name(id='record', ctx=Load())",
+      "rendered": "record"
+    },
+    {
+      "line_start": 208,
+      "line_end": 208,
+      "column": 32,
+      "kind": "Name",
+      "original_ast": "Name(id='outcome', ctx=Load())",
+      "rendered": "outcome"
+    },
+    {
+      "line_start": 209,
+      "line_end": 209,
+      "column": 37,
+      "kind": "Name",
+      "original_ast": "Name(id='duration_sec', ctx=Load())",
+      "rendered": "duration_sec"
+    },
+    {
+      "line_start": 213,
+      "line_end": 213,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_lock', ctx=Load())",
+      "rendered": "self._lock"
+    },
+    {
+      "line_start": 214,
+      "line_end": 215,
+      "column": 37,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='StageRecord', ctx=Load()), args=[], keywords=[keyword(arg='label', value=Name(id='label', ctx=Load())), keyword(arg='outcome', value=Name(id='outcome', ctx=Load())), keyword(arg='duration_sec', value=Constant(value=None))])",
+      "rendered": "StageRecord(label=label, outcome=outcome, duration_sec=None)"
+    },
+    {
+      "line_start": 219,
+      "line_end": 219,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_lock', ctx=Load())",
+      "rendered": "self._lock"
+    },
+    {
+      "line_start": 220,
+      "line_end": 220,
+      "column": 27,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 224,
+      "line_end": 224,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_lock', ctx=Load())",
+      "rendered": "self._lock"
+    },
+    {
+      "line_start": 225,
+      "line_end": 225,
+      "column": 20,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='s', ctx=Load()), generators=[comprehension(target=Name(id='s', ctx=Store()), iter=Name(id='STAGE_IDS', ctx=Load()), ifs=[Compare(left=Name(id='s', ctx=Load()), ops=[In()], comparators=[Attribute(value=Name(id='self', ctx=Load()), attr='_stages', ctx=Load())])], is_async=0)])",
+      "rendered": "[s for s in STAGE_IDS if s in self._stages]"
+    },
+    {
+      "line_start": 226,
+      "line_end": 226,
+      "column": 20,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='s', ctx=Load()), generators=[comprehension(target=Name(id='s', ctx=Store()), iter=Attribute(value=Name(id='self', ctx=Load()), attr='_stages', ctx=Load()), ifs=[Compare(left=Name(id='s', ctx=Load()), ops=[NotIn()], comparators=[Name(id='STAGE_IDS', ctx=Load())])], is_async=0)])",
+      "rendered": "[s for s in self._stages if s not in STAGE_IDS]"
+    },
+    {
+      "line_start": 227,
+      "line_end": 227,
+      "column": 19,
+      "kind": "DictComp",
+      "original_ast": "DictComp(key=Name(id='s', ctx=Load()), value=Call(func=Name(id='_copy', ctx=Load()), args=[Subscript(value=Attribute(value=Name(id='self', ctx=Load()), attr='_stages', ctx=Load()), slice=Name(id='s', ctx=Load()), ctx=Load())], keywords=[]), generators=[comprehension(target=Name(id='s', ctx=Store()), iter=BinOp(left=Name(id='known', ctx=Load()), op=Add(), right=Name(id='extra', ctx=Load())), ifs=[], is_async=0)])",
+      "rendered": "{s: _copy(self._stages[s]) for s in known + extra}"
+    },
+    {
+      "line_start": 230,
+      "line_end": 230,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_StageRecorder', ctx=Load()), args=[], keywords=[])",
+      "rendered": "_StageRecorder()"
+    },
+    {
+      "line_start": 237,
+      "line_end": 237,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='threading', ctx=Load()), attr='Lock', ctx=Load()), args=[], keywords=[])",
+      "rendered": "threading.Lock()"
+    },
+    {
+      "line_start": 238,
+      "line_end": 238,
+      "column": 57,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 241,
+      "line_end": 241,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_lock', ctx=Load())",
+      "rendered": "self._lock"
+    },
+    {
+      "line_start": 242,
+      "line_end": 242,
+      "column": 38,
+      "kind": "Name",
+      "original_ast": "Name(id='provenance', ctx=Load())",
+      "rendered": "provenance"
+    },
+    {
+      "line_start": 245,
+      "line_end": 245,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_lock', ctx=Load())",
+      "rendered": "self._lock"
+    },
+    {
+      "line_start": 246,
+      "line_end": 246,
+      "column": 28,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 249,
+      "line_end": 249,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_lock', ctx=Load())",
+      "rendered": "self._lock"
+    },
+    {
+      "line_start": 250,
+      "line_end": 250,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dict', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='_entries', ctx=Load())], keywords=[])",
+      "rendered": "dict(self._entries)"
+    },
+    {
+      "line_start": 253,
+      "line_end": 253,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_CachedProvenanceRecorder', ctx=Load()), args=[], keywords=[])",
+      "rendered": "_CachedProvenanceRecorder()"
+    },
+    {
+      "line_start": 257,
+      "line_end": 263,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='TokenBucket', ctx=Load()), args=[], keywords=[keyword(arg='prompt', value=Call(func=Name(id='sum', ctx=Load()), args=[GeneratorExp(elt=Call(func=Attribute(value=Name(id='b', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='prompt'), Constant(value=0)], keywords=[]), generators=[comprehension(target=Name(id='b', ctx=Store()), iter=Name(id='buckets', ctx=Load()), ifs=[], is_async=0)])], keywords=[])), keyword(arg='completion', value=Call(func=Name(id='sum', ctx=Load()), args=[GeneratorExp(elt=Call(func=Attribute(value=Name(id='b', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='completion'), Constant(value=0)], keywords=[]), generators=[comprehension(target=Name(id='b', ctx=Store()), iter=Name(id='buckets', ctx=Load()), ifs=[], is_async=0)])], keywords=[])), keyword(arg='cache_read', value=Call(func=Name(id='sum', ctx=Load()), args=[GeneratorExp(elt=Call(func=Attribute(value=Name(id='b', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='cache_read'), Constant(value=0)], keywords=[]), generators=[comprehension(target=Name(id='b', ctx=Store()), iter=Name(id='buckets', ctx=Load()), ifs=[], is_async=0)])], keywords=[])), keyword(arg='cache_write', value=Call(func=Name(id='sum', ctx=Load()), args=[GeneratorExp(elt=Call(func=Attribute(value=Name(id='b', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='cache_write'), Constant(value=0)], keywords=[]), generators=[comprehension(target=Name(id='b', ctx=Store()), iter=Name(id='buckets', ctx=Load()), ifs=[], is_async=0)])], keywords=[])), keyword(arg='calls', value=Call(func=Name(id='sum', ctx=Load()), args=[GeneratorExp(elt=Call(func=Attribute(value=Name(id='b', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='calls'), Constant(value=0)], keywords=[]), generators=[comprehension(target=Name(id='b', ctx=Store()), iter=Name(id='buckets', ctx=Load()), ifs=[], is_async=0)])], keywords=[]))])",
+      "rendered": "TokenBucket(prompt=sum((b.get('prompt', 0) for b in buckets)), completion=sum((b.get('completion', 0) for b in buckets)), cache_read=sum((b.get('cache_read', 0) for b in buckets)), cache_write=sum((b.get('cache_write', 0) for b in buckets)), calls=sum((b.get('calls', 0) for b in buckets)))"
+    },
+    {
+      "line_start": 267,
+      "line_end": 268,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=BinOp(left=BinOp(left=Call(func=Attribute(value=Name(id='bucket', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='prompt'), Constant(value=0)], keywords=[]), op=Add(), right=Call(func=Attribute(value=Name(id='bucket', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='completion'), Constant(value=0)], keywords=[])), op=Add(), right=Call(func=Attribute(value=Name(id='bucket', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='cache_read'), Constant(value=0)], keywords=[])), ops=[Gt()], comparators=[Constant(value=0)])",
+      "rendered": "bucket.get('prompt', 0) + bucket.get('completion', 0) + bucket.get('cache_read', 0) > 0"
+    },
+    {
+      "line_start": 274,
+      "line_end": 274,
+      "column": 64,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 275,
+      "line_end": 276,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='UnattributedTokens', ctx=Load()), args=[], keywords=[keyword(arg='prompt', value=Constant(value=0)), keyword(arg='completion', value=Constant(value=0)), keyword(arg='cache_read', value=Constant(value=0)), keyword(arg='cache_write', value=Constant(value=0)), keyword(arg='calls', value=Constant(value=0))])",
+      "rendered": "UnattributedTokens(prompt=0, completion=0, cache_read=0, cache_write=0, calls=0)"
+    },
+    {
+      "line_start": 277,
+      "line_end": 277,
+      "column": 25,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Name(id='token_snap', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='by_phase'), Dict(keys=[], values=[])], keywords=[]), attr='items', ctx=Load()), args=[], keywords=[])",
+      "rendered": "token_snap.get('by_phase', {}).items()"
+    },
+    {
+      "line_start": 278,
+      "line_end": 278,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='PHASE_MAP', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='phase', ctx=Load())], keywords=[])",
+      "rendered": "PHASE_MAP.get(phase)"
+    },
+    {
+      "line_start": 279,
+      "line_end": 279,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='mapped', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "mapped is None"
+    },
+    {
+      "line_start": 281,
+      "line_end": 281,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Subscript(value=Name(id='unattributed', ctx=Load()), slice=Constant(value='prompt'), ctx=Store()), op=Add(), value=Call(func=Attribute(value=Name(id='bucket', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='prompt'), Constant(value=0)], keywords=[]))",
+      "rendered": "unattributed['prompt'] += bucket.get('prompt', 0)"
+    },
+    {
+      "line_start": 282,
+      "line_end": 282,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Subscript(value=Name(id='unattributed', ctx=Load()), slice=Constant(value='completion'), ctx=Store()), op=Add(), value=Call(func=Attribute(value=Name(id='bucket', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='completion'), Constant(value=0)], keywords=[]))",
+      "rendered": "unattributed['completion'] += bucket.get('completion', 0)"
+    },
+    {
+      "line_start": 283,
+      "line_end": 283,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Subscript(value=Name(id='unattributed', ctx=Load()), slice=Constant(value='cache_read'), ctx=Store()), op=Add(), value=Call(func=Attribute(value=Name(id='bucket', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='cache_read'), Constant(value=0)], keywords=[]))",
+      "rendered": "unattributed['cache_read'] += bucket.get('cache_read', 0)"
+    },
+    {
+      "line_start": 284,
+      "line_end": 284,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Subscript(value=Name(id='unattributed', ctx=Load()), slice=Constant(value='cache_write'), ctx=Store()), op=Add(), value=Call(func=Attribute(value=Name(id='bucket', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='cache_write'), Constant(value=0)], keywords=[]))",
+      "rendered": "unattributed['cache_write'] += bucket.get('cache_write', 0)"
+    },
+    {
+      "line_start": 285,
+      "line_end": 285,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Subscript(value=Name(id='unattributed', ctx=Load()), slice=Constant(value='calls'), ctx=Store()), op=Add(), value=Call(func=Attribute(value=Name(id='bucket', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='calls'), Constant(value=0)], keywords=[]))",
+      "rendered": "unattributed['calls'] += bucket.get('calls', 0)"
+    },
+    {
+      "line_start": 287,
+      "line_end": 287,
+      "column": 25,
+      "kind": "Name",
+      "original_ast": "Name(id='mapped', ctx=Load())",
+      "rendered": "mapped"
+    },
+    {
+      "line_start": 288,
+      "line_end": 288,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Name(id='by_stage', ctx=Load()), attr='setdefault', ctx=Load()), args=[Name(id='stage_id', ctx=Load()), List(elts=[], ctx=Load())], keywords=[]), attr='append', ctx=Load()), args=[Tuple(elts=[Name(id='role', ctx=Load()), Name(id='bucket', ctx=Load())], ctx=Load())], keywords=[])",
+      "rendered": "by_stage.setdefault(stage_id, []).append((role, bucket))"
+    },
+    {
+      "line_start": 289,
+      "line_end": 289,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='by_stage', ctx=Load()), Name(id='unattributed', ctx=Load())], ctx=Load())",
+      "rendered": "(by_stage, unattributed)"
+    },
+    {
+      "line_start": 294,
+      "line_end": 294,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_group_phases', ctx=Load()), args=[Name(id='token_snap', ctx=Load())], keywords=[])",
+      "rendered": "_group_phases(token_snap)"
+    },
+    {
+      "line_start": 295,
+      "line_end": 295,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_sum_buckets', ctx=Load()), args=[ListComp(elt=Name(id='bucket', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='_', ctx=Store()), Name(id='bucket', ctx=Store())], ctx=Store()), iter=Call(func=Attribute(value=Name(id='by_stage', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='step_id', ctx=Load()), List(elts=[], ctx=Load())], keywords=[]), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "_sum_buckets([bucket for _, bucket in by_stage.get(step_id, [])])"
+    },
+    {
+      "line_start": 301,
+      "line_end": 301,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='role', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "role is None"
+    },
+    {
+      "line_start": 302,
+      "line_end": 302,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 303,
+      "line_end": 303,
+      "column": 13,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='role', ctx=Load()), Starred(value=Call(func=Attribute(value=Name(id='_ROLE_FALLBACKS', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='role', ctx=Load()), Tuple(elts=[], ctx=Load())], keywords=[]), ctx=Load())], ctx=Load())",
+      "rendered": "(role, *_ROLE_FALLBACKS.get(role, ()))"
+    },
+    {
+      "line_start": 304,
+      "line_end": 304,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='role_models', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='r', ctx=Load())], keywords=[])",
+      "rendered": "role_models.get(r)"
+    },
+    {
+      "line_start": 305,
+      "line_end": 305,
+      "column": 19,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Name(id='role_models', ctx=Load()), slice=Name(id='r', ctx=Load()), ctx=Load())",
+      "rendered": "role_models[r]"
+    },
+    {
+      "line_start": 306,
+      "line_end": 306,
+      "column": 11,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 311,
+      "line_end": 311,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_resolve_model', ctx=Load()), args=[Name(id='role', ctx=Load()), Name(id='role_models', ctx=Load())], keywords=[])",
+      "rendered": "_resolve_model(role, role_models)"
+    },
+    {
+      "line_start": 312,
+      "line_end": 312,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='model_id', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "model_id is None"
+    },
+    {
+      "line_start": 313,
+      "line_end": 313,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 314,
+      "line_end": 314,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='pricing', ctx=Load()), attr='models', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='model_id', ctx=Load())], keywords=[])",
+      "rendered": "pricing.models.get(model_id)"
+    },
+    {
+      "line_start": 321,
+      "line_end": 321,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='pricing', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "pricing is None"
+    },
+    {
+      "line_start": 322,
+      "line_end": 322,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 323,
+      "line_end": 323,
+      "column": 12,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0.0)",
+      "rendered": "0.0"
+    },
+    {
+      "line_start": 324,
+      "line_end": 324,
+      "column": 24,
+      "kind": "Name",
+      "original_ast": "Name(id='phases', ctx=Load())",
+      "rendered": "phases"
+    },
+    {
+      "line_start": 325,
+      "line_end": 325,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_rate_for', ctx=Load()), args=[Name(id='role', ctx=Load()), Name(id='role_models', ctx=Load()), Name(id='pricing', ctx=Load())], keywords=[])",
+      "rendered": "_rate_for(role, role_models, pricing)"
+    },
+    {
+      "line_start": 326,
+      "line_end": 326,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='rate', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "rate is not None"
+    },
+    {
+      "line_start": 328,
+      "line_end": 328,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='total', ctx=Store()), op=Add(), value=Call(func=Name(id='bucket_cost_usd', ctx=Load()), args=[Name(id='bucket', ctx=Load()), Name(id='rate', ctx=Load()), Attribute(value=Name(id='pricing', ctx=Load()), attr='cache_defaults', ctx=Load())], keywords=[]))",
+      "rendered": "total += bucket_cost_usd(bucket, rate, pricing.cache_defaults)"
+    },
+    {
+      "line_start": 329,
+      "line_end": 329,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_has_tokens', ctx=Load()), args=[Name(id='bucket', ctx=Load())], keywords=[])",
+      "rendered": "_has_tokens(bucket)"
+    },
+    {
+      "line_start": 330,
+      "line_end": 330,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 331,
+      "line_end": 331,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='total', ctx=Load())",
+      "rendered": "total"
+    },
+    {
+      "line_start": 337,
+      "line_end": 337,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='pricing', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "pricing is None"
+    },
+    {
+      "line_start": 338,
+      "line_end": 338,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 339,
+      "line_end": 339,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='model_id', ctx=Load()), body=Call(func=Attribute(value=Attribute(value=Name(id='pricing', ctx=Load()), attr='models', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='model_id', ctx=Load())], keywords=[]), orelse=Constant(value=None))",
+      "rendered": "pricing.models.get(model_id) if model_id else None"
+    },
+    {
+      "line_start": 340,
+      "line_end": 340,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='rate', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "rate is not None"
+    },
+    {
+      "line_start": 341,
+      "line_end": 341,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='bucket_cost_usd', ctx=Load()), args=[Name(id='bucket', ctx=Load()), Name(id='rate', ctx=Load()), Attribute(value=Name(id='pricing', ctx=Load()), attr='cache_defaults', ctx=Load())], keywords=[])",
+      "rendered": "bucket_cost_usd(bucket, rate, pricing.cache_defaults)"
+    },
+    {
+      "line_start": 342,
+      "line_end": 342,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Name(id='_has_tokens', ctx=Load()), args=[Name(id='bucket', ctx=Load())], keywords=[]), body=Constant(value=None), orelse=Constant(value=0.0))",
+      "rendered": "None if _has_tokens(bucket) else 0.0"
+    },
+    {
+      "line_start": 350,
+      "line_end": 350,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='STAGE_ROLES', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='stage_id', ctx=Load())], keywords=[])",
+      "rendered": "STAGE_ROLES.get(stage_id)"
+    },
+    {
+      "line_start": 351,
+      "line_end": 351,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='provenance', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "provenance is not None"
+    },
+    {
+      "line_start": 353,
+      "line_end": 353,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='provenance', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='model')], keywords=[])",
+      "rendered": "provenance.get('model')"
+    },
+    {
+      "line_start": 355,
+      "line_end": 355,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='cast', ctx=Load()), args=[Name(id='TokenBucket', ctx=Load()), BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='provenance', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='tokens')], keywords=[]), Dict(keys=[], values=[])])], keywords=[])",
+      "rendered": "cast(TokenBucket, provenance.get('tokens') or {})"
+    },
+    {
+      "line_start": 357,
+      "line_end": 357,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_sum_buckets', ctx=Load()), args=[ListComp(elt=Name(id='bucket', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='_', ctx=Store()), Name(id='bucket', ctx=Store())], ctx=Store()), iter=Name(id='phases', ctx=Load()), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "_sum_buckets([bucket for _, bucket in phases])"
+    },
+    {
+      "line_start": 358,
+      "line_end": 358,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_sum_buckets', ctx=Load()), args=[List(elts=[Name(id='raw_tokens', ctx=Load()), Name(id='live_tokens', ctx=Load())], ctx=Load())], keywords=[])",
+      "rendered": "_sum_buckets([raw_tokens, live_tokens])"
+    },
+    {
+      "line_start": 359,
+      "line_end": 359,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_provenance_cost', ctx=Load()), args=[Name(id='model', ctx=Load()), Name(id='raw_tokens', ctx=Load()), Name(id='pricing', ctx=Load())], keywords=[])",
+      "rendered": "_provenance_cost(model, raw_tokens, pricing)"
+    },
+    {
+      "line_start": 360,
+      "line_end": 360,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_stage_cost', ctx=Load()), args=[Name(id='phases', ctx=Load()), Name(id='role_models', ctx=Load()), Name(id='pricing', ctx=Load())], keywords=[])",
+      "rendered": "_stage_cost(phases, role_models, pricing)"
+    },
+    {
+      "line_start": 361,
+      "line_end": 362,
+      "column": 16,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=BoolOp(op=Or(), values=[Compare(left=Name(id='cached_cost', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)]), Compare(left=Name(id='live_cost', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])]), body=Constant(value=None), orelse=BinOp(left=Name(id='cached_cost', ctx=Load()), op=Add(), right=Name(id='live_cost', ctx=Load())))",
+      "rendered": "None if cached_cost is None or live_cost is None else cached_cost + live_cost"
+    },
+    {
+      "line_start": 363,
+      "line_end": 363,
+      "column": 33,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='provenance', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='config_sha256')], keywords=[])",
+      "rendered": "provenance.get('config_sha256')"
+    },
+    {
+      "line_start": 365,
+      "line_end": 365,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_resolve_model', ctx=Load()), args=[Name(id='role', ctx=Load()), Name(id='role_models', ctx=Load())], keywords=[])",
+      "rendered": "_resolve_model(role, role_models)"
+    },
+    {
+      "line_start": 366,
+      "line_end": 366,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_sum_buckets', ctx=Load()), args=[ListComp(elt=Name(id='bucket', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='_', ctx=Store()), Name(id='bucket', ctx=Store())], ctx=Store()), iter=Name(id='phases', ctx=Load()), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "_sum_buckets([bucket for _, bucket in phases])"
+    },
+    {
+      "line_start": 367,
+      "line_end": 367,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_stage_cost', ctx=Load()), args=[Name(id='phases', ctx=Load()), Name(id='role_models', ctx=Load()), Name(id='pricing', ctx=Load())], keywords=[])",
+      "rendered": "_stage_cost(phases, role_models, pricing)"
+    },
+    {
+      "line_start": 368,
+      "line_end": 368,
+      "column": 33,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 369,
+      "line_end": 380,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='StageEntry', ctx=Load()), args=[], keywords=[keyword(arg='label', value=IfExp(test=Name(id='record', ctx=Load()), body=Subscript(value=Name(id='record', ctx=Load()), slice=Constant(value='label'), ctx=Load()), orelse=Constant(value=''))), keyword(arg='outcome', value=IfExp(test=Name(id='record', ctx=Load()), body=Subscript(value=Name(id='record', ctx=Load()), slice=Constant(value='outcome'), ctx=Load()), orelse=Name(id='_NOT_RUN', ctx=Load()))), keyword(arg='duration_sec', value=IfExp(test=Name(id='record', ctx=Load()), body=Subscript(value=Name(id='record', ctx=Load()), slice=Constant(value='duration_sec'), ctx=Load()), orelse=Constant(value=None))), keyword(arg='tokens', value=Name(id='tokens', ctx=Load())), keyword(arg='model', value=Name(id='model', ctx=Load())), keyword(arg='cost_usd', value=Name(id='cost', ctx=Load())), keyword(arg='cost_estimated', value=BoolOp(op=Or(), values=[Compare(left=Name(id='stage_id', ctx=Load()), ops=[In()], comparators=[Name(id='ESTIMATED_COST_STAGES', ctx=Load())]), Call(func=Name(id='any', ctx=Load()), args=[GeneratorExp(elt=BoolOp(op=And(), values=[Compare(left=Name(id='r', ctx=Load()), ops=[In()], comparators=[Name(id='ESTIMATED_COST_ROLES', ctx=Load())]), Call(func=Name(id='_has_tokens', ctx=Load()), args=[Name(id='b', ctx=Load())], keywords=[])]), generators=[comprehension(target=Tuple(elts=[Name(id='r', ctx=Store()), Name(id='b', ctx=Store())], ctx=Store()), iter=Name(id='phases', ctx=Load()), ifs=[], is_async=0)])], keywords=[])])), keyword(arg='cached_from_config_sha', value=Name(id='cached_from_config_sha', ctx=Load()))])",
+      "rendered": "StageEntry(label=record['label'] if record else '', outcome=record['outcome'] if record else _NOT_RUN, duration_sec=record['duration_sec'] if record else None, tokens=tokens, model=model, cost_usd=cost, cost_estimated=stage_id in ESTIMATED_COST_STAGES or any((r in ESTIMATED_COST_ROLES and _has_tokens(b) for r, b in phases)), cached_from_config_sha=cached_from_config_sha)"
+    },
+    {
+      "line_start": 384,
+      "line_end": 384,
+      "column": 12,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Subscript(value=Name(id='entry', ctx=Load()), slice=Constant(value='cost_usd'), ctx=Load()), generators=[comprehension(target=Name(id='entry', ctx=Store()), iter=Call(func=Attribute(value=Name(id='stages', ctx=Load()), attr='values', ctx=Load()), args=[], keywords=[]), ifs=[], is_async=0)])",
+      "rendered": "[entry['cost_usd'] for entry in stages.values()]"
+    },
+    {
+      "line_start": 385,
+      "line_end": 385,
+      "column": 13,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='c', ctx=Load()), generators=[comprehension(target=Name(id='c', ctx=Store()), iter=Name(id='costs', ctx=Load()), ifs=[Compare(left=Name(id='c', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])], is_async=0)])",
+      "rendered": "[c for c in costs if c is not None]"
+    },
+    {
+      "line_start": 386,
+      "line_end": 386,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='priced', ctx=Load())], keywords=[]), ops=[NotEq()], comparators=[Call(func=Name(id='len', ctx=Load()), args=[Name(id='costs', ctx=Load())], keywords=[])])",
+      "rendered": "len(priced) != len(costs)"
+    },
+    {
+      "line_start": 387,
+      "line_end": 387,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 388,
+      "line_end": 388,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sum', ctx=Load()), args=[Name(id='priced', ctx=Load())], keywords=[])",
+      "rendered": "sum(priced)"
+    },
+    {
+      "line_start": 394,
+      "line_end": 394,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='token_snap', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='by_phase'), Dict(keys=[], values=[])], keywords=[])",
+      "rendered": "token_snap.get('by_phase', {})"
+    },
+    {
+      "line_start": 395,
+      "line_end": 395,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_sum_buckets', ctx=Load()), args=[Call(func=Name(id='list', ctx=Load()), args=[Call(func=Attribute(value=Name(id='by_phase', ctx=Load()), attr='values', ctx=Load()), args=[], keywords=[])], keywords=[])], keywords=[])",
+      "rendered": "_sum_buckets(list(by_phase.values()))"
+    },
+    {
+      "line_start": 397,
+      "line_end": 399,
+      "column": 27,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sum', ctx=Load()), args=[GeneratorExp(elt=Call(func=Attribute(value=Name(id='b', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='cache_unparsed'), Constant(value=0)], keywords=[]), generators=[comprehension(target=Name(id='b', ctx=Store()), iter=Call(func=Attribute(value=Name(id='by_phase', ctx=Load()), attr='values', ctx=Load()), args=[], keywords=[]), ifs=[Call(func=Name(id='isinstance', ctx=Load()), args=[Call(func=Attribute(value=Name(id='b', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='cache_unparsed')], keywords=[]), Name(id='int', ctx=Load())], keywords=[])], is_async=0)])], keywords=[])",
+      "rendered": "sum((b.get('cache_unparsed', 0) for b in by_phase.values() if isinstance(b.get('cache_unparsed'), int)))"
+    },
+    {
+      "line_start": 401,
+      "line_end": 404,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_sum_buckets', ctx=Load()), args=[ListComp(elt=Call(func=Name(id='cast', ctx=Load()), args=[Name(id='TokenBucket', ctx=Load()), BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='prov', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='tokens')], keywords=[]), Dict(keys=[], values=[])])], keywords=[]), generators=[comprehension(target=Name(id='prov', ctx=Store()), iter=Call(func=Attribute(value=Name(id='cached_provenance', ctx=Load()), attr='values', ctx=Load()), args=[], keywords=[]), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "_sum_buckets([cast(TokenBucket, prov.get('tokens') or {}) for prov in cached_provenance.values()])"
+    },
+    {
+      "line_start": 405,
+      "line_end": 422,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='Totals', ctx=Load()), args=[], keywords=[keyword(arg='prompt_tokens', value=BinOp(left=Call(func=Attribute(value=Name(id='token_snap', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='prompt'), Constant(value=0)], keywords=[]), op=Add(), right=Subscript(value=Name(id='cached_carryover', ctx=Load()), slice=Constant(value='prompt'), ctx=Load()))), keyword(arg='completion_tokens', value=BinOp(left=Call(func=Attribute(value=Name(id='token_snap', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='completion'), Constant(value=0)], keywords=[]), op=Add(), right=Subscript(value=Name(id='cached_carryover', ctx=Load()), slice=Constant(value='completion'), ctx=Load()))), keyword(arg='total_tokens', value=BinOp(left=BinOp(left=Call(func=Attribute(value=Name(id='token_snap', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='total'), Constant(value=0)], keywords=[]), op=Add(), right=Subscript(value=Name(id='cached_carryover', ctx=Load()), slice=Constant(value='prompt'), ctx=Load())), op=Add(), right=Subscript(value=Name(id='cached_carryover', ctx=Load()), slice=Constant(value='completion'), ctx=Load()))), keyword(arg='cache_read_tokens', value=BinOp(left=Call(func=Attribute(value=Name(id='combined', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='cache_read'), Constant(value=0)], keywords=[]), op=Add(), right=Subscript(value=Name(id='cached_carryover', ctx=Load()), slice=Constant(value='cache_read'), ctx=Load()))), keyword(arg='cache_write_tokens', value=BinOp(left=Call(func=Attribute(value=Name(id='combined', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='cache_write'), Constant(value=0)], keywords=[]), op=Add(), right=Subscript(value=Name(id='cached_carryover', ctx=Load()), slice=Constant(value='cache_write'), ctx=Load()))), keyword(arg='calls', value=BinOp(left=Call(func=Attribute(value=Name(id='token_snap', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='calls'), Constant(value=0)], keywords=[]), op=Add(), right=Subscript(value=Name(id='cached_carryover', ctx=Load()), slice=Constant(value='calls'), ctx=Load()))), keyword(arg='calls_with_usage', value=Call(func=Attribute(value=Name(id='token_snap', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='calls_with_usage'), Constant(value=0)], keywords=[])), keyword(arg='completion_absent', value=Call(func=Attribute(value=Name(id='token_snap', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='completion_absent'), Constant(value=0)], keywords=[])), keyword(arg='cache_unparsed_calls', value=Name(id='cache_unparsed_calls', ctx=Load())), keyword(arg='cost_usd', value=Call(func=Name(id='_total_cost', ctx=Load()), args=[Name(id='stages', ctx=Load())], keywords=[])), keyword(arg='unattributed', value=Name(id='unattributed', ctx=Load())), keyword(arg='cached_carryover', value=Name(id='cached_carryover', ctx=Load()))])",
+      "rendered": "Totals(prompt_tokens=token_snap.get('prompt', 0) + cached_carryover['prompt'], completion_tokens=token_snap.get('completion', 0) + cached_carryover['completion'], total_tokens=token_snap.get('total', 0) + cached_carryover['prompt'] + cached_carryover['completion'], cache_read_tokens=combined.get('cache_read', 0) + cached_carryover['cache_read'], cache_write_tokens=combined.get('cache_write', 0) + cached_carryover['cache_write'], calls=token_snap.get('calls', 0) + cached_carryover['calls'], calls_with_usage=token_snap.get('calls_with_usage', 0), completion_absent=token_snap.get('completion_absent', 0), cache_unparsed_calls=cache_unparsed_calls, cost_usd=_total_cost(stages), unattributed=unattributed, cached_carryover=cached_carryover)"
+    },
+    {
+      "line_start": 426,
+      "line_end": 426,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='pricing', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "pricing is None"
+    },
+    {
+      "line_start": 427,
+      "line_end": 427,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 428,
+      "line_end": 429,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='PricingProvenance', ctx=Load()), args=[], keywords=[keyword(arg='file', value=Attribute(value=Name(id='pricing', ctx=Load()), attr='path', ctx=Load())), keyword(arg='sha256', value=Attribute(value=Name(id='pricing', ctx=Load()), attr='sha256', ctx=Load())), keyword(arg='source', value=Attribute(value=Name(id='pricing', ctx=Load()), attr='source', ctx=Load()))])",
+      "rendered": "PricingProvenance(file=pricing.path, sha256=pricing.sha256, source=pricing.source)"
+    },
+    {
+      "line_start": 434,
+      "line_end": 434,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='pricing', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "pricing is None"
+    },
+    {
+      "line_start": 435,
+      "line_end": 435,
+      "column": 15,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='status'), Constant(value='reason')], values=[Constant(value='unavailable'), Constant(value='no pricing table configured')])",
+      "rendered": "{'status': 'unavailable', 'reason': 'no pricing table configured'}"
+    },
+    {
+      "line_start": 436,
+      "line_end": 437,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[SetComp(elt=Subscript(value=Name(id='entry', ctx=Load()), slice=Constant(value='model'), ctx=Load()), generators=[comprehension(target=Name(id='entry', ctx=Store()), iter=Call(func=Attribute(value=Name(id='stages', ctx=Load()), attr='values', ctx=Load()), args=[], keywords=[]), ifs=[BoolOp(op=And(), values=[Compare(left=Subscript(value=Name(id='entry', ctx=Load()), slice=Constant(value='cost_usd'), ctx=Load()), ops=[Is()], comparators=[Constant(value=None)]), Subscript(value=Name(id='entry', ctx=Load()), slice=Constant(value='model'), ctx=Load())])], is_async=0)])], keywords=[])",
+      "rendered": "sorted({entry['model'] for entry in stages.values() if entry['cost_usd'] is None and entry['model']})"
+    },
+    {
+      "line_start": 438,
+      "line_end": 438,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='unpriced', ctx=Load())",
+      "rendered": "unpriced"
+    },
+    {
+      "line_start": 439,
+      "line_end": 442,
+      "column": 15,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='status'), Constant(value='reason')], values=[Constant(value='incomplete'), BinOp(left=Constant(value='pricing missing for model(s): '), op=Add(), right=Call(func=Attribute(value=Constant(value=', '), attr='join', ctx=Load()), args=[Name(id='unpriced', ctx=Load())], keywords=[]))])",
+      "rendered": "{'status': 'incomplete', 'reason': 'pricing missing for model(s): ' + ', '.join(unpriced)}"
+    },
+    {
+      "line_start": 443,
+      "line_end": 443,
+      "column": 11,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='status'), Constant(value='reason')], values=[Constant(value='available'), Constant(value='pricing table applied')])",
+      "rendered": "{'status': 'available', 'reason': 'pricing table applied'}"
+    },
+    {
+      "line_start": 448,
+      "line_end": 448,
+      "column": 14,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Name(id='set', ctx=Load()), args=[Name(id='stage_snap', ctx=Load())], keywords=[]), op=BitOr(), right=Call(func=Name(id='set', ctx=Load()), args=[Name(id='by_stage', ctx=Load())], keywords=[]))",
+      "rendered": "set(stage_snap) | set(by_stage)"
+    },
+    {
+      "line_start": 449,
+      "line_end": 449,
+      "column": 12,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='s', ctx=Load()), generators=[comprehension(target=Name(id='s', ctx=Store()), iter=Name(id='STAGE_IDS', ctx=Load()), ifs=[Compare(left=Name(id='s', ctx=Load()), ops=[In()], comparators=[Name(id='present', ctx=Load())])], is_async=0)])",
+      "rendered": "[s for s in STAGE_IDS if s in present]"
+    },
+    {
+      "line_start": 450,
+      "line_end": 450,
+      "column": 12,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='s', ctx=Load()), generators=[comprehension(target=Name(id='s', ctx=Store()), iter=Name(id='stage_snap', ctx=Load()), ifs=[Compare(left=Name(id='s', ctx=Load()), ops=[NotIn()], comparators=[Name(id='STAGE_IDS', ctx=Load())])], is_async=0)])",
+      "rendered": "[s for s in stage_snap if s not in STAGE_IDS]"
+    },
+    {
+      "line_start": 451,
+      "line_end": 451,
+      "column": 11,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Name(id='known', ctx=Load()), op=Add(), right=Name(id='extra', ctx=Load()))",
+      "rendered": "known + extra"
+    },
+    {
+      "line_start": 462,
+      "line_end": 462,
+      "column": 29,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_group_phases', ctx=Load()), args=[Name(id='token_snap', ctx=Load())], keywords=[])",
+      "rendered": "_group_phases(token_snap)"
+    },
+    {
+      "line_start": 463,
+      "line_end": 463,
+      "column": 24,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Name(id='cached_provenance', ctx=Load()), Dict(keys=[], values=[])])",
+      "rendered": "cached_provenance or {}"
+    },
+    {
+      "line_start": 464,
+      "line_end": 469,
+      "column": 13,
+      "kind": "DictComp",
+      "original_ast": "DictComp(key=Name(id='stage_id', ctx=Load()), value=Call(func=Name(id='_stage_entry', ctx=Load()), args=[Name(id='stage_id', ctx=Load()), Call(func=Attribute(value=Name(id='stage_snap', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='stage_id', ctx=Load())], keywords=[]), Call(func=Attribute(value=Name(id='by_stage', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='stage_id', ctx=Load()), List(elts=[], ctx=Load())], keywords=[]), Name(id='role_models', ctx=Load()), Name(id='pricing', ctx=Load()), Call(func=Attribute(value=Name(id='cached_provenance', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='stage_id', ctx=Load())], keywords=[])], keywords=[]), generators=[comprehension(target=Name(id='stage_id', ctx=Store()), iter=Call(func=Name(id='_ordered_stage_ids', ctx=Load()), args=[Name(id='stage_snap', ctx=Load()), Name(id='by_stage', ctx=Load())], keywords=[]), ifs=[], is_async=0)])",
+      "rendered": "{stage_id: _stage_entry(stage_id, stage_snap.get(stage_id), by_stage.get(stage_id, []), role_models, pricing, cached_provenance.get(stage_id)) for stage_id in _ordered_stage_ids(stage_snap, by_stage)}"
+    },
+    {
+      "line_start": 470,
+      "line_end": 474,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='StageSection', ctx=Load()), args=[], keywords=[keyword(arg='stages', value=Name(id='stages', ctx=Load())), keyword(arg='totals', value=Call(func=Name(id='_totals', ctx=Load()), args=[Name(id='token_snap', ctx=Load()), Name(id='stages', ctx=Load()), Name(id='unattributed', ctx=Load()), Name(id='cached_provenance', ctx=Load())], keywords=[])), keyword(arg='pricing', value=Call(func=Name(id='_provenance', ctx=Load()), args=[Name(id='pricing', ctx=Load())], keywords=[])), keyword(arg='pricing_status', value=Call(func=Name(id='_pricing_status', ctx=Load()), args=[Name(id='stages', ctx=Load()), Name(id='pricing', ctx=Load())], keywords=[]))])",
+      "rendered": "StageSection(stages=stages, totals=_totals(token_snap, stages, unattributed, cached_provenance), pricing=_provenance(pricing), pricing_status=_pricing_status(stages, pricing))"
+    }
+  ],
+  "calls": [
+    {
+      "line": 71,
+      "end_line": 71,
+      "callee": "frozenset",
+      "enclosing": "module initialization",
+      "expression": "frozenset({\"s11\"})"
+    },
+    {
+      "line": 73,
+      "end_line": 73,
+      "callee": "frozenset",
+      "enclosing": "module initialization",
+      "expression": "frozenset({\"exploit_verification.attacker\"})"
+    },
+    {
+      "line": 230,
+      "end_line": 230,
+      "callee": "_StageRecorder",
+      "enclosing": "module initialization",
+      "expression": "_StageRecorder()"
+    },
+    {
+      "line": 253,
+      "end_line": 253,
+      "callee": "_CachedProvenanceRecorder",
+      "enclosing": "module initialization",
+      "expression": "_CachedProvenanceRecorder()"
+    },
+    {
+      "line": 181,
+      "end_line": 182,
+      "callee": "StageRecord",
+      "enclosing": "_copy",
+      "expression": "StageRecord(label=record[\"label\"], outcome=record[\"outcome\"],\n                       duration_sec=record[\"duration_sec\"])"
+    },
+    {
+      "line": 257,
+      "end_line": 263,
+      "callee": "TokenBucket",
+      "enclosing": "_sum_buckets",
+      "expression": "TokenBucket(\n        prompt=sum(b.get(\"prompt\", 0) for b in buckets),\n        completion=sum(b.get(\"completion\", 0) for b in buckets),\n        cache_read=sum(b.get(\"cache_read\", 0) for b in buckets),\n        cache_write=sum(b.get(\"cache_write\", 0) for b in buckets),\n        calls=sum(b.get(\"calls\", 0) for b in buckets),\n    )"
+    },
+    {
+      "line": 275,
+      "end_line": 276,
+      "callee": "UnattributedTokens",
+      "enclosing": "_group_phases",
+      "expression": "UnattributedTokens(prompt=0, completion=0, cache_read=0,\n                                      cache_write=0, calls=0)"
+    },
+    {
+      "line": 277,
+      "end_line": 277,
+      "callee": "token_snap.get('by_phase', {}).items",
+      "enclosing": "_group_phases",
+      "expression": "token_snap.get(\"by_phase\", {}).items()"
+    },
+    {
+      "line": 294,
+      "end_line": 294,
+      "callee": "_group_phases",
+      "enclosing": "stage_token_bucket",
+      "expression": "_group_phases(token_snap)"
+    },
+    {
+      "line": 295,
+      "end_line": 295,
+      "callee": "_sum_buckets",
+      "enclosing": "stage_token_bucket",
+      "expression": "_sum_buckets([bucket for _, bucket in by_stage.get(step_id, [])])"
+    },
+    {
+      "line": 311,
+      "end_line": 311,
+      "callee": "_resolve_model",
+      "enclosing": "_rate_for",
+      "expression": "_resolve_model(role, role_models)"
+    },
+    {
+      "line": 314,
+      "end_line": 314,
+      "callee": "pricing.models.get",
+      "enclosing": "_rate_for",
+      "expression": "pricing.models.get(model_id)"
+    },
+    {
+      "line": 350,
+      "end_line": 350,
+      "callee": "STAGE_ROLES.get",
+      "enclosing": "_stage_entry",
+      "expression": "STAGE_ROLES.get(stage_id)"
+    },
+    {
+      "line": 369,
+      "end_line": 380,
+      "callee": "StageEntry",
+      "enclosing": "_stage_entry",
+      "expression": "StageEntry(\n        label=record[\"label\"] if record else \"\",\n        outcome=record[\"outcome\"] if record else _NOT_RUN,\n        duration_sec=record[\"duration_sec\"] if record else None,\n        tokens=tokens,\n        model=model,\n        cost_usd=cost,\n        cost_estimated=(stage_id in ESTIMATED_COST_STAGES\n                        or any(r in ESTIMATED_COST_ROLES and _has_tokens(b)\n                               for r, b in phases)),\n        cached_from_config_sha=cached_from_config_sha,\n    )"
+    },
+    {
+      "line": 388,
+      "end_line": 388,
+      "callee": "sum",
+      "enclosing": "_total_cost",
+      "expression": "sum(priced)"
+    },
+    {
+      "line": 394,
+      "end_line": 394,
+      "callee": "token_snap.get",
+      "enclosing": "_totals",
+      "expression": "token_snap.get(\"by_phase\", {})"
+    },
+    {
+      "line": 395,
+      "end_line": 395,
+      "callee": "_sum_buckets",
+      "enclosing": "_totals",
+      "expression": "_sum_buckets(list(by_phase.values()))"
+    },
+    {
+      "line": 397,
+      "end_line": 399,
+      "callee": "sum",
+      "enclosing": "_totals",
+      "expression": "sum(\n        b.get(\"cache_unparsed\", 0) for b in by_phase.values()\n        if isinstance(b.get(\"cache_unparsed\"), int))"
+    },
+    {
+      "line": 401,
+      "end_line": 404,
+      "callee": "_sum_buckets",
+      "enclosing": "_totals",
+      "expression": "_sum_buckets([\n        cast(TokenBucket, prov.get(\"tokens\") or {})\n        for prov in cached_provenance.values()\n    ])"
+    },
+    {
+      "line": 405,
+      "end_line": 422,
+      "callee": "Totals",
+      "enclosing": "_totals",
+      "expression": "Totals(\n        prompt_tokens=token_snap.get(\"prompt\", 0) + cached_carryover[\"prompt\"],\n        completion_tokens=(token_snap.get(\"completion\", 0)\n                           + cached_carryover[\"completion\"]),\n        total_tokens=(token_snap.get(\"total\", 0) + cached_carryover[\"prompt\"]\n                     + cached_carryover[\"completion\"]),\n        cache_read_tokens=(combined.get(\"cache_read\", 0)\n                          + cached_carryover[\"cache_read\"]),\n        cache_write_tokens=(combined.get(\"cache_write\", 0)\n                           + cached_carryover[\"cache_write\"]),\n        calls=token_snap.get(\"calls\", 0) + cached_carryover[\"calls\"],\n        calls_with_usage=token_snap.get(\"calls_with_usage\", 0),\n        completion_absent=token_snap.get(\"completion_absent\", 0),\n        cache_unparsed_calls=cache_unparsed_calls,\n        cost_usd=_total_cost(stages),\n        unattributed=unattributed,\n        cached_carryover=cached_carryover,\n    )"
+    },
+    {
+      "line": 428,
+      "end_line": 429,
+      "callee": "PricingProvenance",
+      "enclosing": "_provenance",
+      "expression": "PricingProvenance(file=pricing.path, sha256=pricing.sha256,\n                             source=pricing.source)"
+    },
+    {
+      "line": 436,
+      "end_line": 437,
+      "callee": "sorted",
+      "enclosing": "_pricing_status",
+      "expression": "sorted({entry[\"model\"] for entry in stages.values()\n                       if entry[\"cost_usd\"] is None and entry[\"model\"]})"
+    },
+    {
+      "line": 462,
+      "end_line": 462,
+      "callee": "_group_phases",
+      "enclosing": "compose_stage_section",
+      "expression": "_group_phases(token_snap)"
+    },
+    {
+      "line": 470,
+      "end_line": 474,
+      "callee": "StageSection",
+      "enclosing": "compose_stage_section",
+      "expression": "StageSection(stages=stages,\n                        totals=_totals(token_snap, stages, unattributed,\n                                       cached_provenance),\n                        pricing=_provenance(pricing),\n                        pricing_status=_pricing_status(stages, pricing))"
+    },
+    {
+      "line": 190,
+      "end_line": 190,
+      "callee": "threading.Lock",
+      "enclosing": "_StageRecorder.__init__",
+      "expression": "threading.Lock()"
+    },
+    {
+      "line": 237,
+      "end_line": 237,
+      "callee": "threading.Lock",
+      "enclosing": "_CachedProvenanceRecorder.__init__",
+      "expression": "threading.Lock()"
+    },
+    {
+      "line": 278,
+      "end_line": 278,
+      "callee": "PHASE_MAP.get",
+      "enclosing": "_group_phases",
+      "expression": "PHASE_MAP.get(phase)"
+    },
+    {
+      "line": 288,
+      "end_line": 288,
+      "callee": "by_stage.setdefault(stage_id, []).append",
+      "enclosing": "_group_phases",
+      "expression": "by_stage.setdefault(stage_id, []).append((role, bucket))"
+    },
+    {
+      "line": 304,
+      "end_line": 304,
+      "callee": "role_models.get",
+      "enclosing": "_resolve_model",
+      "expression": "role_models.get(r)"
+    },
+    {
+      "line": 325,
+      "end_line": 325,
+      "callee": "_rate_for",
+      "enclosing": "_stage_cost",
+      "expression": "_rate_for(role, role_models, pricing)"
+    },
+    {
+      "line": 339,
+      "end_line": 339,
+      "callee": "pricing.models.get",
+      "enclosing": "_provenance_cost",
+      "expression": "pricing.models.get(model_id)"
+    },
+    {
+      "line": 341,
+      "end_line": 341,
+      "callee": "bucket_cost_usd",
+      "enclosing": "_provenance_cost",
+      "expression": "bucket_cost_usd(bucket, rate, pricing.cache_defaults)"
+    },
+    {
+      "line": 342,
+      "end_line": 342,
+      "callee": "_has_tokens",
+      "enclosing": "_provenance_cost",
+      "expression": "_has_tokens(bucket)"
+    },
+    {
+      "line": 353,
+      "end_line": 353,
+      "callee": "provenance.get",
+      "enclosing": "_stage_entry",
+      "expression": "provenance.get(\"model\")"
+    },
+    {
+      "line": 355,
+      "end_line": 355,
+      "callee": "cast",
+      "enclosing": "_stage_entry",
+      "expression": "cast(TokenBucket, provenance.get(\"tokens\") or {})"
+    },
+    {
+      "line": 357,
+      "end_line": 357,
+      "callee": "_sum_buckets",
+      "enclosing": "_stage_entry",
+      "expression": "_sum_buckets([bucket for _, bucket in phases])"
+    },
+    {
+      "line": 358,
+      "end_line": 358,
+      "callee": "_sum_buckets",
+      "enclosing": "_stage_entry",
+      "expression": "_sum_buckets([raw_tokens, live_tokens])"
+    },
+    {
+      "line": 359,
+      "end_line": 359,
+      "callee": "_provenance_cost",
+      "enclosing": "_stage_entry",
+      "expression": "_provenance_cost(model, raw_tokens, pricing)"
+    },
+    {
+      "line": 360,
+      "end_line": 360,
+      "callee": "_stage_cost",
+      "enclosing": "_stage_entry",
+      "expression": "_stage_cost(phases, role_models, pricing)"
+    },
+    {
+      "line": 363,
+      "end_line": 363,
+      "callee": "provenance.get",
+      "enclosing": "_stage_entry",
+      "expression": "provenance.get(\"config_sha256\")"
+    },
+    {
+      "line": 365,
+      "end_line": 365,
+      "callee": "_resolve_model",
+      "enclosing": "_stage_entry",
+      "expression": "_resolve_model(role, role_models)"
+    },
+    {
+      "line": 366,
+      "end_line": 366,
+      "callee": "_sum_buckets",
+      "enclosing": "_stage_entry",
+      "expression": "_sum_buckets([bucket for _, bucket in phases])"
+    },
+    {
+      "line": 367,
+      "end_line": 367,
+      "callee": "_stage_cost",
+      "enclosing": "_stage_entry",
+      "expression": "_stage_cost(phases, role_models, pricing)"
+    },
+    {
+      "line": 386,
+      "end_line": 386,
+      "callee": "len",
+      "enclosing": "_total_cost",
+      "expression": "len(priced)"
+    },
+    {
+      "line": 386,
+      "end_line": 386,
+      "callee": "len",
+      "enclosing": "_total_cost",
+      "expression": "len(costs)"
+    },
+    {
+      "line": 395,
+      "end_line": 395,
+      "callee": "list",
+      "enclosing": "_totals",
+      "expression": "list(by_phase.values())"
+    },
+    {
+      "line": 448,
+      "end_line": 448,
+      "callee": "set",
+      "enclosing": "_ordered_stage_ids",
+      "expression": "set(stage_snap)"
+    },
+    {
+      "line": 448,
+      "end_line": 448,
+      "callee": "set",
+      "enclosing": "_ordered_stage_ids",
+      "expression": "set(by_stage)"
+    },
+    {
+      "line": 465,
+      "end_line": 467,
+      "callee": "_stage_entry",
+      "enclosing": "compose_stage_section",
+      "expression": "_stage_entry(stage_id, stage_snap.get(stage_id),\n                               by_stage.get(stage_id, []), role_models, pricing,\n                               cached_provenance.get(stage_id))"
+    },
+    {
+      "line": 196,
+      "end_line": 197,
+      "callee": "StageRecord",
+      "enclosing": "_StageRecorder.start",
+      "expression": "StageRecord(label=label, outcome=_RUNNING,\n                                                 duration_sec=None)"
+    },
+    {
+      "line": 203,
+      "end_line": 203,
+      "callee": "self._stages.get",
+      "enclosing": "_StageRecorder.done",
+      "expression": "self._stages.get(stage_id)"
+    },
+    {
+      "line": 214,
+      "end_line": 215,
+      "callee": "StageRecord",
+      "enclosing": "_StageRecorder.mark",
+      "expression": "StageRecord(label=label, outcome=outcome,\n                                                 duration_sec=None)"
+    },
+    {
+      "line": 250,
+      "end_line": 250,
+      "callee": "dict",
+      "enclosing": "_CachedProvenanceRecorder.snapshot",
+      "expression": "dict(self._entries)"
+    },
+    {
+      "line": 258,
+      "end_line": 258,
+      "callee": "sum",
+      "enclosing": "_sum_buckets",
+      "expression": "sum(b.get(\"prompt\", 0) for b in buckets)"
+    },
+    {
+      "line": 259,
+      "end_line": 259,
+      "callee": "sum",
+      "enclosing": "_sum_buckets",
+      "expression": "sum(b.get(\"completion\", 0) for b in buckets)"
+    },
+    {
+      "line": 260,
+      "end_line": 260,
+      "callee": "sum",
+      "enclosing": "_sum_buckets",
+      "expression": "sum(b.get(\"cache_read\", 0) for b in buckets)"
+    },
+    {
+      "line": 261,
+      "end_line": 261,
+      "callee": "sum",
+      "enclosing": "_sum_buckets",
+      "expression": "sum(b.get(\"cache_write\", 0) for b in buckets)"
+    },
+    {
+      "line": 262,
+      "end_line": 262,
+      "callee": "sum",
+      "enclosing": "_sum_buckets",
+      "expression": "sum(b.get(\"calls\", 0) for b in buckets)"
+    },
+    {
+      "line": 268,
+      "end_line": 268,
+      "callee": "bucket.get",
+      "enclosing": "_has_tokens",
+      "expression": "bucket.get(\"cache_read\", 0)"
+    },
+    {
+      "line": 277,
+      "end_line": 277,
+      "callee": "token_snap.get",
+      "enclosing": "_group_phases",
+      "expression": "token_snap.get(\"by_phase\", {})"
+    },
+    {
+      "line": 281,
+      "end_line": 281,
+      "callee": "bucket.get",
+      "enclosing": "_group_phases",
+      "expression": "bucket.get(\"prompt\", 0)"
+    },
+    {
+      "line": 282,
+      "end_line": 282,
+      "callee": "bucket.get",
+      "enclosing": "_group_phases",
+      "expression": "bucket.get(\"completion\", 0)"
+    },
+    {
+      "line": 283,
+      "end_line": 283,
+      "callee": "bucket.get",
+      "enclosing": "_group_phases",
+      "expression": "bucket.get(\"cache_read\", 0)"
+    },
+    {
+      "line": 284,
+      "end_line": 284,
+      "callee": "bucket.get",
+      "enclosing": "_group_phases",
+      "expression": "bucket.get(\"cache_write\", 0)"
+    },
+    {
+      "line": 285,
+      "end_line": 285,
+      "callee": "bucket.get",
+      "enclosing": "_group_phases",
+      "expression": "bucket.get(\"calls\", 0)"
+    },
+    {
+      "line": 303,
+      "end_line": 303,
+      "callee": "_ROLE_FALLBACKS.get",
+      "enclosing": "_resolve_model",
+      "expression": "_ROLE_FALLBACKS.get(role, ())"
+    },
+    {
+      "line": 328,
+      "end_line": 328,
+      "callee": "bucket_cost_usd",
+      "enclosing": "_stage_cost",
+      "expression": "bucket_cost_usd(bucket, rate, pricing.cache_defaults)"
+    },
+    {
+      "line": 329,
+      "end_line": 329,
+      "callee": "_has_tokens",
+      "enclosing": "_stage_cost",
+      "expression": "_has_tokens(bucket)"
+    },
+    {
+      "line": 384,
+      "end_line": 384,
+      "callee": "stages.values",
+      "enclosing": "_total_cost",
+      "expression": "stages.values()"
+    },
+    {
+      "line": 395,
+      "end_line": 395,
+      "callee": "by_phase.values",
+      "enclosing": "_totals",
+      "expression": "by_phase.values()"
+    },
+    {
+      "line": 398,
+      "end_line": 398,
+      "callee": "b.get",
+      "enclosing": "_totals",
+      "expression": "b.get(\"cache_unparsed\", 0)"
+    },
+    {
+      "line": 402,
+      "end_line": 402,
+      "callee": "cast",
+      "enclosing": "_totals",
+      "expression": "cast(TokenBucket, prov.get(\"tokens\") or {})"
+    },
+    {
+      "line": 416,
+      "end_line": 416,
+      "callee": "token_snap.get",
+      "enclosing": "_totals",
+      "expression": "token_snap.get(\"calls_with_usage\", 0)"
+    },
+    {
+      "line": 417,
+      "end_line": 417,
+      "callee": "token_snap.get",
+      "enclosing": "_totals",
+      "expression": "token_snap.get(\"completion_absent\", 0)"
+    },
+    {
+      "line": 419,
+      "end_line": 419,
+      "callee": "_total_cost",
+      "enclosing": "_totals",
+      "expression": "_total_cost(stages)"
+    },
+    {
+      "line": 465,
+      "end_line": 465,
+      "callee": "stage_snap.get",
+      "enclosing": "compose_stage_section",
+      "expression": "stage_snap.get(stage_id)"
+    },
+    {
+      "line": 466,
+      "end_line": 466,
+      "callee": "by_stage.get",
+      "enclosing": "compose_stage_section",
+      "expression": "by_stage.get(stage_id, [])"
+    },
+    {
+      "line": 467,
+      "end_line": 467,
+      "callee": "cached_provenance.get",
+      "enclosing": "compose_stage_section",
+      "expression": "cached_provenance.get(stage_id)"
+    },
+    {
+      "line": 468,
+      "end_line": 468,
+      "callee": "_ordered_stage_ids",
+      "enclosing": "compose_stage_section",
+      "expression": "_ordered_stage_ids(stage_snap, by_stage)"
+    },
+    {
+      "line": 471,
+      "end_line": 472,
+      "callee": "_totals",
+      "enclosing": "compose_stage_section",
+      "expression": "_totals(token_snap, stages, unattributed,\n                                       cached_provenance)"
+    },
+    {
+      "line": 473,
+      "end_line": 473,
+      "callee": "_provenance",
+      "enclosing": "compose_stage_section",
+      "expression": "_provenance(pricing)"
+    },
+    {
+      "line": 474,
+      "end_line": 474,
+      "callee": "_pricing_status",
+      "enclosing": "compose_stage_section",
+      "expression": "_pricing_status(stages, pricing)"
+    },
+    {
+      "line": 205,
+      "end_line": 206,
+      "callee": "StageRecord",
+      "enclosing": "_StageRecorder.done",
+      "expression": "StageRecord(label=\"\", outcome=outcome,\n                                     duration_sec=None)"
+    },
+    {
+      "line": 227,
+      "end_line": 227,
+      "callee": "_copy",
+      "enclosing": "_StageRecorder.snapshot",
+      "expression": "_copy(self._stages[s])"
+    },
+    {
+      "line": 267,
+      "end_line": 267,
+      "callee": "bucket.get",
+      "enclosing": "_has_tokens",
+      "expression": "bucket.get(\"prompt\", 0)"
+    },
+    {
+      "line": 267,
+      "end_line": 267,
+      "callee": "bucket.get",
+      "enclosing": "_has_tokens",
+      "expression": "bucket.get(\"completion\", 0)"
+    },
+    {
+      "line": 288,
+      "end_line": 288,
+      "callee": "by_stage.setdefault",
+      "enclosing": "_group_phases",
+      "expression": "by_stage.setdefault(stage_id, [])"
+    },
+    {
+      "line": 295,
+      "end_line": 295,
+      "callee": "by_stage.get",
+      "enclosing": "stage_token_bucket",
+      "expression": "by_stage.get(step_id, [])"
+    },
+    {
+      "line": 355,
+      "end_line": 355,
+      "callee": "provenance.get",
+      "enclosing": "_stage_entry",
+      "expression": "provenance.get(\"tokens\")"
+    },
+    {
+      "line": 377,
+      "end_line": 378,
+      "callee": "any",
+      "enclosing": "_stage_entry",
+      "expression": "any(r in ESTIMATED_COST_ROLES and _has_tokens(b)\n                               for r, b in phases)"
+    },
+    {
+      "line": 398,
+      "end_line": 398,
+      "callee": "by_phase.values",
+      "enclosing": "_totals",
+      "expression": "by_phase.values()"
+    },
+    {
+      "line": 399,
+      "end_line": 399,
+      "callee": "isinstance",
+      "enclosing": "_totals",
+      "expression": "isinstance(b.get(\"cache_unparsed\"), int)"
+    },
+    {
+      "line": 403,
+      "end_line": 403,
+      "callee": "cached_provenance.values",
+      "enclosing": "_totals",
+      "expression": "cached_provenance.values()"
+    },
+    {
+      "line": 406,
+      "end_line": 406,
+      "callee": "token_snap.get",
+      "enclosing": "_totals",
+      "expression": "token_snap.get(\"prompt\", 0)"
+    },
+    {
+      "line": 407,
+      "end_line": 407,
+      "callee": "token_snap.get",
+      "enclosing": "_totals",
+      "expression": "token_snap.get(\"completion\", 0)"
+    },
+    {
+      "line": 411,
+      "end_line": 411,
+      "callee": "combined.get",
+      "enclosing": "_totals",
+      "expression": "combined.get(\"cache_read\", 0)"
+    },
+    {
+      "line": 413,
+      "end_line": 413,
+      "callee": "combined.get",
+      "enclosing": "_totals",
+      "expression": "combined.get(\"cache_write\", 0)"
+    },
+    {
+      "line": 415,
+      "end_line": 415,
+      "callee": "token_snap.get",
+      "enclosing": "_totals",
+      "expression": "token_snap.get(\"calls\", 0)"
+    },
+    {
+      "line": 436,
+      "end_line": 436,
+      "callee": "stages.values",
+      "enclosing": "_pricing_status",
+      "expression": "stages.values()"
+    },
+    {
+      "line": 441,
+      "end_line": 441,
+      "callee": "', '.join",
+      "enclosing": "_pricing_status",
+      "expression": "\", \".join(unpriced)"
+    },
+    {
+      "line": 258,
+      "end_line": 258,
+      "callee": "b.get",
+      "enclosing": "_sum_buckets",
+      "expression": "b.get(\"prompt\", 0)"
+    },
+    {
+      "line": 259,
+      "end_line": 259,
+      "callee": "b.get",
+      "enclosing": "_sum_buckets",
+      "expression": "b.get(\"completion\", 0)"
+    },
+    {
+      "line": 260,
+      "end_line": 260,
+      "callee": "b.get",
+      "enclosing": "_sum_buckets",
+      "expression": "b.get(\"cache_read\", 0)"
+    },
+    {
+      "line": 261,
+      "end_line": 261,
+      "callee": "b.get",
+      "enclosing": "_sum_buckets",
+      "expression": "b.get(\"cache_write\", 0)"
+    },
+    {
+      "line": 262,
+      "end_line": 262,
+      "callee": "b.get",
+      "enclosing": "_sum_buckets",
+      "expression": "b.get(\"calls\", 0)"
+    },
+    {
+      "line": 399,
+      "end_line": 399,
+      "callee": "b.get",
+      "enclosing": "_totals",
+      "expression": "b.get(\"cache_unparsed\")"
+    },
+    {
+      "line": 402,
+      "end_line": 402,
+      "callee": "prov.get",
+      "enclosing": "_totals",
+      "expression": "prov.get(\"tokens\")"
+    },
+    {
+      "line": 409,
+      "end_line": 409,
+      "callee": "token_snap.get",
+      "enclosing": "_totals",
+      "expression": "token_snap.get(\"total\", 0)"
+    },
+    {
+      "line": 377,
+      "end_line": 377,
+      "callee": "_has_tokens",
+      "enclosing": "_stage_entry",
+      "expression": "_has_tokens(b)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 18,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "import threading",
+      "targets": [
+        "threading"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "from collections.abc import Mapping, Sequence",
+      "targets": [
+        "collections.abc",
+        "collections.abc.Mapping",
+        "collections.abc.Sequence"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "from typing import TYPE_CHECKING, TypedDict, cast",
+      "targets": [
+        "typing",
+        "typing.TYPE_CHECKING",
+        "typing.TypedDict",
+        "typing.cast"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 24,
+      "source_expression": "from vvaharness.util.pricing import ModelPricing, PricingTable, TokenBucket, bucket_cost_usd",
+      "targets": [
+        "vvaharness.util.pricing",
+        "vvaharness.util.pricing.ModelPricing",
+        "vvaharness.util.pricing.PricingTable",
+        "vvaharness.util.pricing.TokenBucket",
+        "vvaharness.util.pricing.bucket_cost_usd"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/pricing.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 32,
+      "source_expression": "from vvaharness.orchestrator.checkpoints import StageProvenance",
+      "targets": [
+        "vvaharness.orchestrator.checkpoints",
+        "vvaharness.orchestrator.checkpoints.StageProvenance"
+      ],
+      "local_source_paths": [
+        "vvaharness/orchestrator/checkpoints.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

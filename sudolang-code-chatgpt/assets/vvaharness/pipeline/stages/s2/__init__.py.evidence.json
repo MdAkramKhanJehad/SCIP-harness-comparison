@@ -1,0 +1,3053 @@
+{
+  "source": "vvaharness/pipeline/stages/s2/__init__.py",
+  "sha256": "6588bdc580de5f7f56360b1d771b253b9f983459c829fd7f16557db8e2107e0d",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\n\"\"\"Step 2 — the application threat model, reasoned over s1's mapped attack surface.\"\"\"\nfrom __future__ import annotations\nfrom vvaharness.util import logs\n\nimport re\nfrom pathlib import Path\n\n# Module import keeps the monkeypatch seam for tests.\nfrom langchain.agents.middleware import TodoListMiddleware\n\nfrom vvaharness.backends.harness.deepagents.evidence_gate import EvidenceGate\nfrom vvaharness.backends.harness.deepagents.tool_budget import ToolCallBudget\nfrom vvaharness.backends.llm import deepagents as _deepagents\nfrom vvaharness.backends.llm.models import (\n    RESPONSE_MODEL_VIAS,\n    refusal_resend_allowed,\n    validate_detection_tools,\n)\nfrom vvaharness.backends.llm.registry import resolve\nfrom vvaharness.codegraph.build import graph_is_degenerate\nfrom vvaharness.codegraph.tools import (\n    GRAPH_TOOL_NAMES,\n    build_graph_tool_builder,\n    graph_tool_names,\n)\nfrom vvaharness.evidence import (\n    ThreatEvidence,\n    _cap_int,\n    gather,\n    render_api_artefacts_block,\n    render_components_block,\n    render_config_reps_block,\n    render_docs_block,\n    render_entry_points_block,\n    render_inventory_block,\n    render_language_block,\n    render_manifests_block,\n    render_modules_block,\n)\nfrom vvaharness.models import (\n    CVE,\n    AppProfile,\n    ContextPackage,\n    Control,\n    Threat,\n    ThreatModel,\n    _cap_assets,\n    _cap_boundaries,\n    _cap_threats,\n)\nfrom vvaharness.pipeline.stages.s2_planning import (\n    PLAN_SYSTEM_PROMPT as S2_PLAN_SYSTEM_PROMPT,\n)\nfrom vvaharness.pipeline.stages.s2_planning import (\n    PLAN_TOOL_DESCRIPTION as S2_PLAN_TOOL_DESCRIPTION,\n)\nfrom vvaharness.report.redact import redact\nfrom vvaharness.rules.repo_kinds import BASELINES, STRIDE_BY_KIND, repo_kind\nfrom vvaharness.scope import resolve_inventory_path\nfrom vvaharness.skills import inject_skills\nfrom vvaharness.util import console\nfrom vvaharness.util import errlog as _errlog\nfrom vvaharness.util.config import knob\nfrom vvaharness.util.counters import COUNTERS\nfrom vvaharness.util.json_extract import extract_json\nfrom vvaharness.util.response_quality import dispatch_or_retry_unforced\nfrom vvaharness.util.warn_once import warn_once\n\nlog = logs.get_logger(__name__)\n\n\nfrom vvaharness.pipeline.stages.s2.baseline import (\n    _BASELINE_EVIDENCE_RX,\n    _baseline_audit,\n    _category_covered_elsewhere,\n    _category_terms,\n    _required_baselines,\n)\nfrom vvaharness.pipeline.stages.s2.outcomes import (\n    _finalize_threats,\n    _parse_threat_model,\n    _warn_output_caps,\n)\nfrom vvaharness.pipeline.stages.s2.prompts import (\n    SYSTEM,\n    _AGENTIC_SYSTEM_LINE,\n    _GRAPH_TOOLS_SYSTEM_LINE,\n    _baseline_block,\n    _build_user_prompt,\n    _repair_json_prompt,\n)\nfrom vvaharness.pipeline.stages.replay import (\n    RecordTranscript,\n    Transcript,\n    replay_prompt,\n    run_with_deadline,\n)\nfrom vvaharness.pipeline.stages.s2.session import (\n    _DISPATCH_TAG,\n    _WARNED_DEGENERATE_GRAPH,\n    _WARNED_NO_GRAPH_TOOLS,\n    _graph_tool_route_ok,\n    _retry_if_hollow,\n    _threatmodel_call,\n)\nfrom vvaharness.util.events import Event\n\n__all__ = [\"RecordTranscript\", \"SYSTEM\", \"Transcript\", \"gather\", \"replay_prompt\",\n           \"run\", \"run_with_deadline\"]\n\n\ndef run(repo_root: str, repo_name: str, cfg,\n        known_cves: list[CVE], controls: list[Control],\n        ctx: ContextPackage | None = None,\n        app_profile: AppProfile | None = None) -> ThreatModel:\n    s2 = getattr(cfg, \"step2\", None)\n    tracker = getattr(cfg, \"_scan_progress\", None)\n    log.info(\"s2/threatmodel: starting threat modeling for %s\", repo_name)\n    if ctx is not None:\n        log.debug(\"s2/threatmodel: context has_ast_view=%s files=%d\",\n                  hasattr(ctx, 'ast_context_view'), len(getattr(ctx, 'all_files', []) or []))\n    ev = gather(repo_root, cfg, ctx)\n    note = console.counts(\"s2\", \"evidence\", files=ev.file_count, modules=len(ev.modules),\n                          entry_points=len(ev.entry_points), config_reps=len(ev.config_reps),\n                          api_artefacts=len(ev.api_artefacts), docs=len(ev.docs),\n                          manifests=len(ev.manifests))\n    if tracker is not None:\n        tracker.stage_note(\"s2\", f\"evidence {note}\")\n    console.write(f\"  [s2] frontier: {ev.file_count} / {ev.original_file_count} files \"\n                  f\"(AST-focused evidence view)\")\n\n    baseline_mode = getattr(s2, \"baseline\", \"auto\")\n    kinds, baseline = _baseline_block(ev, ctx, baseline_mode)\n    COUNTERS.note(\"s2_repo_kinds\", \",\".join(sorted(kinds)))\n    console.write(f\"  [s2] baseline={baseline_mode} repo_kind={sorted(kinds) or '-'}\")\n\n    user = _build_user_prompt(repo_name, ev, known_cves, controls,\n                              app_profile=app_profile,\n                              baseline_block=baseline)\n    if tracker is not None:\n        tracker.stage_note(\"s2\", \"threat-model LLM request started\")\n\n    effort = getattr(s2, \"effort\", None) or None\n    try:\n        # A memoised model or manual thinking can still drop forced tool_choice (a session may\n        # end on prose), and the tier's thinking shares step2.max_tokens: either failure gets\n        # one resend without it\n        raw = dispatch_or_retry_unforced(\n            lambda *, drop_thinking: _threatmodel_call(user, cfg, repo_root, ctx,\n                                                       drop_thinking=drop_thinking,\n                                                       require_tool_call=ev.file_count > 0),\n            repo_name, stage=\"s2\",\n            effort=_deepagents.droppable_effort(cfg.models.threatmodel, effort, agentic=True),\n            may_retry=lambda: bool(getattr(s2, \"empty_retry\", True)),\n            resend_refusal=refusal_resend_allowed(cfg, cfg.models.threatmodel))\n    except Exception as e:\n        # Record-then-raise, never swallow: swallowing reads as a stage that merely found\n        # nothing. One record even after a failed retry (one bad reply != two failures).\n        log.error(Event.S2_CALL_FAILED, detail=redact(str(e)))\n        _errlog.log(\"s2\", repo_name, e, reason=\"threat_model_call_failed\")\n        raise\n    if tracker is not None:\n        tracker.stage_note(\"s2\", \"threat-model LLM response received\")\n\n    try:\n        tm = _parse_threat_model(raw)\n    except Exception as parse_err:\n        # Repair keeps the full step2 caps: it re-emits the FULL model, so a smaller cap truncates\n        console.write(f\"  [s2] threat-model response did not parse, retrying repair \"\n                      f\"— {parse_err}\")\n        # Deliberately NOT errlogged: a non-zero errors_by_stage reads as degraded; counter instead\n        COUNTERS.bump(\"s2_parse_repair_attempted\")\n        repaired = None\n        try:\n            # Same dispatch seam: the registry has no deepagents backend, so registry.prompt raises\n            repaired = _deepagents.dispatch_prompt(\n                _repair_json_prompt(raw, parse_err),\n                model=cfg.models.threatmodel,\n                cfg=cfg,\n                cwd=repo_root,\n                system_prompt=SYSTEM,\n                max_tokens=getattr(s2, \"max_tokens\", 64000),\n                timeout=_cap_int(s2, \"timeout\", 1800),\n                tag=\"s2 threatmodel json-repair\",\n            )\n            tm = _parse_threat_model(repaired)\n        except Exception as e:\n            # No threat model != found nothing: the raise makes the orchestrator bump s2_degraded\n            log.error(Event.S2_RESPONSE_UNPARSEABLE, detail=str(e))\n            # redact the FULL text BEFORE the [:500] cut, or capping first leaks a bisected secret\n            _errlog.log(\"s2\", repo_name, e,\n                        reason=\"threat_model_parse_failed\",\n                        raw_head=redact((repaired if repaired is not None\n                                         else raw) or \"\")[:500],\n                        note=\"s2 JSON extraction or model validation failed \"\n                             \"after one repair retry; s3–s8 will receive no \"\n                             \"threat context\")\n            raise\n        COUNTERS.bump(\"s2_parse_repair_recovered\")\n        log.warning(Event.S2_PARSE_REPAIR_RECOVERED)\n\n    _finalize_threats(tm, ctx)\n\n    tm = _retry_if_hollow(tm, ev, user, cfg, repo_root, ctx)\n\n    if not tm.threats:                    # success path, not inside an except —\n        # DELIBERATELY UNMARKED: the only signal of a vacuous reply; completed_with_errors is meant\n        _errlog.log(\n            \"s2\", \"threatmodel\",\n            \"zero threats — s3's per-threat annotator has nothing to \"\n            \"annotate; the run proceeds with no threat-derived targeting\",\n        )\n        if ev.file_count > 0:\n            # Becomes Metrics.s2_degraded; a zero-file repo stays un-bumped, nothing to model\n            COUNTERS.bump(\"s2_degraded\")\n\n    # Audit BEFORE the cap: baseline threats are low-likelihood, so they rank last and truncate\n    undisposed = _baseline_audit(tm, kinds)\n\n    max_threats = _cap_int(s2, \"max_threats\", 50)\n    max_assets = _cap_int(s2, \"max_assets\", 40)\n    max_boundaries = _cap_int(s2, \"max_trust_boundaries\", 60)\n    raw_counts = (len(tm.threats), len(tm.assets), len(tm.trust_boundaries))\n    tm = _cap_threats(tm, max_threats)\n    tm = _cap_assets(tm, max_assets)\n    tm = _cap_boundaries(tm, max_boundaries)\n    _warn_output_caps(raw_counts, tm, (max_threats, max_assets, max_boundaries))\n\n    # A count tells an operator nothing actionable; the ids themselves do.\n    COUNTERS.note(\"s2_baseline_undisposed\", \",\".join(sorted(undisposed)))\n    if undisposed:\n        # The ids NOT undisposed are available to cover an undisposed id's alias\n        disposed = _required_baselines(kinds) - set(undisposed)\n        # ALL covered elsewhere is a note; a PARTIAL match must not be marked recovered=True\n        all_covered_elsewhere = all(\n            _category_covered_elsewhere(bid, tm.threats, disposed=disposed)\n            for bid in undisposed)\n        if all_covered_elsewhere:\n            _errlog.log(\"s2\", repo_name, \"baseline items undisposed\",\n                        reason=\"baseline_items_undisposed\",\n                        baseline_ids=sorted(undisposed),\n                        recovered=True)\n            COUNTERS.bump(\"s2_baseline_undisposed_recovered\")\n        else:\n            # DELIBERATELY UNMARKED: s3 targets units off baseline threats, so this is a real gap\n            _errlog.log(\"s2\", repo_name, \"baseline items undisposed\",\n                        reason=\"baseline_items_undisposed\",\n                        baseline_ids=sorted(undisposed))\n        log.warning(Event.S2_BASELINE_UNDISPOSED, count=len(undisposed),\n                    baseline_ids=sorted(undisposed),\n                    covered_elsewhere=all_covered_elsewhere)\n\n    console.counts(\"s2\", \"done\", assets=len(tm.assets),\n                   trust_boundaries=len(tm.trust_boundaries), threats=len(tm.threats))\n    log.info(\"s2/threatmodel: threat model complete - assets=%d boundaries=%d threats=%d\",\n             len(tm.assets), len(tm.trust_boundaries), len(tm.threats))\n    return tm\n",
+  "literals": {
+    "source_literal_16_0": {
+      "source": "vvaharness/pipeline/stages/s2/__init__.py",
+      "line_start": 16,
+      "line_end": 16,
+      "value": "Step 2 — the application threat model, reasoned over s1's mapped attack surface.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_143_33": {
+      "source": "vvaharness/pipeline/stages/s2/__init__.py",
+      "line_start": 143,
+      "line_end": 143,
+      "source_expression": "f\"evidence {note}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_144_18": {
+      "source": "vvaharness/pipeline/stages/s2/__init__.py",
+      "line_start": 144,
+      "line_end": 145,
+      "source_expression": "f\"  [s2] frontier: {ev.file_count} / {ev.original_file_count} files \"\n                  f\"(AST-focused evidence view)\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_150_18": {
+      "source": "vvaharness/pipeline/stages/s2/__init__.py",
+      "line_start": 150,
+      "line_end": 150,
+      "source_expression": "f\"  [s2] baseline={baseline_mode} repo_kind={sorted(kinds) or '-'}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_184_22": {
+      "source": "vvaharness/pipeline/stages/s2/__init__.py",
+      "line_start": 184,
+      "line_end": 185,
+      "source_expression": "f\"  [s2] threat-model response did not parse, retrying repair \"\n                      f\"— {parse_err}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "value": "Step 2 — the application threat model, reasoned over s1's mapped attack surface.",
+      "context": "literal"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 11,
+      "value": "RecordTranscript",
+      "context": "literal"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 31,
+      "value": "SYSTEM",
+      "context": "literal"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 41,
+      "value": "Transcript",
+      "context": "literal"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 55,
+      "value": "gather",
+      "context": "literal"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 65,
+      "value": "replay_prompt",
+      "context": "literal"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 11,
+      "value": "run",
+      "context": "literal"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 18,
+      "value": "run_with_deadline",
+      "context": "literal"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 22,
+      "value": "step2",
+      "context": "literal"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 27,
+      "value": "_scan_progress",
+      "context": "literal"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 13,
+      "value": "s2/threatmodel: starting threat modeling for %s",
+      "context": "literal"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 26,
+      "value": "s2",
+      "context": "literal"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 32,
+      "value": "evidence",
+      "context": "literal"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 32,
+      "value": "baseline",
+      "context": "literal"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 44,
+      "value": "auto",
+      "context": "literal"
+    },
+    {
+      "line_start": 149,
+      "line_end": 149,
+      "column": 18,
+      "value": "s2_repo_kinds",
+      "context": "literal"
+    },
+    {
+      "line_start": 235,
+      "line_end": 235,
+      "column": 31,
+      "value": "max_threats",
+      "context": "literal"
+    },
+    {
+      "line_start": 236,
+      "line_end": 236,
+      "column": 30,
+      "value": "max_assets",
+      "context": "literal"
+    },
+    {
+      "line_start": 237,
+      "line_end": 237,
+      "column": 34,
+      "value": "max_trust_boundaries",
+      "context": "literal"
+    },
+    {
+      "line_start": 245,
+      "line_end": 245,
+      "column": 18,
+      "value": "s2_baseline_undisposed",
+      "context": "literal"
+    },
+    {
+      "line_start": 268,
+      "line_end": 268,
+      "column": 19,
+      "value": "s2",
+      "context": "literal"
+    },
+    {
+      "line_start": 268,
+      "line_end": 268,
+      "column": 25,
+      "value": "done",
+      "context": "literal"
+    },
+    {
+      "line_start": 270,
+      "line_end": 270,
+      "column": 13,
+      "value": "s2/threatmodel: threat model complete - assets=%d boundaries=%d threats=%d",
+      "context": "literal"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 18,
+      "value": "s2/threatmodel: context has_ast_view=%s files=%d",
+      "context": "literal"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 27,
+      "value": "s2",
+      "context": "literal"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 20,
+      "value": "  [s2] frontier: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 52,
+      "value": " / ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 144,
+      "line_end": 145,
+      "column": 79,
+      "value": " files (AST-focused evidence view)",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 20,
+      "value": "  [s2] baseline=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 51,
+      "value": " repo_kind=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 156,
+      "line_end": 156,
+      "column": 27,
+      "value": "s2",
+      "context": "literal"
+    },
+    {
+      "line_start": 156,
+      "line_end": 156,
+      "column": 33,
+      "value": "threat-model LLM request started",
+      "context": "literal"
+    },
+    {
+      "line_start": 158,
+      "line_end": 158,
+      "column": 25,
+      "value": "effort",
+      "context": "literal"
+    },
+    {
+      "line_start": 178,
+      "line_end": 178,
+      "column": 27,
+      "value": "s2",
+      "context": "literal"
+    },
+    {
+      "line_start": 178,
+      "line_end": 178,
+      "column": 33,
+      "value": "threat-model LLM response received",
+      "context": "literal"
+    },
+    {
+      "line_start": 224,
+      "line_end": 224,
+      "column": 12,
+      "value": "s2",
+      "context": "literal"
+    },
+    {
+      "line_start": 224,
+      "line_end": 224,
+      "column": 18,
+      "value": "threatmodel",
+      "context": "literal"
+    },
+    {
+      "line_start": 225,
+      "line_end": 226,
+      "column": 12,
+      "value": "zero threats — s3's per-threat annotator has nothing to annotate; the run proceeds with no threat-derived targeting",
+      "context": "literal"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 31,
+      "value": "ast_context_view",
+      "context": "literal"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 35,
+      "value": "evidence ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 149,
+      "line_end": 149,
+      "column": 35,
+      "value": ",",
+      "context": "literal"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 29,
+      "value": "s2",
+      "context": "literal"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 20,
+      "value": "s2",
+      "context": "literal"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 22,
+      "value": "s2_parse_repair_attempted",
+      "context": "literal"
+    },
+    {
+      "line_start": 214,
+      "line_end": 214,
+      "column": 22,
+      "value": "s2_parse_repair_recovered",
+      "context": "literal"
+    },
+    {
+      "line_start": 230,
+      "line_end": 230,
+      "column": 26,
+      "value": "s2_degraded",
+      "context": "literal"
+    },
+    {
+      "line_start": 245,
+      "line_end": 245,
+      "column": 44,
+      "value": ",",
+      "context": "literal"
+    },
+    {
+      "line_start": 254,
+      "line_end": 254,
+      "column": 24,
+      "value": "s2",
+      "context": "literal"
+    },
+    {
+      "line_start": 254,
+      "line_end": 254,
+      "column": 41,
+      "value": "baseline items undisposed",
+      "context": "literal"
+    },
+    {
+      "line_start": 258,
+      "line_end": 258,
+      "column": 26,
+      "value": "s2_baseline_undisposed_recovered",
+      "context": "literal"
+    },
+    {
+      "line_start": 261,
+      "line_end": 261,
+      "column": 24,
+      "value": "s2",
+      "context": "literal"
+    },
+    {
+      "line_start": 261,
+      "line_end": 261,
+      "column": 41,
+      "value": "baseline items undisposed",
+      "context": "literal"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 80,
+      "value": "-",
+      "context": "literal"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 47,
+      "value": "threat_model_call_failed",
+      "context": "literal"
+    },
+    {
+      "line_start": 184,
+      "line_end": 185,
+      "column": 24,
+      "value": "  [s2] threat-model response did not parse, retrying repair — ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 255,
+      "line_end": 255,
+      "column": 31,
+      "value": "baseline_items_undisposed",
+      "context": "literal"
+    },
+    {
+      "line_start": 262,
+      "line_end": 262,
+      "column": 31,
+      "value": "baseline_items_undisposed",
+      "context": "literal"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 69,
+      "value": "all_files",
+      "context": "literal"
+    },
+    {
+      "line_start": 199,
+      "line_end": 199,
+      "column": 20,
+      "value": "s2 threatmodel json-repair",
+      "context": "literal"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 24,
+      "value": "s2",
+      "context": "literal"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 47,
+      "value": "empty_retry",
+      "context": "literal"
+    },
+    {
+      "line_start": 197,
+      "line_end": 197,
+      "column": 39,
+      "value": "max_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 198,
+      "line_end": 198,
+      "column": 37,
+      "value": "timeout",
+      "context": "literal"
+    },
+    {
+      "line_start": 207,
+      "line_end": 207,
+      "column": 31,
+      "value": "threat_model_parse_failed",
+      "context": "literal"
+    },
+    {
+      "line_start": 210,
+      "line_end": 212,
+      "column": 29,
+      "value": "s2 JSON extraction or model validation failed after one repair retry; s3–s8 will receive no threat context",
+      "context": "literal"
+    },
+    {
+      "line_start": 209,
+      "line_end": 209,
+      "column": 54,
+      "value": "",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 23,
+      "text": "# Module import keeps the monkeypatch seam for tests."
+    },
+    {
+      "line": 160,
+      "text": "# A memoised model or manual thinking can still drop forced tool_choice (a session may"
+    },
+    {
+      "line": 161,
+      "text": "# end on prose), and the tier's thinking shares step2.max_tokens: either failure gets"
+    },
+    {
+      "line": 162,
+      "text": "# one resend without it"
+    },
+    {
+      "line": 172,
+      "text": "# Record-then-raise, never swallow: swallowing reads as a stage that merely found"
+    },
+    {
+      "line": 173,
+      "text": "# nothing. One record even after a failed retry (one bad reply != two failures)."
+    },
+    {
+      "line": 183,
+      "text": "# Repair keeps the full step2 caps: it re-emits the FULL model, so a smaller cap truncates"
+    },
+    {
+      "line": 186,
+      "text": "# Deliberately NOT errlogged: a non-zero errors_by_stage reads as degraded; counter instead"
+    },
+    {
+      "line": 190,
+      "text": "# Same dispatch seam: the registry has no deepagents backend, so registry.prompt raises"
+    },
+    {
+      "line": 203,
+      "text": "# No threat model != found nothing: the raise makes the orchestrator bump s2_degraded"
+    },
+    {
+      "line": 205,
+      "text": "# redact the FULL text BEFORE the [:500] cut, or capping first leaks a bisected secret"
+    },
+    {
+      "line": 221,
+      "text": "# success path, not inside an except —"
+    },
+    {
+      "line": 222,
+      "text": "# DELIBERATELY UNMARKED: the only signal of a vacuous reply; completed_with_errors is meant"
+    },
+    {
+      "line": 229,
+      "text": "# Becomes Metrics.s2_degraded; a zero-file repo stays un-bumped, nothing to model"
+    },
+    {
+      "line": 232,
+      "text": "# Audit BEFORE the cap: baseline threats are low-likelihood, so they rank last and truncate"
+    },
+    {
+      "line": 244,
+      "text": "# A count tells an operator nothing actionable; the ids themselves do."
+    },
+    {
+      "line": 247,
+      "text": "# The ids NOT undisposed are available to cover an undisposed id's alias"
+    },
+    {
+      "line": 249,
+      "text": "# ALL covered elsewhere is a note; a PARTIAL match must not be marked recovered=True"
+    },
+    {
+      "line": 260,
+      "text": "# DELIBERATELY UNMARKED: s3 targets units off baseline threats, so this is a real gap"
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 18,
+      "line_end": 18,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 26,
+      "line_end": 26,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 27,
+      "line_end": 27,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 28,
+      "line_end": 28,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 29,
+      "line_end": 33,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 34,
+      "line_end": 34,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 35,
+      "line_end": 35,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 36,
+      "line_end": 40,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 41,
+      "line_end": 54,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 55,
+      "line_end": 65,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 66,
+      "line_end": 68,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 69,
+      "line_end": 71,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 72,
+      "line_end": 72,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 73,
+      "line_end": 73,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 74,
+      "line_end": 74,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 75,
+      "line_end": 75,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 10
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 76,
+      "line_end": 76,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 10
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 77,
+      "line_end": 77,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 10
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 78,
+      "line_end": 78,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 10
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 79,
+      "line_end": 79,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 10
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 80,
+      "line_end": 80,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 12
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 81,
+      "line_end": 81,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 12
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 82,
+      "line_end": 82,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 12
+    },
+    {
+      "kind": "Assign",
+      "line_start": 84,
+      "line_end": 84,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 12
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 87,
+      "line_end": 93,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 12
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 94,
+      "line_end": 98,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 14
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 99,
+      "line_end": 106,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 14
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 107,
+      "line_end": 112,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 14
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 113,
+      "line_end": 120,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 14
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 121,
+      "line_end": 121,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 14
+    },
+    {
+      "kind": "Assign",
+      "line_start": 123,
+      "line_end": 124,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 16
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 127,
+      "line_end": 272,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 17
+    },
+    {
+      "kind": "Assign",
+      "line_start": 131,
+      "line_end": 131,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 23
+    },
+    {
+      "kind": "Assign",
+      "line_start": 132,
+      "line_end": 132,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 23
+    },
+    {
+      "kind": "Expr",
+      "line_start": 133,
+      "line_end": 133,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 23
+    },
+    {
+      "kind": "If",
+      "line_start": 134,
+      "line_end": 136,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 24
+    },
+    {
+      "kind": "Expr",
+      "line_start": 135,
+      "line_end": 136,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 27
+    },
+    {
+      "kind": "Assign",
+      "line_start": 137,
+      "line_end": 137,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 30
+    },
+    {
+      "kind": "Assign",
+      "line_start": 138,
+      "line_end": 141,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 30
+    },
+    {
+      "kind": "If",
+      "line_start": 142,
+      "line_end": 143,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 31
+    },
+    {
+      "kind": "Expr",
+      "line_start": 143,
+      "line_end": 143,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 34
+    },
+    {
+      "kind": "Expr",
+      "line_start": 144,
+      "line_end": 145,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 37
+    },
+    {
+      "kind": "Assign",
+      "line_start": 147,
+      "line_end": 147,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 37
+    },
+    {
+      "kind": "Assign",
+      "line_start": 148,
+      "line_end": 148,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 37
+    },
+    {
+      "kind": "Expr",
+      "line_start": 149,
+      "line_end": 149,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 37
+    },
+    {
+      "kind": "Expr",
+      "line_start": 150,
+      "line_end": 150,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 37
+    },
+    {
+      "kind": "Assign",
+      "line_start": 152,
+      "line_end": 154,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 39
+    },
+    {
+      "kind": "If",
+      "line_start": 155,
+      "line_end": 156,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 40
+    },
+    {
+      "kind": "Expr",
+      "line_start": 156,
+      "line_end": 156,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 43
+    },
+    {
+      "kind": "Assign",
+      "line_start": 158,
+      "line_end": 158,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 46
+    },
+    {
+      "kind": "Try",
+      "line_start": 159,
+      "line_end": 176,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 47
+    },
+    {
+      "kind": "Assign",
+      "line_start": 163,
+      "line_end": 170,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 50
+    },
+    {
+      "kind": "Expr",
+      "line_start": 174,
+      "line_end": 174,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 55
+    },
+    {
+      "kind": "Expr",
+      "line_start": 175,
+      "line_end": 175,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 55
+    },
+    {
+      "kind": "Raise",
+      "line_start": 176,
+      "line_end": 176,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 56
+    },
+    {
+      "kind": "If",
+      "line_start": 177,
+      "line_end": 178,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 59
+    },
+    {
+      "kind": "Expr",
+      "line_start": 178,
+      "line_end": 178,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 62
+    },
+    {
+      "kind": "Try",
+      "line_start": 180,
+      "line_end": 215,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 64
+    },
+    {
+      "kind": "Assign",
+      "line_start": 181,
+      "line_end": 181,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 67
+    },
+    {
+      "kind": "Expr",
+      "line_start": 184,
+      "line_end": 185,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 72
+    },
+    {
+      "kind": "Expr",
+      "line_start": 187,
+      "line_end": 187,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 72
+    },
+    {
+      "kind": "Assign",
+      "line_start": 188,
+      "line_end": 188,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 72
+    },
+    {
+      "kind": "Try",
+      "line_start": 189,
+      "line_end": 213,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 73
+    },
+    {
+      "kind": "Assign",
+      "line_start": 191,
+      "line_end": 200,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 76
+    },
+    {
+      "kind": "Assign",
+      "line_start": 201,
+      "line_end": 201,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 76
+    },
+    {
+      "kind": "Expr",
+      "line_start": 204,
+      "line_end": 204,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 81
+    },
+    {
+      "kind": "Expr",
+      "line_start": 206,
+      "line_end": 212,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 81
+    },
+    {
+      "kind": "Raise",
+      "line_start": 213,
+      "line_end": 213,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 82
+    },
+    {
+      "kind": "Expr",
+      "line_start": 214,
+      "line_end": 214,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 86
+    },
+    {
+      "kind": "Expr",
+      "line_start": 215,
+      "line_end": 215,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 86
+    },
+    {
+      "kind": "Expr",
+      "line_start": 217,
+      "line_end": 217,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 89
+    },
+    {
+      "kind": "Assign",
+      "line_start": 219,
+      "line_end": 219,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 89
+    },
+    {
+      "kind": "If",
+      "line_start": 221,
+      "line_end": 230,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 90
+    },
+    {
+      "kind": "Expr",
+      "line_start": 223,
+      "line_end": 227,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 93
+    },
+    {
+      "kind": "If",
+      "line_start": 228,
+      "line_end": 230,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 94
+    },
+    {
+      "kind": "Expr",
+      "line_start": 230,
+      "line_end": 230,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 97
+    },
+    {
+      "kind": "Assign",
+      "line_start": 233,
+      "line_end": 233,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 101
+    },
+    {
+      "kind": "Assign",
+      "line_start": 235,
+      "line_end": 235,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 101
+    },
+    {
+      "kind": "Assign",
+      "line_start": 236,
+      "line_end": 236,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 101
+    },
+    {
+      "kind": "Assign",
+      "line_start": 237,
+      "line_end": 237,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 101
+    },
+    {
+      "kind": "Assign",
+      "line_start": 238,
+      "line_end": 238,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 101
+    },
+    {
+      "kind": "Assign",
+      "line_start": 239,
+      "line_end": 239,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 103
+    },
+    {
+      "kind": "Assign",
+      "line_start": 240,
+      "line_end": 240,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 103
+    },
+    {
+      "kind": "Assign",
+      "line_start": 241,
+      "line_end": 241,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 103
+    },
+    {
+      "kind": "Expr",
+      "line_start": 242,
+      "line_end": 242,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 103
+    },
+    {
+      "kind": "Expr",
+      "line_start": 245,
+      "line_end": 245,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 103
+    },
+    {
+      "kind": "If",
+      "line_start": 246,
+      "line_end": 266,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 104
+    },
+    {
+      "kind": "Assign",
+      "line_start": 248,
+      "line_end": 248,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 107
+    },
+    {
+      "kind": "Assign",
+      "line_start": 250,
+      "line_end": 252,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 107
+    },
+    {
+      "kind": "If",
+      "line_start": 253,
+      "line_end": 263,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 108
+    },
+    {
+      "kind": "Expr",
+      "line_start": 254,
+      "line_end": 257,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 111
+    },
+    {
+      "kind": "Expr",
+      "line_start": 258,
+      "line_end": 258,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 111
+    },
+    {
+      "kind": "Expr",
+      "line_start": 261,
+      "line_end": 263,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 115
+    },
+    {
+      "kind": "Expr",
+      "line_start": 264,
+      "line_end": 266,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 118
+    },
+    {
+      "kind": "Expr",
+      "line_start": 268,
+      "line_end": 269,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 121
+    },
+    {
+      "kind": "Expr",
+      "line_start": 270,
+      "line_end": 271,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 121
+    },
+    {
+      "kind": "Return",
+      "line_start": 272,
+      "line_end": 272,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 122
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 84,
+      "line_end": 84,
+      "column": 6,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='logs', ctx=Load()), attr='get_logger', ctx=Load()), args=[Name(id='__name__', ctx=Load())], keywords=[])",
+      "rendered": "logs.get_logger(__name__)"
+    },
+    {
+      "line_start": 123,
+      "line_end": 124,
+      "column": 10,
+      "kind": "List",
+      "original_ast": "List(elts=[Constant(value='RecordTranscript'), Constant(value='SYSTEM'), Constant(value='Transcript'), Constant(value='gather'), Constant(value='replay_prompt'), Constant(value='run'), Constant(value='run_with_deadline')], ctx=Load())",
+      "rendered": "['RecordTranscript', 'SYSTEM', 'Transcript', 'gather', 'replay_prompt', 'run', 'run_with_deadline']"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='cfg', ctx=Load()), Constant(value='step2'), Constant(value=None)], keywords=[])",
+      "rendered": "getattr(cfg, 'step2', None)"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='cfg', ctx=Load()), Constant(value='_scan_progress'), Constant(value=None)], keywords=[])",
+      "rendered": "getattr(cfg, '_scan_progress', None)"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='info', ctx=Load()), args=[Constant(value='s2/threatmodel: starting threat modeling for %s'), Name(id='repo_name', ctx=Load())], keywords=[])",
+      "rendered": "log.info('s2/threatmodel: starting threat modeling for %s', repo_name)"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='ctx', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "ctx is not None"
+    },
+    {
+      "line_start": 135,
+      "line_end": 136,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='debug', ctx=Load()), args=[Constant(value='s2/threatmodel: context has_ast_view=%s files=%d'), Call(func=Name(id='hasattr', ctx=Load()), args=[Name(id='ctx', ctx=Load()), Constant(value='ast_context_view')], keywords=[]), Call(func=Name(id='len', ctx=Load()), args=[BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='ctx', ctx=Load()), Constant(value='all_files'), List(elts=[], ctx=Load())], keywords=[]), List(elts=[], ctx=Load())])], keywords=[])], keywords=[])",
+      "rendered": "log.debug('s2/threatmodel: context has_ast_view=%s files=%d', hasattr(ctx, 'ast_context_view'), len(getattr(ctx, 'all_files', []) or []))"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='gather', ctx=Load()), args=[Name(id='repo_root', ctx=Load()), Name(id='cfg', ctx=Load()), Name(id='ctx', ctx=Load())], keywords=[])",
+      "rendered": "gather(repo_root, cfg, ctx)"
+    },
+    {
+      "line_start": 138,
+      "line_end": 141,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='counts', ctx=Load()), args=[Constant(value='s2'), Constant(value='evidence')], keywords=[keyword(arg='files', value=Attribute(value=Name(id='ev', ctx=Load()), attr='file_count', ctx=Load())), keyword(arg='modules', value=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='ev', ctx=Load()), attr='modules', ctx=Load())], keywords=[])), keyword(arg='entry_points', value=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='ev', ctx=Load()), attr='entry_points', ctx=Load())], keywords=[])), keyword(arg='config_reps', value=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='ev', ctx=Load()), attr='config_reps', ctx=Load())], keywords=[])), keyword(arg='api_artefacts', value=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='ev', ctx=Load()), attr='api_artefacts', ctx=Load())], keywords=[])), keyword(arg='docs', value=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='ev', ctx=Load()), attr='docs', ctx=Load())], keywords=[])), keyword(arg='manifests', value=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='ev', ctx=Load()), attr='manifests', ctx=Load())], keywords=[]))])",
+      "rendered": "console.counts('s2', 'evidence', files=ev.file_count, modules=len(ev.modules), entry_points=len(ev.entry_points), config_reps=len(ev.config_reps), api_artefacts=len(ev.api_artefacts), docs=len(ev.docs), manifests=len(ev.manifests))"
+    },
+    {
+      "line_start": 142,
+      "line_end": 142,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='tracker', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "tracker is not None"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='tracker', ctx=Load()), attr='stage_note', ctx=Load()), args=[Constant(value='s2'), JoinedStr(values=[Constant(value='evidence '), FormattedValue(value=Name(id='note', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "tracker.stage_note('s2', source_template_143_33)"
+    },
+    {
+      "line_start": 144,
+      "line_end": 145,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='  [s2] frontier: '), FormattedValue(value=Attribute(value=Name(id='ev', ctx=Load()), attr='file_count', ctx=Load()), conversion=-1), Constant(value=' / '), FormattedValue(value=Attribute(value=Name(id='ev', ctx=Load()), attr='original_file_count', ctx=Load()), conversion=-1), Constant(value=' files (AST-focused evidence view)')])], keywords=[])",
+      "rendered": "console.write(source_template_144_18)"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='baseline'), Constant(value='auto')], keywords=[])",
+      "rendered": "getattr(s2, 'baseline', 'auto')"
+    },
+    {
+      "line_start": 148,
+      "line_end": 148,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_baseline_block', ctx=Load()), args=[Name(id='ev', ctx=Load()), Name(id='ctx', ctx=Load()), Name(id='baseline_mode', ctx=Load())], keywords=[])",
+      "rendered": "_baseline_block(ev, ctx, baseline_mode)"
+    },
+    {
+      "line_start": 149,
+      "line_end": 149,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='note', ctx=Load()), args=[Constant(value='s2_repo_kinds'), Call(func=Attribute(value=Constant(value=','), attr='join', ctx=Load()), args=[Call(func=Name(id='sorted', ctx=Load()), args=[Name(id='kinds', ctx=Load())], keywords=[])], keywords=[])], keywords=[])",
+      "rendered": "COUNTERS.note('s2_repo_kinds', ','.join(sorted(kinds)))"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='  [s2] baseline='), FormattedValue(value=Name(id='baseline_mode', ctx=Load()), conversion=-1), Constant(value=' repo_kind='), FormattedValue(value=BoolOp(op=Or(), values=[Call(func=Name(id='sorted', ctx=Load()), args=[Name(id='kinds', ctx=Load())], keywords=[]), Constant(value='-')]), conversion=-1)])], keywords=[])",
+      "rendered": "console.write(source_template_150_18)"
+    },
+    {
+      "line_start": 152,
+      "line_end": 154,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_build_user_prompt', ctx=Load()), args=[Name(id='repo_name', ctx=Load()), Name(id='ev', ctx=Load()), Name(id='known_cves', ctx=Load()), Name(id='controls', ctx=Load())], keywords=[keyword(arg='app_profile', value=Name(id='app_profile', ctx=Load())), keyword(arg='baseline_block', value=Name(id='baseline', ctx=Load()))])",
+      "rendered": "_build_user_prompt(repo_name, ev, known_cves, controls, app_profile=app_profile, baseline_block=baseline)"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='tracker', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "tracker is not None"
+    },
+    {
+      "line_start": 156,
+      "line_end": 156,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='tracker', ctx=Load()), attr='stage_note', ctx=Load()), args=[Constant(value='s2'), Constant(value='threat-model LLM request started')], keywords=[])",
+      "rendered": "tracker.stage_note('s2', 'threat-model LLM request started')"
+    },
+    {
+      "line_start": 158,
+      "line_end": 158,
+      "column": 13,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='effort'), Constant(value=None)], keywords=[]), Constant(value=None)])",
+      "rendered": "getattr(s2, 'effort', None) or None"
+    },
+    {
+      "line_start": 163,
+      "line_end": 170,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dispatch_or_retry_unforced', ctx=Load()), args=[Lambda(args=arguments(posonlyargs=[], args=[], kwonlyargs=[arg(arg='drop_thinking')], kw_defaults=[None], defaults=[]), body=Call(func=Name(id='_threatmodel_call', ctx=Load()), args=[Name(id='user', ctx=Load()), Name(id='cfg', ctx=Load()), Name(id='repo_root', ctx=Load()), Name(id='ctx', ctx=Load())], keywords=[keyword(arg='drop_thinking', value=Name(id='drop_thinking', ctx=Load())), keyword(arg='require_tool_call', value=Compare(left=Attribute(value=Name(id='ev', ctx=Load()), attr='file_count', ctx=Load()), ops=[Gt()], comparators=[Constant(value=0)]))])), Name(id='repo_name', ctx=Load())], keywords=[keyword(arg='stage', value=Constant(value='s2')), keyword(arg='effort', value=Call(func=Attribute(value=Name(id='_deepagents', ctx=Load()), attr='droppable_effort', ctx=Load()), args=[Attribute(value=Attribute(value=Name(id='cfg', ctx=Load()), attr='models', ctx=Load()), attr='threatmodel', ctx=Load()), Name(id='effort', ctx=Load())], keywords=[keyword(arg='agentic', value=Constant(value=True))])), keyword(arg='may_retry', value=Lambda(args=arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]), body=Call(func=Name(id='bool', ctx=Load()), args=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='empty_retry'), Constant(value=True)], keywords=[])], keywords=[]))), keyword(arg='resend_refusal', value=Call(func=Name(id='refusal_resend_allowed', ctx=Load()), args=[Name(id='cfg', ctx=Load()), Attribute(value=Attribute(value=Name(id='cfg', ctx=Load()), attr='models', ctx=Load()), attr='threatmodel', ctx=Load())], keywords=[]))])",
+      "rendered": "dispatch_or_retry_unforced(lambda *, drop_thinking: _threatmodel_call(user, cfg, repo_root, ctx, drop_thinking=drop_thinking, require_tool_call=ev.file_count > 0), repo_name, stage='s2', effort=_deepagents.droppable_effort(cfg.models.threatmodel, effort, agentic=True), may_retry=lambda: bool(getattr(s2, 'empty_retry', True)), resend_refusal=refusal_resend_allowed(cfg, cfg.models.threatmodel))"
+    },
+    {
+      "line_start": 171,
+      "line_end": 171,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='error', ctx=Load()), args=[Attribute(value=Name(id='Event', ctx=Load()), attr='S2_CALL_FAILED', ctx=Load())], keywords=[keyword(arg='detail', value=Call(func=Name(id='redact', ctx=Load()), args=[Call(func=Name(id='str', ctx=Load()), args=[Name(id='e', ctx=Load())], keywords=[])], keywords=[]))])",
+      "rendered": "log.error(Event.S2_CALL_FAILED, detail=redact(str(e)))"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_errlog', ctx=Load()), attr='log', ctx=Load()), args=[Constant(value='s2'), Name(id='repo_name', ctx=Load()), Name(id='e', ctx=Load())], keywords=[keyword(arg='reason', value=Constant(value='threat_model_call_failed'))])",
+      "rendered": "_errlog.log('s2', repo_name, e, reason='threat_model_call_failed')"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='tracker', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "tracker is not None"
+    },
+    {
+      "line_start": 178,
+      "line_end": 178,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='tracker', ctx=Load()), attr='stage_note', ctx=Load()), args=[Constant(value='s2'), Constant(value='threat-model LLM response received')], keywords=[])",
+      "rendered": "tracker.stage_note('s2', 'threat-model LLM response received')"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_parse_threat_model', ctx=Load()), args=[Name(id='raw', ctx=Load())], keywords=[])",
+      "rendered": "_parse_threat_model(raw)"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 184,
+      "line_end": 185,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='  [s2] threat-model response did not parse, retrying repair — '), FormattedValue(value=Name(id='parse_err', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "console.write(source_template_184_22)"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Constant(value='s2_parse_repair_attempted')], keywords=[])",
+      "rendered": "COUNTERS.bump('s2_parse_repair_attempted')"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 191,
+      "line_end": 200,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_deepagents', ctx=Load()), attr='dispatch_prompt', ctx=Load()), args=[Call(func=Name(id='_repair_json_prompt', ctx=Load()), args=[Name(id='raw', ctx=Load()), Name(id='parse_err', ctx=Load())], keywords=[])], keywords=[keyword(arg='model', value=Attribute(value=Attribute(value=Name(id='cfg', ctx=Load()), attr='models', ctx=Load()), attr='threatmodel', ctx=Load())), keyword(arg='cfg', value=Name(id='cfg', ctx=Load())), keyword(arg='cwd', value=Name(id='repo_root', ctx=Load())), keyword(arg='system_prompt', value=Name(id='SYSTEM', ctx=Load())), keyword(arg='max_tokens', value=Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='max_tokens'), Constant(value=64000)], keywords=[])), keyword(arg='timeout', value=Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='timeout'), Constant(value=1800)], keywords=[])), keyword(arg='tag', value=Constant(value='s2 threatmodel json-repair'))])",
+      "rendered": "_deepagents.dispatch_prompt(_repair_json_prompt(raw, parse_err), model=cfg.models.threatmodel, cfg=cfg, cwd=repo_root, system_prompt=SYSTEM, max_tokens=getattr(s2, 'max_tokens', 64000), timeout=_cap_int(s2, 'timeout', 1800), tag='s2 threatmodel json-repair')"
+    },
+    {
+      "line_start": 201,
+      "line_end": 201,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_parse_threat_model', ctx=Load()), args=[Name(id='repaired', ctx=Load())], keywords=[])",
+      "rendered": "_parse_threat_model(repaired)"
+    },
+    {
+      "line_start": 202,
+      "line_end": 202,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 204,
+      "line_end": 204,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='error', ctx=Load()), args=[Attribute(value=Name(id='Event', ctx=Load()), attr='S2_RESPONSE_UNPARSEABLE', ctx=Load())], keywords=[keyword(arg='detail', value=Call(func=Name(id='str', ctx=Load()), args=[Name(id='e', ctx=Load())], keywords=[]))])",
+      "rendered": "log.error(Event.S2_RESPONSE_UNPARSEABLE, detail=str(e))"
+    },
+    {
+      "line_start": 206,
+      "line_end": 212,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_errlog', ctx=Load()), attr='log', ctx=Load()), args=[Constant(value='s2'), Name(id='repo_name', ctx=Load()), Name(id='e', ctx=Load())], keywords=[keyword(arg='reason', value=Constant(value='threat_model_parse_failed')), keyword(arg='raw_head', value=Subscript(value=Call(func=Name(id='redact', ctx=Load()), args=[BoolOp(op=Or(), values=[IfExp(test=Compare(left=Name(id='repaired', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), body=Name(id='repaired', ctx=Load()), orelse=Name(id='raw', ctx=Load())), Constant(value='')])], keywords=[]), slice=Slice(upper=Constant(value=500)), ctx=Load())), keyword(arg='note', value=Constant(value='s2 JSON extraction or model validation failed after one repair retry; s3–s8 will receive no threat context'))])",
+      "rendered": "_errlog.log('s2', repo_name, e, reason='threat_model_parse_failed', raw_head=redact((repaired if repaired is not None else raw) or '')[:500], note='s2 JSON extraction or model validation failed after one repair retry; s3–s8 will receive no threat context')"
+    },
+    {
+      "line_start": 214,
+      "line_end": 214,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Constant(value='s2_parse_repair_recovered')], keywords=[])",
+      "rendered": "COUNTERS.bump('s2_parse_repair_recovered')"
+    },
+    {
+      "line_start": 215,
+      "line_end": 215,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Attribute(value=Name(id='Event', ctx=Load()), attr='S2_PARSE_REPAIR_RECOVERED', ctx=Load())], keywords=[])",
+      "rendered": "log.warning(Event.S2_PARSE_REPAIR_RECOVERED)"
+    },
+    {
+      "line_start": 217,
+      "line_end": 217,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_finalize_threats', ctx=Load()), args=[Name(id='tm', ctx=Load()), Name(id='ctx', ctx=Load())], keywords=[])",
+      "rendered": "_finalize_threats(tm, ctx)"
+    },
+    {
+      "line_start": 219,
+      "line_end": 219,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_retry_if_hollow', ctx=Load()), args=[Name(id='tm', ctx=Load()), Name(id='ev', ctx=Load()), Name(id='user', ctx=Load()), Name(id='cfg', ctx=Load()), Name(id='repo_root', ctx=Load()), Name(id='ctx', ctx=Load())], keywords=[])",
+      "rendered": "_retry_if_hollow(tm, ev, user, cfg, repo_root, ctx)"
+    },
+    {
+      "line_start": 221,
+      "line_end": 221,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Attribute(value=Name(id='tm', ctx=Load()), attr='threats', ctx=Load()))",
+      "rendered": "not tm.threats"
+    },
+    {
+      "line_start": 223,
+      "line_end": 227,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_errlog', ctx=Load()), attr='log', ctx=Load()), args=[Constant(value='s2'), Constant(value='threatmodel'), Constant(value=\"zero threats — s3's per-threat annotator has nothing to annotate; the run proceeds with no threat-derived targeting\")], keywords=[])",
+      "rendered": "_errlog.log('s2', 'threatmodel', \"zero threats — s3's per-threat annotator has nothing to annotate; the run proceeds with no threat-derived targeting\")"
+    },
+    {
+      "line_start": 228,
+      "line_end": 228,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='ev', ctx=Load()), attr='file_count', ctx=Load()), ops=[Gt()], comparators=[Constant(value=0)])",
+      "rendered": "ev.file_count > 0"
+    },
+    {
+      "line_start": 230,
+      "line_end": 230,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Constant(value='s2_degraded')], keywords=[])",
+      "rendered": "COUNTERS.bump('s2_degraded')"
+    },
+    {
+      "line_start": 233,
+      "line_end": 233,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_baseline_audit', ctx=Load()), args=[Name(id='tm', ctx=Load()), Name(id='kinds', ctx=Load())], keywords=[])",
+      "rendered": "_baseline_audit(tm, kinds)"
+    },
+    {
+      "line_start": 235,
+      "line_end": 235,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='max_threats'), Constant(value=50)], keywords=[])",
+      "rendered": "_cap_int(s2, 'max_threats', 50)"
+    },
+    {
+      "line_start": 236,
+      "line_end": 236,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='max_assets'), Constant(value=40)], keywords=[])",
+      "rendered": "_cap_int(s2, 'max_assets', 40)"
+    },
+    {
+      "line_start": 237,
+      "line_end": 237,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_cap_int', ctx=Load()), args=[Name(id='s2', ctx=Load()), Constant(value='max_trust_boundaries'), Constant(value=60)], keywords=[])",
+      "rendered": "_cap_int(s2, 'max_trust_boundaries', 60)"
+    },
+    {
+      "line_start": 238,
+      "line_end": 238,
+      "column": 17,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='tm', ctx=Load()), attr='threats', ctx=Load())], keywords=[]), Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='tm', ctx=Load()), attr='assets', ctx=Load())], keywords=[]), Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='tm', ctx=Load()), attr='trust_boundaries', ctx=Load())], keywords=[])], ctx=Load())",
+      "rendered": "(len(tm.threats), len(tm.assets), len(tm.trust_boundaries))"
+    },
+    {
+      "line_start": 239,
+      "line_end": 239,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_cap_threats', ctx=Load()), args=[Name(id='tm', ctx=Load()), Name(id='max_threats', ctx=Load())], keywords=[])",
+      "rendered": "_cap_threats(tm, max_threats)"
+    },
+    {
+      "line_start": 240,
+      "line_end": 240,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_cap_assets', ctx=Load()), args=[Name(id='tm', ctx=Load()), Name(id='max_assets', ctx=Load())], keywords=[])",
+      "rendered": "_cap_assets(tm, max_assets)"
+    },
+    {
+      "line_start": 241,
+      "line_end": 241,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_cap_boundaries', ctx=Load()), args=[Name(id='tm', ctx=Load()), Name(id='max_boundaries', ctx=Load())], keywords=[])",
+      "rendered": "_cap_boundaries(tm, max_boundaries)"
+    },
+    {
+      "line_start": 242,
+      "line_end": 242,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_warn_output_caps', ctx=Load()), args=[Name(id='raw_counts', ctx=Load()), Name(id='tm', ctx=Load()), Tuple(elts=[Name(id='max_threats', ctx=Load()), Name(id='max_assets', ctx=Load()), Name(id='max_boundaries', ctx=Load())], ctx=Load())], keywords=[])",
+      "rendered": "_warn_output_caps(raw_counts, tm, (max_threats, max_assets, max_boundaries))"
+    },
+    {
+      "line_start": 245,
+      "line_end": 245,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='note', ctx=Load()), args=[Constant(value='s2_baseline_undisposed'), Call(func=Attribute(value=Constant(value=','), attr='join', ctx=Load()), args=[Call(func=Name(id='sorted', ctx=Load()), args=[Name(id='undisposed', ctx=Load())], keywords=[])], keywords=[])], keywords=[])",
+      "rendered": "COUNTERS.note('s2_baseline_undisposed', ','.join(sorted(undisposed)))"
+    },
+    {
+      "line_start": 246,
+      "line_end": 246,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='undisposed', ctx=Load())",
+      "rendered": "undisposed"
+    },
+    {
+      "line_start": 248,
+      "line_end": 248,
+      "column": 19,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Name(id='_required_baselines', ctx=Load()), args=[Name(id='kinds', ctx=Load())], keywords=[]), op=Sub(), right=Call(func=Name(id='set', ctx=Load()), args=[Name(id='undisposed', ctx=Load())], keywords=[]))",
+      "rendered": "_required_baselines(kinds) - set(undisposed)"
+    },
+    {
+      "line_start": 250,
+      "line_end": 252,
+      "column": 32,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='all', ctx=Load()), args=[GeneratorExp(elt=Call(func=Name(id='_category_covered_elsewhere', ctx=Load()), args=[Name(id='bid', ctx=Load()), Attribute(value=Name(id='tm', ctx=Load()), attr='threats', ctx=Load())], keywords=[keyword(arg='disposed', value=Name(id='disposed', ctx=Load()))]), generators=[comprehension(target=Name(id='bid', ctx=Store()), iter=Name(id='undisposed', ctx=Load()), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "all((_category_covered_elsewhere(bid, tm.threats, disposed=disposed) for bid in undisposed))"
+    },
+    {
+      "line_start": 253,
+      "line_end": 253,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='all_covered_elsewhere', ctx=Load())",
+      "rendered": "all_covered_elsewhere"
+    },
+    {
+      "line_start": 254,
+      "line_end": 257,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_errlog', ctx=Load()), attr='log', ctx=Load()), args=[Constant(value='s2'), Name(id='repo_name', ctx=Load()), Constant(value='baseline items undisposed')], keywords=[keyword(arg='reason', value=Constant(value='baseline_items_undisposed')), keyword(arg='baseline_ids', value=Call(func=Name(id='sorted', ctx=Load()), args=[Name(id='undisposed', ctx=Load())], keywords=[])), keyword(arg='recovered', value=Constant(value=True))])",
+      "rendered": "_errlog.log('s2', repo_name, 'baseline items undisposed', reason='baseline_items_undisposed', baseline_ids=sorted(undisposed), recovered=True)"
+    },
+    {
+      "line_start": 258,
+      "line_end": 258,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Constant(value='s2_baseline_undisposed_recovered')], keywords=[])",
+      "rendered": "COUNTERS.bump('s2_baseline_undisposed_recovered')"
+    },
+    {
+      "line_start": 261,
+      "line_end": 263,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_errlog', ctx=Load()), attr='log', ctx=Load()), args=[Constant(value='s2'), Name(id='repo_name', ctx=Load()), Constant(value='baseline items undisposed')], keywords=[keyword(arg='reason', value=Constant(value='baseline_items_undisposed')), keyword(arg='baseline_ids', value=Call(func=Name(id='sorted', ctx=Load()), args=[Name(id='undisposed', ctx=Load())], keywords=[]))])",
+      "rendered": "_errlog.log('s2', repo_name, 'baseline items undisposed', reason='baseline_items_undisposed', baseline_ids=sorted(undisposed))"
+    },
+    {
+      "line_start": 264,
+      "line_end": 266,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Attribute(value=Name(id='Event', ctx=Load()), attr='S2_BASELINE_UNDISPOSED', ctx=Load())], keywords=[keyword(arg='count', value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='undisposed', ctx=Load())], keywords=[])), keyword(arg='baseline_ids', value=Call(func=Name(id='sorted', ctx=Load()), args=[Name(id='undisposed', ctx=Load())], keywords=[])), keyword(arg='covered_elsewhere', value=Name(id='all_covered_elsewhere', ctx=Load()))])",
+      "rendered": "log.warning(Event.S2_BASELINE_UNDISPOSED, count=len(undisposed), baseline_ids=sorted(undisposed), covered_elsewhere=all_covered_elsewhere)"
+    },
+    {
+      "line_start": 268,
+      "line_end": 269,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='counts', ctx=Load()), args=[Constant(value='s2'), Constant(value='done')], keywords=[keyword(arg='assets', value=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='tm', ctx=Load()), attr='assets', ctx=Load())], keywords=[])), keyword(arg='trust_boundaries', value=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='tm', ctx=Load()), attr='trust_boundaries', ctx=Load())], keywords=[])), keyword(arg='threats', value=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='tm', ctx=Load()), attr='threats', ctx=Load())], keywords=[]))])",
+      "rendered": "console.counts('s2', 'done', assets=len(tm.assets), trust_boundaries=len(tm.trust_boundaries), threats=len(tm.threats))"
+    },
+    {
+      "line_start": 270,
+      "line_end": 271,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='info', ctx=Load()), args=[Constant(value='s2/threatmodel: threat model complete - assets=%d boundaries=%d threats=%d'), Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='tm', ctx=Load()), attr='assets', ctx=Load())], keywords=[]), Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='tm', ctx=Load()), attr='trust_boundaries', ctx=Load())], keywords=[]), Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='tm', ctx=Load()), attr='threats', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "log.info('s2/threatmodel: threat model complete - assets=%d boundaries=%d threats=%d', len(tm.assets), len(tm.trust_boundaries), len(tm.threats))"
+    },
+    {
+      "line_start": 272,
+      "line_end": 272,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='tm', ctx=Load())",
+      "rendered": "tm"
+    }
+  ],
+  "calls": [
+    {
+      "line": 84,
+      "end_line": 84,
+      "callee": "logs.get_logger",
+      "enclosing": "module initialization",
+      "expression": "logs.get_logger(__name__)"
+    },
+    {
+      "line": 131,
+      "end_line": 131,
+      "callee": "getattr",
+      "enclosing": "run",
+      "expression": "getattr(cfg, \"step2\", None)"
+    },
+    {
+      "line": 132,
+      "end_line": 132,
+      "callee": "getattr",
+      "enclosing": "run",
+      "expression": "getattr(cfg, \"_scan_progress\", None)"
+    },
+    {
+      "line": 133,
+      "end_line": 133,
+      "callee": "log.info",
+      "enclosing": "run",
+      "expression": "log.info(\"s2/threatmodel: starting threat modeling for %s\", repo_name)"
+    },
+    {
+      "line": 137,
+      "end_line": 137,
+      "callee": "gather",
+      "enclosing": "run",
+      "expression": "gather(repo_root, cfg, ctx)"
+    },
+    {
+      "line": 138,
+      "end_line": 141,
+      "callee": "console.counts",
+      "enclosing": "run",
+      "expression": "console.counts(\"s2\", \"evidence\", files=ev.file_count, modules=len(ev.modules),\n                          entry_points=len(ev.entry_points), config_reps=len(ev.config_reps),\n                          api_artefacts=len(ev.api_artefacts), docs=len(ev.docs),\n                          manifests=len(ev.manifests))"
+    },
+    {
+      "line": 144,
+      "end_line": 145,
+      "callee": "console.write",
+      "enclosing": "run",
+      "expression": "console.write(f\"  [s2] frontier: {ev.file_count} / {ev.original_file_count} files \"\n                  f\"(AST-focused evidence view)\")"
+    },
+    {
+      "line": 147,
+      "end_line": 147,
+      "callee": "getattr",
+      "enclosing": "run",
+      "expression": "getattr(s2, \"baseline\", \"auto\")"
+    },
+    {
+      "line": 148,
+      "end_line": 148,
+      "callee": "_baseline_block",
+      "enclosing": "run",
+      "expression": "_baseline_block(ev, ctx, baseline_mode)"
+    },
+    {
+      "line": 149,
+      "end_line": 149,
+      "callee": "COUNTERS.note",
+      "enclosing": "run",
+      "expression": "COUNTERS.note(\"s2_repo_kinds\", \",\".join(sorted(kinds)))"
+    },
+    {
+      "line": 150,
+      "end_line": 150,
+      "callee": "console.write",
+      "enclosing": "run",
+      "expression": "console.write(f\"  [s2] baseline={baseline_mode} repo_kind={sorted(kinds) or '-'}\")"
+    },
+    {
+      "line": 152,
+      "end_line": 154,
+      "callee": "_build_user_prompt",
+      "enclosing": "run",
+      "expression": "_build_user_prompt(repo_name, ev, known_cves, controls,\n                              app_profile=app_profile,\n                              baseline_block=baseline)"
+    },
+    {
+      "line": 217,
+      "end_line": 217,
+      "callee": "_finalize_threats",
+      "enclosing": "run",
+      "expression": "_finalize_threats(tm, ctx)"
+    },
+    {
+      "line": 219,
+      "end_line": 219,
+      "callee": "_retry_if_hollow",
+      "enclosing": "run",
+      "expression": "_retry_if_hollow(tm, ev, user, cfg, repo_root, ctx)"
+    },
+    {
+      "line": 233,
+      "end_line": 233,
+      "callee": "_baseline_audit",
+      "enclosing": "run",
+      "expression": "_baseline_audit(tm, kinds)"
+    },
+    {
+      "line": 235,
+      "end_line": 235,
+      "callee": "_cap_int",
+      "enclosing": "run",
+      "expression": "_cap_int(s2, \"max_threats\", 50)"
+    },
+    {
+      "line": 236,
+      "end_line": 236,
+      "callee": "_cap_int",
+      "enclosing": "run",
+      "expression": "_cap_int(s2, \"max_assets\", 40)"
+    },
+    {
+      "line": 237,
+      "end_line": 237,
+      "callee": "_cap_int",
+      "enclosing": "run",
+      "expression": "_cap_int(s2, \"max_trust_boundaries\", 60)"
+    },
+    {
+      "line": 239,
+      "end_line": 239,
+      "callee": "_cap_threats",
+      "enclosing": "run",
+      "expression": "_cap_threats(tm, max_threats)"
+    },
+    {
+      "line": 240,
+      "end_line": 240,
+      "callee": "_cap_assets",
+      "enclosing": "run",
+      "expression": "_cap_assets(tm, max_assets)"
+    },
+    {
+      "line": 241,
+      "end_line": 241,
+      "callee": "_cap_boundaries",
+      "enclosing": "run",
+      "expression": "_cap_boundaries(tm, max_boundaries)"
+    },
+    {
+      "line": 242,
+      "end_line": 242,
+      "callee": "_warn_output_caps",
+      "enclosing": "run",
+      "expression": "_warn_output_caps(raw_counts, tm, (max_threats, max_assets, max_boundaries))"
+    },
+    {
+      "line": 245,
+      "end_line": 245,
+      "callee": "COUNTERS.note",
+      "enclosing": "run",
+      "expression": "COUNTERS.note(\"s2_baseline_undisposed\", \",\".join(sorted(undisposed)))"
+    },
+    {
+      "line": 268,
+      "end_line": 269,
+      "callee": "console.counts",
+      "enclosing": "run",
+      "expression": "console.counts(\"s2\", \"done\", assets=len(tm.assets),\n                   trust_boundaries=len(tm.trust_boundaries), threats=len(tm.threats))"
+    },
+    {
+      "line": 270,
+      "end_line": 271,
+      "callee": "log.info",
+      "enclosing": "run",
+      "expression": "log.info(\"s2/threatmodel: threat model complete - assets=%d boundaries=%d threats=%d\",\n             len(tm.assets), len(tm.trust_boundaries), len(tm.threats))"
+    },
+    {
+      "line": 135,
+      "end_line": 136,
+      "callee": "log.debug",
+      "enclosing": "run",
+      "expression": "log.debug(\"s2/threatmodel: context has_ast_view=%s files=%d\",\n                  hasattr(ctx, 'ast_context_view'), len(getattr(ctx, 'all_files', []) or []))"
+    },
+    {
+      "line": 143,
+      "end_line": 143,
+      "callee": "tracker.stage_note",
+      "enclosing": "run",
+      "expression": "tracker.stage_note(\"s2\", f\"evidence {note}\")"
+    },
+    {
+      "line": 149,
+      "end_line": 149,
+      "callee": "','.join",
+      "enclosing": "run",
+      "expression": "\",\".join(sorted(kinds))"
+    },
+    {
+      "line": 156,
+      "end_line": 156,
+      "callee": "tracker.stage_note",
+      "enclosing": "run",
+      "expression": "tracker.stage_note(\"s2\", \"threat-model LLM request started\")"
+    },
+    {
+      "line": 158,
+      "end_line": 158,
+      "callee": "getattr",
+      "enclosing": "run",
+      "expression": "getattr(s2, \"effort\", None)"
+    },
+    {
+      "line": 163,
+      "end_line": 170,
+      "callee": "dispatch_or_retry_unforced",
+      "enclosing": "run",
+      "expression": "dispatch_or_retry_unforced(\n            lambda *, drop_thinking: _threatmodel_call(user, cfg, repo_root, ctx,\n                                                       drop_thinking=drop_thinking,\n                                                       require_tool_call=ev.file_count > 0),\n            repo_name, stage=\"s2\",\n            effort=_deepagents.droppable_effort(cfg.models.threatmodel, effort, agentic=True),\n            may_retry=lambda: bool(getattr(s2, \"empty_retry\", True)),\n            resend_refusal=refusal_resend_allowed(cfg, cfg.models.threatmodel))"
+    },
+    {
+      "line": 178,
+      "end_line": 178,
+      "callee": "tracker.stage_note",
+      "enclosing": "run",
+      "expression": "tracker.stage_note(\"s2\", \"threat-model LLM response received\")"
+    },
+    {
+      "line": 181,
+      "end_line": 181,
+      "callee": "_parse_threat_model",
+      "enclosing": "run",
+      "expression": "_parse_threat_model(raw)"
+    },
+    {
+      "line": 223,
+      "end_line": 227,
+      "callee": "_errlog.log",
+      "enclosing": "run",
+      "expression": "_errlog.log(\n            \"s2\", \"threatmodel\",\n            \"zero threats — s3's per-threat annotator has nothing to \"\n            \"annotate; the run proceeds with no threat-derived targeting\",\n        )"
+    },
+    {
+      "line": 238,
+      "end_line": 238,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(tm.threats)"
+    },
+    {
+      "line": 238,
+      "end_line": 238,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(tm.assets)"
+    },
+    {
+      "line": 238,
+      "end_line": 238,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(tm.trust_boundaries)"
+    },
+    {
+      "line": 245,
+      "end_line": 245,
+      "callee": "','.join",
+      "enclosing": "run",
+      "expression": "\",\".join(sorted(undisposed))"
+    },
+    {
+      "line": 250,
+      "end_line": 252,
+      "callee": "all",
+      "enclosing": "run",
+      "expression": "all(\n            _category_covered_elsewhere(bid, tm.threats, disposed=disposed)\n            for bid in undisposed)"
+    },
+    {
+      "line": 264,
+      "end_line": 266,
+      "callee": "log.warning",
+      "enclosing": "run",
+      "expression": "log.warning(Event.S2_BASELINE_UNDISPOSED, count=len(undisposed),\n                    baseline_ids=sorted(undisposed),\n                    covered_elsewhere=all_covered_elsewhere)"
+    },
+    {
+      "line": 271,
+      "end_line": 271,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(tm.assets)"
+    },
+    {
+      "line": 271,
+      "end_line": 271,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(tm.trust_boundaries)"
+    },
+    {
+      "line": 271,
+      "end_line": 271,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(tm.threats)"
+    },
+    {
+      "line": 136,
+      "end_line": 136,
+      "callee": "hasattr",
+      "enclosing": "run",
+      "expression": "hasattr(ctx, 'ast_context_view')"
+    },
+    {
+      "line": 136,
+      "end_line": 136,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(getattr(ctx, 'all_files', []) or [])"
+    },
+    {
+      "line": 138,
+      "end_line": 138,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(ev.modules)"
+    },
+    {
+      "line": 139,
+      "end_line": 139,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(ev.entry_points)"
+    },
+    {
+      "line": 139,
+      "end_line": 139,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(ev.config_reps)"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(ev.api_artefacts)"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(ev.docs)"
+    },
+    {
+      "line": 141,
+      "end_line": 141,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(ev.manifests)"
+    },
+    {
+      "line": 149,
+      "end_line": 149,
+      "callee": "sorted",
+      "enclosing": "run",
+      "expression": "sorted(kinds)"
+    },
+    {
+      "line": 174,
+      "end_line": 174,
+      "callee": "log.error",
+      "enclosing": "run",
+      "expression": "log.error(Event.S2_CALL_FAILED, detail=redact(str(e)))"
+    },
+    {
+      "line": 175,
+      "end_line": 175,
+      "callee": "_errlog.log",
+      "enclosing": "run",
+      "expression": "_errlog.log(\"s2\", repo_name, e, reason=\"threat_model_call_failed\")"
+    },
+    {
+      "line": 184,
+      "end_line": 185,
+      "callee": "console.write",
+      "enclosing": "run",
+      "expression": "console.write(f\"  [s2] threat-model response did not parse, retrying repair \"\n                      f\"— {parse_err}\")"
+    },
+    {
+      "line": 187,
+      "end_line": 187,
+      "callee": "COUNTERS.bump",
+      "enclosing": "run",
+      "expression": "COUNTERS.bump(\"s2_parse_repair_attempted\")"
+    },
+    {
+      "line": 214,
+      "end_line": 214,
+      "callee": "COUNTERS.bump",
+      "enclosing": "run",
+      "expression": "COUNTERS.bump(\"s2_parse_repair_recovered\")"
+    },
+    {
+      "line": 215,
+      "end_line": 215,
+      "callee": "log.warning",
+      "enclosing": "run",
+      "expression": "log.warning(Event.S2_PARSE_REPAIR_RECOVERED)"
+    },
+    {
+      "line": 230,
+      "end_line": 230,
+      "callee": "COUNTERS.bump",
+      "enclosing": "run",
+      "expression": "COUNTERS.bump(\"s2_degraded\")"
+    },
+    {
+      "line": 245,
+      "end_line": 245,
+      "callee": "sorted",
+      "enclosing": "run",
+      "expression": "sorted(undisposed)"
+    },
+    {
+      "line": 248,
+      "end_line": 248,
+      "callee": "_required_baselines",
+      "enclosing": "run",
+      "expression": "_required_baselines(kinds)"
+    },
+    {
+      "line": 248,
+      "end_line": 248,
+      "callee": "set",
+      "enclosing": "run",
+      "expression": "set(undisposed)"
+    },
+    {
+      "line": 254,
+      "end_line": 257,
+      "callee": "_errlog.log",
+      "enclosing": "run",
+      "expression": "_errlog.log(\"s2\", repo_name, \"baseline items undisposed\",\n                        reason=\"baseline_items_undisposed\",\n                        baseline_ids=sorted(undisposed),\n                        recovered=True)"
+    },
+    {
+      "line": 258,
+      "end_line": 258,
+      "callee": "COUNTERS.bump",
+      "enclosing": "run",
+      "expression": "COUNTERS.bump(\"s2_baseline_undisposed_recovered\")"
+    },
+    {
+      "line": 261,
+      "end_line": 263,
+      "callee": "_errlog.log",
+      "enclosing": "run",
+      "expression": "_errlog.log(\"s2\", repo_name, \"baseline items undisposed\",\n                        reason=\"baseline_items_undisposed\",\n                        baseline_ids=sorted(undisposed))"
+    },
+    {
+      "line": 268,
+      "end_line": 268,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(tm.assets)"
+    },
+    {
+      "line": 269,
+      "end_line": 269,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(tm.trust_boundaries)"
+    },
+    {
+      "line": 269,
+      "end_line": 269,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(tm.threats)"
+    },
+    {
+      "line": 164,
+      "end_line": 166,
+      "callee": "_threatmodel_call",
+      "enclosing": "run",
+      "expression": "_threatmodel_call(user, cfg, repo_root, ctx,\n                                                       drop_thinking=drop_thinking,\n                                                       require_tool_call=ev.file_count > 0)"
+    },
+    {
+      "line": 168,
+      "end_line": 168,
+      "callee": "_deepagents.droppable_effort",
+      "enclosing": "run",
+      "expression": "_deepagents.droppable_effort(cfg.models.threatmodel, effort, agentic=True)"
+    },
+    {
+      "line": 170,
+      "end_line": 170,
+      "callee": "refusal_resend_allowed",
+      "enclosing": "run",
+      "expression": "refusal_resend_allowed(cfg, cfg.models.threatmodel)"
+    },
+    {
+      "line": 191,
+      "end_line": 200,
+      "callee": "_deepagents.dispatch_prompt",
+      "enclosing": "run",
+      "expression": "_deepagents.dispatch_prompt(\n                _repair_json_prompt(raw, parse_err),\n                model=cfg.models.threatmodel,\n                cfg=cfg,\n                cwd=repo_root,\n                system_prompt=SYSTEM,\n                max_tokens=getattr(s2, \"max_tokens\", 64000),\n                timeout=_cap_int(s2, \"timeout\", 1800),\n                tag=\"s2 threatmodel json-repair\",\n            )"
+    },
+    {
+      "line": 201,
+      "end_line": 201,
+      "callee": "_parse_threat_model",
+      "enclosing": "run",
+      "expression": "_parse_threat_model(repaired)"
+    },
+    {
+      "line": 251,
+      "end_line": 251,
+      "callee": "_category_covered_elsewhere",
+      "enclosing": "run",
+      "expression": "_category_covered_elsewhere(bid, tm.threats, disposed=disposed)"
+    },
+    {
+      "line": 264,
+      "end_line": 264,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(undisposed)"
+    },
+    {
+      "line": 265,
+      "end_line": 265,
+      "callee": "sorted",
+      "enclosing": "run",
+      "expression": "sorted(undisposed)"
+    },
+    {
+      "line": 136,
+      "end_line": 136,
+      "callee": "getattr",
+      "enclosing": "run",
+      "expression": "getattr(ctx, 'all_files', [])"
+    },
+    {
+      "line": 150,
+      "end_line": 150,
+      "callee": "sorted",
+      "enclosing": "run",
+      "expression": "sorted(kinds)"
+    },
+    {
+      "line": 169,
+      "end_line": 169,
+      "callee": "bool",
+      "enclosing": "run",
+      "expression": "bool(getattr(s2, \"empty_retry\", True))"
+    },
+    {
+      "line": 174,
+      "end_line": 174,
+      "callee": "redact",
+      "enclosing": "run",
+      "expression": "redact(str(e))"
+    },
+    {
+      "line": 192,
+      "end_line": 192,
+      "callee": "_repair_json_prompt",
+      "enclosing": "run",
+      "expression": "_repair_json_prompt(raw, parse_err)"
+    },
+    {
+      "line": 204,
+      "end_line": 204,
+      "callee": "log.error",
+      "enclosing": "run",
+      "expression": "log.error(Event.S2_RESPONSE_UNPARSEABLE, detail=str(e))"
+    },
+    {
+      "line": 206,
+      "end_line": 212,
+      "callee": "_errlog.log",
+      "enclosing": "run",
+      "expression": "_errlog.log(\"s2\", repo_name, e,\n                        reason=\"threat_model_parse_failed\",\n                        raw_head=redact((repaired if repaired is not None\n                                         else raw) or \"\")[:500],\n                        note=\"s2 JSON extraction or model validation failed \"\n                             \"after one repair retry; s3–s8 will receive no \"\n                             \"threat context\")"
+    },
+    {
+      "line": 256,
+      "end_line": 256,
+      "callee": "sorted",
+      "enclosing": "run",
+      "expression": "sorted(undisposed)"
+    },
+    {
+      "line": 263,
+      "end_line": 263,
+      "callee": "sorted",
+      "enclosing": "run",
+      "expression": "sorted(undisposed)"
+    },
+    {
+      "line": 169,
+      "end_line": 169,
+      "callee": "getattr",
+      "enclosing": "run",
+      "expression": "getattr(s2, \"empty_retry\", True)"
+    },
+    {
+      "line": 174,
+      "end_line": 174,
+      "callee": "str",
+      "enclosing": "run",
+      "expression": "str(e)"
+    },
+    {
+      "line": 197,
+      "end_line": 197,
+      "callee": "getattr",
+      "enclosing": "run",
+      "expression": "getattr(s2, \"max_tokens\", 64000)"
+    },
+    {
+      "line": 198,
+      "end_line": 198,
+      "callee": "_cap_int",
+      "enclosing": "run",
+      "expression": "_cap_int(s2, \"timeout\", 1800)"
+    },
+    {
+      "line": 204,
+      "end_line": 204,
+      "callee": "str",
+      "enclosing": "run",
+      "expression": "str(e)"
+    },
+    {
+      "line": 208,
+      "end_line": 209,
+      "callee": "redact",
+      "enclosing": "run",
+      "expression": "redact((repaired if repaired is not None\n                                         else raw) or \"\")"
+    }
+  ],
+  "imports": [
+    {
+      "line": 17,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 18,
+      "source_expression": "from vvaharness.util import logs",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.logs"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/logs.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 20,
+      "source_expression": "import re",
+      "targets": [
+        "re"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "from pathlib import Path",
+      "targets": [
+        "pathlib",
+        "pathlib.Path"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 24,
+      "source_expression": "from langchain.agents.middleware import TodoListMiddleware",
+      "targets": [
+        "langchain.agents.middleware",
+        "langchain.agents.middleware.TodoListMiddleware"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 26,
+      "source_expression": "from vvaharness.backends.harness.deepagents.evidence_gate import EvidenceGate",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.evidence_gate",
+        "vvaharness.backends.harness.deepagents.evidence_gate.EvidenceGate"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/evidence_gate.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 27,
+      "source_expression": "from vvaharness.backends.harness.deepagents.tool_budget import ToolCallBudget",
+      "targets": [
+        "vvaharness.backends.harness.deepagents.tool_budget",
+        "vvaharness.backends.harness.deepagents.tool_budget.ToolCallBudget"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/harness/deepagents/tool_budget.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 28,
+      "source_expression": "from vvaharness.backends.llm import deepagents as _deepagents",
+      "targets": [
+        "vvaharness.backends.llm",
+        "vvaharness.backends.llm.deepagents"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/llm/__init__.py",
+        "vvaharness/backends/llm/deepagents.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 29,
+      "source_expression": "from vvaharness.backends.llm.models import RESPONSE_MODEL_VIAS, refusal_resend_allowed, validate_detection_tools",
+      "targets": [
+        "vvaharness.backends.llm.models",
+        "vvaharness.backends.llm.models.RESPONSE_MODEL_VIAS",
+        "vvaharness.backends.llm.models.refusal_resend_allowed",
+        "vvaharness.backends.llm.models.validate_detection_tools"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/llm/models.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 34,
+      "source_expression": "from vvaharness.backends.llm.registry import resolve",
+      "targets": [
+        "vvaharness.backends.llm.registry",
+        "vvaharness.backends.llm.registry.resolve"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/llm/registry.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 35,
+      "source_expression": "from vvaharness.codegraph.build import graph_is_degenerate",
+      "targets": [
+        "vvaharness.codegraph.build",
+        "vvaharness.codegraph.build.graph_is_degenerate"
+      ],
+      "local_source_paths": [
+        "vvaharness/codegraph/build.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 36,
+      "source_expression": "from vvaharness.codegraph.tools import GRAPH_TOOL_NAMES, build_graph_tool_builder, graph_tool_names",
+      "targets": [
+        "vvaharness.codegraph.tools",
+        "vvaharness.codegraph.tools.GRAPH_TOOL_NAMES",
+        "vvaharness.codegraph.tools.build_graph_tool_builder",
+        "vvaharness.codegraph.tools.graph_tool_names"
+      ],
+      "local_source_paths": [
+        "vvaharness/codegraph/tools.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 41,
+      "source_expression": "from vvaharness.evidence import ThreatEvidence, _cap_int, gather, render_api_artefacts_block, render_components_block, render_config_reps_block, render_docs_block, render_entry_points_block, render_inventory_block, render_language_block, render_manifests_block, render_modules_block",
+      "targets": [
+        "vvaharness.evidence",
+        "vvaharness.evidence.ThreatEvidence",
+        "vvaharness.evidence._cap_int",
+        "vvaharness.evidence.gather",
+        "vvaharness.evidence.render_api_artefacts_block",
+        "vvaharness.evidence.render_components_block",
+        "vvaharness.evidence.render_config_reps_block",
+        "vvaharness.evidence.render_docs_block",
+        "vvaharness.evidence.render_entry_points_block",
+        "vvaharness.evidence.render_inventory_block",
+        "vvaharness.evidence.render_language_block",
+        "vvaharness.evidence.render_manifests_block",
+        "vvaharness.evidence.render_modules_block"
+      ],
+      "local_source_paths": [
+        "vvaharness/evidence/__init__.py",
+        "vvaharness/evidence/gather.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 55,
+      "source_expression": "from vvaharness.models import CVE, AppProfile, ContextPackage, Control, Threat, ThreatModel, _cap_assets, _cap_boundaries, _cap_threats",
+      "targets": [
+        "vvaharness.models",
+        "vvaharness.models.CVE",
+        "vvaharness.models.AppProfile",
+        "vvaharness.models.ContextPackage",
+        "vvaharness.models.Control",
+        "vvaharness.models.Threat",
+        "vvaharness.models.ThreatModel",
+        "vvaharness.models._cap_assets",
+        "vvaharness.models._cap_boundaries",
+        "vvaharness.models._cap_threats"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 66,
+      "source_expression": "from vvaharness.pipeline.stages.s2_planning import PLAN_SYSTEM_PROMPT as S2_PLAN_SYSTEM_PROMPT",
+      "targets": [
+        "vvaharness.pipeline.stages.s2_planning",
+        "vvaharness.pipeline.stages.s2_planning.PLAN_SYSTEM_PROMPT"
+      ],
+      "local_source_paths": [
+        "vvaharness/pipeline/stages/s2_planning.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 69,
+      "source_expression": "from vvaharness.pipeline.stages.s2_planning import PLAN_TOOL_DESCRIPTION as S2_PLAN_TOOL_DESCRIPTION",
+      "targets": [
+        "vvaharness.pipeline.stages.s2_planning",
+        "vvaharness.pipeline.stages.s2_planning.PLAN_TOOL_DESCRIPTION"
+      ],
+      "local_source_paths": [
+        "vvaharness/pipeline/stages/s2_planning.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 72,
+      "source_expression": "from vvaharness.report.redact import redact",
+      "targets": [
+        "vvaharness.report.redact",
+        "vvaharness.report.redact.redact"
+      ],
+      "local_source_paths": [
+        "vvaharness/report/redact.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 73,
+      "source_expression": "from vvaharness.rules.repo_kinds import BASELINES, STRIDE_BY_KIND, repo_kind",
+      "targets": [
+        "vvaharness.rules.repo_kinds",
+        "vvaharness.rules.repo_kinds.BASELINES",
+        "vvaharness.rules.repo_kinds.STRIDE_BY_KIND",
+        "vvaharness.rules.repo_kinds.repo_kind"
+      ],
+      "local_source_paths": [
+        "vvaharness/rules/repo_kinds.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 74,
+      "source_expression": "from vvaharness.scope import resolve_inventory_path",
+      "targets": [
+        "vvaharness.scope",
+        "vvaharness.scope.resolve_inventory_path"
+      ],
+      "local_source_paths": [
+        "vvaharness/scope/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 75,
+      "source_expression": "from vvaharness.skills import inject_skills",
+      "targets": [
+        "vvaharness.skills",
+        "vvaharness.skills.inject_skills"
+      ],
+      "local_source_paths": [
+        "vvaharness/skills/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 76,
+      "source_expression": "from vvaharness.util import console",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.console"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/console.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 77,
+      "source_expression": "from vvaharness.util import errlog as _errlog",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.errlog"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/errlog.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 78,
+      "source_expression": "from vvaharness.util.config import knob",
+      "targets": [
+        "vvaharness.util.config",
+        "vvaharness.util.config.knob"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/config.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 79,
+      "source_expression": "from vvaharness.util.counters import COUNTERS",
+      "targets": [
+        "vvaharness.util.counters",
+        "vvaharness.util.counters.COUNTERS"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/counters.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 80,
+      "source_expression": "from vvaharness.util.json_extract import extract_json",
+      "targets": [
+        "vvaharness.util.json_extract",
+        "vvaharness.util.json_extract.extract_json"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/json_extract.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 81,
+      "source_expression": "from vvaharness.util.response_quality import dispatch_or_retry_unforced",
+      "targets": [
+        "vvaharness.util.response_quality",
+        "vvaharness.util.response_quality.dispatch_or_retry_unforced"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/response_quality.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 82,
+      "source_expression": "from vvaharness.util.warn_once import warn_once",
+      "targets": [
+        "vvaharness.util.warn_once",
+        "vvaharness.util.warn_once.warn_once"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/warn_once.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 87,
+      "source_expression": "from vvaharness.pipeline.stages.s2.baseline import _BASELINE_EVIDENCE_RX, _baseline_audit, _category_covered_elsewhere, _category_terms, _required_baselines",
+      "targets": [
+        "vvaharness.pipeline.stages.s2.baseline",
+        "vvaharness.pipeline.stages.s2.baseline._BASELINE_EVIDENCE_RX",
+        "vvaharness.pipeline.stages.s2.baseline._baseline_audit",
+        "vvaharness.pipeline.stages.s2.baseline._category_covered_elsewhere",
+        "vvaharness.pipeline.stages.s2.baseline._category_terms",
+        "vvaharness.pipeline.stages.s2.baseline._required_baselines"
+      ],
+      "local_source_paths": [
+        "vvaharness/pipeline/stages/s2/baseline.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 94,
+      "source_expression": "from vvaharness.pipeline.stages.s2.outcomes import _finalize_threats, _parse_threat_model, _warn_output_caps",
+      "targets": [
+        "vvaharness.pipeline.stages.s2.outcomes",
+        "vvaharness.pipeline.stages.s2.outcomes._finalize_threats",
+        "vvaharness.pipeline.stages.s2.outcomes._parse_threat_model",
+        "vvaharness.pipeline.stages.s2.outcomes._warn_output_caps"
+      ],
+      "local_source_paths": [
+        "vvaharness/pipeline/stages/s2/outcomes.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 99,
+      "source_expression": "from vvaharness.pipeline.stages.s2.prompts import SYSTEM, _AGENTIC_SYSTEM_LINE, _GRAPH_TOOLS_SYSTEM_LINE, _baseline_block, _build_user_prompt, _repair_json_prompt",
+      "targets": [
+        "vvaharness.pipeline.stages.s2.prompts",
+        "vvaharness.pipeline.stages.s2.prompts.SYSTEM",
+        "vvaharness.pipeline.stages.s2.prompts._AGENTIC_SYSTEM_LINE",
+        "vvaharness.pipeline.stages.s2.prompts._GRAPH_TOOLS_SYSTEM_LINE",
+        "vvaharness.pipeline.stages.s2.prompts._baseline_block",
+        "vvaharness.pipeline.stages.s2.prompts._build_user_prompt",
+        "vvaharness.pipeline.stages.s2.prompts._repair_json_prompt"
+      ],
+      "local_source_paths": [
+        "vvaharness/pipeline/stages/s2/prompts.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 107,
+      "source_expression": "from vvaharness.pipeline.stages.replay import RecordTranscript, Transcript, replay_prompt, run_with_deadline",
+      "targets": [
+        "vvaharness.pipeline.stages.replay",
+        "vvaharness.pipeline.stages.replay.RecordTranscript",
+        "vvaharness.pipeline.stages.replay.Transcript",
+        "vvaharness.pipeline.stages.replay.replay_prompt",
+        "vvaharness.pipeline.stages.replay.run_with_deadline"
+      ],
+      "local_source_paths": [
+        "vvaharness/pipeline/stages/replay.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 113,
+      "source_expression": "from vvaharness.pipeline.stages.s2.session import _DISPATCH_TAG, _WARNED_DEGENERATE_GRAPH, _WARNED_NO_GRAPH_TOOLS, _graph_tool_route_ok, _retry_if_hollow, _threatmodel_call",
+      "targets": [
+        "vvaharness.pipeline.stages.s2.session",
+        "vvaharness.pipeline.stages.s2.session._DISPATCH_TAG",
+        "vvaharness.pipeline.stages.s2.session._WARNED_DEGENERATE_GRAPH",
+        "vvaharness.pipeline.stages.s2.session._WARNED_NO_GRAPH_TOOLS",
+        "vvaharness.pipeline.stages.s2.session._graph_tool_route_ok",
+        "vvaharness.pipeline.stages.s2.session._retry_if_hollow",
+        "vvaharness.pipeline.stages.s2.session._threatmodel_call"
+      ],
+      "local_source_paths": [
+        "vvaharness/pipeline/stages/s2/session.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 121,
+      "source_expression": "from vvaharness.util.events import Event",
+      "targets": [
+        "vvaharness.util.events",
+        "vvaharness.util.events.Event"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/events.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

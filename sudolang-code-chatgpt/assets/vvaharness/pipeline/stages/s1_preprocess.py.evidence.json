@@ -1,0 +1,3304 @@
+{
+  "source": "vvaharness/pipeline/stages/s1_preprocess.py",
+  "sha256": "5e56808364c59b4fe2ce3f74156ec0bec242bd9f85edc3318a3e09834c342bb4",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Step 1 — injects CVEs/controls, merges the s0 seed, and derives modules, notes and language from the graph.\"\"\"\nfrom __future__ import annotations\nfrom vvaharness.util import logs\n\nfrom pathlib import Path\n\nfrom vvaharness.backends.llm import tools as _localtools\nfrom vvaharness.codegraph import (\n    GraphHandle,\n    communities_as_modules,\n    primary_language,\n    system_context_notes,\n)\nfrom vvaharness.lang.detect import EXT_TO_LANG\nfrom vvaharness.models import CVE, ContextPackage, Control\nfrom vvaharness.scope import (\n    EmptyScopeError,\n    _dedup_configs,\n    _resolve_scope_path,\n    _walk_repo,\n)\nfrom vvaharness.util import console\nfrom vvaharness.util import errlog as _errlog\nfrom vvaharness.util.events import Event\n\nlog = logs.get_logger(__name__)\n\n\nQSEP = \"::\"\nMODULE_SCOPE = \"<module>\"\n\n\ndef q_join(file: str, name: str) -> str:\n    return f\"{file}{QSEP}{name}\"\n\n\ndef q_split(qname: str) -> tuple[str, str]:\n    if QSEP in qname:\n        f, _, n = qname.rpartition(QSEP)\n        return f, n\n    return \"\", qname\n\n\ndef q_file(qname: str) -> str:\n    return q_split(qname)[0]\n\n\ndef q_name(qname: str) -> str:\n    return q_split(qname)[1]\n\n\ndef _modules_from_graph(graph_handle: GraphHandle, resolve_in_scope) -> list[dict]:\n    \"\"\"Leiden communities, filtered to the in-scope inventory, as ``ModuleInfo`` dicts.\"\"\"\n    modules: list[dict] = []\n    for name, files in communities_as_modules(graph_handle).items():\n        in_scope = sorted({hit for f in files if (hit := resolve_in_scope(f))})\n        if in_scope:\n            modules.append({\"name\": name, \"files\": in_scope})\n    return modules\n\n\ndef run(repo_root: str, cfg, known_cves: list[CVE], controls: list[Control],\n        seed=None, graph_handle: GraphHandle | None = None) -> ContextPackage:\n    \"\"\"Merges the optional s0 seed and graph into a ContextPackage, making no model call.\"\"\"\n    # Reuse s0's walk, not a second walk; falls back when s0 was off or its checkpoint has no walk\n    if seed is not None and getattr(seed, \"all_files\", None):\n        all_files, excluded = list(seed.all_files), dict(seed.excluded)\n    else:\n        all_files, excluded = _walk_repo(repo_root, cfg)\n    # Jail agentic reads to the inventory or .git/config is readable; before dedup so siblings stay\n    _localtools.set_scope(repo_root, all_files)\n    all_files, dedup_report = _dedup_configs(all_files, Path(repo_root), cfg)\n    excluded[\"config_dedup\"] = dedup_report\n    tracker = getattr(cfg, \"_scan_progress\", None)\n    if tracker is not None:\n        tracker.discovered(all_files)\n\n    # Seed paths are normalized so './foo', 'foo', '<abs>/foo' and 'foo\\bar' all match the inventory\n    keep = set(all_files)\n    # In --group-by-app a seed path may omit its top-level repo dir, so try each as a prefix first\n    top_dirs = sorted(d.name for d in Path(repo_root).iterdir()\n                      if d.is_dir() and d.name not in (\"checkpoints\",\n                                                       \"security-scan\"))\n\n    ambiguous: list[str] = []   # matched 2+ top dirs: dropped, never guessed\n\n    def _resolve_in_scope(path: str) -> str | None:\n        hit, amb = _resolve_scope_path(path, repo_root, keep, top_dirs)\n        if amb:\n            ambiguous.append(path)        # raw seed string, for the log\n        return hit\n\n    data: dict = {\"unsafe_sinks\": [], \"entry_points\": []}\n\n    if seed:\n        seed_sinks = [dict(s.model_dump(), file=hit)\n                      for s in seed.unsafe_sinks\n                      if (hit := _resolve_in_scope(s.file))]\n        seed_eps = [dict(e.model_dump(), file=hit)\n                    for e in seed.entry_points\n                    if (hit := _resolve_in_scope(e.file))]\n        data[\"unsafe_sinks\"].extend(seed_sinks)\n        data[\"entry_points\"].extend(seed_eps)\n        log.info(\"s1/preprocess: merged s0 seed - sinks=%d entry_points=%d\",\n                 len(seed_sinks), len(seed_eps))\n        # Semgrep codeFlow hops are \"file:line\"; re-resolve so s3._reachable_files can trust them\n        seed_paths: list[list[str]] = []\n        for path in getattr(seed, \"taint_paths\", None) or []:\n            resolved = []\n            for hop in path:\n                f, sep, ln = hop.rpartition(\":\")\n                hit = _resolve_in_scope(f or hop)\n                if hit:\n                    resolved.append(f\"{hit}:{ln}\" if sep else hit)\n            if len(resolved) >= 2:\n                seed_paths.append(resolved)\n        data[\"seed_taint_paths\"] = seed_paths\n        log.debug(\"s1/preprocess: seed taint paths processed - paths=%d\", len(seed_paths))\n\n        # Framework entry points arrive inside seed.entry_points, not separately.\n        framework_unresolvable: set[str] = set()\n        for ep in getattr(seed, \"entry_points\", []) or []:\n            if getattr(ep, \"kind\", \"\").lower() == \"framework\" and not _resolve_in_scope(ep.file):\n                framework_unresolvable.add(f\"{ep.file}::{ep.function}\")\n        if framework_unresolvable:\n            sample = \", \".join(sorted(framework_unresolvable)[:3])\n            n_str = f\" (+{len(framework_unresolvable)-3} more)\" if len(framework_unresolvable) > 3 else \"\"\n            log.warning(Event.S1_FRAMEWORK_ENTRY_UNRESOLVED, count=len(framework_unresolvable),\n                        sample=f\"{sample}{n_str}\")\n\n        if seed_sinks or seed_eps or seed_paths:\n            console.write(f\"  [s1] merged s0 seed: +{len(seed_eps)} entry points, \"\n                          f\"+{len(seed_sinks)} sinks, {len(seed_paths)} codeFlow paths\")\n\n    if ambiguous:\n        uniq = sorted(set(ambiguous))\n        sample = \", \".join(uniq[:5]) + (\"…\" if len(uniq) > 5 else \"\")\n        log.warning(Event.S1_AMBIGUOUS_PATHS_DROPPED, count=len(ambiguous), sample=sample)\n\n    data[\"repo_root\"] = repo_root\n    if graph_handle is not None:\n        data[\"language\"] = primary_language(graph_handle)\n        data[\"modules\"] = _modules_from_graph(graph_handle, _resolve_in_scope)\n        data[\"notes\"] = system_context_notes(graph_handle)\n    else:\n        data[\"modules\"] = []\n        data[\"notes\"] = \"\"\n    # `language` is required with no default; fall back to the commonest ext if the graph has none\n    if not data.get(\"language\"):\n        ext_counts: dict[str, int] = {}\n        for f in all_files:\n            lang = EXT_TO_LANG.get(Path(f).suffix.lower())\n            if lang:\n                ext_counts[lang] = ext_counts.get(lang, 0) + 1\n        data[\"language\"] = (max(ext_counts, key=lambda k: ext_counts[k])\n                            if ext_counts else \"unknown\")\n    data[\"all_files\"] = all_files\n    data[\"excluded\"] = excluded\n    data[\"known_cves\"] = [c.model_dump() for c in known_cves]\n    data[\"design_controls\"] = [c.model_dump() for c in controls]\n\n    # models.py field_validator(mode=\"before\") coerces off-schema enums/ints, so this never raises\n    pkg = ContextPackage.model_validate(data)\n    n_ex_dirs = sum(excluded[\"dirs\"].values())\n    n_ex_exts = sum(excluded[\"exts\"].values())\n    n_ex_globs = sum(excluded[\"globs\"].values())\n    n_ex_size = excluded[\"oversize\"]\n    n_ex_dedup = (excluded.get(\"config_dedup\") or {}).get(\"dropped\", 0) or 0\n    n_in_scope = len(pkg.all_files)\n    n_total = n_in_scope + n_ex_dirs + n_ex_exts + n_ex_globs + n_ex_size + n_ex_dedup\n    console.write(f\"  [s1] file inventory: {n_total} on disk -> {n_in_scope} in scope \"\n                  f\"(excluded: {n_ex_dirs} dir, {n_ex_exts} ext, {n_ex_globs} glob, \"\n                  f\"{n_ex_size} oversize, {n_ex_dedup} config-dedup)\")\n    console.counts(\"s1\", \"done\", modules=len(pkg.modules),\n                   entry_points=len(pkg.entry_points), sinks=len(pkg.unsafe_sinks),\n                   files_in_scope=n_in_scope)\n    # Every later stage would process the empty set and report success, so refuse here instead\n    if not n_in_scope:\n        raise EmptyScopeError(\n            f\"0 files in scope after exclusions ({n_total} on disk: \"\n            f\"{n_ex_dirs} dir, {n_ex_exts} ext, {n_ex_globs} glob, \"\n            f\"{n_ex_size} oversize, {n_ex_dedup} config-dedup). Nothing was \"\n            f\"analysed, so no conclusion can be drawn about this repository. \"\n            f\"Re-run with --no-auto-step1, or widen the step1 exclusions.\")\n    # All-zero output on a non-empty inventory: record it so scan health/SARIF show the degradation\n    if (n_in_scope and not pkg.modules and not pkg.entry_points\n            and not pkg.unsafe_sinks):\n        _errlog.log(\"s1\", \"context-package\",\n                    \"S1 produced 0 modules, 0 entry points and 0 sinks \"\n                    f\"with {n_in_scope} files in scope\",\n                    reason=\"s1_zero_output\",\n                    files_in_scope=n_in_scope)\n    return pkg\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/pipeline/stages/s1_preprocess.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "Step 1 — injects CVEs/controls, merges the s0 seed, and derives modules, notes and language from the graph.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_48_11": {
+      "source": "vvaharness/pipeline/stages/s1_preprocess.py",
+      "line_start": 48,
+      "line_end": 48,
+      "source_expression": "f\"{file}{QSEP}{name}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_67_4": {
+      "source": "vvaharness/pipeline/stages/s1_preprocess.py",
+      "line_start": 67,
+      "line_end": 67,
+      "value": "Leiden communities, filtered to the in-scope inventory, as ``ModuleInfo`` dicts.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_78_4": {
+      "source": "vvaharness/pipeline/stages/s1_preprocess.py",
+      "line_start": 78,
+      "line_end": 78,
+      "value": "Merges the optional s0 seed and graph into a ContextPackage, making no model call.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_128_36": {
+      "source": "vvaharness/pipeline/stages/s1_preprocess.py",
+      "line_start": 128,
+      "line_end": 128,
+      "source_expression": "f\"{hit}:{ln}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_138_43": {
+      "source": "vvaharness/pipeline/stages/s1_preprocess.py",
+      "line_start": 138,
+      "line_end": 138,
+      "source_expression": "f\"{ep.file}::{ep.function}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_141_20": {
+      "source": "vvaharness/pipeline/stages/s1_preprocess.py",
+      "line_start": 141,
+      "line_end": 141,
+      "source_expression": "f\" (+{len(framework_unresolvable)-3} more)\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_143_31": {
+      "source": "vvaharness/pipeline/stages/s1_preprocess.py",
+      "line_start": 143,
+      "line_end": 143,
+      "source_expression": "f\"{sample}{n_str}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_146_26": {
+      "source": "vvaharness/pipeline/stages/s1_preprocess.py",
+      "line_start": 146,
+      "line_end": 147,
+      "source_expression": "f\"  [s1] merged s0 seed: +{len(seed_eps)} entry points, \"\n                          f\"+{len(seed_sinks)} sinks, {len(seed_paths)} codeFlow paths\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_185_18": {
+      "source": "vvaharness/pipeline/stages/s1_preprocess.py",
+      "line_start": 185,
+      "line_end": 187,
+      "source_expression": "f\"  [s1] file inventory: {n_total} on disk -> {n_in_scope} in scope \"\n                  f\"(excluded: {n_ex_dirs} dir, {n_ex_exts} ext, {n_ex_globs} glob, \"\n                  f\"{n_ex_size} oversize, {n_ex_dedup} config-dedup)\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_194_12": {
+      "source": "vvaharness/pipeline/stages/s1_preprocess.py",
+      "line_start": 194,
+      "line_end": 198,
+      "source_expression": "f\"0 files in scope after exclusions ({n_total} on disk: \"\n            f\"{n_ex_dirs} dir, {n_ex_exts} ext, {n_ex_globs} glob, \"\n            f\"{n_ex_size} oversize, {n_ex_dedup} config-dedup). Nothing was \"\n            f\"analysed, so no conclusion can be drawn about this repository. \"\n            f\"Re-run with --no-auto-step1, or widen the step1 exclusions.\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_203_20": {
+      "source": "vvaharness/pipeline/stages/s1_preprocess.py",
+      "line_start": 203,
+      "line_end": 204,
+      "source_expression": "\"S1 produced 0 modules, 0 entry points and 0 sinks \"\n                    f\"with {n_in_scope} files in scope\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "Step 1 — injects CVEs/controls, merges the s0 seed, and derives modules, notes and language from the graph.",
+      "context": "literal"
+    },
+    {
+      "line_start": 43,
+      "line_end": 43,
+      "column": 7,
+      "value": "::",
+      "context": "literal"
+    },
+    {
+      "line_start": 44,
+      "line_end": 44,
+      "column": 15,
+      "value": "<module>",
+      "context": "literal"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 4,
+      "value": "Leiden communities, filtered to the in-scope inventory, as ``ModuleInfo`` dicts.",
+      "context": "literal"
+    },
+    {
+      "line_start": 78,
+      "line_end": 78,
+      "column": 4,
+      "value": "Merges the optional s0 seed and graph into a ContextPackage, making no model call.",
+      "context": "literal"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 11,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 87,
+      "line_end": 87,
+      "column": 13,
+      "value": "config_dedup",
+      "context": "literal"
+    },
+    {
+      "line_start": 88,
+      "line_end": 88,
+      "column": 27,
+      "value": "_scan_progress",
+      "context": "literal"
+    },
+    {
+      "line_start": 107,
+      "line_end": 107,
+      "column": 18,
+      "value": "unsafe_sinks",
+      "context": "literal"
+    },
+    {
+      "line_start": 107,
+      "line_end": 107,
+      "column": 38,
+      "value": "entry_points",
+      "context": "literal"
+    },
+    {
+      "line_start": 154,
+      "line_end": 154,
+      "column": 9,
+      "value": "repo_root",
+      "context": "literal"
+    },
+    {
+      "line_start": 161,
+      "line_end": 161,
+      "column": 24,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 171,
+      "line_end": 171,
+      "column": 9,
+      "value": "all_files",
+      "context": "literal"
+    },
+    {
+      "line_start": 172,
+      "line_end": 172,
+      "column": 9,
+      "value": "excluded",
+      "context": "literal"
+    },
+    {
+      "line_start": 173,
+      "line_end": 173,
+      "column": 9,
+      "value": "known_cves",
+      "context": "literal"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 9,
+      "value": "design_controls",
+      "context": "literal"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 25,
+      "value": "oversize",
+      "context": "literal"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 19,
+      "value": "s1",
+      "context": "literal"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 25,
+      "value": "done",
+      "context": "literal"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 42,
+      "value": "all_files",
+      "context": "literal"
+    },
+    {
+      "line_start": 118,
+      "line_end": 118,
+      "column": 17,
+      "value": "s1/preprocess: merged s0 seed - sinks=%d entry_points=%d",
+      "context": "literal"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 13,
+      "value": "seed_taint_paths",
+      "context": "literal"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 18,
+      "value": "s1/preprocess: seed taint paths processed - paths=%d",
+      "context": "literal"
+    },
+    {
+      "line_start": 156,
+      "line_end": 156,
+      "column": 13,
+      "value": "language",
+      "context": "literal"
+    },
+    {
+      "line_start": 157,
+      "line_end": 157,
+      "column": 13,
+      "value": "modules",
+      "context": "literal"
+    },
+    {
+      "line_start": 158,
+      "line_end": 158,
+      "column": 13,
+      "value": "notes",
+      "context": "literal"
+    },
+    {
+      "line_start": 160,
+      "line_end": 160,
+      "column": 13,
+      "value": "modules",
+      "context": "literal"
+    },
+    {
+      "line_start": 161,
+      "line_end": 161,
+      "column": 13,
+      "value": "notes",
+      "context": "literal"
+    },
+    {
+      "line_start": 163,
+      "line_end": 163,
+      "column": 20,
+      "value": "language",
+      "context": "literal"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 13,
+      "value": "language",
+      "context": "literal"
+    },
+    {
+      "line_start": 170,
+      "line_end": 170,
+      "column": 47,
+      "value": "unknown",
+      "context": "literal"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 58,
+      "value": "dropped",
+      "context": "literal"
+    },
+    {
+      "line_start": 185,
+      "line_end": 185,
+      "column": 20,
+      "value": "  [s1] file inventory: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 185,
+      "line_end": 185,
+      "column": 52,
+      "value": " on disk -> ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 185,
+      "line_end": 186,
+      "column": 76,
+      "value": " in scope (excluded: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 186,
+      "line_end": 186,
+      "column": 42,
+      "value": " dir, ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 186,
+      "line_end": 186,
+      "column": 59,
+      "value": " ext, ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 186,
+      "line_end": 186,
+      "column": 77,
+      "value": " glob, ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 31,
+      "value": " oversize, ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 54,
+      "value": " config-dedup)",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 202,
+      "line_end": 202,
+      "column": 20,
+      "value": "s1",
+      "context": "literal"
+    },
+    {
+      "line_start": 202,
+      "line_end": 202,
+      "column": 26,
+      "value": "context-package",
+      "context": "literal"
+    },
+    {
+      "line_start": 122,
+      "line_end": 122,
+      "column": 34,
+      "value": "taint_paths",
+      "context": "literal"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 32,
+      "value": "entry_points",
+      "context": "literal"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 104,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 151,
+      "line_end": 151,
+      "column": 40,
+      "value": "…",
+      "context": "literal"
+    },
+    {
+      "line_start": 151,
+      "line_end": 151,
+      "column": 68,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 14,
+      "value": "0 files in scope after exclusions (",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 58,
+      "value": " on disk: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 195,
+      "line_end": 195,
+      "column": 25,
+      "value": " dir, ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 195,
+      "line_end": 195,
+      "column": 42,
+      "value": " ext, ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 195,
+      "line_end": 195,
+      "column": 60,
+      "value": " glob, ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 196,
+      "line_end": 196,
+      "column": 25,
+      "value": " oversize, ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 196,
+      "line_end": 198,
+      "column": 48,
+      "value": " config-dedup). Nothing was analysed, so no conclusion can be drawn about this repository. Re-run with --no-auto-step1, or widen the step1 exclusions.",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 203,
+      "line_end": 204,
+      "column": 20,
+      "value": "S1 produced 0 modules, 0 entry points and 0 sinks with ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 204,
+      "line_end": 204,
+      "column": 39,
+      "value": " files in scope",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 27,
+      "value": "s1_zero_output",
+      "context": "literal"
+    },
+    {
+      "line_start": 72,
+      "line_end": 72,
+      "column": 28,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 72,
+      "line_end": 72,
+      "column": 42,
+      "value": "files",
+      "context": "literal"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 13,
+      "value": "unsafe_sinks",
+      "context": "literal"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 13,
+      "value": "entry_points",
+      "context": "literal"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 44,
+      "value": ":",
+      "context": "literal"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 50,
+      "value": "framework",
+      "context": "literal"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 21,
+      "value": ", ",
+      "context": "literal"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 22,
+      "value": " (+",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 56,
+      "value": " more)",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 146,
+      "line_end": 146,
+      "column": 28,
+      "value": "  [s1] merged s0 seed: +",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 146,
+      "line_end": 147,
+      "column": 67,
+      "value": " entry points, +",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 46,
+      "value": " sinks, ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 71,
+      "value": " codeFlow paths",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 151,
+      "line_end": 151,
+      "column": 17,
+      "value": ", ",
+      "context": "literal"
+    },
+    {
+      "line_start": 178,
+      "line_end": 178,
+      "column": 29,
+      "value": "dirs",
+      "context": "literal"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 29,
+      "value": "exts",
+      "context": "literal"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 30,
+      "value": "globs",
+      "context": "literal"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 54,
+      "value": "::",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 31,
+      "value": "config_dedup",
+      "context": "literal"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 55,
+      "value": "checkpoints",
+      "context": "literal"
+    },
+    {
+      "line_start": 97,
+      "line_end": 97,
+      "column": 55,
+      "value": "security-scan",
+      "context": "literal"
+    },
+    {
+      "line_start": 128,
+      "line_end": 128,
+      "column": 43,
+      "value": ":",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 27,
+      "value": "kind",
+      "context": "literal"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 35,
+      "value": "",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 79,
+      "text": "# Reuse s0's walk, not a second walk; falls back when s0 was off or its checkpoint has no walk"
+    },
+    {
+      "line": 84,
+      "text": "# Jail agentic reads to the inventory or .git/config is readable; before dedup so siblings stay"
+    },
+    {
+      "line": 92,
+      "text": "# Seed paths are normalized so './foo', 'foo', '<abs>/foo' and 'foo\\bar' all match the inventory"
+    },
+    {
+      "line": 94,
+      "text": "# In --group-by-app a seed path may omit its top-level repo dir, so try each as a prefix first"
+    },
+    {
+      "line": 99,
+      "text": "# matched 2+ top dirs: dropped, never guessed"
+    },
+    {
+      "line": 104,
+      "text": "# raw seed string, for the log"
+    },
+    {
+      "line": 120,
+      "text": "# Semgrep codeFlow hops are \"file:line\"; re-resolve so s3._reachable_files can trust them"
+    },
+    {
+      "line": 134,
+      "text": "# Framework entry points arrive inside seed.entry_points, not separately."
+    },
+    {
+      "line": 162,
+      "text": "# `language` is required with no default; fall back to the commonest ext if the graph has none"
+    },
+    {
+      "line": 176,
+      "text": "# models.py field_validator(mode=\"before\") coerces off-schema enums/ints, so this never raises"
+    },
+    {
+      "line": 191,
+      "text": "# Every later stage would process the empty set and report success, so refuse here instead"
+    },
+    {
+      "line": 199,
+      "text": "# All-zero output on a non-empty inventory: record it so scan health/SARIF show the degradation"
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 27,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 28,
+      "line_end": 28,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 29,
+      "line_end": 29,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 30,
+      "line_end": 35,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 36,
+      "line_end": 36,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 37,
+      "line_end": 37,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 38,
+      "line_end": 38,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 40,
+      "line_end": 40,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 43,
+      "line_end": 43,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 44,
+      "line_end": 44,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 47,
+      "line_end": 48,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 7
+    },
+    {
+      "kind": "Return",
+      "line_start": 48,
+      "line_end": 48,
+      "column": 4,
+      "owner": "q_join",
+      "representation_line": 12
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 51,
+      "line_end": 55,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 16
+    },
+    {
+      "kind": "If",
+      "line_start": 52,
+      "line_end": 54,
+      "column": 4,
+      "owner": "q_split",
+      "representation_line": 21
+    },
+    {
+      "kind": "Assign",
+      "line_start": 53,
+      "line_end": 53,
+      "column": 8,
+      "owner": "q_split",
+      "representation_line": 24
+    },
+    {
+      "kind": "Return",
+      "line_start": 54,
+      "line_end": 54,
+      "column": 8,
+      "owner": "q_split",
+      "representation_line": 25
+    },
+    {
+      "kind": "Return",
+      "line_start": 55,
+      "line_end": 55,
+      "column": 4,
+      "owner": "q_split",
+      "representation_line": 28
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 58,
+      "line_end": 59,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 32
+    },
+    {
+      "kind": "Return",
+      "line_start": 59,
+      "line_end": 59,
+      "column": 4,
+      "owner": "q_file",
+      "representation_line": 37
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 62,
+      "line_end": 63,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 41
+    },
+    {
+      "kind": "Return",
+      "line_start": 63,
+      "line_end": 63,
+      "column": 4,
+      "owner": "q_name",
+      "representation_line": 46
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 66,
+      "line_end": 73,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 50
+    },
+    {
+      "kind": "Expr",
+      "line_start": 67,
+      "line_end": 67,
+      "column": 4,
+      "owner": "_modules_from_graph",
+      "representation_line": 56
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 68,
+      "line_end": 68,
+      "column": 4,
+      "owner": "_modules_from_graph",
+      "representation_line": 56
+    },
+    {
+      "kind": "For",
+      "line_start": 69,
+      "line_end": 72,
+      "column": 4,
+      "owner": "_modules_from_graph",
+      "representation_line": 57
+    },
+    {
+      "kind": "Assign",
+      "line_start": 70,
+      "line_end": 70,
+      "column": 8,
+      "owner": "_modules_from_graph",
+      "representation_line": 60
+    },
+    {
+      "kind": "If",
+      "line_start": 71,
+      "line_end": 72,
+      "column": 8,
+      "owner": "_modules_from_graph",
+      "representation_line": 61
+    },
+    {
+      "kind": "Expr",
+      "line_start": 72,
+      "line_end": 72,
+      "column": 12,
+      "owner": "_modules_from_graph",
+      "representation_line": 64
+    },
+    {
+      "kind": "Return",
+      "line_start": 73,
+      "line_end": 73,
+      "column": 4,
+      "owner": "_modules_from_graph",
+      "representation_line": 67
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 76,
+      "line_end": 207,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 71
+    },
+    {
+      "kind": "Expr",
+      "line_start": 78,
+      "line_end": 78,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 77
+    },
+    {
+      "kind": "If",
+      "line_start": 80,
+      "line_end": 83,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 78
+    },
+    {
+      "kind": "Assign",
+      "line_start": 81,
+      "line_end": 81,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 81
+    },
+    {
+      "kind": "Assign",
+      "line_start": 83,
+      "line_end": 83,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 85
+    },
+    {
+      "kind": "Expr",
+      "line_start": 85,
+      "line_end": 85,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 88
+    },
+    {
+      "kind": "Assign",
+      "line_start": 86,
+      "line_end": 86,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 88
+    },
+    {
+      "kind": "Assign",
+      "line_start": 87,
+      "line_end": 87,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 88
+    },
+    {
+      "kind": "Assign",
+      "line_start": 88,
+      "line_end": 88,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 88
+    },
+    {
+      "kind": "If",
+      "line_start": 89,
+      "line_end": 90,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 89
+    },
+    {
+      "kind": "Expr",
+      "line_start": 90,
+      "line_end": 90,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 92
+    },
+    {
+      "kind": "Assign",
+      "line_start": 93,
+      "line_end": 93,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 95
+    },
+    {
+      "kind": "Assign",
+      "line_start": 95,
+      "line_end": 97,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 95
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 99,
+      "line_end": 99,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 95
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 101,
+      "line_end": 105,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 96
+    },
+    {
+      "kind": "Assign",
+      "line_start": 102,
+      "line_end": 102,
+      "column": 8,
+      "owner": "run._resolve_in_scope",
+      "representation_line": 102
+    },
+    {
+      "kind": "If",
+      "line_start": 103,
+      "line_end": 104,
+      "column": 8,
+      "owner": "run._resolve_in_scope",
+      "representation_line": 103
+    },
+    {
+      "kind": "Expr",
+      "line_start": 104,
+      "line_end": 104,
+      "column": 12,
+      "owner": "run._resolve_in_scope",
+      "representation_line": 106
+    },
+    {
+      "kind": "Return",
+      "line_start": 105,
+      "line_end": 105,
+      "column": 8,
+      "owner": "run._resolve_in_scope",
+      "representation_line": 108
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 107,
+      "line_end": 107,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 113
+    },
+    {
+      "kind": "If",
+      "line_start": 109,
+      "line_end": 147,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 114
+    },
+    {
+      "kind": "Assign",
+      "line_start": 110,
+      "line_end": 112,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 117
+    },
+    {
+      "kind": "Assign",
+      "line_start": 113,
+      "line_end": 115,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 117
+    },
+    {
+      "kind": "Expr",
+      "line_start": 116,
+      "line_end": 116,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 117
+    },
+    {
+      "kind": "Expr",
+      "line_start": 117,
+      "line_end": 117,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 117
+    },
+    {
+      "kind": "Expr",
+      "line_start": 118,
+      "line_end": 119,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 117
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 121,
+      "line_end": 121,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 119
+    },
+    {
+      "kind": "For",
+      "line_start": 122,
+      "line_end": 130,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 120
+    },
+    {
+      "kind": "Assign",
+      "line_start": 123,
+      "line_end": 123,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 123
+    },
+    {
+      "kind": "For",
+      "line_start": 124,
+      "line_end": 128,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 124
+    },
+    {
+      "kind": "Assign",
+      "line_start": 125,
+      "line_end": 125,
+      "column": 16,
+      "owner": "run",
+      "representation_line": 127
+    },
+    {
+      "kind": "Assign",
+      "line_start": 126,
+      "line_end": 126,
+      "column": 16,
+      "owner": "run",
+      "representation_line": 127
+    },
+    {
+      "kind": "If",
+      "line_start": 127,
+      "line_end": 128,
+      "column": 16,
+      "owner": "run",
+      "representation_line": 128
+    },
+    {
+      "kind": "Expr",
+      "line_start": 128,
+      "line_end": 128,
+      "column": 20,
+      "owner": "run",
+      "representation_line": 131
+    },
+    {
+      "kind": "If",
+      "line_start": 129,
+      "line_end": 130,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 134
+    },
+    {
+      "kind": "Expr",
+      "line_start": 130,
+      "line_end": 130,
+      "column": 16,
+      "owner": "run",
+      "representation_line": 137
+    },
+    {
+      "kind": "Assign",
+      "line_start": 131,
+      "line_end": 131,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 141
+    },
+    {
+      "kind": "Expr",
+      "line_start": 132,
+      "line_end": 132,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 141
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 135,
+      "line_end": 135,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 141
+    },
+    {
+      "kind": "For",
+      "line_start": 136,
+      "line_end": 138,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 142
+    },
+    {
+      "kind": "If",
+      "line_start": 137,
+      "line_end": 138,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 144
+    },
+    {
+      "kind": "Expr",
+      "line_start": 138,
+      "line_end": 138,
+      "column": 16,
+      "owner": "run",
+      "representation_line": 147
+    },
+    {
+      "kind": "If",
+      "line_start": 139,
+      "line_end": 143,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 150
+    },
+    {
+      "kind": "Assign",
+      "line_start": 140,
+      "line_end": 140,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 153
+    },
+    {
+      "kind": "Assign",
+      "line_start": 141,
+      "line_end": 141,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 153
+    },
+    {
+      "kind": "Expr",
+      "line_start": 142,
+      "line_end": 143,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 153
+    },
+    {
+      "kind": "If",
+      "line_start": 145,
+      "line_end": 147,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 155
+    },
+    {
+      "kind": "Expr",
+      "line_start": 146,
+      "line_end": 147,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 158
+    },
+    {
+      "kind": "If",
+      "line_start": 149,
+      "line_end": 152,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 161
+    },
+    {
+      "kind": "Assign",
+      "line_start": 150,
+      "line_end": 150,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 164
+    },
+    {
+      "kind": "Assign",
+      "line_start": 151,
+      "line_end": 151,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 164
+    },
+    {
+      "kind": "Expr",
+      "line_start": 152,
+      "line_end": 152,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 164
+    },
+    {
+      "kind": "Assign",
+      "line_start": 154,
+      "line_end": 154,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 167
+    },
+    {
+      "kind": "If",
+      "line_start": 155,
+      "line_end": 161,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 168
+    },
+    {
+      "kind": "Assign",
+      "line_start": 156,
+      "line_end": 156,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 171
+    },
+    {
+      "kind": "Assign",
+      "line_start": 157,
+      "line_end": 157,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 171
+    },
+    {
+      "kind": "Assign",
+      "line_start": 158,
+      "line_end": 158,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 171
+    },
+    {
+      "kind": "Assign",
+      "line_start": 160,
+      "line_end": 160,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 175
+    },
+    {
+      "kind": "Assign",
+      "line_start": 161,
+      "line_end": 161,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 175
+    },
+    {
+      "kind": "If",
+      "line_start": 163,
+      "line_end": 170,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 177
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 164,
+      "line_end": 164,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 180
+    },
+    {
+      "kind": "For",
+      "line_start": 165,
+      "line_end": 168,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 181
+    },
+    {
+      "kind": "Assign",
+      "line_start": 166,
+      "line_end": 166,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 184
+    },
+    {
+      "kind": "If",
+      "line_start": 167,
+      "line_end": 168,
+      "column": 12,
+      "owner": "run",
+      "representation_line": 185
+    },
+    {
+      "kind": "Assign",
+      "line_start": 168,
+      "line_end": 168,
+      "column": 16,
+      "owner": "run",
+      "representation_line": 188
+    },
+    {
+      "kind": "Assign",
+      "line_start": 169,
+      "line_end": 170,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 192
+    },
+    {
+      "kind": "Assign",
+      "line_start": 171,
+      "line_end": 171,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 195
+    },
+    {
+      "kind": "Assign",
+      "line_start": 172,
+      "line_end": 172,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 195
+    },
+    {
+      "kind": "Assign",
+      "line_start": 173,
+      "line_end": 173,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 195
+    },
+    {
+      "kind": "Assign",
+      "line_start": 174,
+      "line_end": 174,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 195
+    },
+    {
+      "kind": "Assign",
+      "line_start": 177,
+      "line_end": 177,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 195
+    },
+    {
+      "kind": "Assign",
+      "line_start": 178,
+      "line_end": 178,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 197
+    },
+    {
+      "kind": "Assign",
+      "line_start": 179,
+      "line_end": 179,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 197
+    },
+    {
+      "kind": "Assign",
+      "line_start": 180,
+      "line_end": 180,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 197
+    },
+    {
+      "kind": "Assign",
+      "line_start": 181,
+      "line_end": 181,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 197
+    },
+    {
+      "kind": "Assign",
+      "line_start": 182,
+      "line_end": 182,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 197
+    },
+    {
+      "kind": "Assign",
+      "line_start": 183,
+      "line_end": 183,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 199
+    },
+    {
+      "kind": "Assign",
+      "line_start": 184,
+      "line_end": 184,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 199
+    },
+    {
+      "kind": "Expr",
+      "line_start": 185,
+      "line_end": 187,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 199
+    },
+    {
+      "kind": "Expr",
+      "line_start": 188,
+      "line_end": 190,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 199
+    },
+    {
+      "kind": "If",
+      "line_start": 192,
+      "line_end": 198,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 200
+    },
+    {
+      "kind": "Raise",
+      "line_start": 193,
+      "line_end": 198,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 202
+    },
+    {
+      "kind": "If",
+      "line_start": 200,
+      "line_end": 206,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 205
+    },
+    {
+      "kind": "Expr",
+      "line_start": 202,
+      "line_end": 206,
+      "column": 8,
+      "owner": "run",
+      "representation_line": 208
+    },
+    {
+      "kind": "Return",
+      "line_start": 207,
+      "line_end": 207,
+      "column": 4,
+      "owner": "run",
+      "representation_line": 210
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 6,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='logs', ctx=Load()), attr='get_logger', ctx=Load()), args=[Name(id='__name__', ctx=Load())], keywords=[])",
+      "rendered": "logs.get_logger(__name__)"
+    },
+    {
+      "line_start": 43,
+      "line_end": 43,
+      "column": 7,
+      "kind": "Constant",
+      "original_ast": "Constant(value='::')",
+      "rendered": "'::'"
+    },
+    {
+      "line_start": 44,
+      "line_end": 44,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value='<module>')",
+      "rendered": "'<module>'"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 11,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[FormattedValue(value=Name(id='file', ctx=Load()), conversion=-1), FormattedValue(value=Name(id='QSEP', ctx=Load()), conversion=-1), FormattedValue(value=Name(id='name', ctx=Load()), conversion=-1)])",
+      "rendered": "source_template_48_11"
+    },
+    {
+      "line_start": 52,
+      "line_end": 52,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='QSEP', ctx=Load()), ops=[In()], comparators=[Name(id='qname', ctx=Load())])",
+      "rendered": "QSEP in qname"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='qname', ctx=Load()), attr='rpartition', ctx=Load()), args=[Name(id='QSEP', ctx=Load())], keywords=[])",
+      "rendered": "qname.rpartition(QSEP)"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='f', ctx=Load()), Name(id='n', ctx=Load())], ctx=Load())",
+      "rendered": "(f, n)"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value=''), Name(id='qname', ctx=Load())], ctx=Load())",
+      "rendered": "('', qname)"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 11,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Call(func=Name(id='q_split', ctx=Load()), args=[Name(id='qname', ctx=Load())], keywords=[]), slice=Constant(value=0), ctx=Load())",
+      "rendered": "q_split(qname)[0]"
+    },
+    {
+      "line_start": 63,
+      "line_end": 63,
+      "column": 11,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Call(func=Name(id='q_split', ctx=Load()), args=[Name(id='qname', ctx=Load())], keywords=[]), slice=Constant(value=1), ctx=Load())",
+      "rendered": "q_split(qname)[1]"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 26,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Name(id='communities_as_modules', ctx=Load()), args=[Name(id='graph_handle', ctx=Load())], keywords=[]), attr='items', ctx=Load()), args=[], keywords=[])",
+      "rendered": "communities_as_modules(graph_handle).items()"
+    },
+    {
+      "line_start": 70,
+      "line_end": 70,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[SetComp(elt=Name(id='hit', ctx=Load()), generators=[comprehension(target=Name(id='f', ctx=Store()), iter=Name(id='files', ctx=Load()), ifs=[NamedExpr(target=Name(id='hit', ctx=Store()), value=Call(func=Name(id='resolve_in_scope', ctx=Load()), args=[Name(id='f', ctx=Load())], keywords=[]))], is_async=0)])], keywords=[])",
+      "rendered": "sorted({hit for f in files if (hit := resolve_in_scope(f))})"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='in_scope', ctx=Load())",
+      "rendered": "in_scope"
+    },
+    {
+      "line_start": 72,
+      "line_end": 72,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='modules', ctx=Load()), attr='append', ctx=Load()), args=[Dict(keys=[Constant(value='name'), Constant(value='files')], values=[Name(id='name', ctx=Load()), Name(id='in_scope', ctx=Load())])], keywords=[])",
+      "rendered": "modules.append({'name': name, 'files': in_scope})"
+    },
+    {
+      "line_start": 73,
+      "line_end": 73,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='modules', ctx=Load())",
+      "rendered": "modules"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='seed', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='seed', ctx=Load()), Constant(value='all_files'), Constant(value=None)], keywords=[])])",
+      "rendered": "seed is not None and getattr(seed, 'all_files', None)"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 30,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Call(func=Name(id='list', ctx=Load()), args=[Attribute(value=Name(id='seed', ctx=Load()), attr='all_files', ctx=Load())], keywords=[]), Call(func=Name(id='dict', ctx=Load()), args=[Attribute(value=Name(id='seed', ctx=Load()), attr='excluded', ctx=Load())], keywords=[])], ctx=Load())",
+      "rendered": "(list(seed.all_files), dict(seed.excluded))"
+    },
+    {
+      "line_start": 83,
+      "line_end": 83,
+      "column": 30,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_walk_repo', ctx=Load()), args=[Name(id='repo_root', ctx=Load()), Name(id='cfg', ctx=Load())], keywords=[])",
+      "rendered": "_walk_repo(repo_root, cfg)"
+    },
+    {
+      "line_start": 85,
+      "line_end": 85,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_localtools', ctx=Load()), attr='set_scope', ctx=Load()), args=[Name(id='repo_root', ctx=Load()), Name(id='all_files', ctx=Load())], keywords=[])",
+      "rendered": "_localtools.set_scope(repo_root, all_files)"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 30,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_dedup_configs', ctx=Load()), args=[Name(id='all_files', ctx=Load()), Call(func=Name(id='Path', ctx=Load()), args=[Name(id='repo_root', ctx=Load())], keywords=[]), Name(id='cfg', ctx=Load())], keywords=[])",
+      "rendered": "_dedup_configs(all_files, Path(repo_root), cfg)"
+    },
+    {
+      "line_start": 87,
+      "line_end": 87,
+      "column": 31,
+      "kind": "Name",
+      "original_ast": "Name(id='dedup_report', ctx=Load())",
+      "rendered": "dedup_report"
+    },
+    {
+      "line_start": 88,
+      "line_end": 88,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='cfg', ctx=Load()), Constant(value='_scan_progress'), Constant(value=None)], keywords=[])",
+      "rendered": "getattr(cfg, '_scan_progress', None)"
+    },
+    {
+      "line_start": 89,
+      "line_end": 89,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='tracker', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "tracker is not None"
+    },
+    {
+      "line_start": 90,
+      "line_end": 90,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='tracker', ctx=Load()), attr='discovered', ctx=Load()), args=[Name(id='all_files', ctx=Load())], keywords=[])",
+      "rendered": "tracker.discovered(all_files)"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[Name(id='all_files', ctx=Load())], keywords=[])",
+      "rendered": "set(all_files)"
+    },
+    {
+      "line_start": 95,
+      "line_end": 97,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[GeneratorExp(elt=Attribute(value=Name(id='d', ctx=Load()), attr='name', ctx=Load()), generators=[comprehension(target=Name(id='d', ctx=Store()), iter=Call(func=Attribute(value=Call(func=Name(id='Path', ctx=Load()), args=[Name(id='repo_root', ctx=Load())], keywords=[]), attr='iterdir', ctx=Load()), args=[], keywords=[]), ifs=[BoolOp(op=And(), values=[Call(func=Attribute(value=Name(id='d', ctx=Load()), attr='is_dir', ctx=Load()), args=[], keywords=[]), Compare(left=Attribute(value=Name(id='d', ctx=Load()), attr='name', ctx=Load()), ops=[NotIn()], comparators=[Tuple(elts=[Constant(value='checkpoints'), Constant(value='security-scan')], ctx=Load())])])], is_async=0)])], keywords=[])",
+      "rendered": "sorted((d.name for d in Path(repo_root).iterdir() if d.is_dir() and d.name not in ('checkpoints', 'security-scan')))"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 27,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 102,
+      "line_end": 102,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_resolve_scope_path', ctx=Load()), args=[Name(id='path', ctx=Load()), Name(id='repo_root', ctx=Load()), Name(id='keep', ctx=Load()), Name(id='top_dirs', ctx=Load())], keywords=[])",
+      "rendered": "_resolve_scope_path(path, repo_root, keep, top_dirs)"
+    },
+    {
+      "line_start": 103,
+      "line_end": 103,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='amb', ctx=Load())",
+      "rendered": "amb"
+    },
+    {
+      "line_start": 104,
+      "line_end": 104,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='ambiguous', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='path', ctx=Load())], keywords=[])",
+      "rendered": "ambiguous.append(path)"
+    },
+    {
+      "line_start": 105,
+      "line_end": 105,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='hit', ctx=Load())",
+      "rendered": "hit"
+    },
+    {
+      "line_start": 107,
+      "line_end": 107,
+      "column": 17,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='unsafe_sinks'), Constant(value='entry_points')], values=[List(elts=[], ctx=Load()), List(elts=[], ctx=Load())])",
+      "rendered": "{'unsafe_sinks': [], 'entry_points': []}"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='seed', ctx=Load())",
+      "rendered": "seed"
+    },
+    {
+      "line_start": 110,
+      "line_end": 112,
+      "column": 21,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Call(func=Name(id='dict', ctx=Load()), args=[Call(func=Attribute(value=Name(id='s', ctx=Load()), attr='model_dump', ctx=Load()), args=[], keywords=[])], keywords=[keyword(arg='file', value=Name(id='hit', ctx=Load()))]), generators=[comprehension(target=Name(id='s', ctx=Store()), iter=Attribute(value=Name(id='seed', ctx=Load()), attr='unsafe_sinks', ctx=Load()), ifs=[NamedExpr(target=Name(id='hit', ctx=Store()), value=Call(func=Name(id='_resolve_in_scope', ctx=Load()), args=[Attribute(value=Name(id='s', ctx=Load()), attr='file', ctx=Load())], keywords=[]))], is_async=0)])",
+      "rendered": "[dict(s.model_dump(), file=hit) for s in seed.unsafe_sinks if (hit := _resolve_in_scope(s.file))]"
+    },
+    {
+      "line_start": 113,
+      "line_end": 115,
+      "column": 19,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Call(func=Name(id='dict', ctx=Load()), args=[Call(func=Attribute(value=Name(id='e', ctx=Load()), attr='model_dump', ctx=Load()), args=[], keywords=[])], keywords=[keyword(arg='file', value=Name(id='hit', ctx=Load()))]), generators=[comprehension(target=Name(id='e', ctx=Store()), iter=Attribute(value=Name(id='seed', ctx=Load()), attr='entry_points', ctx=Load()), ifs=[NamedExpr(target=Name(id='hit', ctx=Store()), value=Call(func=Name(id='_resolve_in_scope', ctx=Load()), args=[Attribute(value=Name(id='e', ctx=Load()), attr='file', ctx=Load())], keywords=[]))], is_async=0)])",
+      "rendered": "[dict(e.model_dump(), file=hit) for e in seed.entry_points if (hit := _resolve_in_scope(e.file))]"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Subscript(value=Name(id='data', ctx=Load()), slice=Constant(value='unsafe_sinks'), ctx=Load()), attr='extend', ctx=Load()), args=[Name(id='seed_sinks', ctx=Load())], keywords=[])",
+      "rendered": "data['unsafe_sinks'].extend(seed_sinks)"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Subscript(value=Name(id='data', ctx=Load()), slice=Constant(value='entry_points'), ctx=Load()), attr='extend', ctx=Load()), args=[Name(id='seed_eps', ctx=Load())], keywords=[])",
+      "rendered": "data['entry_points'].extend(seed_eps)"
+    },
+    {
+      "line_start": 118,
+      "line_end": 119,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='info', ctx=Load()), args=[Constant(value='s1/preprocess: merged s0 seed - sinks=%d entry_points=%d'), Call(func=Name(id='len', ctx=Load()), args=[Name(id='seed_sinks', ctx=Load())], keywords=[]), Call(func=Name(id='len', ctx=Load()), args=[Name(id='seed_eps', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "log.info('s1/preprocess: merged s0 seed - sinks=%d entry_points=%d', len(seed_sinks), len(seed_eps))"
+    },
+    {
+      "line_start": 121,
+      "line_end": 121,
+      "column": 38,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 122,
+      "line_end": 122,
+      "column": 20,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='seed', ctx=Load()), Constant(value='taint_paths'), Constant(value=None)], keywords=[]), List(elts=[], ctx=Load())])",
+      "rendered": "getattr(seed, 'taint_paths', None) or []"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 23,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='path', ctx=Load())",
+      "rendered": "path"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 29,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='hop', ctx=Load()), attr='rpartition', ctx=Load()), args=[Constant(value=':')], keywords=[])",
+      "rendered": "hop.rpartition(':')"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_resolve_in_scope', ctx=Load()), args=[BoolOp(op=Or(), values=[Name(id='f', ctx=Load()), Name(id='hop', ctx=Load())])], keywords=[])",
+      "rendered": "_resolve_in_scope(f or hop)"
+    },
+    {
+      "line_start": 127,
+      "line_end": 127,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='hit', ctx=Load())",
+      "rendered": "hit"
+    },
+    {
+      "line_start": 128,
+      "line_end": 128,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='resolved', ctx=Load()), attr='append', ctx=Load()), args=[IfExp(test=Name(id='sep', ctx=Load()), body=JoinedStr(values=[FormattedValue(value=Name(id='hit', ctx=Load()), conversion=-1), Constant(value=':'), FormattedValue(value=Name(id='ln', ctx=Load()), conversion=-1)]), orelse=Name(id='hit', ctx=Load()))], keywords=[])",
+      "rendered": "resolved.append(source_template_128_36 if sep else hit)"
+    },
+    {
+      "line_start": 129,
+      "line_end": 129,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='resolved', ctx=Load())], keywords=[]), ops=[GtE()], comparators=[Constant(value=2)])",
+      "rendered": "len(resolved) >= 2"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='seed_paths', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='resolved', ctx=Load())], keywords=[])",
+      "rendered": "seed_paths.append(resolved)"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 35,
+      "kind": "Name",
+      "original_ast": "Name(id='seed_paths', ctx=Load())",
+      "rendered": "seed_paths"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='debug', ctx=Load()), args=[Constant(value='s1/preprocess: seed taint paths processed - paths=%d'), Call(func=Name(id='len', ctx=Load()), args=[Name(id='seed_paths', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "log.debug('s1/preprocess: seed taint paths processed - paths=%d', len(seed_paths))"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 43,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 18,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='seed', ctx=Load()), Constant(value='entry_points'), List(elts=[], ctx=Load())], keywords=[]), List(elts=[], ctx=Load())])",
+      "rendered": "getattr(seed, 'entry_points', []) or []"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 15,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Call(func=Attribute(value=Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='ep', ctx=Load()), Constant(value='kind'), Constant(value='')], keywords=[]), attr='lower', ctx=Load()), args=[], keywords=[]), ops=[Eq()], comparators=[Constant(value='framework')]), UnaryOp(op=Not(), operand=Call(func=Name(id='_resolve_in_scope', ctx=Load()), args=[Attribute(value=Name(id='ep', ctx=Load()), attr='file', ctx=Load())], keywords=[]))])",
+      "rendered": "getattr(ep, 'kind', '').lower() == 'framework' and (not _resolve_in_scope(ep.file))"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='framework_unresolvable', ctx=Load()), attr='add', ctx=Load()), args=[JoinedStr(values=[FormattedValue(value=Attribute(value=Name(id='ep', ctx=Load()), attr='file', ctx=Load()), conversion=-1), Constant(value='::'), FormattedValue(value=Attribute(value=Name(id='ep', ctx=Load()), attr='function', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "framework_unresolvable.add(source_template_138_43)"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='framework_unresolvable', ctx=Load())",
+      "rendered": "framework_unresolvable"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Constant(value=', '), attr='join', ctx=Load()), args=[Subscript(value=Call(func=Name(id='sorted', ctx=Load()), args=[Name(id='framework_unresolvable', ctx=Load())], keywords=[]), slice=Slice(upper=Constant(value=3)), ctx=Load())], keywords=[])",
+      "rendered": "', '.join(sorted(framework_unresolvable)[:3])"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 20,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='framework_unresolvable', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Constant(value=3)]), body=JoinedStr(values=[Constant(value=' (+'), FormattedValue(value=BinOp(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='framework_unresolvable', ctx=Load())], keywords=[]), op=Sub(), right=Constant(value=3)), conversion=-1), Constant(value=' more)')]), orelse=Constant(value=''))",
+      "rendered": "source_template_141_20 if len(framework_unresolvable) > 3 else ''"
+    },
+    {
+      "line_start": 142,
+      "line_end": 143,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Attribute(value=Name(id='Event', ctx=Load()), attr='S1_FRAMEWORK_ENTRY_UNRESOLVED', ctx=Load())], keywords=[keyword(arg='count', value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='framework_unresolvable', ctx=Load())], keywords=[])), keyword(arg='sample', value=JoinedStr(values=[FormattedValue(value=Name(id='sample', ctx=Load()), conversion=-1), FormattedValue(value=Name(id='n_str', ctx=Load()), conversion=-1)]))])",
+      "rendered": "log.warning(Event.S1_FRAMEWORK_ENTRY_UNRESOLVED, count=len(framework_unresolvable), sample=source_template_143_31)"
+    },
+    {
+      "line_start": 145,
+      "line_end": 145,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Name(id='seed_sinks', ctx=Load()), Name(id='seed_eps', ctx=Load()), Name(id='seed_paths', ctx=Load())])",
+      "rendered": "seed_sinks or seed_eps or seed_paths"
+    },
+    {
+      "line_start": 146,
+      "line_end": 147,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='  [s1] merged s0 seed: +'), FormattedValue(value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='seed_eps', ctx=Load())], keywords=[]), conversion=-1), Constant(value=' entry points, +'), FormattedValue(value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='seed_sinks', ctx=Load())], keywords=[]), conversion=-1), Constant(value=' sinks, '), FormattedValue(value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='seed_paths', ctx=Load())], keywords=[]), conversion=-1), Constant(value=' codeFlow paths')])], keywords=[])",
+      "rendered": "console.write(source_template_146_26)"
+    },
+    {
+      "line_start": 149,
+      "line_end": 149,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='ambiguous', ctx=Load())",
+      "rendered": "ambiguous"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[Call(func=Name(id='set', ctx=Load()), args=[Name(id='ambiguous', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "sorted(set(ambiguous))"
+    },
+    {
+      "line_start": 151,
+      "line_end": 151,
+      "column": 17,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Attribute(value=Constant(value=', '), attr='join', ctx=Load()), args=[Subscript(value=Name(id='uniq', ctx=Load()), slice=Slice(upper=Constant(value=5)), ctx=Load())], keywords=[]), op=Add(), right=IfExp(test=Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='uniq', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Constant(value=5)]), body=Constant(value='…'), orelse=Constant(value='')))",
+      "rendered": "', '.join(uniq[:5]) + ('…' if len(uniq) > 5 else '')"
+    },
+    {
+      "line_start": 152,
+      "line_end": 152,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Attribute(value=Name(id='Event', ctx=Load()), attr='S1_AMBIGUOUS_PATHS_DROPPED', ctx=Load())], keywords=[keyword(arg='count', value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='ambiguous', ctx=Load())], keywords=[])), keyword(arg='sample', value=Name(id='sample', ctx=Load()))])",
+      "rendered": "log.warning(Event.S1_AMBIGUOUS_PATHS_DROPPED, count=len(ambiguous), sample=sample)"
+    },
+    {
+      "line_start": 154,
+      "line_end": 154,
+      "column": 24,
+      "kind": "Name",
+      "original_ast": "Name(id='repo_root', ctx=Load())",
+      "rendered": "repo_root"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='graph_handle', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "graph_handle is not None"
+    },
+    {
+      "line_start": 156,
+      "line_end": 156,
+      "column": 27,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='primary_language', ctx=Load()), args=[Name(id='graph_handle', ctx=Load())], keywords=[])",
+      "rendered": "primary_language(graph_handle)"
+    },
+    {
+      "line_start": 157,
+      "line_end": 157,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_modules_from_graph', ctx=Load()), args=[Name(id='graph_handle', ctx=Load()), Name(id='_resolve_in_scope', ctx=Load())], keywords=[])",
+      "rendered": "_modules_from_graph(graph_handle, _resolve_in_scope)"
+    },
+    {
+      "line_start": 158,
+      "line_end": 158,
+      "column": 24,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='system_context_notes', ctx=Load()), args=[Name(id='graph_handle', ctx=Load())], keywords=[])",
+      "rendered": "system_context_notes(graph_handle)"
+    },
+    {
+      "line_start": 160,
+      "line_end": 160,
+      "column": 26,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 161,
+      "line_end": 161,
+      "column": 24,
+      "kind": "Constant",
+      "original_ast": "Constant(value='')",
+      "rendered": "''"
+    },
+    {
+      "line_start": 163,
+      "line_end": 163,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='data', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='language')], keywords=[]))",
+      "rendered": "not data.get('language')"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 37,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 17,
+      "kind": "Name",
+      "original_ast": "Name(id='all_files', ctx=Load())",
+      "rendered": "all_files"
+    },
+    {
+      "line_start": 166,
+      "line_end": 166,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='EXT_TO_LANG', ctx=Load()), attr='get', ctx=Load()), args=[Call(func=Attribute(value=Attribute(value=Call(func=Name(id='Path', ctx=Load()), args=[Name(id='f', ctx=Load())], keywords=[]), attr='suffix', ctx=Load()), attr='lower', ctx=Load()), args=[], keywords=[])], keywords=[])",
+      "rendered": "EXT_TO_LANG.get(Path(f).suffix.lower())"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='lang', ctx=Load())",
+      "rendered": "lang"
+    },
+    {
+      "line_start": 168,
+      "line_end": 168,
+      "column": 35,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Attribute(value=Name(id='ext_counts', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='lang', ctx=Load()), Constant(value=0)], keywords=[]), op=Add(), right=Constant(value=1))",
+      "rendered": "ext_counts.get(lang, 0) + 1"
+    },
+    {
+      "line_start": 169,
+      "line_end": 170,
+      "column": 28,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='ext_counts', ctx=Load()), body=Call(func=Name(id='max', ctx=Load()), args=[Name(id='ext_counts', ctx=Load())], keywords=[keyword(arg='key', value=Lambda(args=arguments(posonlyargs=[], args=[arg(arg='k')], kwonlyargs=[], kw_defaults=[], defaults=[]), body=Subscript(value=Name(id='ext_counts', ctx=Load()), slice=Name(id='k', ctx=Load()), ctx=Load())))]), orelse=Constant(value='unknown'))",
+      "rendered": "max(ext_counts, key=lambda k: ext_counts[k]) if ext_counts else 'unknown'"
+    },
+    {
+      "line_start": 171,
+      "line_end": 171,
+      "column": 24,
+      "kind": "Name",
+      "original_ast": "Name(id='all_files', ctx=Load())",
+      "rendered": "all_files"
+    },
+    {
+      "line_start": 172,
+      "line_end": 172,
+      "column": 23,
+      "kind": "Name",
+      "original_ast": "Name(id='excluded', ctx=Load())",
+      "rendered": "excluded"
+    },
+    {
+      "line_start": 173,
+      "line_end": 173,
+      "column": 25,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Call(func=Attribute(value=Name(id='c', ctx=Load()), attr='model_dump', ctx=Load()), args=[], keywords=[]), generators=[comprehension(target=Name(id='c', ctx=Store()), iter=Name(id='known_cves', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "[c.model_dump() for c in known_cves]"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 30,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Call(func=Attribute(value=Name(id='c', ctx=Load()), attr='model_dump', ctx=Load()), args=[], keywords=[]), generators=[comprehension(target=Name(id='c', ctx=Store()), iter=Name(id='controls', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "[c.model_dump() for c in controls]"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='ContextPackage', ctx=Load()), attr='model_validate', ctx=Load()), args=[Name(id='data', ctx=Load())], keywords=[])",
+      "rendered": "ContextPackage.model_validate(data)"
+    },
+    {
+      "line_start": 178,
+      "line_end": 178,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sum', ctx=Load()), args=[Call(func=Attribute(value=Subscript(value=Name(id='excluded', ctx=Load()), slice=Constant(value='dirs'), ctx=Load()), attr='values', ctx=Load()), args=[], keywords=[])], keywords=[])",
+      "rendered": "sum(excluded['dirs'].values())"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sum', ctx=Load()), args=[Call(func=Attribute(value=Subscript(value=Name(id='excluded', ctx=Load()), slice=Constant(value='exts'), ctx=Load()), attr='values', ctx=Load()), args=[], keywords=[])], keywords=[])",
+      "rendered": "sum(excluded['exts'].values())"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sum', ctx=Load()), args=[Call(func=Attribute(value=Subscript(value=Name(id='excluded', ctx=Load()), slice=Constant(value='globs'), ctx=Load()), attr='values', ctx=Load()), args=[], keywords=[])], keywords=[])",
+      "rendered": "sum(excluded['globs'].values())"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 16,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Name(id='excluded', ctx=Load()), slice=Constant(value='oversize'), ctx=Load())",
+      "rendered": "excluded['oversize']"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 17,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Attribute(value=BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='excluded', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='config_dedup')], keywords=[]), Dict(keys=[], values=[])]), attr='get', ctx=Load()), args=[Constant(value='dropped'), Constant(value=0)], keywords=[]), Constant(value=0)])",
+      "rendered": "(excluded.get('config_dedup') or {}).get('dropped', 0) or 0"
+    },
+    {
+      "line_start": 183,
+      "line_end": 183,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='pkg', ctx=Load()), attr='all_files', ctx=Load())], keywords=[])",
+      "rendered": "len(pkg.all_files)"
+    },
+    {
+      "line_start": 184,
+      "line_end": 184,
+      "column": 14,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=BinOp(left=BinOp(left=BinOp(left=BinOp(left=Name(id='n_in_scope', ctx=Load()), op=Add(), right=Name(id='n_ex_dirs', ctx=Load())), op=Add(), right=Name(id='n_ex_exts', ctx=Load())), op=Add(), right=Name(id='n_ex_globs', ctx=Load())), op=Add(), right=Name(id='n_ex_size', ctx=Load())), op=Add(), right=Name(id='n_ex_dedup', ctx=Load()))",
+      "rendered": "n_in_scope + n_ex_dirs + n_ex_exts + n_ex_globs + n_ex_size + n_ex_dedup"
+    },
+    {
+      "line_start": 185,
+      "line_end": 187,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='  [s1] file inventory: '), FormattedValue(value=Name(id='n_total', ctx=Load()), conversion=-1), Constant(value=' on disk -> '), FormattedValue(value=Name(id='n_in_scope', ctx=Load()), conversion=-1), Constant(value=' in scope (excluded: '), FormattedValue(value=Name(id='n_ex_dirs', ctx=Load()), conversion=-1), Constant(value=' dir, '), FormattedValue(value=Name(id='n_ex_exts', ctx=Load()), conversion=-1), Constant(value=' ext, '), FormattedValue(value=Name(id='n_ex_globs', ctx=Load()), conversion=-1), Constant(value=' glob, '), FormattedValue(value=Name(id='n_ex_size', ctx=Load()), conversion=-1), Constant(value=' oversize, '), FormattedValue(value=Name(id='n_ex_dedup', ctx=Load()), conversion=-1), Constant(value=' config-dedup)')])], keywords=[])",
+      "rendered": "console.write(source_template_185_18)"
+    },
+    {
+      "line_start": 188,
+      "line_end": 190,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='counts', ctx=Load()), args=[Constant(value='s1'), Constant(value='done')], keywords=[keyword(arg='modules', value=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='pkg', ctx=Load()), attr='modules', ctx=Load())], keywords=[])), keyword(arg='entry_points', value=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='pkg', ctx=Load()), attr='entry_points', ctx=Load())], keywords=[])), keyword(arg='sinks', value=Call(func=Name(id='len', ctx=Load()), args=[Attribute(value=Name(id='pkg', ctx=Load()), attr='unsafe_sinks', ctx=Load())], keywords=[])), keyword(arg='files_in_scope', value=Name(id='n_in_scope', ctx=Load()))])",
+      "rendered": "console.counts('s1', 'done', modules=len(pkg.modules), entry_points=len(pkg.entry_points), sinks=len(pkg.unsafe_sinks), files_in_scope=n_in_scope)"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='n_in_scope', ctx=Load()))",
+      "rendered": "not n_in_scope"
+    },
+    {
+      "line_start": 193,
+      "line_end": 198,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='EmptyScopeError', ctx=Load()), args=[JoinedStr(values=[Constant(value='0 files in scope after exclusions ('), FormattedValue(value=Name(id='n_total', ctx=Load()), conversion=-1), Constant(value=' on disk: '), FormattedValue(value=Name(id='n_ex_dirs', ctx=Load()), conversion=-1), Constant(value=' dir, '), FormattedValue(value=Name(id='n_ex_exts', ctx=Load()), conversion=-1), Constant(value=' ext, '), FormattedValue(value=Name(id='n_ex_globs', ctx=Load()), conversion=-1), Constant(value=' glob, '), FormattedValue(value=Name(id='n_ex_size', ctx=Load()), conversion=-1), Constant(value=' oversize, '), FormattedValue(value=Name(id='n_ex_dedup', ctx=Load()), conversion=-1), Constant(value=' config-dedup). Nothing was analysed, so no conclusion can be drawn about this repository. Re-run with --no-auto-step1, or widen the step1 exclusions.')])], keywords=[])",
+      "rendered": "EmptyScopeError(source_template_194_12)"
+    },
+    {
+      "line_start": 200,
+      "line_end": 201,
+      "column": 8,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Name(id='n_in_scope', ctx=Load()), UnaryOp(op=Not(), operand=Attribute(value=Name(id='pkg', ctx=Load()), attr='modules', ctx=Load())), UnaryOp(op=Not(), operand=Attribute(value=Name(id='pkg', ctx=Load()), attr='entry_points', ctx=Load())), UnaryOp(op=Not(), operand=Attribute(value=Name(id='pkg', ctx=Load()), attr='unsafe_sinks', ctx=Load()))])",
+      "rendered": "n_in_scope and (not pkg.modules) and (not pkg.entry_points) and (not pkg.unsafe_sinks)"
+    },
+    {
+      "line_start": 202,
+      "line_end": 206,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_errlog', ctx=Load()), attr='log', ctx=Load()), args=[Constant(value='s1'), Constant(value='context-package'), JoinedStr(values=[Constant(value='S1 produced 0 modules, 0 entry points and 0 sinks with '), FormattedValue(value=Name(id='n_in_scope', ctx=Load()), conversion=-1), Constant(value=' files in scope')])], keywords=[keyword(arg='reason', value=Constant(value='s1_zero_output')), keyword(arg='files_in_scope', value=Name(id='n_in_scope', ctx=Load()))])",
+      "rendered": "_errlog.log('s1', 'context-package', source_template_203_20, reason='s1_zero_output', files_in_scope=n_in_scope)"
+    },
+    {
+      "line_start": 207,
+      "line_end": 207,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='pkg', ctx=Load())",
+      "rendered": "pkg"
+    }
+  ],
+  "calls": [
+    {
+      "line": 40,
+      "end_line": 40,
+      "callee": "logs.get_logger",
+      "enclosing": "module initialization",
+      "expression": "logs.get_logger(__name__)"
+    },
+    {
+      "line": 69,
+      "end_line": 69,
+      "callee": "communities_as_modules(graph_handle).items",
+      "enclosing": "_modules_from_graph",
+      "expression": "communities_as_modules(graph_handle).items()"
+    },
+    {
+      "line": 85,
+      "end_line": 85,
+      "callee": "_localtools.set_scope",
+      "enclosing": "run",
+      "expression": "_localtools.set_scope(repo_root, all_files)"
+    },
+    {
+      "line": 86,
+      "end_line": 86,
+      "callee": "_dedup_configs",
+      "enclosing": "run",
+      "expression": "_dedup_configs(all_files, Path(repo_root), cfg)"
+    },
+    {
+      "line": 88,
+      "end_line": 88,
+      "callee": "getattr",
+      "enclosing": "run",
+      "expression": "getattr(cfg, \"_scan_progress\", None)"
+    },
+    {
+      "line": 93,
+      "end_line": 93,
+      "callee": "set",
+      "enclosing": "run",
+      "expression": "set(all_files)"
+    },
+    {
+      "line": 95,
+      "end_line": 97,
+      "callee": "sorted",
+      "enclosing": "run",
+      "expression": "sorted(d.name for d in Path(repo_root).iterdir()\n                      if d.is_dir() and d.name not in (\"checkpoints\",\n                                                       \"security-scan\"))"
+    },
+    {
+      "line": 177,
+      "end_line": 177,
+      "callee": "ContextPackage.model_validate",
+      "enclosing": "run",
+      "expression": "ContextPackage.model_validate(data)"
+    },
+    {
+      "line": 178,
+      "end_line": 178,
+      "callee": "sum",
+      "enclosing": "run",
+      "expression": "sum(excluded[\"dirs\"].values())"
+    },
+    {
+      "line": 179,
+      "end_line": 179,
+      "callee": "sum",
+      "enclosing": "run",
+      "expression": "sum(excluded[\"exts\"].values())"
+    },
+    {
+      "line": 180,
+      "end_line": 180,
+      "callee": "sum",
+      "enclosing": "run",
+      "expression": "sum(excluded[\"globs\"].values())"
+    },
+    {
+      "line": 183,
+      "end_line": 183,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(pkg.all_files)"
+    },
+    {
+      "line": 185,
+      "end_line": 187,
+      "callee": "console.write",
+      "enclosing": "run",
+      "expression": "console.write(f\"  [s1] file inventory: {n_total} on disk -> {n_in_scope} in scope \"\n                  f\"(excluded: {n_ex_dirs} dir, {n_ex_exts} ext, {n_ex_globs} glob, \"\n                  f\"{n_ex_size} oversize, {n_ex_dedup} config-dedup)\")"
+    },
+    {
+      "line": 188,
+      "end_line": 190,
+      "callee": "console.counts",
+      "enclosing": "run",
+      "expression": "console.counts(\"s1\", \"done\", modules=len(pkg.modules),\n                   entry_points=len(pkg.entry_points), sinks=len(pkg.unsafe_sinks),\n                   files_in_scope=n_in_scope)"
+    },
+    {
+      "line": 53,
+      "end_line": 53,
+      "callee": "qname.rpartition",
+      "enclosing": "q_split",
+      "expression": "qname.rpartition(QSEP)"
+    },
+    {
+      "line": 59,
+      "end_line": 59,
+      "callee": "q_split",
+      "enclosing": "q_file",
+      "expression": "q_split(qname)"
+    },
+    {
+      "line": 63,
+      "end_line": 63,
+      "callee": "q_split",
+      "enclosing": "q_name",
+      "expression": "q_split(qname)"
+    },
+    {
+      "line": 70,
+      "end_line": 70,
+      "callee": "sorted",
+      "enclosing": "_modules_from_graph",
+      "expression": "sorted({hit for f in files if (hit := resolve_in_scope(f))})"
+    },
+    {
+      "line": 80,
+      "end_line": 80,
+      "callee": "getattr",
+      "enclosing": "run",
+      "expression": "getattr(seed, \"all_files\", None)"
+    },
+    {
+      "line": 83,
+      "end_line": 83,
+      "callee": "_walk_repo",
+      "enclosing": "run",
+      "expression": "_walk_repo(repo_root, cfg)"
+    },
+    {
+      "line": 86,
+      "end_line": 86,
+      "callee": "Path",
+      "enclosing": "run",
+      "expression": "Path(repo_root)"
+    },
+    {
+      "line": 90,
+      "end_line": 90,
+      "callee": "tracker.discovered",
+      "enclosing": "run",
+      "expression": "tracker.discovered(all_files)"
+    },
+    {
+      "line": 102,
+      "end_line": 102,
+      "callee": "_resolve_scope_path",
+      "enclosing": "run._resolve_in_scope",
+      "expression": "_resolve_scope_path(path, repo_root, keep, top_dirs)"
+    },
+    {
+      "line": 116,
+      "end_line": 116,
+      "callee": "data['unsafe_sinks'].extend",
+      "enclosing": "run",
+      "expression": "data[\"unsafe_sinks\"].extend(seed_sinks)"
+    },
+    {
+      "line": 117,
+      "end_line": 117,
+      "callee": "data['entry_points'].extend",
+      "enclosing": "run",
+      "expression": "data[\"entry_points\"].extend(seed_eps)"
+    },
+    {
+      "line": 118,
+      "end_line": 119,
+      "callee": "log.info",
+      "enclosing": "run",
+      "expression": "log.info(\"s1/preprocess: merged s0 seed - sinks=%d entry_points=%d\",\n                 len(seed_sinks), len(seed_eps))"
+    },
+    {
+      "line": 132,
+      "end_line": 132,
+      "callee": "log.debug",
+      "enclosing": "run",
+      "expression": "log.debug(\"s1/preprocess: seed taint paths processed - paths=%d\", len(seed_paths))"
+    },
+    {
+      "line": 135,
+      "end_line": 135,
+      "callee": "set",
+      "enclosing": "run",
+      "expression": "set()"
+    },
+    {
+      "line": 150,
+      "end_line": 150,
+      "callee": "sorted",
+      "enclosing": "run",
+      "expression": "sorted(set(ambiguous))"
+    },
+    {
+      "line": 152,
+      "end_line": 152,
+      "callee": "log.warning",
+      "enclosing": "run",
+      "expression": "log.warning(Event.S1_AMBIGUOUS_PATHS_DROPPED, count=len(ambiguous), sample=sample)"
+    },
+    {
+      "line": 156,
+      "end_line": 156,
+      "callee": "primary_language",
+      "enclosing": "run",
+      "expression": "primary_language(graph_handle)"
+    },
+    {
+      "line": 157,
+      "end_line": 157,
+      "callee": "_modules_from_graph",
+      "enclosing": "run",
+      "expression": "_modules_from_graph(graph_handle, _resolve_in_scope)"
+    },
+    {
+      "line": 158,
+      "end_line": 158,
+      "callee": "system_context_notes",
+      "enclosing": "run",
+      "expression": "system_context_notes(graph_handle)"
+    },
+    {
+      "line": 163,
+      "end_line": 163,
+      "callee": "data.get",
+      "enclosing": "run",
+      "expression": "data.get(\"language\")"
+    },
+    {
+      "line": 173,
+      "end_line": 173,
+      "callee": "c.model_dump",
+      "enclosing": "run",
+      "expression": "c.model_dump()"
+    },
+    {
+      "line": 174,
+      "end_line": 174,
+      "callee": "c.model_dump",
+      "enclosing": "run",
+      "expression": "c.model_dump()"
+    },
+    {
+      "line": 178,
+      "end_line": 178,
+      "callee": "excluded['dirs'].values",
+      "enclosing": "run",
+      "expression": "excluded[\"dirs\"].values()"
+    },
+    {
+      "line": 179,
+      "end_line": 179,
+      "callee": "excluded['exts'].values",
+      "enclosing": "run",
+      "expression": "excluded[\"exts\"].values()"
+    },
+    {
+      "line": 180,
+      "end_line": 180,
+      "callee": "excluded['globs'].values",
+      "enclosing": "run",
+      "expression": "excluded[\"globs\"].values()"
+    },
+    {
+      "line": 182,
+      "end_line": 182,
+      "callee": "(excluded.get('config_dedup') or {}).get",
+      "enclosing": "run",
+      "expression": "(excluded.get(\"config_dedup\") or {}).get(\"dropped\", 0)"
+    },
+    {
+      "line": 193,
+      "end_line": 198,
+      "callee": "EmptyScopeError",
+      "enclosing": "run",
+      "expression": "EmptyScopeError(\n            f\"0 files in scope after exclusions ({n_total} on disk: \"\n            f\"{n_ex_dirs} dir, {n_ex_exts} ext, {n_ex_globs} glob, \"\n            f\"{n_ex_size} oversize, {n_ex_dedup} config-dedup). Nothing was \"\n            f\"analysed, so no conclusion can be drawn about this repository. \"\n            f\"Re-run with --no-auto-step1, or widen the step1 exclusions.\")"
+    },
+    {
+      "line": 202,
+      "end_line": 206,
+      "callee": "_errlog.log",
+      "enclosing": "run",
+      "expression": "_errlog.log(\"s1\", \"context-package\",\n                    \"S1 produced 0 modules, 0 entry points and 0 sinks \"\n                    f\"with {n_in_scope} files in scope\",\n                    reason=\"s1_zero_output\",\n                    files_in_scope=n_in_scope)"
+    },
+    {
+      "line": 69,
+      "end_line": 69,
+      "callee": "communities_as_modules",
+      "enclosing": "_modules_from_graph",
+      "expression": "communities_as_modules(graph_handle)"
+    },
+    {
+      "line": 72,
+      "end_line": 72,
+      "callee": "modules.append",
+      "enclosing": "_modules_from_graph",
+      "expression": "modules.append({\"name\": name, \"files\": in_scope})"
+    },
+    {
+      "line": 81,
+      "end_line": 81,
+      "callee": "list",
+      "enclosing": "run",
+      "expression": "list(seed.all_files)"
+    },
+    {
+      "line": 81,
+      "end_line": 81,
+      "callee": "dict",
+      "enclosing": "run",
+      "expression": "dict(seed.excluded)"
+    },
+    {
+      "line": 104,
+      "end_line": 104,
+      "callee": "ambiguous.append",
+      "enclosing": "run._resolve_in_scope",
+      "expression": "ambiguous.append(path)"
+    },
+    {
+      "line": 110,
+      "end_line": 110,
+      "callee": "dict",
+      "enclosing": "run",
+      "expression": "dict(s.model_dump(), file=hit)"
+    },
+    {
+      "line": 113,
+      "end_line": 113,
+      "callee": "dict",
+      "enclosing": "run",
+      "expression": "dict(e.model_dump(), file=hit)"
+    },
+    {
+      "line": 119,
+      "end_line": 119,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(seed_sinks)"
+    },
+    {
+      "line": 119,
+      "end_line": 119,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(seed_eps)"
+    },
+    {
+      "line": 122,
+      "end_line": 122,
+      "callee": "getattr",
+      "enclosing": "run",
+      "expression": "getattr(seed, \"taint_paths\", None)"
+    },
+    {
+      "line": 132,
+      "end_line": 132,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(seed_paths)"
+    },
+    {
+      "line": 136,
+      "end_line": 136,
+      "callee": "getattr",
+      "enclosing": "run",
+      "expression": "getattr(seed, \"entry_points\", [])"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "', '.join",
+      "enclosing": "run",
+      "expression": "\", \".join(sorted(framework_unresolvable)[:3])"
+    },
+    {
+      "line": 142,
+      "end_line": 143,
+      "callee": "log.warning",
+      "enclosing": "run",
+      "expression": "log.warning(Event.S1_FRAMEWORK_ENTRY_UNRESOLVED, count=len(framework_unresolvable),\n                        sample=f\"{sample}{n_str}\")"
+    },
+    {
+      "line": 146,
+      "end_line": 147,
+      "callee": "console.write",
+      "enclosing": "run",
+      "expression": "console.write(f\"  [s1] merged s0 seed: +{len(seed_eps)} entry points, \"\n                          f\"+{len(seed_sinks)} sinks, {len(seed_paths)} codeFlow paths\")"
+    },
+    {
+      "line": 150,
+      "end_line": 150,
+      "callee": "set",
+      "enclosing": "run",
+      "expression": "set(ambiguous)"
+    },
+    {
+      "line": 151,
+      "end_line": 151,
+      "callee": "', '.join",
+      "enclosing": "run",
+      "expression": "\", \".join(uniq[:5])"
+    },
+    {
+      "line": 166,
+      "end_line": 166,
+      "callee": "EXT_TO_LANG.get",
+      "enclosing": "run",
+      "expression": "EXT_TO_LANG.get(Path(f).suffix.lower())"
+    },
+    {
+      "line": 169,
+      "end_line": 169,
+      "callee": "max",
+      "enclosing": "run",
+      "expression": "max(ext_counts, key=lambda k: ext_counts[k])"
+    },
+    {
+      "line": 188,
+      "end_line": 188,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(pkg.modules)"
+    },
+    {
+      "line": 189,
+      "end_line": 189,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(pkg.entry_points)"
+    },
+    {
+      "line": 189,
+      "end_line": 189,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(pkg.unsafe_sinks)"
+    },
+    {
+      "line": 95,
+      "end_line": 95,
+      "callee": "Path(repo_root).iterdir",
+      "enclosing": "run",
+      "expression": "Path(repo_root).iterdir()"
+    },
+    {
+      "line": 110,
+      "end_line": 110,
+      "callee": "s.model_dump",
+      "enclosing": "run",
+      "expression": "s.model_dump()"
+    },
+    {
+      "line": 113,
+      "end_line": 113,
+      "callee": "e.model_dump",
+      "enclosing": "run",
+      "expression": "e.model_dump()"
+    },
+    {
+      "line": 125,
+      "end_line": 125,
+      "callee": "hop.rpartition",
+      "enclosing": "run",
+      "expression": "hop.rpartition(\":\")"
+    },
+    {
+      "line": 126,
+      "end_line": 126,
+      "callee": "_resolve_in_scope",
+      "enclosing": "run",
+      "expression": "_resolve_in_scope(f or hop)"
+    },
+    {
+      "line": 129,
+      "end_line": 129,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(resolved)"
+    },
+    {
+      "line": 130,
+      "end_line": 130,
+      "callee": "seed_paths.append",
+      "enclosing": "run",
+      "expression": "seed_paths.append(resolved)"
+    },
+    {
+      "line": 138,
+      "end_line": 138,
+      "callee": "framework_unresolvable.add",
+      "enclosing": "run",
+      "expression": "framework_unresolvable.add(f\"{ep.file}::{ep.function}\")"
+    },
+    {
+      "line": 152,
+      "end_line": 152,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(ambiguous)"
+    },
+    {
+      "line": 166,
+      "end_line": 166,
+      "callee": "Path(f).suffix.lower",
+      "enclosing": "run",
+      "expression": "Path(f).suffix.lower()"
+    },
+    {
+      "line": 96,
+      "end_line": 96,
+      "callee": "d.is_dir",
+      "enclosing": "run",
+      "expression": "d.is_dir()"
+    },
+    {
+      "line": 112,
+      "end_line": 112,
+      "callee": "_resolve_in_scope",
+      "enclosing": "run",
+      "expression": "_resolve_in_scope(s.file)"
+    },
+    {
+      "line": 115,
+      "end_line": 115,
+      "callee": "_resolve_in_scope",
+      "enclosing": "run",
+      "expression": "_resolve_in_scope(e.file)"
+    },
+    {
+      "line": 128,
+      "end_line": 128,
+      "callee": "resolved.append",
+      "enclosing": "run",
+      "expression": "resolved.append(f\"{hit}:{ln}\" if sep else hit)"
+    },
+    {
+      "line": 137,
+      "end_line": 137,
+      "callee": "getattr(ep, 'kind', '').lower",
+      "enclosing": "run",
+      "expression": "getattr(ep, \"kind\", \"\").lower()"
+    },
+    {
+      "line": 137,
+      "end_line": 137,
+      "callee": "_resolve_in_scope",
+      "enclosing": "run",
+      "expression": "_resolve_in_scope(ep.file)"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "sorted",
+      "enclosing": "run",
+      "expression": "sorted(framework_unresolvable)"
+    },
+    {
+      "line": 141,
+      "end_line": 141,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(framework_unresolvable)"
+    },
+    {
+      "line": 142,
+      "end_line": 142,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(framework_unresolvable)"
+    },
+    {
+      "line": 151,
+      "end_line": 151,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(uniq)"
+    },
+    {
+      "line": 168,
+      "end_line": 168,
+      "callee": "ext_counts.get",
+      "enclosing": "run",
+      "expression": "ext_counts.get(lang, 0)"
+    },
+    {
+      "line": 182,
+      "end_line": 182,
+      "callee": "excluded.get",
+      "enclosing": "run",
+      "expression": "excluded.get(\"config_dedup\")"
+    },
+    {
+      "line": 70,
+      "end_line": 70,
+      "callee": "resolve_in_scope",
+      "enclosing": "_modules_from_graph",
+      "expression": "resolve_in_scope(f)"
+    },
+    {
+      "line": 95,
+      "end_line": 95,
+      "callee": "Path",
+      "enclosing": "run",
+      "expression": "Path(repo_root)"
+    },
+    {
+      "line": 146,
+      "end_line": 146,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(seed_eps)"
+    },
+    {
+      "line": 147,
+      "end_line": 147,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(seed_sinks)"
+    },
+    {
+      "line": 147,
+      "end_line": 147,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(seed_paths)"
+    },
+    {
+      "line": 137,
+      "end_line": 137,
+      "callee": "getattr",
+      "enclosing": "run",
+      "expression": "getattr(ep, \"kind\", \"\")"
+    },
+    {
+      "line": 141,
+      "end_line": 141,
+      "callee": "len",
+      "enclosing": "run",
+      "expression": "len(framework_unresolvable)"
+    },
+    {
+      "line": 166,
+      "end_line": 166,
+      "callee": "Path",
+      "enclosing": "run",
+      "expression": "Path(f)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 16,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 17,
+      "source_expression": "from vvaharness.util import logs",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.logs"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/logs.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 19,
+      "source_expression": "from pathlib import Path",
+      "targets": [
+        "pathlib",
+        "pathlib.Path"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "from vvaharness.backends.llm import tools as _localtools",
+      "targets": [
+        "vvaharness.backends.llm",
+        "vvaharness.backends.llm.tools"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/llm/__init__.py",
+        "vvaharness/backends/llm/tools.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 22,
+      "source_expression": "from vvaharness.codegraph import GraphHandle, communities_as_modules, primary_language, system_context_notes",
+      "targets": [
+        "vvaharness.codegraph",
+        "vvaharness.codegraph.GraphHandle",
+        "vvaharness.codegraph.communities_as_modules",
+        "vvaharness.codegraph.primary_language",
+        "vvaharness.codegraph.system_context_notes"
+      ],
+      "local_source_paths": [
+        "vvaharness/codegraph/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 28,
+      "source_expression": "from vvaharness.lang.detect import EXT_TO_LANG",
+      "targets": [
+        "vvaharness.lang.detect",
+        "vvaharness.lang.detect.EXT_TO_LANG"
+      ],
+      "local_source_paths": [
+        "vvaharness/lang/detect.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 29,
+      "source_expression": "from vvaharness.models import CVE, ContextPackage, Control",
+      "targets": [
+        "vvaharness.models",
+        "vvaharness.models.CVE",
+        "vvaharness.models.ContextPackage",
+        "vvaharness.models.Control"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 30,
+      "source_expression": "from vvaharness.scope import EmptyScopeError, _dedup_configs, _resolve_scope_path, _walk_repo",
+      "targets": [
+        "vvaharness.scope",
+        "vvaharness.scope.EmptyScopeError",
+        "vvaharness.scope._dedup_configs",
+        "vvaharness.scope._resolve_scope_path",
+        "vvaharness.scope._walk_repo"
+      ],
+      "local_source_paths": [
+        "vvaharness/scope/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 36,
+      "source_expression": "from vvaharness.util import console",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.console"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/console.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 37,
+      "source_expression": "from vvaharness.util import errlog as _errlog",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.errlog"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/errlog.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 38,
+      "source_expression": "from vvaharness.util.events import Event",
+      "targets": [
+        "vvaharness.util.events",
+        "vvaharness.util.events.Event"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/events.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

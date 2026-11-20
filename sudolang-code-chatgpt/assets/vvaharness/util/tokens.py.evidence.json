@@ -1,0 +1,2982 @@
+{
+  "source": "vvaharness/util/tokens.py",
+  "sha256": "bd187172a7225597ab99561e8096d73944744a678413f526652115269bc114d0",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Process-wide token accounting shared by every model backend.\"\"\"\n# Per-phase buckets rely on phases NEVER overlapping (s4/s6 pools sit inside one), hence one global\nfrom __future__ import annotations\n\nimport re\nimport threading\nfrom collections import defaultdict\nfrom contextlib import contextmanager\nfrom typing import NamedTuple, TypedDict\n\nfrom vvaharness.util.warn_once import warn_once\n\n\nclass TokenUsage(TypedDict, total=False):\n    \"\"\"The usage fields a backend reports, in Anthropic's field names; every reader defaults absent ones to 0.\"\"\"\n\n    input_tokens: int\n    # Pass an explicit null THROUGH, never `or 0`: that pinned completion_absent at 0 on openai\n    output_tokens: int | None\n    cache_creation_input_tokens: int\n    cache_read_input_tokens: int\n    # OpenAI-only detail ALREADY inside the billed output_tokens; never add it to a total again\n    reasoning_tokens: int\n\n\nDEFAULT_PHASE = \"unscoped\"\n\n\nclass Spend(NamedTuple):\n    \"\"\"A cumulative reading of REPORTED cost/turns, with per-axis report counts.\"\"\"\n\n    usd: float = 0.0\n    turns: int = 0\n    usd_reports: int = 0\n    turn_reports: int = 0\n\n\ndef reported_between(before: Spend, after: Spend) -> tuple[float | None, int | None]:\n    \"\"\"The (usd, turns) reported between two readings, None where nothing was; assumes no overlap.\"\"\"\n    usd = (after.usd - before.usd\n           if after.usd_reports > before.usd_reports else None)\n    turns = (after.turns - before.turns\n             if after.turn_reports > before.turn_reports else None)\n    return usd, turns\n\n\n# The ONE offline estimator; flat chars/4 under-counts dense source, so the ratio is content-aware\n\n_CPT_PROSE = 4.4       # chars/token for narrative + schema text\n_CPT_DENSE = 2.45      # chars/token for dense numbered source\n_DENSE_FRAC_LO = 0.08  # <= this fraction of digits/punctuation reads as prose\n_DENSE_FRAC_HI = 0.34  # >= this reads as fully dense numbered source\n\n\ndef estimate_tokens(text: str) -> int:\n    \"\"\"Content-aware token estimate for `text` (see the notes above).\"\"\"\n    n = len(text)\n    if n <= 0:\n        return 0\n    dense = 0\n    for ch in text:\n        if not ch.isspace() and not ch.isalpha():\n            dense += 1\n    frac = dense / n\n    if frac <= _DENSE_FRAC_LO:\n        cpt = _CPT_PROSE\n    elif frac >= _DENSE_FRAC_HI:\n        cpt = _CPT_DENSE\n    else:\n        span = (frac - _DENSE_FRAC_LO) / (_DENSE_FRAC_HI - _DENSE_FRAC_LO)\n        cpt = _CPT_PROSE + span * (_CPT_DENSE - _CPT_PROSE)\n    return int(n / cpt)\n\n\ndef _bucket() -> dict:\n    # cache_unparsed counts CALLS; usd/turns seed None, not 0, so unreported never reads as $0\n    return {\"prompt\": 0, \"completion\": 0, \"cache_read\": 0,\n            \"cache_write\": 0, \"calls\": 0, \"cache_unparsed\": 0,\n            \"usd\": None, \"turns\": None, \"reasoning\": 0}\n\n\n# SECURITY: KEY NAMES ONLY, never values (hostile gateway); backends must filter RAW usage first\n\n_UNPARSED_CACHE_KEY_RX = re.compile(r\"^[A-Za-z0-9_.\\-]{1,64}$\")\n_UNPARSED_CACHE_KEY_CAP = 8\n\n\ndef unparsed_cache_keys(usage, parsed) -> tuple[str, ...]:\n    \"\"\"The cache-ish key names in `usage` that `parsed` does not cover.\"\"\"\n    # Present-as-zero counts; None does not — a typed-model dump fabricates that for absent fields\n    if not isinstance(usage, dict):\n        return ()\n    hits = {\n        k for k, v in usage.items()\n        if isinstance(k, str) and k not in parsed and v is not None\n        and \"cache\" in k.lower() and _UNPARSED_CACHE_KEY_RX.match(k)\n    }\n    return tuple(sorted(hits)[:_UNPARSED_CACHE_KEY_CAP])\n\n\nclass _TokenCounter:\n    def __init__(self) -> None:\n        self._lock = threading.Lock()\n        self._phase = DEFAULT_PHASE\n        self.prompt = 0\n        self.completion = 0\n        self.calls = 0\n        self.calls_with_usage = 0\n        # Explicit nulls coerced to 0 for the total, counted here so absent ≠ a genuine zero\n        self.completion_absent = 0\n        self.usd = 0.0\n        self.turns = 0\n        self.usd_reports = 0\n        self.turn_reports = 0\n        self.by_phase: dict[str, dict] = defaultdict(_bucket)\n        # Distinct (via, key-set) pairs already noted, so each backend logs once per key-set.\n        self._cache_unparsed_seen: set[tuple] = set()\n        # One stderr note per counter lifetime; noting every short preflight ping would be noise.\n        self._completion_absent_noted: set[str] = set()\n\n    @contextmanager\n    def phase(self, name: str):\n        prev, self._phase = self._phase, name\n        try:\n            yield\n        finally:\n            self._phase = prev\n\n    def current_phase(self) -> str:\n        with self._lock:\n            return self._phase\n\n    def add(self, usage: TokenUsage | None, *,\n            usd: float | None = None, turns: int | None = None) -> None:\n        \"\"\"Record one usage record; *usd*/*turns* of None means unreported, not zero (see :class:`Spend`).\"\"\"\n        with self._lock:\n            n_requests = 1\n            if isinstance(usage, dict):\n                raw_calls = usage.get(\"calls\")\n                if (isinstance(raw_calls, int)\n                        and not isinstance(raw_calls, bool) and raw_calls > 0):\n                    n_requests = raw_calls\n            self.calls += n_requests\n            b = self.by_phase[self._phase]\n            b[\"calls\"] += n_requests\n            if usd is not None:\n                self.usd_reports += 1\n                self.usd += usd\n                b[\"usd\"] = (b[\"usd\"] or 0.0) + usd\n            if turns is not None:\n                self.turn_reports += 1\n                self.turns += turns\n                b[\"turns\"] = (b[\"turns\"] or 0) + turns\n            if not isinstance(usage, dict):\n                return\n            self.calls_with_usage += n_requests\n            fresh = int(usage.get(\"input_tokens\", 0) or 0)\n            cw = int(usage.get(\"cache_creation_input_tokens\", 0) or 0)\n            cr = int(usage.get(\"cache_read_input_tokens\", 0) or 0)\n            out_raw = usage.get(\"output_tokens\", 0)\n            if out_raw is None:\n                # Coerce to 0 for the totals, but count the coercion so the absence is visible.\n                self.completion_absent += 1\n                warn_once(\n                    self._completion_absent_noted,\n                    \"null-completion-count\",\n                    \"  [tokens] WARN: a usage record carried a null \"\n                    \"completion count; coerced to 0 (occurrences counted \"\n                    \"under completion_absent)\",\n                )\n            out = int(out_raw or 0)\n            # prompt = billable input (fresh + cache-write); cache-read is ~10% cost, tracked apart\n            self.prompt += fresh + cw\n            self.completion += out\n            b[\"prompt\"] += fresh + cw\n            b[\"completion\"] += out\n            b[\"cache_read\"] += cr\n            b[\"cache_write\"] += cw\n            # Detail only, already inside `completion` above — never a second addend to a total.\n            b[\"reasoning\"] += int(usage.get(\"reasoning_tokens\", 0) or 0)\n\n    def spend(self) -> Spend:\n        \"\"\"A point-in-time reading, for diffing across one engine call.\"\"\"\n        with self._lock:\n            return Spend(usd=self.usd, turns=self.turns,\n                         usd_reports=self.usd_reports, turn_reports=self.turn_reports)\n\n    def note_cache_unparsed(self, keys: tuple[str, ...], *,\n                            via: str = \"\") -> bool:\n        \"\"\"Count one call whose usage carried cache accounting under key names nothing parses.\"\"\"\n        if not keys:\n            return False\n        with self._lock:\n            self.by_phase[self._phase][\"cache_unparsed\"] += 1\n            marker = (via, keys)\n            if marker in self._cache_unparsed_seen:\n                return False\n            self._cache_unparsed_seen.add(marker)\n            return True\n\n    def reset(self) -> None:\n        with self._lock:\n            self.prompt = self.completion = self.calls = self.calls_with_usage = 0\n            self.completion_absent = 0\n            self.usd = 0.0\n            self.turns = self.usd_reports = self.turn_reports = 0\n            self.by_phase = defaultdict(_bucket)\n            self._cache_unparsed_seen = set()\n            self._completion_absent_noted = set()\n\n    def snapshot(self) -> dict:\n        with self._lock:\n            return {\n                \"prompt\": self.prompt,\n                \"completion\": self.completion,\n                \"total\": self.prompt + self.completion,\n                \"calls\": self.calls,\n                \"calls_with_usage\": self.calls_with_usage,\n                \"completion_absent\": self.completion_absent,\n                \"usd\": self.usd if self.usd_reports else None,\n                \"turns\": self.turns if self.turn_reports else None,\n                \"by_phase\": {k: dict(v) for k, v in self.by_phase.items()},\n            }\n\n\nTOKENS = _TokenCounter()\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/util/tokens.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "Process-wide token accounting shared by every model backend.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_29_4": {
+      "source": "vvaharness/util/tokens.py",
+      "line_start": 29,
+      "line_end": 29,
+      "value": "The usage fields a backend reports, in Anthropic's field names; every reader defaults absent ones to 0.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_44_4": {
+      "source": "vvaharness/util/tokens.py",
+      "line_start": 44,
+      "line_end": 44,
+      "value": "A cumulative reading of REPORTED cost/turns, with per-axis report counts.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_53_4": {
+      "source": "vvaharness/util/tokens.py",
+      "line_start": 53,
+      "line_end": 53,
+      "value": "The (usd, turns) reported between two readings, None where nothing was; assumes no overlap.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_70_4": {
+      "source": "vvaharness/util/tokens.py",
+      "line_start": 70,
+      "line_end": 70,
+      "value": "Content-aware token estimate for `text` (see the notes above).",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_103_4": {
+      "source": "vvaharness/util/tokens.py",
+      "line_start": 103,
+      "line_end": 103,
+      "value": "The cache-ish key names in `usage` that `parsed` does not cover.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_149_8": {
+      "source": "vvaharness/util/tokens.py",
+      "line_start": 149,
+      "line_end": 149,
+      "value": "Record one usage record; *usd*/*turns* of None means unreported, not zero (see :class:`Spend`).",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_181_20": {
+      "source": "vvaharness/util/tokens.py",
+      "line_start": 181,
+      "line_end": 183,
+      "value": "  [tokens] WARN: a usage record carried a null completion count; coerced to 0 (occurrences counted under completion_absent)",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_197_8": {
+      "source": "vvaharness/util/tokens.py",
+      "line_start": 197,
+      "line_end": 197,
+      "value": "A point-in-time reading, for diffing across one engine call.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_204_8": {
+      "source": "vvaharness/util/tokens.py",
+      "line_start": 204,
+      "line_end": 204,
+      "value": "Count one call whose usage carried cache accounting under key names nothing parses.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "Process-wide token accounting shared by every model backend.",
+      "context": "literal"
+    },
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 16,
+      "value": "unscoped",
+      "context": "literal"
+    },
+    {
+      "line_start": 29,
+      "line_end": 29,
+      "column": 4,
+      "value": "The usage fields a backend reports, in Anthropic's field names; every reader defaults absent ones to 0.",
+      "context": "literal"
+    },
+    {
+      "line_start": 44,
+      "line_end": 44,
+      "column": 4,
+      "value": "A cumulative reading of REPORTED cost/turns, with per-axis report counts.",
+      "context": "literal"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 4,
+      "value": "The (usd, turns) reported between two readings, None where nothing was; assumes no overlap.",
+      "context": "literal"
+    },
+    {
+      "line_start": 70,
+      "line_end": 70,
+      "column": 4,
+      "value": "Content-aware token estimate for `text` (see the notes above).",
+      "context": "literal"
+    },
+    {
+      "line_start": 98,
+      "line_end": 98,
+      "column": 36,
+      "value": "^[A-Za-z0-9_.\\-]{1,64}$",
+      "context": "literal"
+    },
+    {
+      "line_start": 103,
+      "line_end": 103,
+      "column": 4,
+      "value": "The cache-ish key names in `usage` that `parsed` does not cover.",
+      "context": "literal"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 12,
+      "value": "prompt",
+      "context": "literal"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 25,
+      "value": "completion",
+      "context": "literal"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 42,
+      "value": "cache_read",
+      "context": "literal"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 12,
+      "value": "cache_write",
+      "context": "literal"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 30,
+      "value": "calls",
+      "context": "literal"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 42,
+      "value": "cache_unparsed",
+      "context": "literal"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 12,
+      "value": "usd",
+      "context": "literal"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 25,
+      "value": "turns",
+      "context": "literal"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 40,
+      "value": "reasoning",
+      "context": "literal"
+    },
+    {
+      "line_start": 149,
+      "line_end": 149,
+      "column": 8,
+      "value": "Record one usage record; *usd*/*turns* of None means unreported, not zero (see :class:`Spend`).",
+      "context": "literal"
+    },
+    {
+      "line_start": 197,
+      "line_end": 197,
+      "column": 8,
+      "value": "A point-in-time reading, for diffing across one engine call.",
+      "context": "literal"
+    },
+    {
+      "line_start": 203,
+      "line_end": 203,
+      "column": 39,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 204,
+      "line_end": 204,
+      "column": 8,
+      "value": "Count one call whose usage carried cache accounting under key names nothing parses.",
+      "context": "literal"
+    },
+    {
+      "line_start": 159,
+      "line_end": 159,
+      "column": 14,
+      "value": "calls",
+      "context": "literal"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 32,
+      "value": "output_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 14,
+      "value": "prompt",
+      "context": "literal"
+    },
+    {
+      "line_start": 190,
+      "line_end": 190,
+      "column": 14,
+      "value": "completion",
+      "context": "literal"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 14,
+      "value": "cache_read",
+      "context": "literal"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 14,
+      "value": "cache_write",
+      "context": "literal"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 14,
+      "value": "reasoning",
+      "context": "literal"
+    },
+    {
+      "line_start": 208,
+      "line_end": 208,
+      "column": 39,
+      "value": "cache_unparsed",
+      "context": "literal"
+    },
+    {
+      "line_start": 228,
+      "line_end": 228,
+      "column": 16,
+      "value": "prompt",
+      "context": "literal"
+    },
+    {
+      "line_start": 229,
+      "line_end": 229,
+      "column": 16,
+      "value": "completion",
+      "context": "literal"
+    },
+    {
+      "line_start": 230,
+      "line_end": 230,
+      "column": 16,
+      "value": "total",
+      "context": "literal"
+    },
+    {
+      "line_start": 231,
+      "line_end": 231,
+      "column": 16,
+      "value": "calls",
+      "context": "literal"
+    },
+    {
+      "line_start": 232,
+      "line_end": 232,
+      "column": 16,
+      "value": "calls_with_usage",
+      "context": "literal"
+    },
+    {
+      "line_start": 233,
+      "line_end": 233,
+      "column": 16,
+      "value": "completion_absent",
+      "context": "literal"
+    },
+    {
+      "line_start": 234,
+      "line_end": 234,
+      "column": 16,
+      "value": "usd",
+      "context": "literal"
+    },
+    {
+      "line_start": 235,
+      "line_end": 235,
+      "column": 16,
+      "value": "turns",
+      "context": "literal"
+    },
+    {
+      "line_start": 236,
+      "line_end": 236,
+      "column": 16,
+      "value": "by_phase",
+      "context": "literal"
+    },
+    {
+      "line_start": 110,
+      "line_end": 110,
+      "column": 12,
+      "value": "cache",
+      "context": "literal"
+    },
+    {
+      "line_start": 153,
+      "line_end": 153,
+      "column": 38,
+      "value": "calls",
+      "context": "literal"
+    },
+    {
+      "line_start": 163,
+      "line_end": 163,
+      "column": 18,
+      "value": "usd",
+      "context": "literal"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 18,
+      "value": "turns",
+      "context": "literal"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 20,
+      "value": "null-completion-count",
+      "context": "literal"
+    },
+    {
+      "line_start": 181,
+      "line_end": 183,
+      "column": 20,
+      "value": "  [tokens] WARN: a usage record carried a null completion count; coerced to 0 (occurrences counted under completion_absent)",
+      "context": "literal"
+    },
+    {
+      "line_start": 171,
+      "line_end": 171,
+      "column": 34,
+      "value": "input_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 172,
+      "line_end": 172,
+      "column": 31,
+      "value": "cache_creation_input_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 173,
+      "line_end": 173,
+      "column": 31,
+      "value": "cache_read_input_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 44,
+      "value": "reasoning_tokens",
+      "context": "literal"
+    },
+    {
+      "line_start": 163,
+      "line_end": 163,
+      "column": 30,
+      "value": "usd",
+      "context": "literal"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 32,
+      "value": "turns",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 16,
+      "text": "# Per-phase buckets rely on phases NEVER overlapping (s4/s6 pools sit inside one), hence one global"
+    },
+    {
+      "line": 32,
+      "text": "# Pass an explicit null THROUGH, never `or 0`: that pinned completion_absent at 0 on openai"
+    },
+    {
+      "line": 36,
+      "text": "# OpenAI-only detail ALREADY inside the billed output_tokens; never add it to a total again"
+    },
+    {
+      "line": 61,
+      "text": "# The ONE offline estimator; flat chars/4 under-counts dense source, so the ratio is content-aware"
+    },
+    {
+      "line": 63,
+      "text": "# chars/token for narrative + schema text"
+    },
+    {
+      "line": 64,
+      "text": "# chars/token for dense numbered source"
+    },
+    {
+      "line": 65,
+      "text": "# <= this fraction of digits/punctuation reads as prose"
+    },
+    {
+      "line": 66,
+      "text": "# >= this reads as fully dense numbered source"
+    },
+    {
+      "line": 90,
+      "text": "# cache_unparsed counts CALLS; usd/turns seed None, not 0, so unreported never reads as $0"
+    },
+    {
+      "line": 96,
+      "text": "# SECURITY: KEY NAMES ONLY, never values (hostile gateway); backends must filter RAW usage first"
+    },
+    {
+      "line": 104,
+      "text": "# Present-as-zero counts; None does not — a typed-model dump fabricates that for absent fields"
+    },
+    {
+      "line": 123,
+      "text": "# Explicit nulls coerced to 0 for the total, counted here so absent ≠ a genuine zero"
+    },
+    {
+      "line": 130,
+      "text": "# Distinct (via, key-set) pairs already noted, so each backend logs once per key-set."
+    },
+    {
+      "line": 132,
+      "text": "# One stderr note per counter lifetime; noting every short preflight ping would be noise."
+    },
+    {
+      "line": 176,
+      "text": "# Coerce to 0 for the totals, but count the coercion so the absence is visible."
+    },
+    {
+      "line": 186,
+      "text": "# prompt = billable input (fresh + cache-write); cache-read is ~10% cost, tracked apart"
+    },
+    {
+      "line": 193,
+      "text": "# Detail only, already inside `completion` above — never a second addend to a total."
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 23,
+      "line_end": 23,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 28,
+      "line_end": 37,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 5
+    },
+    {
+      "kind": "Expr",
+      "line_start": 29,
+      "line_end": 29,
+      "column": 4,
+      "owner": "TokenUsage",
+      "representation_line": 10
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 31,
+      "line_end": 31,
+      "column": 4,
+      "owner": "TokenUsage",
+      "representation_line": 10
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 33,
+      "line_end": 33,
+      "column": 4,
+      "owner": "TokenUsage",
+      "representation_line": 10
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 34,
+      "line_end": 34,
+      "column": 4,
+      "owner": "TokenUsage",
+      "representation_line": 10
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 35,
+      "line_end": 35,
+      "column": 4,
+      "owner": "TokenUsage",
+      "representation_line": 10
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 37,
+      "line_end": 37,
+      "column": 4,
+      "owner": "TokenUsage",
+      "representation_line": 12
+    },
+    {
+      "kind": "Assign",
+      "line_start": 40,
+      "line_end": 40,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 15
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 43,
+      "line_end": 49,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 16
+    },
+    {
+      "kind": "Expr",
+      "line_start": 44,
+      "line_end": 44,
+      "column": 4,
+      "owner": "Spend",
+      "representation_line": 21
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 46,
+      "line_end": 46,
+      "column": 4,
+      "owner": "Spend",
+      "representation_line": 21
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 47,
+      "line_end": 47,
+      "column": 4,
+      "owner": "Spend",
+      "representation_line": 21
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 48,
+      "line_end": 48,
+      "column": 4,
+      "owner": "Spend",
+      "representation_line": 21
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 49,
+      "line_end": 49,
+      "column": 4,
+      "owner": "Spend",
+      "representation_line": 21
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 52,
+      "line_end": 58,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 23
+    },
+    {
+      "kind": "Expr",
+      "line_start": 53,
+      "line_end": 53,
+      "column": 4,
+      "owner": "reported_between",
+      "representation_line": 29
+    },
+    {
+      "kind": "Assign",
+      "line_start": 54,
+      "line_end": 55,
+      "column": 4,
+      "owner": "reported_between",
+      "representation_line": 29
+    },
+    {
+      "kind": "Assign",
+      "line_start": 56,
+      "line_end": 57,
+      "column": 4,
+      "owner": "reported_between",
+      "representation_line": 29
+    },
+    {
+      "kind": "Return",
+      "line_start": 58,
+      "line_end": 58,
+      "column": 4,
+      "owner": "reported_between",
+      "representation_line": 30
+    },
+    {
+      "kind": "Assign",
+      "line_start": 63,
+      "line_end": 63,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 35
+    },
+    {
+      "kind": "Assign",
+      "line_start": 64,
+      "line_end": 64,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 35
+    },
+    {
+      "kind": "Assign",
+      "line_start": 65,
+      "line_end": 65,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 35
+    },
+    {
+      "kind": "Assign",
+      "line_start": 66,
+      "line_end": 66,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 35
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 69,
+      "line_end": 86,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 36
+    },
+    {
+      "kind": "Expr",
+      "line_start": 70,
+      "line_end": 70,
+      "column": 4,
+      "owner": "estimate_tokens",
+      "representation_line": 42
+    },
+    {
+      "kind": "Assign",
+      "line_start": 71,
+      "line_end": 71,
+      "column": 4,
+      "owner": "estimate_tokens",
+      "representation_line": 42
+    },
+    {
+      "kind": "If",
+      "line_start": 72,
+      "line_end": 73,
+      "column": 4,
+      "owner": "estimate_tokens",
+      "representation_line": 43
+    },
+    {
+      "kind": "Return",
+      "line_start": 73,
+      "line_end": 73,
+      "column": 8,
+      "owner": "estimate_tokens",
+      "representation_line": 45
+    },
+    {
+      "kind": "Assign",
+      "line_start": 74,
+      "line_end": 74,
+      "column": 4,
+      "owner": "estimate_tokens",
+      "representation_line": 49
+    },
+    {
+      "kind": "For",
+      "line_start": 75,
+      "line_end": 77,
+      "column": 4,
+      "owner": "estimate_tokens",
+      "representation_line": 50
+    },
+    {
+      "kind": "If",
+      "line_start": 76,
+      "line_end": 77,
+      "column": 8,
+      "owner": "estimate_tokens",
+      "representation_line": 52
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 77,
+      "line_end": 77,
+      "column": 12,
+      "owner": "estimate_tokens",
+      "representation_line": 55
+    },
+    {
+      "kind": "Assign",
+      "line_start": 78,
+      "line_end": 78,
+      "column": 4,
+      "owner": "estimate_tokens",
+      "representation_line": 59
+    },
+    {
+      "kind": "If",
+      "line_start": 79,
+      "line_end": 85,
+      "column": 4,
+      "owner": "estimate_tokens",
+      "representation_line": 60
+    },
+    {
+      "kind": "Assign",
+      "line_start": 80,
+      "line_end": 80,
+      "column": 8,
+      "owner": "estimate_tokens",
+      "representation_line": 63
+    },
+    {
+      "kind": "If",
+      "line_start": 81,
+      "line_end": 85,
+      "column": 4,
+      "owner": "estimate_tokens",
+      "representation_line": 66
+    },
+    {
+      "kind": "Assign",
+      "line_start": 82,
+      "line_end": 82,
+      "column": 8,
+      "owner": "estimate_tokens",
+      "representation_line": 69
+    },
+    {
+      "kind": "Assign",
+      "line_start": 84,
+      "line_end": 84,
+      "column": 8,
+      "owner": "estimate_tokens",
+      "representation_line": 73
+    },
+    {
+      "kind": "Assign",
+      "line_start": 85,
+      "line_end": 85,
+      "column": 8,
+      "owner": "estimate_tokens",
+      "representation_line": 73
+    },
+    {
+      "kind": "Return",
+      "line_start": 86,
+      "line_end": 86,
+      "column": 4,
+      "owner": "estimate_tokens",
+      "representation_line": 76
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 89,
+      "line_end": 93,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 80
+    },
+    {
+      "kind": "Return",
+      "line_start": 91,
+      "line_end": 93,
+      "column": 4,
+      "owner": "_bucket",
+      "representation_line": 85
+    },
+    {
+      "kind": "Assign",
+      "line_start": 98,
+      "line_end": 98,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 90
+    },
+    {
+      "kind": "Assign",
+      "line_start": 99,
+      "line_end": 99,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 90
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 102,
+      "line_end": 112,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 91
+    },
+    {
+      "kind": "Expr",
+      "line_start": 103,
+      "line_end": 103,
+      "column": 4,
+      "owner": "unparsed_cache_keys",
+      "representation_line": 97
+    },
+    {
+      "kind": "If",
+      "line_start": 105,
+      "line_end": 106,
+      "column": 4,
+      "owner": "unparsed_cache_keys",
+      "representation_line": 98
+    },
+    {
+      "kind": "Return",
+      "line_start": 106,
+      "line_end": 106,
+      "column": 8,
+      "owner": "unparsed_cache_keys",
+      "representation_line": 100
+    },
+    {
+      "kind": "Assign",
+      "line_start": 107,
+      "line_end": 111,
+      "column": 4,
+      "owner": "unparsed_cache_keys",
+      "representation_line": 104
+    },
+    {
+      "kind": "Return",
+      "line_start": 112,
+      "line_end": 112,
+      "column": 4,
+      "owner": "unparsed_cache_keys",
+      "representation_line": 105
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 115,
+      "line_end": 237,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 109
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 116,
+      "line_end": 133,
+      "column": 4,
+      "owner": "_TokenCounter",
+      "representation_line": 113
+    },
+    {
+      "kind": "Assign",
+      "line_start": 117,
+      "line_end": 117,
+      "column": 8,
+      "owner": "_TokenCounter.__init__",
+      "representation_line": 119
+    },
+    {
+      "kind": "Assign",
+      "line_start": 118,
+      "line_end": 118,
+      "column": 8,
+      "owner": "_TokenCounter.__init__",
+      "representation_line": 119
+    },
+    {
+      "kind": "Assign",
+      "line_start": 119,
+      "line_end": 119,
+      "column": 8,
+      "owner": "_TokenCounter.__init__",
+      "representation_line": 119
+    },
+    {
+      "kind": "Assign",
+      "line_start": 120,
+      "line_end": 120,
+      "column": 8,
+      "owner": "_TokenCounter.__init__",
+      "representation_line": 119
+    },
+    {
+      "kind": "Assign",
+      "line_start": 121,
+      "line_end": 121,
+      "column": 8,
+      "owner": "_TokenCounter.__init__",
+      "representation_line": 119
+    },
+    {
+      "kind": "Assign",
+      "line_start": 122,
+      "line_end": 122,
+      "column": 8,
+      "owner": "_TokenCounter.__init__",
+      "representation_line": 121
+    },
+    {
+      "kind": "Assign",
+      "line_start": 124,
+      "line_end": 124,
+      "column": 8,
+      "owner": "_TokenCounter.__init__",
+      "representation_line": 121
+    },
+    {
+      "kind": "Assign",
+      "line_start": 125,
+      "line_end": 125,
+      "column": 8,
+      "owner": "_TokenCounter.__init__",
+      "representation_line": 121
+    },
+    {
+      "kind": "Assign",
+      "line_start": 126,
+      "line_end": 126,
+      "column": 8,
+      "owner": "_TokenCounter.__init__",
+      "representation_line": 121
+    },
+    {
+      "kind": "Assign",
+      "line_start": 127,
+      "line_end": 127,
+      "column": 8,
+      "owner": "_TokenCounter.__init__",
+      "representation_line": 121
+    },
+    {
+      "kind": "Assign",
+      "line_start": 128,
+      "line_end": 128,
+      "column": 8,
+      "owner": "_TokenCounter.__init__",
+      "representation_line": 123
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 129,
+      "line_end": 129,
+      "column": 8,
+      "owner": "_TokenCounter.__init__",
+      "representation_line": 123
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 131,
+      "line_end": 131,
+      "column": 8,
+      "owner": "_TokenCounter.__init__",
+      "representation_line": 123
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 133,
+      "line_end": 133,
+      "column": 8,
+      "owner": "_TokenCounter.__init__",
+      "representation_line": 123
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 136,
+      "line_end": 141,
+      "column": 4,
+      "owner": "_TokenCounter",
+      "representation_line": 126
+    },
+    {
+      "kind": "Assign",
+      "line_start": 137,
+      "line_end": 137,
+      "column": 8,
+      "owner": "_TokenCounter.phase",
+      "representation_line": 135
+    },
+    {
+      "kind": "Try",
+      "line_start": 138,
+      "line_end": 141,
+      "column": 8,
+      "owner": "_TokenCounter.phase",
+      "representation_line": 136
+    },
+    {
+      "kind": "Expr",
+      "line_start": 139,
+      "line_end": 139,
+      "column": 12,
+      "owner": "_TokenCounter.phase",
+      "representation_line": 139
+    },
+    {
+      "kind": "Assign",
+      "line_start": 141,
+      "line_end": 141,
+      "column": 12,
+      "owner": "_TokenCounter.phase",
+      "representation_line": 143
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 143,
+      "line_end": 145,
+      "column": 4,
+      "owner": "_TokenCounter",
+      "representation_line": 148
+    },
+    {
+      "kind": "With",
+      "line_start": 144,
+      "line_end": 145,
+      "column": 8,
+      "owner": "_TokenCounter.current_phase",
+      "representation_line": 153
+    },
+    {
+      "kind": "Return",
+      "line_start": 145,
+      "line_end": 145,
+      "column": 12,
+      "owner": "_TokenCounter.current_phase",
+      "representation_line": 155
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 147,
+      "line_end": 194,
+      "column": 4,
+      "owner": "_TokenCounter",
+      "representation_line": 161
+    },
+    {
+      "kind": "Expr",
+      "line_start": 149,
+      "line_end": 149,
+      "column": 8,
+      "owner": "_TokenCounter.add",
+      "representation_line": 167
+    },
+    {
+      "kind": "With",
+      "line_start": 150,
+      "line_end": 194,
+      "column": 8,
+      "owner": "_TokenCounter.add",
+      "representation_line": 168
+    },
+    {
+      "kind": "Assign",
+      "line_start": 151,
+      "line_end": 151,
+      "column": 12,
+      "owner": "_TokenCounter.add",
+      "representation_line": 171
+    },
+    {
+      "kind": "If",
+      "line_start": 152,
+      "line_end": 156,
+      "column": 12,
+      "owner": "_TokenCounter.add",
+      "representation_line": 172
+    },
+    {
+      "kind": "Assign",
+      "line_start": 153,
+      "line_end": 153,
+      "column": 16,
+      "owner": "_TokenCounter.add",
+      "representation_line": 175
+    },
+    {
+      "kind": "If",
+      "line_start": 154,
+      "line_end": 156,
+      "column": 16,
+      "owner": "_TokenCounter.add",
+      "representation_line": 176
+    },
+    {
+      "kind": "Assign",
+      "line_start": 156,
+      "line_end": 156,
+      "column": 20,
+      "owner": "_TokenCounter.add",
+      "representation_line": 179
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 157,
+      "line_end": 157,
+      "column": 12,
+      "owner": "_TokenCounter.add",
+      "representation_line": 183
+    },
+    {
+      "kind": "Assign",
+      "line_start": 158,
+      "line_end": 158,
+      "column": 12,
+      "owner": "_TokenCounter.add",
+      "representation_line": 183
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 159,
+      "line_end": 159,
+      "column": 12,
+      "owner": "_TokenCounter.add",
+      "representation_line": 183
+    },
+    {
+      "kind": "If",
+      "line_start": 160,
+      "line_end": 163,
+      "column": 12,
+      "owner": "_TokenCounter.add",
+      "representation_line": 184
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 161,
+      "line_end": 161,
+      "column": 16,
+      "owner": "_TokenCounter.add",
+      "representation_line": 187
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 162,
+      "line_end": 162,
+      "column": 16,
+      "owner": "_TokenCounter.add",
+      "representation_line": 187
+    },
+    {
+      "kind": "Assign",
+      "line_start": 163,
+      "line_end": 163,
+      "column": 16,
+      "owner": "_TokenCounter.add",
+      "representation_line": 187
+    },
+    {
+      "kind": "If",
+      "line_start": 164,
+      "line_end": 167,
+      "column": 12,
+      "owner": "_TokenCounter.add",
+      "representation_line": 189
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 165,
+      "line_end": 165,
+      "column": 16,
+      "owner": "_TokenCounter.add",
+      "representation_line": 192
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 166,
+      "line_end": 166,
+      "column": 16,
+      "owner": "_TokenCounter.add",
+      "representation_line": 192
+    },
+    {
+      "kind": "Assign",
+      "line_start": 167,
+      "line_end": 167,
+      "column": 16,
+      "owner": "_TokenCounter.add",
+      "representation_line": 192
+    },
+    {
+      "kind": "If",
+      "line_start": 168,
+      "line_end": 169,
+      "column": 12,
+      "owner": "_TokenCounter.add",
+      "representation_line": 194
+    },
+    {
+      "kind": "Return",
+      "line_start": 169,
+      "line_end": 169,
+      "column": 16,
+      "owner": "_TokenCounter.add",
+      "representation_line": 196
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 170,
+      "line_end": 170,
+      "column": 12,
+      "owner": "_TokenCounter.add",
+      "representation_line": 200
+    },
+    {
+      "kind": "Assign",
+      "line_start": 171,
+      "line_end": 171,
+      "column": 12,
+      "owner": "_TokenCounter.add",
+      "representation_line": 200
+    },
+    {
+      "kind": "Assign",
+      "line_start": 172,
+      "line_end": 172,
+      "column": 12,
+      "owner": "_TokenCounter.add",
+      "representation_line": 200
+    },
+    {
+      "kind": "Assign",
+      "line_start": 173,
+      "line_end": 173,
+      "column": 12,
+      "owner": "_TokenCounter.add",
+      "representation_line": 200
+    },
+    {
+      "kind": "Assign",
+      "line_start": 174,
+      "line_end": 174,
+      "column": 12,
+      "owner": "_TokenCounter.add",
+      "representation_line": 200
+    },
+    {
+      "kind": "If",
+      "line_start": 175,
+      "line_end": 184,
+      "column": 12,
+      "owner": "_TokenCounter.add",
+      "representation_line": 201
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 177,
+      "line_end": 177,
+      "column": 16,
+      "owner": "_TokenCounter.add",
+      "representation_line": 204
+    },
+    {
+      "kind": "Expr",
+      "line_start": 178,
+      "line_end": 184,
+      "column": 16,
+      "owner": "_TokenCounter.add",
+      "representation_line": 204
+    },
+    {
+      "kind": "Assign",
+      "line_start": 185,
+      "line_end": 185,
+      "column": 12,
+      "owner": "_TokenCounter.add",
+      "representation_line": 207
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 187,
+      "line_end": 187,
+      "column": 12,
+      "owner": "_TokenCounter.add",
+      "representation_line": 207
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 188,
+      "line_end": 188,
+      "column": 12,
+      "owner": "_TokenCounter.add",
+      "representation_line": 207
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 189,
+      "line_end": 189,
+      "column": 12,
+      "owner": "_TokenCounter.add",
+      "representation_line": 207
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 190,
+      "line_end": 190,
+      "column": 12,
+      "owner": "_TokenCounter.add",
+      "representation_line": 207
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 191,
+      "line_end": 191,
+      "column": 12,
+      "owner": "_TokenCounter.add",
+      "representation_line": 209
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 192,
+      "line_end": 192,
+      "column": 12,
+      "owner": "_TokenCounter.add",
+      "representation_line": 209
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 194,
+      "line_end": 194,
+      "column": 12,
+      "owner": "_TokenCounter.add",
+      "representation_line": 209
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 196,
+      "line_end": 200,
+      "column": 4,
+      "owner": "_TokenCounter",
+      "representation_line": 214
+    },
+    {
+      "kind": "Expr",
+      "line_start": 197,
+      "line_end": 197,
+      "column": 8,
+      "owner": "_TokenCounter.spend",
+      "representation_line": 220
+    },
+    {
+      "kind": "With",
+      "line_start": 198,
+      "line_end": 200,
+      "column": 8,
+      "owner": "_TokenCounter.spend",
+      "representation_line": 221
+    },
+    {
+      "kind": "Return",
+      "line_start": 199,
+      "line_end": 200,
+      "column": 12,
+      "owner": "_TokenCounter.spend",
+      "representation_line": 223
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 202,
+      "line_end": 213,
+      "column": 4,
+      "owner": "_TokenCounter",
+      "representation_line": 229
+    },
+    {
+      "kind": "Expr",
+      "line_start": 204,
+      "line_end": 204,
+      "column": 8,
+      "owner": "_TokenCounter.note_cache_unparsed",
+      "representation_line": 235
+    },
+    {
+      "kind": "If",
+      "line_start": 205,
+      "line_end": 206,
+      "column": 8,
+      "owner": "_TokenCounter.note_cache_unparsed",
+      "representation_line": 236
+    },
+    {
+      "kind": "Return",
+      "line_start": 206,
+      "line_end": 206,
+      "column": 12,
+      "owner": "_TokenCounter.note_cache_unparsed",
+      "representation_line": 238
+    },
+    {
+      "kind": "With",
+      "line_start": 207,
+      "line_end": 213,
+      "column": 8,
+      "owner": "_TokenCounter.note_cache_unparsed",
+      "representation_line": 241
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 208,
+      "line_end": 208,
+      "column": 12,
+      "owner": "_TokenCounter.note_cache_unparsed",
+      "representation_line": 244
+    },
+    {
+      "kind": "Assign",
+      "line_start": 209,
+      "line_end": 209,
+      "column": 12,
+      "owner": "_TokenCounter.note_cache_unparsed",
+      "representation_line": 244
+    },
+    {
+      "kind": "If",
+      "line_start": 210,
+      "line_end": 211,
+      "column": 12,
+      "owner": "_TokenCounter.note_cache_unparsed",
+      "representation_line": 245
+    },
+    {
+      "kind": "Return",
+      "line_start": 211,
+      "line_end": 211,
+      "column": 16,
+      "owner": "_TokenCounter.note_cache_unparsed",
+      "representation_line": 247
+    },
+    {
+      "kind": "Expr",
+      "line_start": 212,
+      "line_end": 212,
+      "column": 12,
+      "owner": "_TokenCounter.note_cache_unparsed",
+      "representation_line": 251
+    },
+    {
+      "kind": "Return",
+      "line_start": 213,
+      "line_end": 213,
+      "column": 12,
+      "owner": "_TokenCounter.note_cache_unparsed",
+      "representation_line": 252
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 215,
+      "line_end": 223,
+      "column": 4,
+      "owner": "_TokenCounter",
+      "representation_line": 258
+    },
+    {
+      "kind": "With",
+      "line_start": 216,
+      "line_end": 223,
+      "column": 8,
+      "owner": "_TokenCounter.reset",
+      "representation_line": 263
+    },
+    {
+      "kind": "Assign",
+      "line_start": 217,
+      "line_end": 217,
+      "column": 12,
+      "owner": "_TokenCounter.reset",
+      "representation_line": 266
+    },
+    {
+      "kind": "Assign",
+      "line_start": 218,
+      "line_end": 218,
+      "column": 12,
+      "owner": "_TokenCounter.reset",
+      "representation_line": 266
+    },
+    {
+      "kind": "Assign",
+      "line_start": 219,
+      "line_end": 219,
+      "column": 12,
+      "owner": "_TokenCounter.reset",
+      "representation_line": 266
+    },
+    {
+      "kind": "Assign",
+      "line_start": 220,
+      "line_end": 220,
+      "column": 12,
+      "owner": "_TokenCounter.reset",
+      "representation_line": 266
+    },
+    {
+      "kind": "Assign",
+      "line_start": 221,
+      "line_end": 221,
+      "column": 12,
+      "owner": "_TokenCounter.reset",
+      "representation_line": 266
+    },
+    {
+      "kind": "Assign",
+      "line_start": 222,
+      "line_end": 222,
+      "column": 12,
+      "owner": "_TokenCounter.reset",
+      "representation_line": 268
+    },
+    {
+      "kind": "Assign",
+      "line_start": 223,
+      "line_end": 223,
+      "column": 12,
+      "owner": "_TokenCounter.reset",
+      "representation_line": 268
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 225,
+      "line_end": 237,
+      "column": 4,
+      "owner": "_TokenCounter",
+      "representation_line": 273
+    },
+    {
+      "kind": "With",
+      "line_start": 226,
+      "line_end": 237,
+      "column": 8,
+      "owner": "_TokenCounter.snapshot",
+      "representation_line": 278
+    },
+    {
+      "kind": "Return",
+      "line_start": 227,
+      "line_end": 237,
+      "column": 12,
+      "owner": "_TokenCounter.snapshot",
+      "representation_line": 280
+    },
+    {
+      "kind": "Assign",
+      "line_start": 240,
+      "line_end": 240,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 288
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 28,
+      "line_end": 28,
+      "column": 17,
+      "kind": "Name",
+      "original_ast": "Name(id='TypedDict', ctx=Load())",
+      "rendered": "TypedDict"
+    },
+    {
+      "line_start": 28,
+      "line_end": 28,
+      "column": 28,
+      "kind": "keyword",
+      "original_ast": "keyword(arg='total', value=Constant(value=False))",
+      "rendered": "total=False"
+    },
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 16,
+      "kind": "Constant",
+      "original_ast": "Constant(value='unscoped')",
+      "rendered": "'unscoped'"
+    },
+    {
+      "line_start": 43,
+      "line_end": 43,
+      "column": 12,
+      "kind": "Name",
+      "original_ast": "Name(id='NamedTuple', ctx=Load())",
+      "rendered": "NamedTuple"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 17,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0.0)",
+      "rendered": "0.0"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 17,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 23,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 24,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 54,
+      "line_end": 55,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=Attribute(value=Name(id='after', ctx=Load()), attr='usd_reports', ctx=Load()), ops=[Gt()], comparators=[Attribute(value=Name(id='before', ctx=Load()), attr='usd_reports', ctx=Load())]), body=BinOp(left=Attribute(value=Name(id='after', ctx=Load()), attr='usd', ctx=Load()), op=Sub(), right=Attribute(value=Name(id='before', ctx=Load()), attr='usd', ctx=Load())), orelse=Constant(value=None))",
+      "rendered": "after.usd - before.usd if after.usd_reports > before.usd_reports else None"
+    },
+    {
+      "line_start": 56,
+      "line_end": 57,
+      "column": 13,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=Attribute(value=Name(id='after', ctx=Load()), attr='turn_reports', ctx=Load()), ops=[Gt()], comparators=[Attribute(value=Name(id='before', ctx=Load()), attr='turn_reports', ctx=Load())]), body=BinOp(left=Attribute(value=Name(id='after', ctx=Load()), attr='turns', ctx=Load()), op=Sub(), right=Attribute(value=Name(id='before', ctx=Load()), attr='turns', ctx=Load())), orelse=Constant(value=None))",
+      "rendered": "after.turns - before.turns if after.turn_reports > before.turn_reports else None"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='usd', ctx=Load()), Name(id='turns', ctx=Load())], ctx=Load())",
+      "rendered": "(usd, turns)"
+    },
+    {
+      "line_start": 63,
+      "line_end": 63,
+      "column": 13,
+      "kind": "Constant",
+      "original_ast": "Constant(value=4.4)",
+      "rendered": "4.4"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 13,
+      "kind": "Constant",
+      "original_ast": "Constant(value=2.45)",
+      "rendered": "2.45"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 17,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0.08)",
+      "rendered": "0.08"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 17,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0.34)",
+      "rendered": "0.34"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='len', ctx=Load()), args=[Name(id='text', ctx=Load())], keywords=[])",
+      "rendered": "len(text)"
+    },
+    {
+      "line_start": 72,
+      "line_end": 72,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='n', ctx=Load()), ops=[LtE()], comparators=[Constant(value=0)])",
+      "rendered": "n <= 0"
+    },
+    {
+      "line_start": 73,
+      "line_end": 73,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 74,
+      "line_end": 74,
+      "column": 12,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 75,
+      "line_end": 75,
+      "column": 14,
+      "kind": "Name",
+      "original_ast": "Name(id='text', ctx=Load())",
+      "rendered": "text"
+    },
+    {
+      "line_start": 76,
+      "line_end": 76,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='ch', ctx=Load()), attr='isspace', ctx=Load()), args=[], keywords=[])), UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='ch', ctx=Load()), attr='isalpha', ctx=Load()), args=[], keywords=[]))])",
+      "rendered": "not ch.isspace() and (not ch.isalpha())"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='dense', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "dense += 1"
+    },
+    {
+      "line_start": 78,
+      "line_end": 78,
+      "column": 11,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Name(id='dense', ctx=Load()), op=Div(), right=Name(id='n', ctx=Load()))",
+      "rendered": "dense / n"
+    },
+    {
+      "line_start": 79,
+      "line_end": 79,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='frac', ctx=Load()), ops=[LtE()], comparators=[Name(id='_DENSE_FRAC_LO', ctx=Load())])",
+      "rendered": "frac <= _DENSE_FRAC_LO"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 14,
+      "kind": "Name",
+      "original_ast": "Name(id='_CPT_PROSE', ctx=Load())",
+      "rendered": "_CPT_PROSE"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 9,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='frac', ctx=Load()), ops=[GtE()], comparators=[Name(id='_DENSE_FRAC_HI', ctx=Load())])",
+      "rendered": "frac >= _DENSE_FRAC_HI"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 14,
+      "kind": "Name",
+      "original_ast": "Name(id='_CPT_DENSE', ctx=Load())",
+      "rendered": "_CPT_DENSE"
+    },
+    {
+      "line_start": 84,
+      "line_end": 84,
+      "column": 15,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=BinOp(left=Name(id='frac', ctx=Load()), op=Sub(), right=Name(id='_DENSE_FRAC_LO', ctx=Load())), op=Div(), right=BinOp(left=Name(id='_DENSE_FRAC_HI', ctx=Load()), op=Sub(), right=Name(id='_DENSE_FRAC_LO', ctx=Load())))",
+      "rendered": "(frac - _DENSE_FRAC_LO) / (_DENSE_FRAC_HI - _DENSE_FRAC_LO)"
+    },
+    {
+      "line_start": 85,
+      "line_end": 85,
+      "column": 14,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Name(id='_CPT_PROSE', ctx=Load()), op=Add(), right=BinOp(left=Name(id='span', ctx=Load()), op=Mult(), right=BinOp(left=Name(id='_CPT_DENSE', ctx=Load()), op=Sub(), right=Name(id='_CPT_PROSE', ctx=Load()))))",
+      "rendered": "_CPT_PROSE + span * (_CPT_DENSE - _CPT_PROSE)"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='int', ctx=Load()), args=[BinOp(left=Name(id='n', ctx=Load()), op=Div(), right=Name(id='cpt', ctx=Load()))], keywords=[])",
+      "rendered": "int(n / cpt)"
+    },
+    {
+      "line_start": 91,
+      "line_end": 93,
+      "column": 11,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='prompt'), Constant(value='completion'), Constant(value='cache_read'), Constant(value='cache_write'), Constant(value='calls'), Constant(value='cache_unparsed'), Constant(value='usd'), Constant(value='turns'), Constant(value='reasoning')], values=[Constant(value=0), Constant(value=0), Constant(value=0), Constant(value=0), Constant(value=0), Constant(value=0), Constant(value=None), Constant(value=None), Constant(value=0)])",
+      "rendered": "{'prompt': 0, 'completion': 0, 'cache_read': 0, 'cache_write': 0, 'calls': 0, 'cache_unparsed': 0, 'usd': None, 'turns': None, 'reasoning': 0}"
+    },
+    {
+      "line_start": 98,
+      "line_end": 98,
+      "column": 25,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='re', ctx=Load()), attr='compile', ctx=Load()), args=[Constant(value='^[A-Za-z0-9_.\\\\-]{1,64}$')], keywords=[])",
+      "rendered": "re.compile('^[A-Za-z0-9_.\\\\-]{1,64}$')"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 26,
+      "kind": "Constant",
+      "original_ast": "Constant(value=8)",
+      "rendered": "8"
+    },
+    {
+      "line_start": 105,
+      "line_end": 105,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='usage', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[]))",
+      "rendered": "not isinstance(usage, dict)"
+    },
+    {
+      "line_start": 106,
+      "line_end": 106,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[], ctx=Load())",
+      "rendered": "()"
+    },
+    {
+      "line_start": 107,
+      "line_end": 111,
+      "column": 11,
+      "kind": "SetComp",
+      "original_ast": "SetComp(elt=Name(id='k', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='k', ctx=Store()), Name(id='v', ctx=Store())], ctx=Store()), iter=Call(func=Attribute(value=Name(id='usage', ctx=Load()), attr='items', ctx=Load()), args=[], keywords=[]), ifs=[BoolOp(op=And(), values=[Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='k', ctx=Load()), Name(id='str', ctx=Load())], keywords=[]), Compare(left=Name(id='k', ctx=Load()), ops=[NotIn()], comparators=[Name(id='parsed', ctx=Load())]), Compare(left=Name(id='v', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), Compare(left=Constant(value='cache'), ops=[In()], comparators=[Call(func=Attribute(value=Name(id='k', ctx=Load()), attr='lower', ctx=Load()), args=[], keywords=[])]), Call(func=Attribute(value=Name(id='_UNPARSED_CACHE_KEY_RX', ctx=Load()), attr='match', ctx=Load()), args=[Name(id='k', ctx=Load())], keywords=[])])], is_async=0)])",
+      "rendered": "{k for k, v in usage.items() if isinstance(k, str) and k not in parsed and (v is not None) and ('cache' in k.lower()) and _UNPARSED_CACHE_KEY_RX.match(k)}"
+    },
+    {
+      "line_start": 112,
+      "line_end": 112,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='tuple', ctx=Load()), args=[Subscript(value=Call(func=Name(id='sorted', ctx=Load()), args=[Name(id='hits', ctx=Load())], keywords=[]), slice=Slice(upper=Name(id='_UNPARSED_CACHE_KEY_CAP', ctx=Load())), ctx=Load())], keywords=[])",
+      "rendered": "tuple(sorted(hits)[:_UNPARSED_CACHE_KEY_CAP])"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='threading', ctx=Load()), attr='Lock', ctx=Load()), args=[], keywords=[])",
+      "rendered": "threading.Lock()"
+    },
+    {
+      "line_start": 118,
+      "line_end": 118,
+      "column": 22,
+      "kind": "Name",
+      "original_ast": "Name(id='DEFAULT_PHASE', ctx=Load())",
+      "rendered": "DEFAULT_PHASE"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 22,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 120,
+      "line_end": 120,
+      "column": 26,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 121,
+      "line_end": 121,
+      "column": 21,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 122,
+      "line_end": 122,
+      "column": 32,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 33,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0.0)",
+      "rendered": "0.0"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 21,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 127,
+      "line_end": 127,
+      "column": 27,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 128,
+      "line_end": 128,
+      "column": 28,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 129,
+      "line_end": 129,
+      "column": 41,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='defaultdict', ctx=Load()), args=[Name(id='_bucket', ctx=Load())], keywords=[])",
+      "rendered": "defaultdict(_bucket)"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 48,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 50,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 5,
+      "kind": "Name",
+      "original_ast": "Name(id='contextmanager', ctx=Load())",
+      "rendered": "contextmanager"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 28,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Attribute(value=Name(id='self', ctx=Load()), attr='_phase', ctx=Load()), Name(id='name', ctx=Load())], ctx=Load())",
+      "rendered": "(self._phase, name)"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 26,
+      "kind": "Name",
+      "original_ast": "Name(id='prev', ctx=Load())",
+      "rendered": "prev"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_lock', ctx=Load())",
+      "rendered": "self._lock"
+    },
+    {
+      "line_start": 145,
+      "line_end": 145,
+      "column": 19,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_phase', ctx=Load())",
+      "rendered": "self._phase"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_lock', ctx=Load())",
+      "rendered": "self._lock"
+    },
+    {
+      "line_start": 151,
+      "line_end": 151,
+      "column": 25,
+      "kind": "Constant",
+      "original_ast": "Constant(value=1)",
+      "rendered": "1"
+    },
+    {
+      "line_start": 152,
+      "line_end": 152,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='usage', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(usage, dict)"
+    },
+    {
+      "line_start": 153,
+      "line_end": 153,
+      "column": 28,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='usage', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='calls')], keywords=[])",
+      "rendered": "usage.get('calls')"
+    },
+    {
+      "line_start": 154,
+      "line_end": 155,
+      "column": 20,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='raw_calls', ctx=Load()), Name(id='int', ctx=Load())], keywords=[]), UnaryOp(op=Not(), operand=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='raw_calls', ctx=Load()), Name(id='bool', ctx=Load())], keywords=[])), Compare(left=Name(id='raw_calls', ctx=Load()), ops=[Gt()], comparators=[Constant(value=0)])])",
+      "rendered": "isinstance(raw_calls, int) and (not isinstance(raw_calls, bool)) and (raw_calls > 0)"
+    },
+    {
+      "line_start": 156,
+      "line_end": 156,
+      "column": 33,
+      "kind": "Name",
+      "original_ast": "Name(id='raw_calls', ctx=Load())",
+      "rendered": "raw_calls"
+    },
+    {
+      "line_start": 157,
+      "line_end": 157,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Attribute(value=Name(id='self', ctx=Load()), attr='calls', ctx=Store()), op=Add(), value=Name(id='n_requests', ctx=Load()))",
+      "rendered": "self.calls += n_requests"
+    },
+    {
+      "line_start": 158,
+      "line_end": 158,
+      "column": 16,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Attribute(value=Name(id='self', ctx=Load()), attr='by_phase', ctx=Load()), slice=Attribute(value=Name(id='self', ctx=Load()), attr='_phase', ctx=Load()), ctx=Load())",
+      "rendered": "self.by_phase[self._phase]"
+    },
+    {
+      "line_start": 159,
+      "line_end": 159,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Subscript(value=Name(id='b', ctx=Load()), slice=Constant(value='calls'), ctx=Store()), op=Add(), value=Name(id='n_requests', ctx=Load()))",
+      "rendered": "b['calls'] += n_requests"
+    },
+    {
+      "line_start": 160,
+      "line_end": 160,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='usd', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "usd is not None"
+    },
+    {
+      "line_start": 161,
+      "line_end": 161,
+      "column": 16,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Attribute(value=Name(id='self', ctx=Load()), attr='usd_reports', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "self.usd_reports += 1"
+    },
+    {
+      "line_start": 162,
+      "line_end": 162,
+      "column": 16,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Attribute(value=Name(id='self', ctx=Load()), attr='usd', ctx=Store()), op=Add(), value=Name(id='usd', ctx=Load()))",
+      "rendered": "self.usd += usd"
+    },
+    {
+      "line_start": 163,
+      "line_end": 163,
+      "column": 27,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=BoolOp(op=Or(), values=[Subscript(value=Name(id='b', ctx=Load()), slice=Constant(value='usd'), ctx=Load()), Constant(value=0.0)]), op=Add(), right=Name(id='usd', ctx=Load()))",
+      "rendered": "(b['usd'] or 0.0) + usd"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='turns', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "turns is not None"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 16,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Attribute(value=Name(id='self', ctx=Load()), attr='turn_reports', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "self.turn_reports += 1"
+    },
+    {
+      "line_start": 166,
+      "line_end": 166,
+      "column": 16,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Attribute(value=Name(id='self', ctx=Load()), attr='turns', ctx=Store()), op=Add(), value=Name(id='turns', ctx=Load()))",
+      "rendered": "self.turns += turns"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 29,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=BoolOp(op=Or(), values=[Subscript(value=Name(id='b', ctx=Load()), slice=Constant(value='turns'), ctx=Load()), Constant(value=0)]), op=Add(), right=Name(id='turns', ctx=Load()))",
+      "rendered": "(b['turns'] or 0) + turns"
+    },
+    {
+      "line_start": 168,
+      "line_end": 168,
+      "column": 15,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='usage', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[]))",
+      "rendered": "not isinstance(usage, dict)"
+    },
+    {
+      "line_start": 170,
+      "line_end": 170,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Attribute(value=Name(id='self', ctx=Load()), attr='calls_with_usage', ctx=Store()), op=Add(), value=Name(id='n_requests', ctx=Load()))",
+      "rendered": "self.calls_with_usage += n_requests"
+    },
+    {
+      "line_start": 171,
+      "line_end": 171,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='int', ctx=Load()), args=[BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='usage', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='input_tokens'), Constant(value=0)], keywords=[]), Constant(value=0)])], keywords=[])",
+      "rendered": "int(usage.get('input_tokens', 0) or 0)"
+    },
+    {
+      "line_start": 172,
+      "line_end": 172,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='int', ctx=Load()), args=[BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='usage', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='cache_creation_input_tokens'), Constant(value=0)], keywords=[]), Constant(value=0)])], keywords=[])",
+      "rendered": "int(usage.get('cache_creation_input_tokens', 0) or 0)"
+    },
+    {
+      "line_start": 173,
+      "line_end": 173,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='int', ctx=Load()), args=[BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='usage', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='cache_read_input_tokens'), Constant(value=0)], keywords=[]), Constant(value=0)])], keywords=[])",
+      "rendered": "int(usage.get('cache_read_input_tokens', 0) or 0)"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='usage', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='output_tokens'), Constant(value=0)], keywords=[])",
+      "rendered": "usage.get('output_tokens', 0)"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='out_raw', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)])",
+      "rendered": "out_raw is None"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 16,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Attribute(value=Name(id='self', ctx=Load()), attr='completion_absent', ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "self.completion_absent += 1"
+    },
+    {
+      "line_start": 178,
+      "line_end": 184,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='warn_once', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='_completion_absent_noted', ctx=Load()), Constant(value='null-completion-count'), Constant(value='  [tokens] WARN: a usage record carried a null completion count; coerced to 0 (occurrences counted under completion_absent)')], keywords=[])",
+      "rendered": "warn_once(self._completion_absent_noted, 'null-completion-count', source_literal_181_20)"
+    },
+    {
+      "line_start": 185,
+      "line_end": 185,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='int', ctx=Load()), args=[BoolOp(op=Or(), values=[Name(id='out_raw', ctx=Load()), Constant(value=0)])], keywords=[])",
+      "rendered": "int(out_raw or 0)"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Attribute(value=Name(id='self', ctx=Load()), attr='prompt', ctx=Store()), op=Add(), value=BinOp(left=Name(id='fresh', ctx=Load()), op=Add(), right=Name(id='cw', ctx=Load())))",
+      "rendered": "self.prompt += fresh + cw"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Attribute(value=Name(id='self', ctx=Load()), attr='completion', ctx=Store()), op=Add(), value=Name(id='out', ctx=Load()))",
+      "rendered": "self.completion += out"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Subscript(value=Name(id='b', ctx=Load()), slice=Constant(value='prompt'), ctx=Store()), op=Add(), value=BinOp(left=Name(id='fresh', ctx=Load()), op=Add(), right=Name(id='cw', ctx=Load())))",
+      "rendered": "b['prompt'] += fresh + cw"
+    },
+    {
+      "line_start": 190,
+      "line_end": 190,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Subscript(value=Name(id='b', ctx=Load()), slice=Constant(value='completion'), ctx=Store()), op=Add(), value=Name(id='out', ctx=Load()))",
+      "rendered": "b['completion'] += out"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Subscript(value=Name(id='b', ctx=Load()), slice=Constant(value='cache_read'), ctx=Store()), op=Add(), value=Name(id='cr', ctx=Load()))",
+      "rendered": "b['cache_read'] += cr"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Subscript(value=Name(id='b', ctx=Load()), slice=Constant(value='cache_write'), ctx=Store()), op=Add(), value=Name(id='cw', ctx=Load()))",
+      "rendered": "b['cache_write'] += cw"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Subscript(value=Name(id='b', ctx=Load()), slice=Constant(value='reasoning'), ctx=Store()), op=Add(), value=Call(func=Name(id='int', ctx=Load()), args=[BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='usage', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='reasoning_tokens'), Constant(value=0)], keywords=[]), Constant(value=0)])], keywords=[]))",
+      "rendered": "b['reasoning'] += int(usage.get('reasoning_tokens', 0) or 0)"
+    },
+    {
+      "line_start": 198,
+      "line_end": 198,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_lock', ctx=Load())",
+      "rendered": "self._lock"
+    },
+    {
+      "line_start": 199,
+      "line_end": 200,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='Spend', ctx=Load()), args=[], keywords=[keyword(arg='usd', value=Attribute(value=Name(id='self', ctx=Load()), attr='usd', ctx=Load())), keyword(arg='turns', value=Attribute(value=Name(id='self', ctx=Load()), attr='turns', ctx=Load())), keyword(arg='usd_reports', value=Attribute(value=Name(id='self', ctx=Load()), attr='usd_reports', ctx=Load())), keyword(arg='turn_reports', value=Attribute(value=Name(id='self', ctx=Load()), attr='turn_reports', ctx=Load()))])",
+      "rendered": "Spend(usd=self.usd, turns=self.turns, usd_reports=self.usd_reports, turn_reports=self.turn_reports)"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='keys', ctx=Load()))",
+      "rendered": "not keys"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 207,
+      "line_end": 207,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_lock', ctx=Load())",
+      "rendered": "self._lock"
+    },
+    {
+      "line_start": 208,
+      "line_end": 208,
+      "column": 12,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Subscript(value=Subscript(value=Attribute(value=Name(id='self', ctx=Load()), attr='by_phase', ctx=Load()), slice=Attribute(value=Name(id='self', ctx=Load()), attr='_phase', ctx=Load()), ctx=Load()), slice=Constant(value='cache_unparsed'), ctx=Store()), op=Add(), value=Constant(value=1))",
+      "rendered": "self.by_phase[self._phase]['cache_unparsed'] += 1"
+    },
+    {
+      "line_start": 209,
+      "line_end": 209,
+      "column": 21,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='via', ctx=Load()), Name(id='keys', ctx=Load())], ctx=Load())",
+      "rendered": "(via, keys)"
+    },
+    {
+      "line_start": 210,
+      "line_end": 210,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='marker', ctx=Load()), ops=[In()], comparators=[Attribute(value=Name(id='self', ctx=Load()), attr='_cache_unparsed_seen', ctx=Load())])",
+      "rendered": "marker in self._cache_unparsed_seen"
+    },
+    {
+      "line_start": 211,
+      "line_end": 211,
+      "column": 23,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='_cache_unparsed_seen', ctx=Load()), attr='add', ctx=Load()), args=[Name(id='marker', ctx=Load())], keywords=[])",
+      "rendered": "self._cache_unparsed_seen.add(marker)"
+    },
+    {
+      "line_start": 213,
+      "line_end": 213,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 216,
+      "line_end": 216,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_lock', ctx=Load())",
+      "rendered": "self._lock"
+    },
+    {
+      "line_start": 217,
+      "line_end": 217,
+      "column": 81,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 218,
+      "line_end": 218,
+      "column": 37,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 219,
+      "line_end": 219,
+      "column": 23,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0.0)",
+      "rendered": "0.0"
+    },
+    {
+      "line_start": 220,
+      "line_end": 220,
+      "column": 64,
+      "kind": "Constant",
+      "original_ast": "Constant(value=0)",
+      "rendered": "0"
+    },
+    {
+      "line_start": 221,
+      "line_end": 221,
+      "column": 28,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='defaultdict', ctx=Load()), args=[Name(id='_bucket', ctx=Load())], keywords=[])",
+      "rendered": "defaultdict(_bucket)"
+    },
+    {
+      "line_start": 222,
+      "line_end": 222,
+      "column": 40,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 223,
+      "line_end": 223,
+      "column": 44,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='set', ctx=Load()), args=[], keywords=[])",
+      "rendered": "set()"
+    },
+    {
+      "line_start": 226,
+      "line_end": 226,
+      "column": 13,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='self', ctx=Load()), attr='_lock', ctx=Load())",
+      "rendered": "self._lock"
+    },
+    {
+      "line_start": 227,
+      "line_end": 237,
+      "column": 19,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='prompt'), Constant(value='completion'), Constant(value='total'), Constant(value='calls'), Constant(value='calls_with_usage'), Constant(value='completion_absent'), Constant(value='usd'), Constant(value='turns'), Constant(value='by_phase')], values=[Attribute(value=Name(id='self', ctx=Load()), attr='prompt', ctx=Load()), Attribute(value=Name(id='self', ctx=Load()), attr='completion', ctx=Load()), BinOp(left=Attribute(value=Name(id='self', ctx=Load()), attr='prompt', ctx=Load()), op=Add(), right=Attribute(value=Name(id='self', ctx=Load()), attr='completion', ctx=Load())), Attribute(value=Name(id='self', ctx=Load()), attr='calls', ctx=Load()), Attribute(value=Name(id='self', ctx=Load()), attr='calls_with_usage', ctx=Load()), Attribute(value=Name(id='self', ctx=Load()), attr='completion_absent', ctx=Load()), IfExp(test=Attribute(value=Name(id='self', ctx=Load()), attr='usd_reports', ctx=Load()), body=Attribute(value=Name(id='self', ctx=Load()), attr='usd', ctx=Load()), orelse=Constant(value=None)), IfExp(test=Attribute(value=Name(id='self', ctx=Load()), attr='turn_reports', ctx=Load()), body=Attribute(value=Name(id='self', ctx=Load()), attr='turns', ctx=Load()), orelse=Constant(value=None)), DictComp(key=Name(id='k', ctx=Load()), value=Call(func=Name(id='dict', ctx=Load()), args=[Name(id='v', ctx=Load())], keywords=[]), generators=[comprehension(target=Tuple(elts=[Name(id='k', ctx=Store()), Name(id='v', ctx=Store())], ctx=Store()), iter=Call(func=Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='by_phase', ctx=Load()), attr='items', ctx=Load()), args=[], keywords=[]), ifs=[], is_async=0)])])",
+      "rendered": "{'prompt': self.prompt, 'completion': self.completion, 'total': self.prompt + self.completion, 'calls': self.calls, 'calls_with_usage': self.calls_with_usage, 'completion_absent': self.completion_absent, 'usd': self.usd if self.usd_reports else None, 'turns': self.turns if self.turn_reports else None, 'by_phase': {k: dict(v) for k, v in self.by_phase.items()}}"
+    },
+    {
+      "line_start": 240,
+      "line_end": 240,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_TokenCounter', ctx=Load()), args=[], keywords=[])",
+      "rendered": "_TokenCounter()"
+    }
+  ],
+  "calls": [
+    {
+      "line": 98,
+      "end_line": 98,
+      "callee": "re.compile",
+      "enclosing": "module initialization",
+      "expression": "re.compile(r\"^[A-Za-z0-9_.\\-]{1,64}$\")"
+    },
+    {
+      "line": 240,
+      "end_line": 240,
+      "callee": "_TokenCounter",
+      "enclosing": "module initialization",
+      "expression": "_TokenCounter()"
+    },
+    {
+      "line": 71,
+      "end_line": 71,
+      "callee": "len",
+      "enclosing": "estimate_tokens",
+      "expression": "len(text)"
+    },
+    {
+      "line": 86,
+      "end_line": 86,
+      "callee": "int",
+      "enclosing": "estimate_tokens",
+      "expression": "int(n / cpt)"
+    },
+    {
+      "line": 112,
+      "end_line": 112,
+      "callee": "tuple",
+      "enclosing": "unparsed_cache_keys",
+      "expression": "tuple(sorted(hits)[:_UNPARSED_CACHE_KEY_CAP])"
+    },
+    {
+      "line": 105,
+      "end_line": 105,
+      "callee": "isinstance",
+      "enclosing": "unparsed_cache_keys",
+      "expression": "isinstance(usage, dict)"
+    },
+    {
+      "line": 117,
+      "end_line": 117,
+      "callee": "threading.Lock",
+      "enclosing": "_TokenCounter.__init__",
+      "expression": "threading.Lock()"
+    },
+    {
+      "line": 129,
+      "end_line": 129,
+      "callee": "defaultdict",
+      "enclosing": "_TokenCounter.__init__",
+      "expression": "defaultdict(_bucket)"
+    },
+    {
+      "line": 131,
+      "end_line": 131,
+      "callee": "set",
+      "enclosing": "_TokenCounter.__init__",
+      "expression": "set()"
+    },
+    {
+      "line": 133,
+      "end_line": 133,
+      "callee": "set",
+      "enclosing": "_TokenCounter.__init__",
+      "expression": "set()"
+    },
+    {
+      "line": 108,
+      "end_line": 108,
+      "callee": "usage.items",
+      "enclosing": "unparsed_cache_keys",
+      "expression": "usage.items()"
+    },
+    {
+      "line": 112,
+      "end_line": 112,
+      "callee": "sorted",
+      "enclosing": "unparsed_cache_keys",
+      "expression": "sorted(hits)"
+    },
+    {
+      "line": 152,
+      "end_line": 152,
+      "callee": "isinstance",
+      "enclosing": "_TokenCounter.add",
+      "expression": "isinstance(usage, dict)"
+    },
+    {
+      "line": 171,
+      "end_line": 171,
+      "callee": "int",
+      "enclosing": "_TokenCounter.add",
+      "expression": "int(usage.get(\"input_tokens\", 0) or 0)"
+    },
+    {
+      "line": 172,
+      "end_line": 172,
+      "callee": "int",
+      "enclosing": "_TokenCounter.add",
+      "expression": "int(usage.get(\"cache_creation_input_tokens\", 0) or 0)"
+    },
+    {
+      "line": 173,
+      "end_line": 173,
+      "callee": "int",
+      "enclosing": "_TokenCounter.add",
+      "expression": "int(usage.get(\"cache_read_input_tokens\", 0) or 0)"
+    },
+    {
+      "line": 174,
+      "end_line": 174,
+      "callee": "usage.get",
+      "enclosing": "_TokenCounter.add",
+      "expression": "usage.get(\"output_tokens\", 0)"
+    },
+    {
+      "line": 185,
+      "end_line": 185,
+      "callee": "int",
+      "enclosing": "_TokenCounter.add",
+      "expression": "int(out_raw or 0)"
+    },
+    {
+      "line": 194,
+      "end_line": 194,
+      "callee": "int",
+      "enclosing": "_TokenCounter.add",
+      "expression": "int(usage.get(\"reasoning_tokens\", 0) or 0)"
+    },
+    {
+      "line": 199,
+      "end_line": 200,
+      "callee": "Spend",
+      "enclosing": "_TokenCounter.spend",
+      "expression": "Spend(usd=self.usd, turns=self.turns,\n                         usd_reports=self.usd_reports, turn_reports=self.turn_reports)"
+    },
+    {
+      "line": 212,
+      "end_line": 212,
+      "callee": "self._cache_unparsed_seen.add",
+      "enclosing": "_TokenCounter.note_cache_unparsed",
+      "expression": "self._cache_unparsed_seen.add(marker)"
+    },
+    {
+      "line": 221,
+      "end_line": 221,
+      "callee": "defaultdict",
+      "enclosing": "_TokenCounter.reset",
+      "expression": "defaultdict(_bucket)"
+    },
+    {
+      "line": 222,
+      "end_line": 222,
+      "callee": "set",
+      "enclosing": "_TokenCounter.reset",
+      "expression": "set()"
+    },
+    {
+      "line": 223,
+      "end_line": 223,
+      "callee": "set",
+      "enclosing": "_TokenCounter.reset",
+      "expression": "set()"
+    },
+    {
+      "line": 76,
+      "end_line": 76,
+      "callee": "ch.isspace",
+      "enclosing": "estimate_tokens",
+      "expression": "ch.isspace()"
+    },
+    {
+      "line": 76,
+      "end_line": 76,
+      "callee": "ch.isalpha",
+      "enclosing": "estimate_tokens",
+      "expression": "ch.isalpha()"
+    },
+    {
+      "line": 109,
+      "end_line": 109,
+      "callee": "isinstance",
+      "enclosing": "unparsed_cache_keys",
+      "expression": "isinstance(k, str)"
+    },
+    {
+      "line": 110,
+      "end_line": 110,
+      "callee": "_UNPARSED_CACHE_KEY_RX.match",
+      "enclosing": "unparsed_cache_keys",
+      "expression": "_UNPARSED_CACHE_KEY_RX.match(k)"
+    },
+    {
+      "line": 153,
+      "end_line": 153,
+      "callee": "usage.get",
+      "enclosing": "_TokenCounter.add",
+      "expression": "usage.get(\"calls\")"
+    },
+    {
+      "line": 168,
+      "end_line": 168,
+      "callee": "isinstance",
+      "enclosing": "_TokenCounter.add",
+      "expression": "isinstance(usage, dict)"
+    },
+    {
+      "line": 178,
+      "end_line": 184,
+      "callee": "warn_once",
+      "enclosing": "_TokenCounter.add",
+      "expression": "warn_once(\n                    self._completion_absent_noted,\n                    \"null-completion-count\",\n                    \"  [tokens] WARN: a usage record carried a null \"\n                    \"completion count; coerced to 0 (occurrences counted \"\n                    \"under completion_absent)\",\n                )"
+    },
+    {
+      "line": 110,
+      "end_line": 110,
+      "callee": "k.lower",
+      "enclosing": "unparsed_cache_keys",
+      "expression": "k.lower()"
+    },
+    {
+      "line": 154,
+      "end_line": 154,
+      "callee": "isinstance",
+      "enclosing": "_TokenCounter.add",
+      "expression": "isinstance(raw_calls, int)"
+    },
+    {
+      "line": 171,
+      "end_line": 171,
+      "callee": "usage.get",
+      "enclosing": "_TokenCounter.add",
+      "expression": "usage.get(\"input_tokens\", 0)"
+    },
+    {
+      "line": 172,
+      "end_line": 172,
+      "callee": "usage.get",
+      "enclosing": "_TokenCounter.add",
+      "expression": "usage.get(\"cache_creation_input_tokens\", 0)"
+    },
+    {
+      "line": 173,
+      "end_line": 173,
+      "callee": "usage.get",
+      "enclosing": "_TokenCounter.add",
+      "expression": "usage.get(\"cache_read_input_tokens\", 0)"
+    },
+    {
+      "line": 194,
+      "end_line": 194,
+      "callee": "usage.get",
+      "enclosing": "_TokenCounter.add",
+      "expression": "usage.get(\"reasoning_tokens\", 0)"
+    },
+    {
+      "line": 236,
+      "end_line": 236,
+      "callee": "dict",
+      "enclosing": "_TokenCounter.snapshot",
+      "expression": "dict(v)"
+    },
+    {
+      "line": 155,
+      "end_line": 155,
+      "callee": "isinstance",
+      "enclosing": "_TokenCounter.add",
+      "expression": "isinstance(raw_calls, bool)"
+    },
+    {
+      "line": 236,
+      "end_line": 236,
+      "callee": "self.by_phase.items",
+      "enclosing": "_TokenCounter.snapshot",
+      "expression": "self.by_phase.items()"
+    }
+  ],
+  "imports": [
+    {
+      "line": 17,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "import re",
+      "targets": [
+        "re"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "import threading",
+      "targets": [
+        "threading"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "from collections import defaultdict",
+      "targets": [
+        "collections",
+        "collections.defaultdict"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "from contextlib import contextmanager",
+      "targets": [
+        "contextlib",
+        "contextlib.contextmanager"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 23,
+      "source_expression": "from typing import NamedTuple, TypedDict",
+      "targets": [
+        "typing",
+        "typing.NamedTuple",
+        "typing.TypedDict"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 25,
+      "source_expression": "from vvaharness.util.warn_once import warn_once",
+      "targets": [
+        "vvaharness.util.warn_once",
+        "vvaharness.util.warn_once.warn_once"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/warn_once.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

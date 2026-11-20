@@ -1,0 +1,4322 @@
+{
+  "source": "vvaharness/scope/walk.py",
+  "sha256": "73ce3d0a3965a91071504b09f6504b17c1de7d64f7322d80ef1e4ebe89003ea4",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"The deterministic repo walk, its exclusion rules, and post-agent scope checks.\"\"\"\nfrom __future__ import annotations\n\nimport fnmatch\nimport re\nfrom collections.abc import Collection\nfrom pathlib import Path\nfrom types import SimpleNamespace\n\nfrom vvaharness.util import console, logs\nfrom vvaharness.util import errlog as _errlog\n\nlog = logs.get_logger(__name__)\n\nclass EmptyScopeError(RuntimeError):\n    \"\"\"No file survived the exclusions, so nothing could be analysed (exit 2).\"\"\"\n\n\n# Deterministic repo walk: s3/s4 see every source file regardless of what the agent explored\n_DEFAULT_EXCLUDE_DIRS = {\n    \".git\", \".hg\", \".svn\", \"node_modules\", \"__pycache__\", \".venv\", \"venv\",\n    \"dist\", \"build\", \".idea\", \".vscode\", \"target\", \"vendor\", \".terraform\",\n    \".next\", \".nuxt\", \"coverage\", \".pytest_cache\", \".mypy_cache\",\n    # `target` excluded only with a build marker; \"spec\"/\"specs\" NOT here (UI component folders)\n    \"test\", \"tests\", \"__tests__\", \"__test__\", \"e2e\", \"testdata\",\n    \"fixtures\", \"__fixtures__\", \"mocks\", \"__mocks__\", \"stubs\",\n    # IaC/CI dirs are KEPT in scope (only .terraform excluded); below: our own output dirs\n    \"checkpoints\", \"security-scan\", \"security-remediation\", \".vvaharness\",\n}\n_DEFAULT_EXCLUDE_EXTS = {\n    \".png\", \".jpg\", \".jpeg\", \".gif\", \".ico\", \".svg\", \".pdf\", \".zip\", \".gz\",\n    \".tar\", \".7z\", \".jar\", \".war\", \".class\", \".exe\", \".dll\", \".so\", \".dylib\",\n    \".bin\", \".o\", \".a\", \".obj\", \".pyc\", \".pyo\", \".pkl\", \".lock\", \".min.js\", \".map\",\n    \".woff\", \".woff2\", \".ttf\", \".eot\", \".mp4\", \".mp3\", \".wav\",\n}\n# Globs matched against the repo-relative posix path: co-located test files and root infra files\n_DEFAULT_EXCLUDE_GLOBS = (\n    \"**/test_*.py\", \"**/*_test.py\", \"**/conftest.py\",\n    \"**/*_test.go\", \"**/*.test.js\", \"**/*.test.ts\", \"**/*.test.jsx\", \"**/*.test.tsx\",\n    \"**/*.spec.js\", \"**/*.spec.ts\", \"**/*.spec.jsx\", \"**/*.spec.tsx\",\n    \"**/*Test.java\", \"**/*Tests.java\", \"**/*IT.java\",\n    \"**/*Test.cs\", \"**/*Tests.cs\", \"**/*Test.kt\",\n    # Dockerfile/Jenkinsfile/Makefile/*.tf and Helm YAML are KEPT; below is repo metadata only\n    \"**/.gitignore\", \"**/.gitattributes\", \"**/.gitmodules\", \"**/.gitkeep\",\n    \"**/.editorconfig\", \"**/.dockerignore\", \"**/.npmignore\", \"**/.eslintignore\",\n    \"**/.prettierignore\", \"**/.mailmap\", \"**/CODEOWNERS\", \"**/.DS_Store\",\n    \"**/LICENSE\", \"**/LICENSE.*\", \"**/NOTICE\",\n)\n\n# Proof a `target/` is real build output, in target/'s own PARENT; absent, it is ordinary app code\n_TARGET_BUILD_MARKERS = (\n    \"pom.xml\", \"build.gradle\", \"build.gradle.kts\", \"Cargo.toml\",\n    \"build.sbt\", \"project.clj\",\n)\n\n\ndef _has_target_build_marker(root: Path, parent_parts: list[str]) -> bool:\n    \"\"\"True when a Maven/Gradle/Cargo/sbt/Leiningen build marker file sits in\n    the directory that directly contains a `target/` dir — i.e. `target/` is\n    genuine build output and should stay excluded. Without a marker, a\n    directory merely named target/ is ordinary app code and must be walked.\"\"\"\n    parent = root.joinpath(*parent_parts) if parent_parts else root\n    return any((parent / marker).is_file() for marker in _TARGET_BUILD_MARKERS)\n\n\ndef _exclusion_sets(cfg) -> tuple[set[str], set[str], list[str]]:\n    \"\"\"Resolve (dirs, exts, globs) once — built-in defaults + config.yaml step1.* appends.\"\"\"\n    excl_dirs = {d.lower() for d in\n                 _DEFAULT_EXCLUDE_DIRS | set(getattr(cfg.step1, \"exclude_dirs\", None) or [])}\n    excl_exts = _DEFAULT_EXCLUDE_EXTS | set(getattr(cfg.step1, \"exclude_exts\", None) or [])\n    excl_globs = list(_DEFAULT_EXCLUDE_GLOBS) + list(\n        getattr(cfg.step1, \"exclude_globs\", None) or [])\n    return excl_dirs, excl_exts, excl_globs\ndef glob_hit(rel: str, globs) -> str | None:\n    \"\"\"Return the first glob that excludes the repo-relative posix path `rel`, else None.\"\"\"\n    name = rel.rsplit(\"/\", 1)[-1]\n    for g in globs:\n        if fnmatch.fnmatchcase(rel, g):\n            return g\n        if g.startswith(\"**/\") and fnmatch.fnmatchcase(name, g[3:]):\n            return g\n    return None\n\n\ndef _fold_slashes(p: str) -> str:\n    \"\"\"Posix separators with any leading './' removed.\"\"\"\n    p = p.replace(\"\\\\\", \"/\")\n    while p.startswith(\"./\"):\n        p = p[2:]\n    return p\n\n\ndef _norm_rel(repo_root: str, p: str) -> str:\n    \"\"\"Normalize an agent-emitted path to the same repo-relative posix form that _walk_repo produces, so set-mem...\"\"\"\n    if not p:\n        return p\n    p = _fold_slashes(p)\n    rel_root = str(Path(repo_root)).replace(\"\\\\\", \"/\").rstrip(\"/\") + \"/\"\n    abs_root = str(Path(repo_root).resolve()).replace(\"\\\\\", \"/\").rstrip(\"/\") + \"/\"\n    pl = p.lower()\n    for r in (abs_root, rel_root):\n        if pl.startswith(r.lower()):\n            return p[len(r):]\n    # DeepAgents' vfs is repo-rooted, so \"/src/app.py\" arrives absolute; strip the virtual root\n    return p.lstrip(\"/\")\n\n\ndef resolve_inventory_path(repo_root: str, p: str, inventory: Collection[str]) -> str:\n    \"\"\"*p* in its inventory spelling if any deterministic reading of it is in *inventory*, else its _norm_rel form.\"\"\"\n    if not p:\n        return p\n    folded = _fold_slashes(p)\n    if not inventory:\n        # Nothing to resolve against: strip only the virtual root (no inventory path carries one);\n        # a root-prefix strip could rewrite a correct path into a wrong one\n        return folded.lstrip(\"/\")\n    # Raw first: a correct spelling must never lose to a prefix strip (repo dir named like a\n    # package dir); the first hit wins, since the string alone cannot tell two readings apart.\n    for cand in (folded, folded.lstrip(\"/\"), folded.removeprefix(Path(repo_root).name + \"/\")):\n        if cand in inventory:\n            return cand\n    return _norm_rel(repo_root, folded)\n\n\ndef _resolve_scope_path(path: str, repo_root: str, keep: set[str],\n                        top_dirs: list[str]) -> tuple[str | None, bool]:\n    \"\"\"Resolve an agent-emitted path to its in-scope inventory form.\"\"\"\n    rel = resolve_inventory_path(repo_root, path, keep)\n    if rel in keep:\n        return rel, False\n    matches = [f\"{td}/{rel}\" for td in top_dirs if f\"{td}/{rel}\" in keep]\n    if len(matches) == 1:\n        return matches[0], False\n    return None, len(matches) > 1\n\n\ndef scope_after(repo_root: str, cfg, *, dirs=(), exts=(), globs=(),\n                max_file_kb: int | None = None) -> list[str]:\n    \"\"\"In-scope inventory _walk_repo yields with these extra step1 exclusions.\"\"\"\n    # A guard on a proposed overlay must measure the walk that actually runs. _survey() is not it — it has no max_file_kb filter.\n    base_dirs, base_exts, base_globs = _exclusion_sets(cfg)\n    shadow = SimpleNamespace(step1=SimpleNamespace(\n        exclude_dirs=sorted(base_dirs | {d.lower() for d in dirs}),\n        exclude_exts=sorted(base_exts | set(exts)),\n        exclude_globs=list(base_globs) + list(globs),\n        max_file_kb=(max_file_kb if max_file_kb is not None\n                     else getattr(cfg.step1, \"max_file_kb\", 1024)),\n        follow_symlinks=False,\n    ))\n    return _walk_repo(repo_root, shadow)[0]\n\n\ndef _walk_repo(repo_root: str, cfg) -> tuple[list[str], dict]:\n    root = Path(repo_root)\n    root_resolved = root.resolve()\n    excl_dirs, excl_exts, excl_globs = _exclusion_sets(cfg)\n    max_kb = getattr(cfg.step1, \"max_file_kb\", 1024)\n    # Off-root symlinks are dropped UNCONDITIONALLY (host-file exfil); follow_symlinks only warns\n    follow_symlinks = bool(getattr(cfg.step1, \"follow_symlinks\", False))\n    if follow_symlinks:\n        console.write(\"  [s1] NOTE: step1.follow_symlinks is set, but symlinks whose \"\n                      \"target resolves outside the repo are still dropped (host-file \"\n                      \"disclosure guard); only in-tree symlinks are followed.\")\n\n    out: list[str] = []\n    skipped_dirs: dict[str, int] = {}\n    skipped_exts: dict[str, int] = {}\n    skipped_globs: dict[str, int] = {}\n    skipped_size: list[tuple[str, int]] = []\n    skipped_symlinks: dict[str, int] = {}\n    skipped_symlink_targets: dict[str, int] = {}\n\n    def _rule_hit(r: str) -> tuple[dict[str, int], str] | None:\n        \"\"\"(bucket, key) of the first dir/ext/glob rule excluding path *r*.\"\"\"\n        parts = r.split(\"/\")\n        hit_idx = next(\n            (i for i, part in enumerate(parts[:-1])\n             if part.lower() in excl_dirs\n             # \"target\" is excluded only when a build marker sits in its parent dir\n             and (part.lower() != \"target\"\n                  or _has_target_build_marker(root, parts[:i]))),\n            None)\n        if hit_idx is not None:\n            return skipped_dirs, \"/\".join(parts[:hit_idx + 1])\n        name = parts[-1].lower()\n        hit_ext = next((e for e in excl_exts\n                        if Path(name).suffix == e or name.endswith(e)), None)\n        if hit_ext:\n            return skipped_exts, hit_ext\n        hit_glob = glob_hit(r, excl_globs)\n        if hit_glob:\n            return skipped_globs, hit_glob\n        return None\n\n    for p in root.rglob(\"*\"):\n        if not p.is_file():\n            continue\n        rel = str(p.relative_to(root)).replace(\"\\\\\", \"/\")\n        # rglob follows symlinks, so this containment check is UNCONDITIONAL: no config re-opens it\n        tgt_rel = None\n        if p.is_symlink():\n            try:\n                tgt = p.resolve(strict=False)\n                escapes = not tgt.is_relative_to(root_resolved)\n                if not escapes:\n                    tgt_rel = tgt.relative_to(root_resolved).as_posix()\n            except OSError as _sym_err:\n                escapes = True\n                _errlog.log(\"s1\", rel, _sym_err, reason=\"symlink_resolve_failed\",\n                            note=\"treated as escaping — file excluded from scope\")\n            if escapes:\n                skipped_symlinks[rel] = skipped_symlinks.get(rel, 0) + 1\n                continue\n        hit = _rule_hit(rel)\n        if hit:\n            bucket, key = hit\n            bucket[key] = bucket.get(key, 0) + 1\n            continue\n        # An in-root link is judged by its target too, or a.txt -> key.pem smuggles it into scope\n        if tgt_rel is not None and _rule_hit(tgt_rel):\n            skipped_symlink_targets[rel] = skipped_symlink_targets.get(rel, 0) + 1\n            continue\n        try:\n            sz = p.stat().st_size\n            if sz > max_kb * 1024:\n                skipped_size.append((rel, sz))\n                continue\n        except OSError as _stat_err:\n            _errlog.log(\"s1\", rel, _stat_err, reason=\"stat_failed\",\n                        note=\"file excluded from scan scope\")\n            continue\n        out.append(rel)\n\n    excluded = {\n        \"dirs\": skipped_dirs,\n        \"exts\": skipped_exts,\n        \"globs\": skipped_globs,\n        \"oversize\": len(skipped_size),\n        \"oversize_files\": sorted(skipped_size, key=lambda kv: -kv[1]),\n        \"symlinks\": skipped_symlinks,\n        \"symlink_targets\": skipped_symlink_targets,\n    }\n    return sorted(out), excluded\n\n\n# Collapses many per-env config copies to one per shape-cluster; only if the secret regex clears\n\n_DEDUP_DEFAULTS = {\n    \"enabled\": True,\n    \"exts\": (\".yml\", \".yaml\", \".json\", \".toml\", \".ini\",\n             \".properties\", \".conf\", \".cfg\", \".env\"),\n    \"min_cluster_size\": 3,\n    \"keep_per_top_dir\": True,\n    \"promote_on_secret_hit\": True,\n    \"promote_on_insecure_value\": True,\n    \"max_file_kb\": 512,\n}\n\n# Layer-2 net: real credential material must never be dropped; lookahead skips templated refs\n_SECRET_RX = re.compile(\n    r\"(?i)(?:password|passwd|pwd|secret|api[_-]?key|apikey|access[_-]?key|\"\n    r\"auth[_-]?token|private[_-]?key|client[_-]?secret|credential)s?\"\n    r\"[ \\t]*[:=][ \\t]*['\\\"]?\"\n    r\"(?!CRYPT:|ENC\\(|\\{\\{|\\$\\{|<%=|<%|vault:|secret:|file:|/)\"\n    r\"(?![\\w.-]+[ \\t]*:)\"\n    r\"[^\\s'\\\",}{]{8,}\"\n    r\"|-----BEGIN [A-Z ]*PRIVATE KEY-----\"\n    r\"|\\bAKIA[0-9A-Z]{16}\\b\"\n    r\"|\\bxox[baprs]-[0-9A-Za-z-]{10,}\\b\"\n    r\"|\\bgh[pousr]_[0-9A-Za-z]{36,}\\b\"\n    r\"|\\beyJ[A-Za-z0-9_-]{10,}\\.eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\b\"\n)\n\n# Insecure *values*, not secrets: they make a variant worth scanning despite a safe-sibling shape\n_INSECURE_RX = re.compile(\n    r\"(?i)\\b(?:verify|verif(?:y|ication)[_-]?ssl|ssl[_-]?verify|\"\n    r\"validate[_-]?cert\\w*|tls[_-]?verify|check[_-]?hostname|\"\n    r\"reject[_-]?unauthori[sz]ed)\\b\\s*[:=]\\s*['\\\"]?(?:false|0|no|none|off)\\b\"\n    r\"|\\binsecure\\w*\\s*[:=]\\s*['\\\"]?(?:true|1|yes)\\b\"\n    r\"|\\bInsecureSkipVerify\\s*[:=]\\s*true\\b\"\n    r\"|\\b(?:auth|authentication|authn|security)\\s*[:=]\\s*['\\\"]?(?:none|disabled|off|false)\\b\"\n    r\"|\\bdebug\\s*[:=]\\s*['\\\"]?(?:true|1|yes)\\b\"\n    r\"|\\ballow[_-]?anonymous\\s*[:=]\\s*['\\\"]?(?:true|1|yes)\\b\"\n)\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/scope/walk.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "The deterministic repo walk, its exclusion rules, and post-agent scope checks.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_30_4": {
+      "source": "vvaharness/scope/walk.py",
+      "line_start": 30,
+      "line_end": 30,
+      "value": "No file survived the exclusions, so nothing could be analysed (exit 2).",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_72_4": {
+      "source": "vvaharness/scope/walk.py",
+      "line_start": 72,
+      "line_end": 75,
+      "value": "True when a Maven/Gradle/Cargo/sbt/Leiningen build marker file sits in\n    the directory that directly contains a `target/` dir — i.e. `target/` is\n    genuine build output and should stay excluded. Without a marker, a\n    directory merely named target/ is ordinary app code and must be walked.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_81_4": {
+      "source": "vvaharness/scope/walk.py",
+      "line_start": 81,
+      "line_end": 81,
+      "value": "Resolve (dirs, exts, globs) once — built-in defaults + config.yaml step1.* appends.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_89_4": {
+      "source": "vvaharness/scope/walk.py",
+      "line_start": 89,
+      "line_end": 89,
+      "value": "Return the first glob that excludes the repo-relative posix path `rel`, else None.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_100_4": {
+      "source": "vvaharness/scope/walk.py",
+      "line_start": 100,
+      "line_end": 100,
+      "value": "Posix separators with any leading './' removed.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_108_4": {
+      "source": "vvaharness/scope/walk.py",
+      "line_start": 108,
+      "line_end": 108,
+      "value": "Normalize an agent-emitted path to the same repo-relative posix form that _walk_repo produces, so set-mem...",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_123_4": {
+      "source": "vvaharness/scope/walk.py",
+      "line_start": 123,
+      "line_end": 123,
+      "value": "*p* in its inventory spelling if any deterministic reading of it is in *inventory*, else its _norm_rel form.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_141_4": {
+      "source": "vvaharness/scope/walk.py",
+      "line_start": 141,
+      "line_end": 141,
+      "value": "Resolve an agent-emitted path to its in-scope inventory form.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_145_15": {
+      "source": "vvaharness/scope/walk.py",
+      "line_start": 145,
+      "line_end": 145,
+      "source_expression": "f\"{td}/{rel}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_145_51": {
+      "source": "vvaharness/scope/walk.py",
+      "line_start": 145,
+      "line_end": 145,
+      "source_expression": "f\"{td}/{rel}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_153_4": {
+      "source": "vvaharness/scope/walk.py",
+      "line_start": 153,
+      "line_end": 153,
+      "value": "In-scope inventory _walk_repo yields with these extra step1 exclusions.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_175_22": {
+      "source": "vvaharness/scope/walk.py",
+      "line_start": 175,
+      "line_end": 177,
+      "value": "  [s1] NOTE: step1.follow_symlinks is set, but symlinks whose target resolves outside the repo are still dropped (host-file disclosure guard); only in-tree symlinks are followed.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_188_8": {
+      "source": "vvaharness/scope/walk.py",
+      "line_start": 188,
+      "line_end": 188,
+      "value": "(bucket, key) of the first dir/ext/glob rule excluding path *r*.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_275_4": {
+      "source": "vvaharness/scope/walk.py",
+      "line_start": 275,
+      "line_end": 285,
+      "value": "(?i)(?:password|passwd|pwd|secret|api[_-]?key|apikey|access[_-]?key|auth[_-]?token|private[_-]?key|client[_-]?secret|credential)s?[ \\t]*[:=][ \\t]*['\\\"]?(?!CRYPT:|ENC\\(|\\{\\{|\\$\\{|<%=|<%|vault:|secret:|file:|/)(?![\\w.-]+[ \\t]*:)[^\\s'\\\",}{]{8,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|\\bAKIA[0-9A-Z]{16}\\b|\\bxox[baprs]-[0-9A-Za-z-]{10,}\\b|\\bgh[pousr]_[0-9A-Za-z]{36,}\\b|\\beyJ[A-Za-z0-9_-]{10,}\\.eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\b",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_290_4": {
+      "source": "vvaharness/scope/walk.py",
+      "line_start": 290,
+      "line_end": 297,
+      "value": "(?i)\\b(?:verify|verif(?:y|ication)[_-]?ssl|ssl[_-]?verify|validate[_-]?cert\\w*|tls[_-]?verify|check[_-]?hostname|reject[_-]?unauthori[sz]ed)\\b\\s*[:=]\\s*['\\\"]?(?:false|0|no|none|off)\\b|\\binsecure\\w*\\s*[:=]\\s*['\\\"]?(?:true|1|yes)\\b|\\bInsecureSkipVerify\\s*[:=]\\s*true\\b|\\b(?:auth|authentication|authn|security)\\s*[:=]\\s*['\\\"]?(?:none|disabled|off|false)\\b|\\bdebug\\s*[:=]\\s*['\\\"]?(?:true|1|yes)\\b|\\ballow[_-]?anonymous\\s*[:=]\\s*['\\\"]?(?:true|1|yes)\\b",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "The deterministic repo walk, its exclusion rules, and post-agent scope checks.",
+      "context": "literal"
+    },
+    {
+      "line_start": 30,
+      "line_end": 30,
+      "column": 4,
+      "value": "No file survived the exclusions, so nothing could be analysed (exit 2).",
+      "context": "literal"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 4,
+      "value": ".git",
+      "context": "literal"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 12,
+      "value": ".hg",
+      "context": "literal"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 19,
+      "value": ".svn",
+      "context": "literal"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 27,
+      "value": "node_modules",
+      "context": "literal"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 43,
+      "value": "__pycache__",
+      "context": "literal"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 58,
+      "value": ".venv",
+      "context": "literal"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 67,
+      "value": "venv",
+      "context": "literal"
+    },
+    {
+      "line_start": 36,
+      "line_end": 36,
+      "column": 4,
+      "value": "dist",
+      "context": "literal"
+    },
+    {
+      "line_start": 36,
+      "line_end": 36,
+      "column": 12,
+      "value": "build",
+      "context": "literal"
+    },
+    {
+      "line_start": 36,
+      "line_end": 36,
+      "column": 21,
+      "value": ".idea",
+      "context": "literal"
+    },
+    {
+      "line_start": 36,
+      "line_end": 36,
+      "column": 30,
+      "value": ".vscode",
+      "context": "literal"
+    },
+    {
+      "line_start": 36,
+      "line_end": 36,
+      "column": 41,
+      "value": "target",
+      "context": "literal"
+    },
+    {
+      "line_start": 36,
+      "line_end": 36,
+      "column": 51,
+      "value": "vendor",
+      "context": "literal"
+    },
+    {
+      "line_start": 36,
+      "line_end": 36,
+      "column": 61,
+      "value": ".terraform",
+      "context": "literal"
+    },
+    {
+      "line_start": 37,
+      "line_end": 37,
+      "column": 4,
+      "value": ".next",
+      "context": "literal"
+    },
+    {
+      "line_start": 37,
+      "line_end": 37,
+      "column": 13,
+      "value": ".nuxt",
+      "context": "literal"
+    },
+    {
+      "line_start": 37,
+      "line_end": 37,
+      "column": 22,
+      "value": "coverage",
+      "context": "literal"
+    },
+    {
+      "line_start": 37,
+      "line_end": 37,
+      "column": 34,
+      "value": ".pytest_cache",
+      "context": "literal"
+    },
+    {
+      "line_start": 37,
+      "line_end": 37,
+      "column": 51,
+      "value": ".mypy_cache",
+      "context": "literal"
+    },
+    {
+      "line_start": 39,
+      "line_end": 39,
+      "column": 4,
+      "value": "test",
+      "context": "literal"
+    },
+    {
+      "line_start": 39,
+      "line_end": 39,
+      "column": 12,
+      "value": "tests",
+      "context": "literal"
+    },
+    {
+      "line_start": 39,
+      "line_end": 39,
+      "column": 21,
+      "value": "__tests__",
+      "context": "literal"
+    },
+    {
+      "line_start": 39,
+      "line_end": 39,
+      "column": 34,
+      "value": "__test__",
+      "context": "literal"
+    },
+    {
+      "line_start": 39,
+      "line_end": 39,
+      "column": 46,
+      "value": "e2e",
+      "context": "literal"
+    },
+    {
+      "line_start": 39,
+      "line_end": 39,
+      "column": 53,
+      "value": "testdata",
+      "context": "literal"
+    },
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 4,
+      "value": "fixtures",
+      "context": "literal"
+    },
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 16,
+      "value": "__fixtures__",
+      "context": "literal"
+    },
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 32,
+      "value": "mocks",
+      "context": "literal"
+    },
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 41,
+      "value": "__mocks__",
+      "context": "literal"
+    },
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 54,
+      "value": "stubs",
+      "context": "literal"
+    },
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 4,
+      "value": "checkpoints",
+      "context": "literal"
+    },
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 19,
+      "value": "security-scan",
+      "context": "literal"
+    },
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 36,
+      "value": "security-remediation",
+      "context": "literal"
+    },
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 60,
+      "value": ".vvaharness",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 4,
+      "value": ".png",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 12,
+      "value": ".jpg",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 20,
+      "value": ".jpeg",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 29,
+      "value": ".gif",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 37,
+      "value": ".ico",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 45,
+      "value": ".svg",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 53,
+      "value": ".pdf",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 61,
+      "value": ".zip",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 69,
+      "value": ".gz",
+      "context": "literal"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 4,
+      "value": ".tar",
+      "context": "literal"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 12,
+      "value": ".7z",
+      "context": "literal"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 19,
+      "value": ".jar",
+      "context": "literal"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 27,
+      "value": ".war",
+      "context": "literal"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 35,
+      "value": ".class",
+      "context": "literal"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 45,
+      "value": ".exe",
+      "context": "literal"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 53,
+      "value": ".dll",
+      "context": "literal"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 61,
+      "value": ".so",
+      "context": "literal"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 68,
+      "value": ".dylib",
+      "context": "literal"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 4,
+      "value": ".bin",
+      "context": "literal"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 12,
+      "value": ".o",
+      "context": "literal"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 18,
+      "value": ".a",
+      "context": "literal"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 24,
+      "value": ".obj",
+      "context": "literal"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 32,
+      "value": ".pyc",
+      "context": "literal"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 40,
+      "value": ".pyo",
+      "context": "literal"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 48,
+      "value": ".pkl",
+      "context": "literal"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 56,
+      "value": ".lock",
+      "context": "literal"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 65,
+      "value": ".min.js",
+      "context": "literal"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 76,
+      "value": ".map",
+      "context": "literal"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 4,
+      "value": ".woff",
+      "context": "literal"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 13,
+      "value": ".woff2",
+      "context": "literal"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 23,
+      "value": ".ttf",
+      "context": "literal"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 31,
+      "value": ".eot",
+      "context": "literal"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 39,
+      "value": ".mp4",
+      "context": "literal"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 47,
+      "value": ".mp3",
+      "context": "literal"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 55,
+      "value": ".wav",
+      "context": "literal"
+    },
+    {
+      "line_start": 52,
+      "line_end": 52,
+      "column": 4,
+      "value": "**/test_*.py",
+      "context": "literal"
+    },
+    {
+      "line_start": 52,
+      "line_end": 52,
+      "column": 20,
+      "value": "**/*_test.py",
+      "context": "literal"
+    },
+    {
+      "line_start": 52,
+      "line_end": 52,
+      "column": 36,
+      "value": "**/conftest.py",
+      "context": "literal"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 4,
+      "value": "**/*_test.go",
+      "context": "literal"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 20,
+      "value": "**/*.test.js",
+      "context": "literal"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 36,
+      "value": "**/*.test.ts",
+      "context": "literal"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 52,
+      "value": "**/*.test.jsx",
+      "context": "literal"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 69,
+      "value": "**/*.test.tsx",
+      "context": "literal"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 4,
+      "value": "**/*.spec.js",
+      "context": "literal"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 20,
+      "value": "**/*.spec.ts",
+      "context": "literal"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 36,
+      "value": "**/*.spec.jsx",
+      "context": "literal"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 53,
+      "value": "**/*.spec.tsx",
+      "context": "literal"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 4,
+      "value": "**/*Test.java",
+      "context": "literal"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 21,
+      "value": "**/*Tests.java",
+      "context": "literal"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 39,
+      "value": "**/*IT.java",
+      "context": "literal"
+    },
+    {
+      "line_start": 56,
+      "line_end": 56,
+      "column": 4,
+      "value": "**/*Test.cs",
+      "context": "literal"
+    },
+    {
+      "line_start": 56,
+      "line_end": 56,
+      "column": 19,
+      "value": "**/*Tests.cs",
+      "context": "literal"
+    },
+    {
+      "line_start": 56,
+      "line_end": 56,
+      "column": 35,
+      "value": "**/*Test.kt",
+      "context": "literal"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 4,
+      "value": "**/.gitignore",
+      "context": "literal"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 21,
+      "value": "**/.gitattributes",
+      "context": "literal"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 42,
+      "value": "**/.gitmodules",
+      "context": "literal"
+    },
+    {
+      "line_start": 58,
+      "line_end": 58,
+      "column": 60,
+      "value": "**/.gitkeep",
+      "context": "literal"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 4,
+      "value": "**/.editorconfig",
+      "context": "literal"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 24,
+      "value": "**/.dockerignore",
+      "context": "literal"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 44,
+      "value": "**/.npmignore",
+      "context": "literal"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 61,
+      "value": "**/.eslintignore",
+      "context": "literal"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 4,
+      "value": "**/.prettierignore",
+      "context": "literal"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 26,
+      "value": "**/.mailmap",
+      "context": "literal"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 41,
+      "value": "**/CODEOWNERS",
+      "context": "literal"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 58,
+      "value": "**/.DS_Store",
+      "context": "literal"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 4,
+      "value": "**/LICENSE",
+      "context": "literal"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 18,
+      "value": "**/LICENSE.*",
+      "context": "literal"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 34,
+      "value": "**/NOTICE",
+      "context": "literal"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 4,
+      "value": "pom.xml",
+      "context": "literal"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 15,
+      "value": "build.gradle",
+      "context": "literal"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 31,
+      "value": "build.gradle.kts",
+      "context": "literal"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 51,
+      "value": "Cargo.toml",
+      "context": "literal"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 4,
+      "value": "build.sbt",
+      "context": "literal"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 17,
+      "value": "project.clj",
+      "context": "literal"
+    },
+    {
+      "line_start": 72,
+      "line_end": 75,
+      "column": 4,
+      "value": "True when a Maven/Gradle/Cargo/sbt/Leiningen build marker file sits in\n    the directory that directly contains a `target/` dir — i.e. `target/` is\n    genuine build output and should stay excluded. Without a marker, a\n    directory merely named target/ is ordinary app code and must be walked.",
+      "context": "literal"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 4,
+      "value": "Resolve (dirs, exts, globs) once — built-in defaults + config.yaml step1.* appends.",
+      "context": "literal"
+    },
+    {
+      "line_start": 89,
+      "line_end": 89,
+      "column": 4,
+      "value": "Return the first glob that excludes the repo-relative posix path `rel`, else None.",
+      "context": "literal"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 4,
+      "value": "Posix separators with any leading './' removed.",
+      "context": "literal"
+    },
+    {
+      "line_start": 108,
+      "line_end": 108,
+      "column": 4,
+      "value": "Normalize an agent-emitted path to the same repo-relative posix form that _walk_repo produces, so set-mem...",
+      "context": "literal"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 4,
+      "value": "*p* in its inventory spelling if any deterministic reading of it is in *inventory*, else its _norm_rel form.",
+      "context": "literal"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 4,
+      "value": "Resolve an agent-emitted path to its in-scope inventory form.",
+      "context": "literal"
+    },
+    {
+      "line_start": 153,
+      "line_end": 153,
+      "column": 4,
+      "value": "In-scope inventory _walk_repo yields with these extra step1 exclusions.",
+      "context": "literal"
+    },
+    {
+      "line_start": 263,
+      "line_end": 263,
+      "column": 4,
+      "value": "enabled",
+      "context": "literal"
+    },
+    {
+      "line_start": 264,
+      "line_end": 264,
+      "column": 4,
+      "value": "exts",
+      "context": "literal"
+    },
+    {
+      "line_start": 266,
+      "line_end": 266,
+      "column": 4,
+      "value": "min_cluster_size",
+      "context": "literal"
+    },
+    {
+      "line_start": 267,
+      "line_end": 267,
+      "column": 4,
+      "value": "keep_per_top_dir",
+      "context": "literal"
+    },
+    {
+      "line_start": 268,
+      "line_end": 268,
+      "column": 4,
+      "value": "promote_on_secret_hit",
+      "context": "literal"
+    },
+    {
+      "line_start": 269,
+      "line_end": 269,
+      "column": 4,
+      "value": "promote_on_insecure_value",
+      "context": "literal"
+    },
+    {
+      "line_start": 270,
+      "line_end": 270,
+      "column": 4,
+      "value": "max_file_kb",
+      "context": "literal"
+    },
+    {
+      "line_start": 275,
+      "line_end": 285,
+      "column": 4,
+      "value": "(?i)(?:password|passwd|pwd|secret|api[_-]?key|apikey|access[_-]?key|auth[_-]?token|private[_-]?key|client[_-]?secret|credential)s?[ \\t]*[:=][ \\t]*['\\\"]?(?!CRYPT:|ENC\\(|\\{\\{|\\$\\{|<%=|<%|vault:|secret:|file:|/)(?![\\w.-]+[ \\t]*:)[^\\s'\\\",}{]{8,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|\\bAKIA[0-9A-Z]{16}\\b|\\bxox[baprs]-[0-9A-Za-z-]{10,}\\b|\\bgh[pousr]_[0-9A-Za-z]{36,}\\b|\\beyJ[A-Za-z0-9_-]{10,}\\.eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\b",
+      "context": "literal"
+    },
+    {
+      "line_start": 290,
+      "line_end": 297,
+      "column": 4,
+      "value": "(?i)\\b(?:verify|verif(?:y|ication)[_-]?ssl|ssl[_-]?verify|validate[_-]?cert\\w*|tls[_-]?verify|check[_-]?hostname|reject[_-]?unauthori[sz]ed)\\b\\s*[:=]\\s*['\\\"]?(?:false|0|no|none|off)\\b|\\binsecure\\w*\\s*[:=]\\s*['\\\"]?(?:true|1|yes)\\b|\\bInsecureSkipVerify\\s*[:=]\\s*true\\b|\\b(?:auth|authentication|authn|security)\\s*[:=]\\s*['\\\"]?(?:none|disabled|off|false)\\b|\\bdebug\\s*[:=]\\s*['\\\"]?(?:true|1|yes)\\b|\\ballow[_-]?anonymous\\s*[:=]\\s*['\\\"]?(?:true|1|yes)\\b",
+      "context": "literal"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 18,
+      "value": "\\",
+      "context": "literal"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 24,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 102,
+      "line_end": 102,
+      "column": 23,
+      "value": "./",
+      "context": "literal"
+    },
+    {
+      "line_start": 112,
+      "line_end": 112,
+      "column": 69,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 113,
+      "line_end": 113,
+      "column": 79,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 20,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 171,
+      "line_end": 171,
+      "column": 32,
+      "value": "max_file_kb",
+      "context": "literal"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 8,
+      "value": "(bucket, key) of the first dir/ext/glob rule excluding path *r*.",
+      "context": "literal"
+    },
+    {
+      "line_start": 209,
+      "line_end": 209,
+      "column": 24,
+      "value": "*",
+      "context": "literal"
+    },
+    {
+      "line_start": 249,
+      "line_end": 249,
+      "column": 8,
+      "value": "dirs",
+      "context": "literal"
+    },
+    {
+      "line_start": 250,
+      "line_end": 250,
+      "column": 8,
+      "value": "exts",
+      "context": "literal"
+    },
+    {
+      "line_start": 251,
+      "line_end": 251,
+      "column": 8,
+      "value": "globs",
+      "context": "literal"
+    },
+    {
+      "line_start": 252,
+      "line_end": 252,
+      "column": 8,
+      "value": "oversize",
+      "context": "literal"
+    },
+    {
+      "line_start": 253,
+      "line_end": 253,
+      "column": 8,
+      "value": "oversize_files",
+      "context": "literal"
+    },
+    {
+      "line_start": 254,
+      "line_end": 254,
+      "column": 8,
+      "value": "symlinks",
+      "context": "literal"
+    },
+    {
+      "line_start": 255,
+      "line_end": 255,
+      "column": 8,
+      "value": "symlink_targets",
+      "context": "literal"
+    },
+    {
+      "line_start": 264,
+      "line_end": 264,
+      "column": 13,
+      "value": ".yml",
+      "context": "literal"
+    },
+    {
+      "line_start": 264,
+      "line_end": 264,
+      "column": 21,
+      "value": ".yaml",
+      "context": "literal"
+    },
+    {
+      "line_start": 264,
+      "line_end": 264,
+      "column": 30,
+      "value": ".json",
+      "context": "literal"
+    },
+    {
+      "line_start": 264,
+      "line_end": 264,
+      "column": 39,
+      "value": ".toml",
+      "context": "literal"
+    },
+    {
+      "line_start": 264,
+      "line_end": 264,
+      "column": 48,
+      "value": ".ini",
+      "context": "literal"
+    },
+    {
+      "line_start": 265,
+      "line_end": 265,
+      "column": 13,
+      "value": ".properties",
+      "context": "literal"
+    },
+    {
+      "line_start": 265,
+      "line_end": 265,
+      "column": 28,
+      "value": ".conf",
+      "context": "literal"
+    },
+    {
+      "line_start": 265,
+      "line_end": 265,
+      "column": 37,
+      "value": ".cfg",
+      "context": "literal"
+    },
+    {
+      "line_start": 265,
+      "line_end": 265,
+      "column": 45,
+      "value": ".env",
+      "context": "literal"
+    },
+    {
+      "line_start": 90,
+      "line_end": 90,
+      "column": 22,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 112,
+      "line_end": 112,
+      "column": 62,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 113,
+      "line_end": 113,
+      "column": 72,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 29,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 39,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 145,
+      "line_end": 145,
+      "column": 21,
+      "value": "/",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 173,
+      "line_end": 173,
+      "column": 46,
+      "value": "follow_symlinks",
+      "context": "literal"
+    },
+    {
+      "line_start": 175,
+      "line_end": 177,
+      "column": 22,
+      "value": "  [s1] NOTE: step1.follow_symlinks is set, but symlinks whose target resolves outside the repo are still dropped (host-file disclosure guard); only in-tree symlinks are followed.",
+      "context": "literal"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 24,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 47,
+      "value": "\\",
+      "context": "literal"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 53,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 24,
+      "value": "**/",
+      "context": "literal"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 88,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 84,
+      "line_end": 84,
+      "column": 63,
+      "value": "exclude_exts",
+      "context": "literal"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 27,
+      "value": "exclude_globs",
+      "context": "literal"
+    },
+    {
+      "line_start": 112,
+      "line_end": 112,
+      "column": 44,
+      "value": "\\",
+      "context": "literal"
+    },
+    {
+      "line_start": 112,
+      "line_end": 112,
+      "column": 50,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 113,
+      "line_end": 113,
+      "column": 54,
+      "value": "\\",
+      "context": "literal"
+    },
+    {
+      "line_start": 113,
+      "line_end": 113,
+      "column": 60,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 145,
+      "line_end": 145,
+      "column": 57,
+      "value": "/",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 243,
+      "line_end": 243,
+      "column": 24,
+      "value": "s1",
+      "context": "literal"
+    },
+    {
+      "line_start": 198,
+      "line_end": 198,
+      "column": 33,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 223,
+      "line_end": 223,
+      "column": 28,
+      "value": "s1",
+      "context": "literal"
+    },
+    {
+      "line_start": 243,
+      "line_end": 243,
+      "column": 53,
+      "value": "stat_failed",
+      "context": "literal"
+    },
+    {
+      "line_start": 244,
+      "line_end": 244,
+      "column": 29,
+      "value": "file excluded from scan scope",
+      "context": "literal"
+    },
+    {
+      "line_start": 83,
+      "line_end": 83,
+      "column": 64,
+      "value": "exclude_dirs",
+      "context": "literal"
+    },
+    {
+      "line_start": 161,
+      "line_end": 161,
+      "column": 45,
+      "value": "max_file_kb",
+      "context": "literal"
+    },
+    {
+      "line_start": 223,
+      "line_end": 223,
+      "column": 56,
+      "value": "symlink_resolve_failed",
+      "context": "literal"
+    },
+    {
+      "line_start": 224,
+      "line_end": 224,
+      "column": 33,
+      "value": "treated as escaping — file excluded from scope",
+      "context": "literal"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 34,
+      "value": "target",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 33,
+      "text": "# Deterministic repo walk: s3/s4 see every source file regardless of what the agent explored"
+    },
+    {
+      "line": 38,
+      "text": "# `target` excluded only with a build marker; \"spec\"/\"specs\" NOT here (UI component folders)"
+    },
+    {
+      "line": 41,
+      "text": "# IaC/CI dirs are KEPT in scope (only .terraform excluded); below: our own output dirs"
+    },
+    {
+      "line": 50,
+      "text": "# Globs matched against the repo-relative posix path: co-located test files and root infra files"
+    },
+    {
+      "line": 57,
+      "text": "# Dockerfile/Jenkinsfile/Makefile/*.tf and Helm YAML are KEPT; below is repo metadata only"
+    },
+    {
+      "line": 64,
+      "text": "# Proof a `target/` is real build output, in target/'s own PARENT; absent, it is ordinary app code"
+    },
+    {
+      "line": 118,
+      "text": "# DeepAgents' vfs is repo-rooted, so \"/src/app.py\" arrives absolute; strip the virtual root"
+    },
+    {
+      "line": 128,
+      "text": "# Nothing to resolve against: strip only the virtual root (no inventory path carries one);"
+    },
+    {
+      "line": 129,
+      "text": "# a root-prefix strip could rewrite a correct path into a wrong one"
+    },
+    {
+      "line": 131,
+      "text": "# Raw first: a correct spelling must never lose to a prefix strip (repo dir named like a"
+    },
+    {
+      "line": 132,
+      "text": "# package dir); the first hit wins, since the string alone cannot tell two readings apart."
+    },
+    {
+      "line": 154,
+      "text": "# A guard on a proposed overlay must measure the walk that actually runs. _survey() is not it — it has no max_file_kb filter."
+    },
+    {
+      "line": 172,
+      "text": "# Off-root symlinks are dropped UNCONDITIONALLY (host-file exfil); follow_symlinks only warns"
+    },
+    {
+      "line": 193,
+      "text": "# \"target\" is excluded only when a build marker sits in its parent dir"
+    },
+    {
+      "line": 213,
+      "text": "# rglob follows symlinks, so this containment check is UNCONDITIONAL: no config re-opens it"
+    },
+    {
+      "line": 233,
+      "text": "# An in-root link is judged by its target too, or a.txt -> key.pem smuggles it into scope"
+    },
+    {
+      "line": 260,
+      "text": "# Collapses many per-env config copies to one per shape-cluster; only if the secret regex clears"
+    },
+    {
+      "line": 273,
+      "text": "# Layer-2 net: real credential material must never be dropped; lookahead skips templated refs"
+    },
+    {
+      "line": 288,
+      "text": "# Insecure *values*, not secrets: they make a variant worth scanning despite a safe-sibling shape"
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 18,
+      "line_end": 18,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "Assign",
+      "line_start": 27,
+      "line_end": 27,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 29,
+      "line_end": 30,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 5
+    },
+    {
+      "kind": "Expr",
+      "line_start": 30,
+      "line_end": 30,
+      "column": 4,
+      "owner": "EmptyScopeError",
+      "representation_line": 10
+    },
+    {
+      "kind": "Assign",
+      "line_start": 34,
+      "line_end": 43,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 13
+    },
+    {
+      "kind": "Assign",
+      "line_start": 44,
+      "line_end": 49,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 13
+    },
+    {
+      "kind": "Assign",
+      "line_start": 51,
+      "line_end": 62,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 13
+    },
+    {
+      "kind": "Assign",
+      "line_start": 65,
+      "line_end": 68,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 13
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 71,
+      "line_end": 77,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 14
+    },
+    {
+      "kind": "Expr",
+      "line_start": 72,
+      "line_end": 75,
+      "column": 4,
+      "owner": "_has_target_build_marker",
+      "representation_line": 20
+    },
+    {
+      "kind": "Assign",
+      "line_start": 76,
+      "line_end": 76,
+      "column": 4,
+      "owner": "_has_target_build_marker",
+      "representation_line": 20
+    },
+    {
+      "kind": "Return",
+      "line_start": 77,
+      "line_end": 77,
+      "column": 4,
+      "owner": "_has_target_build_marker",
+      "representation_line": 21
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 80,
+      "line_end": 87,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 25
+    },
+    {
+      "kind": "Expr",
+      "line_start": 81,
+      "line_end": 81,
+      "column": 4,
+      "owner": "_exclusion_sets",
+      "representation_line": 31
+    },
+    {
+      "kind": "Assign",
+      "line_start": 82,
+      "line_end": 83,
+      "column": 4,
+      "owner": "_exclusion_sets",
+      "representation_line": 31
+    },
+    {
+      "kind": "Assign",
+      "line_start": 84,
+      "line_end": 84,
+      "column": 4,
+      "owner": "_exclusion_sets",
+      "representation_line": 31
+    },
+    {
+      "kind": "Assign",
+      "line_start": 85,
+      "line_end": 86,
+      "column": 4,
+      "owner": "_exclusion_sets",
+      "representation_line": 31
+    },
+    {
+      "kind": "Return",
+      "line_start": 87,
+      "line_end": 87,
+      "column": 4,
+      "owner": "_exclusion_sets",
+      "representation_line": 32
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 88,
+      "line_end": 96,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 36
+    },
+    {
+      "kind": "Expr",
+      "line_start": 89,
+      "line_end": 89,
+      "column": 4,
+      "owner": "glob_hit",
+      "representation_line": 42
+    },
+    {
+      "kind": "Assign",
+      "line_start": 90,
+      "line_end": 90,
+      "column": 4,
+      "owner": "glob_hit",
+      "representation_line": 42
+    },
+    {
+      "kind": "For",
+      "line_start": 91,
+      "line_end": 95,
+      "column": 4,
+      "owner": "glob_hit",
+      "representation_line": 43
+    },
+    {
+      "kind": "If",
+      "line_start": 92,
+      "line_end": 93,
+      "column": 8,
+      "owner": "glob_hit",
+      "representation_line": 45
+    },
+    {
+      "kind": "Return",
+      "line_start": 93,
+      "line_end": 93,
+      "column": 12,
+      "owner": "glob_hit",
+      "representation_line": 47
+    },
+    {
+      "kind": "If",
+      "line_start": 94,
+      "line_end": 95,
+      "column": 8,
+      "owner": "glob_hit",
+      "representation_line": 50
+    },
+    {
+      "kind": "Return",
+      "line_start": 95,
+      "line_end": 95,
+      "column": 12,
+      "owner": "glob_hit",
+      "representation_line": 52
+    },
+    {
+      "kind": "Return",
+      "line_start": 96,
+      "line_end": 96,
+      "column": 4,
+      "owner": "glob_hit",
+      "representation_line": 56
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 99,
+      "line_end": 104,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 60
+    },
+    {
+      "kind": "Expr",
+      "line_start": 100,
+      "line_end": 100,
+      "column": 4,
+      "owner": "_fold_slashes",
+      "representation_line": 66
+    },
+    {
+      "kind": "Assign",
+      "line_start": 101,
+      "line_end": 101,
+      "column": 4,
+      "owner": "_fold_slashes",
+      "representation_line": 66
+    },
+    {
+      "kind": "While",
+      "line_start": 102,
+      "line_end": 103,
+      "column": 4,
+      "owner": "_fold_slashes",
+      "representation_line": 67
+    },
+    {
+      "kind": "Assign",
+      "line_start": 103,
+      "line_end": 103,
+      "column": 8,
+      "owner": "_fold_slashes",
+      "representation_line": 70
+    },
+    {
+      "kind": "Return",
+      "line_start": 104,
+      "line_end": 104,
+      "column": 4,
+      "owner": "_fold_slashes",
+      "representation_line": 72
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 107,
+      "line_end": 119,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 76
+    },
+    {
+      "kind": "Expr",
+      "line_start": 108,
+      "line_end": 108,
+      "column": 4,
+      "owner": "_norm_rel",
+      "representation_line": 82
+    },
+    {
+      "kind": "If",
+      "line_start": 109,
+      "line_end": 110,
+      "column": 4,
+      "owner": "_norm_rel",
+      "representation_line": 83
+    },
+    {
+      "kind": "Return",
+      "line_start": 110,
+      "line_end": 110,
+      "column": 8,
+      "owner": "_norm_rel",
+      "representation_line": 85
+    },
+    {
+      "kind": "Assign",
+      "line_start": 111,
+      "line_end": 111,
+      "column": 4,
+      "owner": "_norm_rel",
+      "representation_line": 89
+    },
+    {
+      "kind": "Assign",
+      "line_start": 112,
+      "line_end": 112,
+      "column": 4,
+      "owner": "_norm_rel",
+      "representation_line": 89
+    },
+    {
+      "kind": "Assign",
+      "line_start": 113,
+      "line_end": 113,
+      "column": 4,
+      "owner": "_norm_rel",
+      "representation_line": 89
+    },
+    {
+      "kind": "Assign",
+      "line_start": 114,
+      "line_end": 114,
+      "column": 4,
+      "owner": "_norm_rel",
+      "representation_line": 89
+    },
+    {
+      "kind": "For",
+      "line_start": 115,
+      "line_end": 117,
+      "column": 4,
+      "owner": "_norm_rel",
+      "representation_line": 90
+    },
+    {
+      "kind": "If",
+      "line_start": 116,
+      "line_end": 117,
+      "column": 8,
+      "owner": "_norm_rel",
+      "representation_line": 92
+    },
+    {
+      "kind": "Return",
+      "line_start": 117,
+      "line_end": 117,
+      "column": 12,
+      "owner": "_norm_rel",
+      "representation_line": 94
+    },
+    {
+      "kind": "Return",
+      "line_start": 119,
+      "line_end": 119,
+      "column": 4,
+      "owner": "_norm_rel",
+      "representation_line": 98
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 122,
+      "line_end": 136,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 102
+    },
+    {
+      "kind": "Expr",
+      "line_start": 123,
+      "line_end": 123,
+      "column": 4,
+      "owner": "resolve_inventory_path",
+      "representation_line": 108
+    },
+    {
+      "kind": "If",
+      "line_start": 124,
+      "line_end": 125,
+      "column": 4,
+      "owner": "resolve_inventory_path",
+      "representation_line": 109
+    },
+    {
+      "kind": "Return",
+      "line_start": 125,
+      "line_end": 125,
+      "column": 8,
+      "owner": "resolve_inventory_path",
+      "representation_line": 111
+    },
+    {
+      "kind": "Assign",
+      "line_start": 126,
+      "line_end": 126,
+      "column": 4,
+      "owner": "resolve_inventory_path",
+      "representation_line": 115
+    },
+    {
+      "kind": "If",
+      "line_start": 127,
+      "line_end": 130,
+      "column": 4,
+      "owner": "resolve_inventory_path",
+      "representation_line": 116
+    },
+    {
+      "kind": "Return",
+      "line_start": 130,
+      "line_end": 130,
+      "column": 8,
+      "owner": "resolve_inventory_path",
+      "representation_line": 118
+    },
+    {
+      "kind": "For",
+      "line_start": 133,
+      "line_end": 135,
+      "column": 4,
+      "owner": "resolve_inventory_path",
+      "representation_line": 121
+    },
+    {
+      "kind": "If",
+      "line_start": 134,
+      "line_end": 135,
+      "column": 8,
+      "owner": "resolve_inventory_path",
+      "representation_line": 123
+    },
+    {
+      "kind": "Return",
+      "line_start": 135,
+      "line_end": 135,
+      "column": 12,
+      "owner": "resolve_inventory_path",
+      "representation_line": 125
+    },
+    {
+      "kind": "Return",
+      "line_start": 136,
+      "line_end": 136,
+      "column": 4,
+      "owner": "resolve_inventory_path",
+      "representation_line": 129
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 139,
+      "line_end": 148,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 133
+    },
+    {
+      "kind": "Expr",
+      "line_start": 141,
+      "line_end": 141,
+      "column": 4,
+      "owner": "_resolve_scope_path",
+      "representation_line": 139
+    },
+    {
+      "kind": "Assign",
+      "line_start": 142,
+      "line_end": 142,
+      "column": 4,
+      "owner": "_resolve_scope_path",
+      "representation_line": 139
+    },
+    {
+      "kind": "If",
+      "line_start": 143,
+      "line_end": 144,
+      "column": 4,
+      "owner": "_resolve_scope_path",
+      "representation_line": 140
+    },
+    {
+      "kind": "Return",
+      "line_start": 144,
+      "line_end": 144,
+      "column": 8,
+      "owner": "_resolve_scope_path",
+      "representation_line": 142
+    },
+    {
+      "kind": "Assign",
+      "line_start": 145,
+      "line_end": 145,
+      "column": 4,
+      "owner": "_resolve_scope_path",
+      "representation_line": 146
+    },
+    {
+      "kind": "If",
+      "line_start": 146,
+      "line_end": 147,
+      "column": 4,
+      "owner": "_resolve_scope_path",
+      "representation_line": 147
+    },
+    {
+      "kind": "Return",
+      "line_start": 147,
+      "line_end": 147,
+      "column": 8,
+      "owner": "_resolve_scope_path",
+      "representation_line": 149
+    },
+    {
+      "kind": "Return",
+      "line_start": 148,
+      "line_end": 148,
+      "column": 4,
+      "owner": "_resolve_scope_path",
+      "representation_line": 152
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 151,
+      "line_end": 164,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 156
+    },
+    {
+      "kind": "Expr",
+      "line_start": 153,
+      "line_end": 153,
+      "column": 4,
+      "owner": "scope_after",
+      "representation_line": 162
+    },
+    {
+      "kind": "Assign",
+      "line_start": 155,
+      "line_end": 155,
+      "column": 4,
+      "owner": "scope_after",
+      "representation_line": 162
+    },
+    {
+      "kind": "Assign",
+      "line_start": 156,
+      "line_end": 163,
+      "column": 4,
+      "owner": "scope_after",
+      "representation_line": 162
+    },
+    {
+      "kind": "Return",
+      "line_start": 164,
+      "line_end": 164,
+      "column": 4,
+      "owner": "scope_after",
+      "representation_line": 163
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 167,
+      "line_end": 257,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 167
+    },
+    {
+      "kind": "Assign",
+      "line_start": 168,
+      "line_end": 168,
+      "column": 4,
+      "owner": "_walk_repo",
+      "representation_line": 173
+    },
+    {
+      "kind": "Assign",
+      "line_start": 169,
+      "line_end": 169,
+      "column": 4,
+      "owner": "_walk_repo",
+      "representation_line": 173
+    },
+    {
+      "kind": "Assign",
+      "line_start": 170,
+      "line_end": 170,
+      "column": 4,
+      "owner": "_walk_repo",
+      "representation_line": 173
+    },
+    {
+      "kind": "Assign",
+      "line_start": 171,
+      "line_end": 171,
+      "column": 4,
+      "owner": "_walk_repo",
+      "representation_line": 173
+    },
+    {
+      "kind": "Assign",
+      "line_start": 173,
+      "line_end": 173,
+      "column": 4,
+      "owner": "_walk_repo",
+      "representation_line": 173
+    },
+    {
+      "kind": "If",
+      "line_start": 174,
+      "line_end": 177,
+      "column": 4,
+      "owner": "_walk_repo",
+      "representation_line": 174
+    },
+    {
+      "kind": "Expr",
+      "line_start": 175,
+      "line_end": 177,
+      "column": 8,
+      "owner": "_walk_repo",
+      "representation_line": 177
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 179,
+      "line_end": 179,
+      "column": 4,
+      "owner": "_walk_repo",
+      "representation_line": 180
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 180,
+      "line_end": 180,
+      "column": 4,
+      "owner": "_walk_repo",
+      "representation_line": 180
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 181,
+      "line_end": 181,
+      "column": 4,
+      "owner": "_walk_repo",
+      "representation_line": 180
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 182,
+      "line_end": 182,
+      "column": 4,
+      "owner": "_walk_repo",
+      "representation_line": 180
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 183,
+      "line_end": 183,
+      "column": 4,
+      "owner": "_walk_repo",
+      "representation_line": 180
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 184,
+      "line_end": 184,
+      "column": 4,
+      "owner": "_walk_repo",
+      "representation_line": 182
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 185,
+      "line_end": 185,
+      "column": 4,
+      "owner": "_walk_repo",
+      "representation_line": 182
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 187,
+      "line_end": 207,
+      "column": 4,
+      "owner": "_walk_repo",
+      "representation_line": 183
+    },
+    {
+      "kind": "Expr",
+      "line_start": 188,
+      "line_end": 188,
+      "column": 8,
+      "owner": "_walk_repo._rule_hit",
+      "representation_line": 189
+    },
+    {
+      "kind": "Assign",
+      "line_start": 189,
+      "line_end": 189,
+      "column": 8,
+      "owner": "_walk_repo._rule_hit",
+      "representation_line": 189
+    },
+    {
+      "kind": "Assign",
+      "line_start": 190,
+      "line_end": 196,
+      "column": 8,
+      "owner": "_walk_repo._rule_hit",
+      "representation_line": 189
+    },
+    {
+      "kind": "If",
+      "line_start": 197,
+      "line_end": 198,
+      "column": 8,
+      "owner": "_walk_repo._rule_hit",
+      "representation_line": 190
+    },
+    {
+      "kind": "Return",
+      "line_start": 198,
+      "line_end": 198,
+      "column": 12,
+      "owner": "_walk_repo._rule_hit",
+      "representation_line": 192
+    },
+    {
+      "kind": "Assign",
+      "line_start": 199,
+      "line_end": 199,
+      "column": 8,
+      "owner": "_walk_repo._rule_hit",
+      "representation_line": 196
+    },
+    {
+      "kind": "Assign",
+      "line_start": 200,
+      "line_end": 201,
+      "column": 8,
+      "owner": "_walk_repo._rule_hit",
+      "representation_line": 196
+    },
+    {
+      "kind": "If",
+      "line_start": 202,
+      "line_end": 203,
+      "column": 8,
+      "owner": "_walk_repo._rule_hit",
+      "representation_line": 197
+    },
+    {
+      "kind": "Return",
+      "line_start": 203,
+      "line_end": 203,
+      "column": 12,
+      "owner": "_walk_repo._rule_hit",
+      "representation_line": 199
+    },
+    {
+      "kind": "Assign",
+      "line_start": 204,
+      "line_end": 204,
+      "column": 8,
+      "owner": "_walk_repo._rule_hit",
+      "representation_line": 203
+    },
+    {
+      "kind": "If",
+      "line_start": 205,
+      "line_end": 206,
+      "column": 8,
+      "owner": "_walk_repo._rule_hit",
+      "representation_line": 204
+    },
+    {
+      "kind": "Return",
+      "line_start": 206,
+      "line_end": 206,
+      "column": 12,
+      "owner": "_walk_repo._rule_hit",
+      "representation_line": 206
+    },
+    {
+      "kind": "Return",
+      "line_start": 207,
+      "line_end": 207,
+      "column": 8,
+      "owner": "_walk_repo._rule_hit",
+      "representation_line": 209
+    },
+    {
+      "kind": "For",
+      "line_start": 209,
+      "line_end": 246,
+      "column": 4,
+      "owner": "_walk_repo",
+      "representation_line": 213
+    },
+    {
+      "kind": "If",
+      "line_start": 210,
+      "line_end": 211,
+      "column": 8,
+      "owner": "_walk_repo",
+      "representation_line": 215
+    },
+    {
+      "kind": "Continue",
+      "line_start": 211,
+      "line_end": 211,
+      "column": 12,
+      "owner": "_walk_repo",
+      "representation_line": 217
+    },
+    {
+      "kind": "Assign",
+      "line_start": 212,
+      "line_end": 212,
+      "column": 8,
+      "owner": "_walk_repo",
+      "representation_line": 221
+    },
+    {
+      "kind": "Assign",
+      "line_start": 214,
+      "line_end": 214,
+      "column": 8,
+      "owner": "_walk_repo",
+      "representation_line": 221
+    },
+    {
+      "kind": "If",
+      "line_start": 215,
+      "line_end": 227,
+      "column": 8,
+      "owner": "_walk_repo",
+      "representation_line": 222
+    },
+    {
+      "kind": "Try",
+      "line_start": 216,
+      "line_end": 224,
+      "column": 12,
+      "owner": "_walk_repo",
+      "representation_line": 224
+    },
+    {
+      "kind": "Assign",
+      "line_start": 217,
+      "line_end": 217,
+      "column": 16,
+      "owner": "_walk_repo",
+      "representation_line": 227
+    },
+    {
+      "kind": "Assign",
+      "line_start": 218,
+      "line_end": 218,
+      "column": 16,
+      "owner": "_walk_repo",
+      "representation_line": 227
+    },
+    {
+      "kind": "If",
+      "line_start": 219,
+      "line_end": 220,
+      "column": 16,
+      "owner": "_walk_repo",
+      "representation_line": 228
+    },
+    {
+      "kind": "Assign",
+      "line_start": 220,
+      "line_end": 220,
+      "column": 20,
+      "owner": "_walk_repo",
+      "representation_line": 231
+    },
+    {
+      "kind": "Assign",
+      "line_start": 222,
+      "line_end": 222,
+      "column": 16,
+      "owner": "_walk_repo",
+      "representation_line": 237
+    },
+    {
+      "kind": "Expr",
+      "line_start": 223,
+      "line_end": 224,
+      "column": 16,
+      "owner": "_walk_repo",
+      "representation_line": 237
+    },
+    {
+      "kind": "If",
+      "line_start": 225,
+      "line_end": 227,
+      "column": 12,
+      "owner": "_walk_repo",
+      "representation_line": 239
+    },
+    {
+      "kind": "Assign",
+      "line_start": 226,
+      "line_end": 226,
+      "column": 16,
+      "owner": "_walk_repo",
+      "representation_line": 242
+    },
+    {
+      "kind": "Continue",
+      "line_start": 227,
+      "line_end": 227,
+      "column": 16,
+      "owner": "_walk_repo",
+      "representation_line": 243
+    },
+    {
+      "kind": "Assign",
+      "line_start": 228,
+      "line_end": 228,
+      "column": 8,
+      "owner": "_walk_repo",
+      "representation_line": 248
+    },
+    {
+      "kind": "If",
+      "line_start": 229,
+      "line_end": 232,
+      "column": 8,
+      "owner": "_walk_repo",
+      "representation_line": 249
+    },
+    {
+      "kind": "Assign",
+      "line_start": 230,
+      "line_end": 230,
+      "column": 12,
+      "owner": "_walk_repo",
+      "representation_line": 252
+    },
+    {
+      "kind": "Assign",
+      "line_start": 231,
+      "line_end": 231,
+      "column": 12,
+      "owner": "_walk_repo",
+      "representation_line": 252
+    },
+    {
+      "kind": "Continue",
+      "line_start": 232,
+      "line_end": 232,
+      "column": 12,
+      "owner": "_walk_repo",
+      "representation_line": 253
+    },
+    {
+      "kind": "If",
+      "line_start": 234,
+      "line_end": 236,
+      "column": 8,
+      "owner": "_walk_repo",
+      "representation_line": 256
+    },
+    {
+      "kind": "Assign",
+      "line_start": 235,
+      "line_end": 235,
+      "column": 12,
+      "owner": "_walk_repo",
+      "representation_line": 259
+    },
+    {
+      "kind": "Continue",
+      "line_start": 236,
+      "line_end": 236,
+      "column": 12,
+      "owner": "_walk_repo",
+      "representation_line": 260
+    },
+    {
+      "kind": "Try",
+      "line_start": 237,
+      "line_end": 245,
+      "column": 8,
+      "owner": "_walk_repo",
+      "representation_line": 263
+    },
+    {
+      "kind": "Assign",
+      "line_start": 238,
+      "line_end": 238,
+      "column": 12,
+      "owner": "_walk_repo",
+      "representation_line": 266
+    },
+    {
+      "kind": "If",
+      "line_start": 239,
+      "line_end": 241,
+      "column": 12,
+      "owner": "_walk_repo",
+      "representation_line": 267
+    },
+    {
+      "kind": "Expr",
+      "line_start": 240,
+      "line_end": 240,
+      "column": 16,
+      "owner": "_walk_repo",
+      "representation_line": 270
+    },
+    {
+      "kind": "Continue",
+      "line_start": 241,
+      "line_end": 241,
+      "column": 16,
+      "owner": "_walk_repo",
+      "representation_line": 271
+    },
+    {
+      "kind": "Expr",
+      "line_start": 243,
+      "line_end": 244,
+      "column": 12,
+      "owner": "_walk_repo",
+      "representation_line": 278
+    },
+    {
+      "kind": "Continue",
+      "line_start": 245,
+      "line_end": 245,
+      "column": 12,
+      "owner": "_walk_repo",
+      "representation_line": 279
+    },
+    {
+      "kind": "Expr",
+      "line_start": 246,
+      "line_end": 246,
+      "column": 8,
+      "owner": "_walk_repo",
+      "representation_line": 283
+    },
+    {
+      "kind": "Assign",
+      "line_start": 248,
+      "line_end": 256,
+      "column": 4,
+      "owner": "_walk_repo",
+      "representation_line": 286
+    },
+    {
+      "kind": "Return",
+      "line_start": 257,
+      "line_end": 257,
+      "column": 4,
+      "owner": "_walk_repo",
+      "representation_line": 287
+    },
+    {
+      "kind": "Assign",
+      "line_start": 262,
+      "line_end": 271,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 292
+    },
+    {
+      "kind": "Assign",
+      "line_start": 274,
+      "line_end": 286,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 292
+    },
+    {
+      "kind": "Assign",
+      "line_start": 289,
+      "line_end": 298,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 292
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 27,
+      "line_end": 27,
+      "column": 6,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='logs', ctx=Load()), attr='get_logger', ctx=Load()), args=[Name(id='__name__', ctx=Load())], keywords=[])",
+      "rendered": "logs.get_logger(__name__)"
+    },
+    {
+      "line_start": 29,
+      "line_end": 29,
+      "column": 22,
+      "kind": "Name",
+      "original_ast": "Name(id='RuntimeError', ctx=Load())",
+      "rendered": "RuntimeError"
+    },
+    {
+      "line_start": 34,
+      "line_end": 43,
+      "column": 24,
+      "kind": "Set",
+      "original_ast": "Set(elts=[Constant(value='.git'), Constant(value='.hg'), Constant(value='.svn'), Constant(value='node_modules'), Constant(value='__pycache__'), Constant(value='.venv'), Constant(value='venv'), Constant(value='dist'), Constant(value='build'), Constant(value='.idea'), Constant(value='.vscode'), Constant(value='target'), Constant(value='vendor'), Constant(value='.terraform'), Constant(value='.next'), Constant(value='.nuxt'), Constant(value='coverage'), Constant(value='.pytest_cache'), Constant(value='.mypy_cache'), Constant(value='test'), Constant(value='tests'), Constant(value='__tests__'), Constant(value='__test__'), Constant(value='e2e'), Constant(value='testdata'), Constant(value='fixtures'), Constant(value='__fixtures__'), Constant(value='mocks'), Constant(value='__mocks__'), Constant(value='stubs'), Constant(value='checkpoints'), Constant(value='security-scan'), Constant(value='security-remediation'), Constant(value='.vvaharness')])",
+      "rendered": "{'.git', '.hg', '.svn', 'node_modules', '__pycache__', '.venv', 'venv', 'dist', 'build', '.idea', '.vscode', 'target', 'vendor', '.terraform', '.next', '.nuxt', 'coverage', '.pytest_cache', '.mypy_cache', 'test', 'tests', '__tests__', '__test__', 'e2e', 'testdata', 'fixtures', '__fixtures__', 'mocks', '__mocks__', 'stubs', 'checkpoints', 'security-scan', 'security-remediation', '.vvaharness'}"
+    },
+    {
+      "line_start": 44,
+      "line_end": 49,
+      "column": 24,
+      "kind": "Set",
+      "original_ast": "Set(elts=[Constant(value='.png'), Constant(value='.jpg'), Constant(value='.jpeg'), Constant(value='.gif'), Constant(value='.ico'), Constant(value='.svg'), Constant(value='.pdf'), Constant(value='.zip'), Constant(value='.gz'), Constant(value='.tar'), Constant(value='.7z'), Constant(value='.jar'), Constant(value='.war'), Constant(value='.class'), Constant(value='.exe'), Constant(value='.dll'), Constant(value='.so'), Constant(value='.dylib'), Constant(value='.bin'), Constant(value='.o'), Constant(value='.a'), Constant(value='.obj'), Constant(value='.pyc'), Constant(value='.pyo'), Constant(value='.pkl'), Constant(value='.lock'), Constant(value='.min.js'), Constant(value='.map'), Constant(value='.woff'), Constant(value='.woff2'), Constant(value='.ttf'), Constant(value='.eot'), Constant(value='.mp4'), Constant(value='.mp3'), Constant(value='.wav')])",
+      "rendered": "{'.png', '.jpg', '.jpeg', '.gif', '.ico', '.svg', '.pdf', '.zip', '.gz', '.tar', '.7z', '.jar', '.war', '.class', '.exe', '.dll', '.so', '.dylib', '.bin', '.o', '.a', '.obj', '.pyc', '.pyo', '.pkl', '.lock', '.min.js', '.map', '.woff', '.woff2', '.ttf', '.eot', '.mp4', '.mp3', '.wav'}"
+    },
+    {
+      "line_start": 51,
+      "line_end": 62,
+      "column": 25,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value='**/test_*.py'), Constant(value='**/*_test.py'), Constant(value='**/conftest.py'), Constant(value='**/*_test.go'), Constant(value='**/*.test.js'), Constant(value='**/*.test.ts'), Constant(value='**/*.test.jsx'), Constant(value='**/*.test.tsx'), Constant(value='**/*.spec.js'), Constant(value='**/*.spec.ts'), Constant(value='**/*.spec.jsx'), Constant(value='**/*.spec.tsx'), Constant(value='**/*Test.java'), Constant(value='**/*Tests.java'), Constant(value='**/*IT.java'), Constant(value='**/*Test.cs'), Constant(value='**/*Tests.cs'), Constant(value='**/*Test.kt'), Constant(value='**/.gitignore'), Constant(value='**/.gitattributes'), Constant(value='**/.gitmodules'), Constant(value='**/.gitkeep'), Constant(value='**/.editorconfig'), Constant(value='**/.dockerignore'), Constant(value='**/.npmignore'), Constant(value='**/.eslintignore'), Constant(value='**/.prettierignore'), Constant(value='**/.mailmap'), Constant(value='**/CODEOWNERS'), Constant(value='**/.DS_Store'), Constant(value='**/LICENSE'), Constant(value='**/LICENSE.*'), Constant(value='**/NOTICE')], ctx=Load())",
+      "rendered": "('**/test_*.py', '**/*_test.py', '**/conftest.py', '**/*_test.go', '**/*.test.js', '**/*.test.ts', '**/*.test.jsx', '**/*.test.tsx', '**/*.spec.js', '**/*.spec.ts', '**/*.spec.jsx', '**/*.spec.tsx', '**/*Test.java', '**/*Tests.java', '**/*IT.java', '**/*Test.cs', '**/*Tests.cs', '**/*Test.kt', '**/.gitignore', '**/.gitattributes', '**/.gitmodules', '**/.gitkeep', '**/.editorconfig', '**/.dockerignore', '**/.npmignore', '**/.eslintignore', '**/.prettierignore', '**/.mailmap', '**/CODEOWNERS', '**/.DS_Store', '**/LICENSE', '**/LICENSE.*', '**/NOTICE')"
+    },
+    {
+      "line_start": 65,
+      "line_end": 68,
+      "column": 24,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value='pom.xml'), Constant(value='build.gradle'), Constant(value='build.gradle.kts'), Constant(value='Cargo.toml'), Constant(value='build.sbt'), Constant(value='project.clj')], ctx=Load())",
+      "rendered": "('pom.xml', 'build.gradle', 'build.gradle.kts', 'Cargo.toml', 'build.sbt', 'project.clj')"
+    },
+    {
+      "line_start": 76,
+      "line_end": 76,
+      "column": 13,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='parent_parts', ctx=Load()), body=Call(func=Attribute(value=Name(id='root', ctx=Load()), attr='joinpath', ctx=Load()), args=[Starred(value=Name(id='parent_parts', ctx=Load()), ctx=Load())], keywords=[]), orelse=Name(id='root', ctx=Load()))",
+      "rendered": "root.joinpath(*parent_parts) if parent_parts else root"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='any', ctx=Load()), args=[GeneratorExp(elt=Call(func=Attribute(value=BinOp(left=Name(id='parent', ctx=Load()), op=Div(), right=Name(id='marker', ctx=Load())), attr='is_file', ctx=Load()), args=[], keywords=[]), generators=[comprehension(target=Name(id='marker', ctx=Store()), iter=Name(id='_TARGET_BUILD_MARKERS', ctx=Load()), ifs=[], is_async=0)])], keywords=[])",
+      "rendered": "any(((parent / marker).is_file() for marker in _TARGET_BUILD_MARKERS))"
+    },
+    {
+      "line_start": 82,
+      "line_end": 83,
+      "column": 16,
+      "kind": "SetComp",
+      "original_ast": "SetComp(elt=Call(func=Attribute(value=Name(id='d', ctx=Load()), attr='lower', ctx=Load()), args=[], keywords=[]), generators=[comprehension(target=Name(id='d', ctx=Store()), iter=BinOp(left=Name(id='_DEFAULT_EXCLUDE_DIRS', ctx=Load()), op=BitOr(), right=Call(func=Name(id='set', ctx=Load()), args=[BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Attribute(value=Name(id='cfg', ctx=Load()), attr='step1', ctx=Load()), Constant(value='exclude_dirs'), Constant(value=None)], keywords=[]), List(elts=[], ctx=Load())])], keywords=[])), ifs=[], is_async=0)])",
+      "rendered": "{d.lower() for d in _DEFAULT_EXCLUDE_DIRS | set(getattr(cfg.step1, 'exclude_dirs', None) or [])}"
+    },
+    {
+      "line_start": 84,
+      "line_end": 84,
+      "column": 16,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Name(id='_DEFAULT_EXCLUDE_EXTS', ctx=Load()), op=BitOr(), right=Call(func=Name(id='set', ctx=Load()), args=[BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Attribute(value=Name(id='cfg', ctx=Load()), attr='step1', ctx=Load()), Constant(value='exclude_exts'), Constant(value=None)], keywords=[]), List(elts=[], ctx=Load())])], keywords=[]))",
+      "rendered": "_DEFAULT_EXCLUDE_EXTS | set(getattr(cfg.step1, 'exclude_exts', None) or [])"
+    },
+    {
+      "line_start": 85,
+      "line_end": 86,
+      "column": 17,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Name(id='list', ctx=Load()), args=[Name(id='_DEFAULT_EXCLUDE_GLOBS', ctx=Load())], keywords=[]), op=Add(), right=Call(func=Name(id='list', ctx=Load()), args=[BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Attribute(value=Name(id='cfg', ctx=Load()), attr='step1', ctx=Load()), Constant(value='exclude_globs'), Constant(value=None)], keywords=[]), List(elts=[], ctx=Load())])], keywords=[]))",
+      "rendered": "list(_DEFAULT_EXCLUDE_GLOBS) + list(getattr(cfg.step1, 'exclude_globs', None) or [])"
+    },
+    {
+      "line_start": 87,
+      "line_end": 87,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='excl_dirs', ctx=Load()), Name(id='excl_exts', ctx=Load()), Name(id='excl_globs', ctx=Load())], ctx=Load())",
+      "rendered": "(excl_dirs, excl_exts, excl_globs)"
+    },
+    {
+      "line_start": 90,
+      "line_end": 90,
+      "column": 11,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Call(func=Attribute(value=Name(id='rel', ctx=Load()), attr='rsplit', ctx=Load()), args=[Constant(value='/'), Constant(value=1)], keywords=[]), slice=UnaryOp(op=USub(), operand=Constant(value=1)), ctx=Load())",
+      "rendered": "rel.rsplit('/', 1)[-1]"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 13,
+      "kind": "Name",
+      "original_ast": "Name(id='globs', ctx=Load())",
+      "rendered": "globs"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='fnmatch', ctx=Load()), attr='fnmatchcase', ctx=Load()), args=[Name(id='rel', ctx=Load()), Name(id='g', ctx=Load())], keywords=[])",
+      "rendered": "fnmatch.fnmatchcase(rel, g)"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='g', ctx=Load())",
+      "rendered": "g"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Call(func=Attribute(value=Name(id='g', ctx=Load()), attr='startswith', ctx=Load()), args=[Constant(value='**/')], keywords=[]), Call(func=Attribute(value=Name(id='fnmatch', ctx=Load()), attr='fnmatchcase', ctx=Load()), args=[Name(id='name', ctx=Load()), Subscript(value=Name(id='g', ctx=Load()), slice=Slice(lower=Constant(value=3)), ctx=Load())], keywords=[])])",
+      "rendered": "g.startswith('**/') and fnmatch.fnmatchcase(name, g[3:])"
+    },
+    {
+      "line_start": 95,
+      "line_end": 95,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='g', ctx=Load())",
+      "rendered": "g"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 11,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='p', ctx=Load()), attr='replace', ctx=Load()), args=[Constant(value='\\\\'), Constant(value='/')], keywords=[])",
+      "rendered": "p.replace('\\\\', '/')"
+    },
+    {
+      "line_start": 102,
+      "line_end": 102,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='p', ctx=Load()), attr='startswith', ctx=Load()), args=[Constant(value='./')], keywords=[])",
+      "rendered": "p.startswith('./')"
+    },
+    {
+      "line_start": 103,
+      "line_end": 103,
+      "column": 12,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Name(id='p', ctx=Load()), slice=Slice(lower=Constant(value=2)), ctx=Load())",
+      "rendered": "p[2:]"
+    },
+    {
+      "line_start": 104,
+      "line_end": 104,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='p', ctx=Load())",
+      "rendered": "p"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='p', ctx=Load()))",
+      "rendered": "not p"
+    },
+    {
+      "line_start": 110,
+      "line_end": 110,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='p', ctx=Load())",
+      "rendered": "p"
+    },
+    {
+      "line_start": 111,
+      "line_end": 111,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_fold_slashes', ctx=Load()), args=[Name(id='p', ctx=Load())], keywords=[])",
+      "rendered": "_fold_slashes(p)"
+    },
+    {
+      "line_start": 112,
+      "line_end": 112,
+      "column": 15,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Attribute(value=Call(func=Attribute(value=Call(func=Name(id='str', ctx=Load()), args=[Call(func=Name(id='Path', ctx=Load()), args=[Name(id='repo_root', ctx=Load())], keywords=[])], keywords=[]), attr='replace', ctx=Load()), args=[Constant(value='\\\\'), Constant(value='/')], keywords=[]), attr='rstrip', ctx=Load()), args=[Constant(value='/')], keywords=[]), op=Add(), right=Constant(value='/'))",
+      "rendered": "str(Path(repo_root)).replace('\\\\', '/').rstrip('/') + '/'"
+    },
+    {
+      "line_start": 113,
+      "line_end": 113,
+      "column": 15,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Attribute(value=Call(func=Attribute(value=Call(func=Name(id='str', ctx=Load()), args=[Call(func=Attribute(value=Call(func=Name(id='Path', ctx=Load()), args=[Name(id='repo_root', ctx=Load())], keywords=[]), attr='resolve', ctx=Load()), args=[], keywords=[])], keywords=[]), attr='replace', ctx=Load()), args=[Constant(value='\\\\'), Constant(value='/')], keywords=[]), attr='rstrip', ctx=Load()), args=[Constant(value='/')], keywords=[]), op=Add(), right=Constant(value='/'))",
+      "rendered": "str(Path(repo_root).resolve()).replace('\\\\', '/').rstrip('/') + '/'"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 9,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='p', ctx=Load()), attr='lower', ctx=Load()), args=[], keywords=[])",
+      "rendered": "p.lower()"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 13,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='abs_root', ctx=Load()), Name(id='rel_root', ctx=Load())], ctx=Load())",
+      "rendered": "(abs_root, rel_root)"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='pl', ctx=Load()), attr='startswith', ctx=Load()), args=[Call(func=Attribute(value=Name(id='r', ctx=Load()), attr='lower', ctx=Load()), args=[], keywords=[])], keywords=[])",
+      "rendered": "pl.startswith(r.lower())"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 19,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Name(id='p', ctx=Load()), slice=Slice(lower=Call(func=Name(id='len', ctx=Load()), args=[Name(id='r', ctx=Load())], keywords=[])), ctx=Load())",
+      "rendered": "p[len(r):]"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='p', ctx=Load()), attr='lstrip', ctx=Load()), args=[Constant(value='/')], keywords=[])",
+      "rendered": "p.lstrip('/')"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='p', ctx=Load()))",
+      "rendered": "not p"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='p', ctx=Load())",
+      "rendered": "p"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_fold_slashes', ctx=Load()), args=[Name(id='p', ctx=Load())], keywords=[])",
+      "rendered": "_fold_slashes(p)"
+    },
+    {
+      "line_start": 127,
+      "line_end": 127,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='inventory', ctx=Load()))",
+      "rendered": "not inventory"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='folded', ctx=Load()), attr='lstrip', ctx=Load()), args=[Constant(value='/')], keywords=[])",
+      "rendered": "folded.lstrip('/')"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 16,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='folded', ctx=Load()), Call(func=Attribute(value=Name(id='folded', ctx=Load()), attr='lstrip', ctx=Load()), args=[Constant(value='/')], keywords=[]), Call(func=Attribute(value=Name(id='folded', ctx=Load()), attr='removeprefix', ctx=Load()), args=[BinOp(left=Attribute(value=Call(func=Name(id='Path', ctx=Load()), args=[Name(id='repo_root', ctx=Load())], keywords=[]), attr='name', ctx=Load()), op=Add(), right=Constant(value='/'))], keywords=[])], ctx=Load())",
+      "rendered": "(folded, folded.lstrip('/'), folded.removeprefix(Path(repo_root).name + '/'))"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='cand', ctx=Load()), ops=[In()], comparators=[Name(id='inventory', ctx=Load())])",
+      "rendered": "cand in inventory"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='cand', ctx=Load())",
+      "rendered": "cand"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_norm_rel', ctx=Load()), args=[Name(id='repo_root', ctx=Load()), Name(id='folded', ctx=Load())], keywords=[])",
+      "rendered": "_norm_rel(repo_root, folded)"
+    },
+    {
+      "line_start": 142,
+      "line_end": 142,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='resolve_inventory_path', ctx=Load()), args=[Name(id='repo_root', ctx=Load()), Name(id='path', ctx=Load()), Name(id='keep', ctx=Load())], keywords=[])",
+      "rendered": "resolve_inventory_path(repo_root, path, keep)"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='rel', ctx=Load()), ops=[In()], comparators=[Name(id='keep', ctx=Load())])",
+      "rendered": "rel in keep"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='rel', ctx=Load()), Constant(value=False)], ctx=Load())",
+      "rendered": "(rel, False)"
+    },
+    {
+      "line_start": 145,
+      "line_end": 145,
+      "column": 14,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=JoinedStr(values=[FormattedValue(value=Name(id='td', ctx=Load()), conversion=-1), Constant(value='/'), FormattedValue(value=Name(id='rel', ctx=Load()), conversion=-1)]), generators=[comprehension(target=Name(id='td', ctx=Store()), iter=Name(id='top_dirs', ctx=Load()), ifs=[Compare(left=JoinedStr(values=[FormattedValue(value=Name(id='td', ctx=Load()), conversion=-1), Constant(value='/'), FormattedValue(value=Name(id='rel', ctx=Load()), conversion=-1)]), ops=[In()], comparators=[Name(id='keep', ctx=Load())])], is_async=0)])",
+      "rendered": "[source_template_145_15 for td in top_dirs if source_template_145_51 in keep]"
+    },
+    {
+      "line_start": 146,
+      "line_end": 146,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='matches', ctx=Load())], keywords=[]), ops=[Eq()], comparators=[Constant(value=1)])",
+      "rendered": "len(matches) == 1"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Subscript(value=Name(id='matches', ctx=Load()), slice=Constant(value=0), ctx=Load()), Constant(value=False)], ctx=Load())",
+      "rendered": "(matches[0], False)"
+    },
+    {
+      "line_start": 148,
+      "line_end": 148,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value=None), Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='matches', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Constant(value=1)])], ctx=Load())",
+      "rendered": "(None, len(matches) > 1)"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 39,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_exclusion_sets', ctx=Load()), args=[Name(id='cfg', ctx=Load())], keywords=[])",
+      "rendered": "_exclusion_sets(cfg)"
+    },
+    {
+      "line_start": 156,
+      "line_end": 163,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='SimpleNamespace', ctx=Load()), args=[], keywords=[keyword(arg='step1', value=Call(func=Name(id='SimpleNamespace', ctx=Load()), args=[], keywords=[keyword(arg='exclude_dirs', value=Call(func=Name(id='sorted', ctx=Load()), args=[BinOp(left=Name(id='base_dirs', ctx=Load()), op=BitOr(), right=SetComp(elt=Call(func=Attribute(value=Name(id='d', ctx=Load()), attr='lower', ctx=Load()), args=[], keywords=[]), generators=[comprehension(target=Name(id='d', ctx=Store()), iter=Name(id='dirs', ctx=Load()), ifs=[], is_async=0)]))], keywords=[])), keyword(arg='exclude_exts', value=Call(func=Name(id='sorted', ctx=Load()), args=[BinOp(left=Name(id='base_exts', ctx=Load()), op=BitOr(), right=Call(func=Name(id='set', ctx=Load()), args=[Name(id='exts', ctx=Load())], keywords=[]))], keywords=[])), keyword(arg='exclude_globs', value=BinOp(left=Call(func=Name(id='list', ctx=Load()), args=[Name(id='base_globs', ctx=Load())], keywords=[]), op=Add(), right=Call(func=Name(id='list', ctx=Load()), args=[Name(id='globs', ctx=Load())], keywords=[]))), keyword(arg='max_file_kb', value=IfExp(test=Compare(left=Name(id='max_file_kb', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), body=Name(id='max_file_kb', ctx=Load()), orelse=Call(func=Name(id='getattr', ctx=Load()), args=[Attribute(value=Name(id='cfg', ctx=Load()), attr='step1', ctx=Load()), Constant(value='max_file_kb'), Constant(value=1024)], keywords=[]))), keyword(arg='follow_symlinks', value=Constant(value=False))]))])",
+      "rendered": "SimpleNamespace(step1=SimpleNamespace(exclude_dirs=sorted(base_dirs | {d.lower() for d in dirs}), exclude_exts=sorted(base_exts | set(exts)), exclude_globs=list(base_globs) + list(globs), max_file_kb=max_file_kb if max_file_kb is not None else getattr(cfg.step1, 'max_file_kb', 1024), follow_symlinks=False))"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 11,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Call(func=Name(id='_walk_repo', ctx=Load()), args=[Name(id='repo_root', ctx=Load()), Name(id='shadow', ctx=Load())], keywords=[]), slice=Constant(value=0), ctx=Load())",
+      "rendered": "_walk_repo(repo_root, shadow)[0]"
+    },
+    {
+      "line_start": 168,
+      "line_end": 168,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='Path', ctx=Load()), args=[Name(id='repo_root', ctx=Load())], keywords=[])",
+      "rendered": "Path(repo_root)"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='root', ctx=Load()), attr='resolve', ctx=Load()), args=[], keywords=[])",
+      "rendered": "root.resolve()"
+    },
+    {
+      "line_start": 170,
+      "line_end": 170,
+      "column": 39,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_exclusion_sets', ctx=Load()), args=[Name(id='cfg', ctx=Load())], keywords=[])",
+      "rendered": "_exclusion_sets(cfg)"
+    },
+    {
+      "line_start": 171,
+      "line_end": 171,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Attribute(value=Name(id='cfg', ctx=Load()), attr='step1', ctx=Load()), Constant(value='max_file_kb'), Constant(value=1024)], keywords=[])",
+      "rendered": "getattr(cfg.step1, 'max_file_kb', 1024)"
+    },
+    {
+      "line_start": 173,
+      "line_end": 173,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='bool', ctx=Load()), args=[Call(func=Name(id='getattr', ctx=Load()), args=[Attribute(value=Name(id='cfg', ctx=Load()), attr='step1', ctx=Load()), Constant(value='follow_symlinks'), Constant(value=False)], keywords=[])], keywords=[])",
+      "rendered": "bool(getattr(cfg.step1, 'follow_symlinks', False))"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='follow_symlinks', ctx=Load())",
+      "rendered": "follow_symlinks"
+    },
+    {
+      "line_start": 175,
+      "line_end": 177,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[Constant(value='  [s1] NOTE: step1.follow_symlinks is set, but symlinks whose target resolves outside the repo are still dropped (host-file disclosure guard); only in-tree symlinks are followed.')], keywords=[])",
+      "rendered": "console.write(source_literal_175_22)"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 21,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 35,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 35,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 36,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 183,
+      "line_end": 183,
+      "column": 42,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 184,
+      "line_end": 184,
+      "column": 39,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 185,
+      "line_end": 185,
+      "column": 46,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='r', ctx=Load()), attr='split', ctx=Load()), args=[Constant(value='/')], keywords=[])",
+      "rendered": "r.split('/')"
+    },
+    {
+      "line_start": 190,
+      "line_end": 196,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='next', ctx=Load()), args=[GeneratorExp(elt=Name(id='i', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='i', ctx=Store()), Name(id='part', ctx=Store())], ctx=Store()), iter=Call(func=Name(id='enumerate', ctx=Load()), args=[Subscript(value=Name(id='parts', ctx=Load()), slice=Slice(upper=UnaryOp(op=USub(), operand=Constant(value=1))), ctx=Load())], keywords=[]), ifs=[BoolOp(op=And(), values=[Compare(left=Call(func=Attribute(value=Name(id='part', ctx=Load()), attr='lower', ctx=Load()), args=[], keywords=[]), ops=[In()], comparators=[Name(id='excl_dirs', ctx=Load())]), BoolOp(op=Or(), values=[Compare(left=Call(func=Attribute(value=Name(id='part', ctx=Load()), attr='lower', ctx=Load()), args=[], keywords=[]), ops=[NotEq()], comparators=[Constant(value='target')]), Call(func=Name(id='_has_target_build_marker', ctx=Load()), args=[Name(id='root', ctx=Load()), Subscript(value=Name(id='parts', ctx=Load()), slice=Slice(upper=Name(id='i', ctx=Load())), ctx=Load())], keywords=[])])])], is_async=0)]), Constant(value=None)], keywords=[])",
+      "rendered": "next((i for i, part in enumerate(parts[:-1]) if part.lower() in excl_dirs and (part.lower() != 'target' or _has_target_build_marker(root, parts[:i]))), None)"
+    },
+    {
+      "line_start": 197,
+      "line_end": 197,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='hit_idx', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "hit_idx is not None"
+    },
+    {
+      "line_start": 198,
+      "line_end": 198,
+      "column": 19,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='skipped_dirs', ctx=Load()), Call(func=Attribute(value=Constant(value='/'), attr='join', ctx=Load()), args=[Subscript(value=Name(id='parts', ctx=Load()), slice=Slice(upper=BinOp(left=Name(id='hit_idx', ctx=Load()), op=Add(), right=Constant(value=1))), ctx=Load())], keywords=[])], ctx=Load())",
+      "rendered": "(skipped_dirs, '/'.join(parts[:hit_idx + 1]))"
+    },
+    {
+      "line_start": 199,
+      "line_end": 199,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Subscript(value=Name(id='parts', ctx=Load()), slice=UnaryOp(op=USub(), operand=Constant(value=1)), ctx=Load()), attr='lower', ctx=Load()), args=[], keywords=[])",
+      "rendered": "parts[-1].lower()"
+    },
+    {
+      "line_start": 200,
+      "line_end": 201,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='next', ctx=Load()), args=[GeneratorExp(elt=Name(id='e', ctx=Load()), generators=[comprehension(target=Name(id='e', ctx=Store()), iter=Name(id='excl_exts', ctx=Load()), ifs=[BoolOp(op=Or(), values=[Compare(left=Attribute(value=Call(func=Name(id='Path', ctx=Load()), args=[Name(id='name', ctx=Load())], keywords=[]), attr='suffix', ctx=Load()), ops=[Eq()], comparators=[Name(id='e', ctx=Load())]), Call(func=Attribute(value=Name(id='name', ctx=Load()), attr='endswith', ctx=Load()), args=[Name(id='e', ctx=Load())], keywords=[])])], is_async=0)]), Constant(value=None)], keywords=[])",
+      "rendered": "next((e for e in excl_exts if Path(name).suffix == e or name.endswith(e)), None)"
+    },
+    {
+      "line_start": 202,
+      "line_end": 202,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='hit_ext', ctx=Load())",
+      "rendered": "hit_ext"
+    },
+    {
+      "line_start": 203,
+      "line_end": 203,
+      "column": 19,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='skipped_exts', ctx=Load()), Name(id='hit_ext', ctx=Load())], ctx=Load())",
+      "rendered": "(skipped_exts, hit_ext)"
+    },
+    {
+      "line_start": 204,
+      "line_end": 204,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='glob_hit', ctx=Load()), args=[Name(id='r', ctx=Load()), Name(id='excl_globs', ctx=Load())], keywords=[])",
+      "rendered": "glob_hit(r, excl_globs)"
+    },
+    {
+      "line_start": 205,
+      "line_end": 205,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='hit_glob', ctx=Load())",
+      "rendered": "hit_glob"
+    },
+    {
+      "line_start": 206,
+      "line_end": 206,
+      "column": 19,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='skipped_globs', ctx=Load()), Name(id='hit_glob', ctx=Load())], ctx=Load())",
+      "rendered": "(skipped_globs, hit_glob)"
+    },
+    {
+      "line_start": 207,
+      "line_end": 207,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 209,
+      "line_end": 209,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='root', ctx=Load()), attr='rglob', ctx=Load()), args=[Constant(value='*')], keywords=[])",
+      "rendered": "root.rglob('*')"
+    },
+    {
+      "line_start": 210,
+      "line_end": 210,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='p', ctx=Load()), attr='is_file', ctx=Load()), args=[], keywords=[]))",
+      "rendered": "not p.is_file()"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Name(id='str', ctx=Load()), args=[Call(func=Attribute(value=Name(id='p', ctx=Load()), attr='relative_to', ctx=Load()), args=[Name(id='root', ctx=Load())], keywords=[])], keywords=[]), attr='replace', ctx=Load()), args=[Constant(value='\\\\'), Constant(value='/')], keywords=[])",
+      "rendered": "str(p.relative_to(root)).replace('\\\\', '/')"
+    },
+    {
+      "line_start": 214,
+      "line_end": 214,
+      "column": 18,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 215,
+      "line_end": 215,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='p', ctx=Load()), attr='is_symlink', ctx=Load()), args=[], keywords=[])",
+      "rendered": "p.is_symlink()"
+    },
+    {
+      "line_start": 217,
+      "line_end": 217,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='p', ctx=Load()), attr='resolve', ctx=Load()), args=[], keywords=[keyword(arg='strict', value=Constant(value=False))])",
+      "rendered": "p.resolve(strict=False)"
+    },
+    {
+      "line_start": 218,
+      "line_end": 218,
+      "column": 26,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='tgt', ctx=Load()), attr='is_relative_to', ctx=Load()), args=[Name(id='root_resolved', ctx=Load())], keywords=[]))",
+      "rendered": "not tgt.is_relative_to(root_resolved)"
+    },
+    {
+      "line_start": 219,
+      "line_end": 219,
+      "column": 19,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='escapes', ctx=Load()))",
+      "rendered": "not escapes"
+    },
+    {
+      "line_start": 220,
+      "line_end": 220,
+      "column": 30,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Name(id='tgt', ctx=Load()), attr='relative_to', ctx=Load()), args=[Name(id='root_resolved', ctx=Load())], keywords=[]), attr='as_posix', ctx=Load()), args=[], keywords=[])",
+      "rendered": "tgt.relative_to(root_resolved).as_posix()"
+    },
+    {
+      "line_start": 221,
+      "line_end": 221,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='OSError', ctx=Load())",
+      "rendered": "OSError"
+    },
+    {
+      "line_start": 222,
+      "line_end": 222,
+      "column": 26,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 223,
+      "line_end": 224,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_errlog', ctx=Load()), attr='log', ctx=Load()), args=[Constant(value='s1'), Name(id='rel', ctx=Load()), Name(id='_sym_err', ctx=Load())], keywords=[keyword(arg='reason', value=Constant(value='symlink_resolve_failed')), keyword(arg='note', value=Constant(value='treated as escaping — file excluded from scope'))])",
+      "rendered": "_errlog.log('s1', rel, _sym_err, reason='symlink_resolve_failed', note='treated as escaping — file excluded from scope')"
+    },
+    {
+      "line_start": 225,
+      "line_end": 225,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='escapes', ctx=Load())",
+      "rendered": "escapes"
+    },
+    {
+      "line_start": 226,
+      "line_end": 226,
+      "column": 40,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Attribute(value=Name(id='skipped_symlinks', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='rel', ctx=Load()), Constant(value=0)], keywords=[]), op=Add(), right=Constant(value=1))",
+      "rendered": "skipped_symlinks.get(rel, 0) + 1"
+    },
+    {
+      "line_start": 228,
+      "line_end": 228,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_rule_hit', ctx=Load()), args=[Name(id='rel', ctx=Load())], keywords=[])",
+      "rendered": "_rule_hit(rel)"
+    },
+    {
+      "line_start": 229,
+      "line_end": 229,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='hit', ctx=Load())",
+      "rendered": "hit"
+    },
+    {
+      "line_start": 230,
+      "line_end": 230,
+      "column": 26,
+      "kind": "Name",
+      "original_ast": "Name(id='hit', ctx=Load())",
+      "rendered": "hit"
+    },
+    {
+      "line_start": 231,
+      "line_end": 231,
+      "column": 26,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Attribute(value=Name(id='bucket', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='key', ctx=Load()), Constant(value=0)], keywords=[]), op=Add(), right=Constant(value=1))",
+      "rendered": "bucket.get(key, 0) + 1"
+    },
+    {
+      "line_start": 234,
+      "line_end": 234,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='tgt_rel', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), Call(func=Name(id='_rule_hit', ctx=Load()), args=[Name(id='tgt_rel', ctx=Load())], keywords=[])])",
+      "rendered": "tgt_rel is not None and _rule_hit(tgt_rel)"
+    },
+    {
+      "line_start": 235,
+      "line_end": 235,
+      "column": 43,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=Call(func=Attribute(value=Name(id='skipped_symlink_targets', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='rel', ctx=Load()), Constant(value=0)], keywords=[]), op=Add(), right=Constant(value=1))",
+      "rendered": "skipped_symlink_targets.get(rel, 0) + 1"
+    },
+    {
+      "line_start": 238,
+      "line_end": 238,
+      "column": 17,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Call(func=Attribute(value=Name(id='p', ctx=Load()), attr='stat', ctx=Load()), args=[], keywords=[]), attr='st_size', ctx=Load())",
+      "rendered": "p.stat().st_size"
+    },
+    {
+      "line_start": 239,
+      "line_end": 239,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='sz', ctx=Load()), ops=[Gt()], comparators=[BinOp(left=Name(id='max_kb', ctx=Load()), op=Mult(), right=Constant(value=1024))])",
+      "rendered": "sz > max_kb * 1024"
+    },
+    {
+      "line_start": 240,
+      "line_end": 240,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='skipped_size', ctx=Load()), attr='append', ctx=Load()), args=[Tuple(elts=[Name(id='rel', ctx=Load()), Name(id='sz', ctx=Load())], ctx=Load())], keywords=[])",
+      "rendered": "skipped_size.append((rel, sz))"
+    },
+    {
+      "line_start": 242,
+      "line_end": 242,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='OSError', ctx=Load())",
+      "rendered": "OSError"
+    },
+    {
+      "line_start": 243,
+      "line_end": 244,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_errlog', ctx=Load()), attr='log', ctx=Load()), args=[Constant(value='s1'), Name(id='rel', ctx=Load()), Name(id='_stat_err', ctx=Load())], keywords=[keyword(arg='reason', value=Constant(value='stat_failed')), keyword(arg='note', value=Constant(value='file excluded from scan scope'))])",
+      "rendered": "_errlog.log('s1', rel, _stat_err, reason='stat_failed', note='file excluded from scan scope')"
+    },
+    {
+      "line_start": 246,
+      "line_end": 246,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='out', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='rel', ctx=Load())], keywords=[])",
+      "rendered": "out.append(rel)"
+    },
+    {
+      "line_start": 248,
+      "line_end": 256,
+      "column": 15,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='dirs'), Constant(value='exts'), Constant(value='globs'), Constant(value='oversize'), Constant(value='oversize_files'), Constant(value='symlinks'), Constant(value='symlink_targets')], values=[Name(id='skipped_dirs', ctx=Load()), Name(id='skipped_exts', ctx=Load()), Name(id='skipped_globs', ctx=Load()), Call(func=Name(id='len', ctx=Load()), args=[Name(id='skipped_size', ctx=Load())], keywords=[]), Call(func=Name(id='sorted', ctx=Load()), args=[Name(id='skipped_size', ctx=Load())], keywords=[keyword(arg='key', value=Lambda(args=arguments(posonlyargs=[], args=[arg(arg='kv')], kwonlyargs=[], kw_defaults=[], defaults=[]), body=UnaryOp(op=USub(), operand=Subscript(value=Name(id='kv', ctx=Load()), slice=Constant(value=1), ctx=Load()))))]), Name(id='skipped_symlinks', ctx=Load()), Name(id='skipped_symlink_targets', ctx=Load())])",
+      "rendered": "{'dirs': skipped_dirs, 'exts': skipped_exts, 'globs': skipped_globs, 'oversize': len(skipped_size), 'oversize_files': sorted(skipped_size, key=lambda kv: -kv[1]), 'symlinks': skipped_symlinks, 'symlink_targets': skipped_symlink_targets}"
+    },
+    {
+      "line_start": 257,
+      "line_end": 257,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Call(func=Name(id='sorted', ctx=Load()), args=[Name(id='out', ctx=Load())], keywords=[]), Name(id='excluded', ctx=Load())], ctx=Load())",
+      "rendered": "(sorted(out), excluded)"
+    },
+    {
+      "line_start": 262,
+      "line_end": 271,
+      "column": 18,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='enabled'), Constant(value='exts'), Constant(value='min_cluster_size'), Constant(value='keep_per_top_dir'), Constant(value='promote_on_secret_hit'), Constant(value='promote_on_insecure_value'), Constant(value='max_file_kb')], values=[Constant(value=True), Tuple(elts=[Constant(value='.yml'), Constant(value='.yaml'), Constant(value='.json'), Constant(value='.toml'), Constant(value='.ini'), Constant(value='.properties'), Constant(value='.conf'), Constant(value='.cfg'), Constant(value='.env')], ctx=Load()), Constant(value=3), Constant(value=True), Constant(value=True), Constant(value=True), Constant(value=512)])",
+      "rendered": "{'enabled': True, 'exts': ('.yml', '.yaml', '.json', '.toml', '.ini', '.properties', '.conf', '.cfg', '.env'), 'min_cluster_size': 3, 'keep_per_top_dir': True, 'promote_on_secret_hit': True, 'promote_on_insecure_value': True, 'max_file_kb': 512}"
+    },
+    {
+      "line_start": 274,
+      "line_end": 286,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='re', ctx=Load()), attr='compile', ctx=Load()), args=[Constant(value='(?i)(?:password|passwd|pwd|secret|api[_-]?key|apikey|access[_-]?key|auth[_-]?token|private[_-]?key|client[_-]?secret|credential)s?[ \\\\t]*[:=][ \\\\t]*[\\'\\\\\"]?(?!CRYPT:|ENC\\\\(|\\\\{\\\\{|\\\\$\\\\{|<%=|<%|vault:|secret:|file:|/)(?![\\\\w.-]+[ \\\\t]*:)[^\\\\s\\'\\\\\",}{]{8,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|\\\\bAKIA[0-9A-Z]{16}\\\\b|\\\\bxox[baprs]-[0-9A-Za-z-]{10,}\\\\b|\\\\bgh[pousr]_[0-9A-Za-z]{36,}\\\\b|\\\\beyJ[A-Za-z0-9_-]{10,}\\\\.eyJ[A-Za-z0-9_-]{10,}\\\\.[A-Za-z0-9_-]{10,}\\\\b')], keywords=[])",
+      "rendered": "re.compile(source_literal_275_4)"
+    },
+    {
+      "line_start": 289,
+      "line_end": 298,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='re', ctx=Load()), attr='compile', ctx=Load()), args=[Constant(value='(?i)\\\\b(?:verify|verif(?:y|ication)[_-]?ssl|ssl[_-]?verify|validate[_-]?cert\\\\w*|tls[_-]?verify|check[_-]?hostname|reject[_-]?unauthori[sz]ed)\\\\b\\\\s*[:=]\\\\s*[\\'\\\\\"]?(?:false|0|no|none|off)\\\\b|\\\\binsecure\\\\w*\\\\s*[:=]\\\\s*[\\'\\\\\"]?(?:true|1|yes)\\\\b|\\\\bInsecureSkipVerify\\\\s*[:=]\\\\s*true\\\\b|\\\\b(?:auth|authentication|authn|security)\\\\s*[:=]\\\\s*[\\'\\\\\"]?(?:none|disabled|off|false)\\\\b|\\\\bdebug\\\\s*[:=]\\\\s*[\\'\\\\\"]?(?:true|1|yes)\\\\b|\\\\ballow[_-]?anonymous\\\\s*[:=]\\\\s*[\\'\\\\\"]?(?:true|1|yes)\\\\b')], keywords=[])",
+      "rendered": "re.compile(source_literal_290_4)"
+    }
+  ],
+  "calls": [
+    {
+      "line": 27,
+      "end_line": 27,
+      "callee": "logs.get_logger",
+      "enclosing": "module initialization",
+      "expression": "logs.get_logger(__name__)"
+    },
+    {
+      "line": 274,
+      "end_line": 286,
+      "callee": "re.compile",
+      "enclosing": "module initialization",
+      "expression": "re.compile(\n    r\"(?i)(?:password|passwd|pwd|secret|api[_-]?key|apikey|access[_-]?key|\"\n    r\"auth[_-]?token|private[_-]?key|client[_-]?secret|credential)s?\"\n    r\"[ \\t]*[:=][ \\t]*['\\\"]?\"\n    r\"(?!CRYPT:|ENC\\(|\\{\\{|\\$\\{|<%=|<%|vault:|secret:|file:|/)\"\n    r\"(?![\\w.-]+[ \\t]*:)\"\n    r\"[^\\s'\\\",}{]{8,}\"\n    r\"|-----BEGIN [A-Z ]*PRIVATE KEY-----\"\n    r\"|\\bAKIA[0-9A-Z]{16}\\b\"\n    r\"|\\bxox[baprs]-[0-9A-Za-z-]{10,}\\b\"\n    r\"|\\bgh[pousr]_[0-9A-Za-z]{36,}\\b\"\n    r\"|\\beyJ[A-Za-z0-9_-]{10,}\\.eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\b\"\n)"
+    },
+    {
+      "line": 289,
+      "end_line": 298,
+      "callee": "re.compile",
+      "enclosing": "module initialization",
+      "expression": "re.compile(\n    r\"(?i)\\b(?:verify|verif(?:y|ication)[_-]?ssl|ssl[_-]?verify|\"\n    r\"validate[_-]?cert\\w*|tls[_-]?verify|check[_-]?hostname|\"\n    r\"reject[_-]?unauthori[sz]ed)\\b\\s*[:=]\\s*['\\\"]?(?:false|0|no|none|off)\\b\"\n    r\"|\\binsecure\\w*\\s*[:=]\\s*['\\\"]?(?:true|1|yes)\\b\"\n    r\"|\\bInsecureSkipVerify\\s*[:=]\\s*true\\b\"\n    r\"|\\b(?:auth|authentication|authn|security)\\s*[:=]\\s*['\\\"]?(?:none|disabled|off|false)\\b\"\n    r\"|\\bdebug\\s*[:=]\\s*['\\\"]?(?:true|1|yes)\\b\"\n    r\"|\\ballow[_-]?anonymous\\s*[:=]\\s*['\\\"]?(?:true|1|yes)\\b\"\n)"
+    },
+    {
+      "line": 77,
+      "end_line": 77,
+      "callee": "any",
+      "enclosing": "_has_target_build_marker",
+      "expression": "any((parent / marker).is_file() for marker in _TARGET_BUILD_MARKERS)"
+    },
+    {
+      "line": 101,
+      "end_line": 101,
+      "callee": "p.replace",
+      "enclosing": "_fold_slashes",
+      "expression": "p.replace(\"\\\\\", \"/\")"
+    },
+    {
+      "line": 102,
+      "end_line": 102,
+      "callee": "p.startswith",
+      "enclosing": "_fold_slashes",
+      "expression": "p.startswith(\"./\")"
+    },
+    {
+      "line": 111,
+      "end_line": 111,
+      "callee": "_fold_slashes",
+      "enclosing": "_norm_rel",
+      "expression": "_fold_slashes(p)"
+    },
+    {
+      "line": 114,
+      "end_line": 114,
+      "callee": "p.lower",
+      "enclosing": "_norm_rel",
+      "expression": "p.lower()"
+    },
+    {
+      "line": 119,
+      "end_line": 119,
+      "callee": "p.lstrip",
+      "enclosing": "_norm_rel",
+      "expression": "p.lstrip(\"/\")"
+    },
+    {
+      "line": 126,
+      "end_line": 126,
+      "callee": "_fold_slashes",
+      "enclosing": "resolve_inventory_path",
+      "expression": "_fold_slashes(p)"
+    },
+    {
+      "line": 136,
+      "end_line": 136,
+      "callee": "_norm_rel",
+      "enclosing": "resolve_inventory_path",
+      "expression": "_norm_rel(repo_root, folded)"
+    },
+    {
+      "line": 142,
+      "end_line": 142,
+      "callee": "resolve_inventory_path",
+      "enclosing": "_resolve_scope_path",
+      "expression": "resolve_inventory_path(repo_root, path, keep)"
+    },
+    {
+      "line": 155,
+      "end_line": 155,
+      "callee": "_exclusion_sets",
+      "enclosing": "scope_after",
+      "expression": "_exclusion_sets(cfg)"
+    },
+    {
+      "line": 156,
+      "end_line": 163,
+      "callee": "SimpleNamespace",
+      "enclosing": "scope_after",
+      "expression": "SimpleNamespace(step1=SimpleNamespace(\n        exclude_dirs=sorted(base_dirs | {d.lower() for d in dirs}),\n        exclude_exts=sorted(base_exts | set(exts)),\n        exclude_globs=list(base_globs) + list(globs),\n        max_file_kb=(max_file_kb if max_file_kb is not None\n                     else getattr(cfg.step1, \"max_file_kb\", 1024)),\n        follow_symlinks=False,\n    ))"
+    },
+    {
+      "line": 168,
+      "end_line": 168,
+      "callee": "Path",
+      "enclosing": "_walk_repo",
+      "expression": "Path(repo_root)"
+    },
+    {
+      "line": 169,
+      "end_line": 169,
+      "callee": "root.resolve",
+      "enclosing": "_walk_repo",
+      "expression": "root.resolve()"
+    },
+    {
+      "line": 170,
+      "end_line": 170,
+      "callee": "_exclusion_sets",
+      "enclosing": "_walk_repo",
+      "expression": "_exclusion_sets(cfg)"
+    },
+    {
+      "line": 171,
+      "end_line": 171,
+      "callee": "getattr",
+      "enclosing": "_walk_repo",
+      "expression": "getattr(cfg.step1, \"max_file_kb\", 1024)"
+    },
+    {
+      "line": 173,
+      "end_line": 173,
+      "callee": "bool",
+      "enclosing": "_walk_repo",
+      "expression": "bool(getattr(cfg.step1, \"follow_symlinks\", False))"
+    },
+    {
+      "line": 209,
+      "end_line": 209,
+      "callee": "root.rglob",
+      "enclosing": "_walk_repo",
+      "expression": "root.rglob(\"*\")"
+    },
+    {
+      "line": 76,
+      "end_line": 76,
+      "callee": "root.joinpath",
+      "enclosing": "_has_target_build_marker",
+      "expression": "root.joinpath(*parent_parts)"
+    },
+    {
+      "line": 82,
+      "end_line": 82,
+      "callee": "d.lower",
+      "enclosing": "_exclusion_sets",
+      "expression": "d.lower()"
+    },
+    {
+      "line": 84,
+      "end_line": 84,
+      "callee": "set",
+      "enclosing": "_exclusion_sets",
+      "expression": "set(getattr(cfg.step1, \"exclude_exts\", None) or [])"
+    },
+    {
+      "line": 85,
+      "end_line": 85,
+      "callee": "list",
+      "enclosing": "_exclusion_sets",
+      "expression": "list(_DEFAULT_EXCLUDE_GLOBS)"
+    },
+    {
+      "line": 85,
+      "end_line": 86,
+      "callee": "list",
+      "enclosing": "_exclusion_sets",
+      "expression": "list(\n        getattr(cfg.step1, \"exclude_globs\", None) or [])"
+    },
+    {
+      "line": 90,
+      "end_line": 90,
+      "callee": "rel.rsplit",
+      "enclosing": "glob_hit",
+      "expression": "rel.rsplit(\"/\", 1)"
+    },
+    {
+      "line": 92,
+      "end_line": 92,
+      "callee": "fnmatch.fnmatchcase",
+      "enclosing": "glob_hit",
+      "expression": "fnmatch.fnmatchcase(rel, g)"
+    },
+    {
+      "line": 112,
+      "end_line": 112,
+      "callee": "str(Path(repo_root)).replace('\\\\', '/').rstrip",
+      "enclosing": "_norm_rel",
+      "expression": "str(Path(repo_root)).replace(\"\\\\\", \"/\").rstrip(\"/\")"
+    },
+    {
+      "line": 113,
+      "end_line": 113,
+      "callee": "str(Path(repo_root).resolve()).replace('\\\\', '/').rstrip",
+      "enclosing": "_norm_rel",
+      "expression": "str(Path(repo_root).resolve()).replace(\"\\\\\", \"/\").rstrip(\"/\")"
+    },
+    {
+      "line": 116,
+      "end_line": 116,
+      "callee": "pl.startswith",
+      "enclosing": "_norm_rel",
+      "expression": "pl.startswith(r.lower())"
+    },
+    {
+      "line": 130,
+      "end_line": 130,
+      "callee": "folded.lstrip",
+      "enclosing": "resolve_inventory_path",
+      "expression": "folded.lstrip(\"/\")"
+    },
+    {
+      "line": 133,
+      "end_line": 133,
+      "callee": "folded.lstrip",
+      "enclosing": "resolve_inventory_path",
+      "expression": "folded.lstrip(\"/\")"
+    },
+    {
+      "line": 133,
+      "end_line": 133,
+      "callee": "folded.removeprefix",
+      "enclosing": "resolve_inventory_path",
+      "expression": "folded.removeprefix(Path(repo_root).name + \"/\")"
+    },
+    {
+      "line": 146,
+      "end_line": 146,
+      "callee": "len",
+      "enclosing": "_resolve_scope_path",
+      "expression": "len(matches)"
+    },
+    {
+      "line": 164,
+      "end_line": 164,
+      "callee": "_walk_repo",
+      "enclosing": "scope_after",
+      "expression": "_walk_repo(repo_root, shadow)"
+    },
+    {
+      "line": 173,
+      "end_line": 173,
+      "callee": "getattr",
+      "enclosing": "_walk_repo",
+      "expression": "getattr(cfg.step1, \"follow_symlinks\", False)"
+    },
+    {
+      "line": 175,
+      "end_line": 177,
+      "callee": "console.write",
+      "enclosing": "_walk_repo",
+      "expression": "console.write(\"  [s1] NOTE: step1.follow_symlinks is set, but symlinks whose \"\n                      \"target resolves outside the repo are still dropped (host-file \"\n                      \"disclosure guard); only in-tree symlinks are followed.\")"
+    },
+    {
+      "line": 189,
+      "end_line": 189,
+      "callee": "r.split",
+      "enclosing": "_walk_repo._rule_hit",
+      "expression": "r.split(\"/\")"
+    },
+    {
+      "line": 190,
+      "end_line": 196,
+      "callee": "next",
+      "enclosing": "_walk_repo._rule_hit",
+      "expression": "next(\n            (i for i, part in enumerate(parts[:-1])\n             if part.lower() in excl_dirs\n             # \"target\" is excluded only when a build marker sits in its parent dir\n             and (part.lower() != \"target\"\n                  or _has_target_build_marker(root, parts[:i]))),\n            None)"
+    },
+    {
+      "line": 199,
+      "end_line": 199,
+      "callee": "parts[-1].lower",
+      "enclosing": "_walk_repo._rule_hit",
+      "expression": "parts[-1].lower()"
+    },
+    {
+      "line": 200,
+      "end_line": 201,
+      "callee": "next",
+      "enclosing": "_walk_repo._rule_hit",
+      "expression": "next((e for e in excl_exts\n                        if Path(name).suffix == e or name.endswith(e)), None)"
+    },
+    {
+      "line": 204,
+      "end_line": 204,
+      "callee": "glob_hit",
+      "enclosing": "_walk_repo._rule_hit",
+      "expression": "glob_hit(r, excl_globs)"
+    },
+    {
+      "line": 212,
+      "end_line": 212,
+      "callee": "str(p.relative_to(root)).replace",
+      "enclosing": "_walk_repo",
+      "expression": "str(p.relative_to(root)).replace(\"\\\\\", \"/\")"
+    },
+    {
+      "line": 215,
+      "end_line": 215,
+      "callee": "p.is_symlink",
+      "enclosing": "_walk_repo",
+      "expression": "p.is_symlink()"
+    },
+    {
+      "line": 228,
+      "end_line": 228,
+      "callee": "_rule_hit",
+      "enclosing": "_walk_repo",
+      "expression": "_rule_hit(rel)"
+    },
+    {
+      "line": 246,
+      "end_line": 246,
+      "callee": "out.append",
+      "enclosing": "_walk_repo",
+      "expression": "out.append(rel)"
+    },
+    {
+      "line": 252,
+      "end_line": 252,
+      "callee": "len",
+      "enclosing": "_walk_repo",
+      "expression": "len(skipped_size)"
+    },
+    {
+      "line": 253,
+      "end_line": 253,
+      "callee": "sorted",
+      "enclosing": "_walk_repo",
+      "expression": "sorted(skipped_size, key=lambda kv: -kv[1])"
+    },
+    {
+      "line": 257,
+      "end_line": 257,
+      "callee": "sorted",
+      "enclosing": "_walk_repo",
+      "expression": "sorted(out)"
+    },
+    {
+      "line": 77,
+      "end_line": 77,
+      "callee": "(parent / marker).is_file",
+      "enclosing": "_has_target_build_marker",
+      "expression": "(parent / marker).is_file()"
+    },
+    {
+      "line": 94,
+      "end_line": 94,
+      "callee": "g.startswith",
+      "enclosing": "glob_hit",
+      "expression": "g.startswith(\"**/\")"
+    },
+    {
+      "line": 94,
+      "end_line": 94,
+      "callee": "fnmatch.fnmatchcase",
+      "enclosing": "glob_hit",
+      "expression": "fnmatch.fnmatchcase(name, g[3:])"
+    },
+    {
+      "line": 116,
+      "end_line": 116,
+      "callee": "r.lower",
+      "enclosing": "_norm_rel",
+      "expression": "r.lower()"
+    },
+    {
+      "line": 148,
+      "end_line": 148,
+      "callee": "len",
+      "enclosing": "_resolve_scope_path",
+      "expression": "len(matches)"
+    },
+    {
+      "line": 156,
+      "end_line": 163,
+      "callee": "SimpleNamespace",
+      "enclosing": "scope_after",
+      "expression": "SimpleNamespace(\n        exclude_dirs=sorted(base_dirs | {d.lower() for d in dirs}),\n        exclude_exts=sorted(base_exts | set(exts)),\n        exclude_globs=list(base_globs) + list(globs),\n        max_file_kb=(max_file_kb if max_file_kb is not None\n                     else getattr(cfg.step1, \"max_file_kb\", 1024)),\n        follow_symlinks=False,\n    )"
+    },
+    {
+      "line": 210,
+      "end_line": 210,
+      "callee": "p.is_file",
+      "enclosing": "_walk_repo",
+      "expression": "p.is_file()"
+    },
+    {
+      "line": 234,
+      "end_line": 234,
+      "callee": "_rule_hit",
+      "enclosing": "_walk_repo",
+      "expression": "_rule_hit(tgt_rel)"
+    },
+    {
+      "line": 83,
+      "end_line": 83,
+      "callee": "set",
+      "enclosing": "_exclusion_sets",
+      "expression": "set(getattr(cfg.step1, \"exclude_dirs\", None) or [])"
+    },
+    {
+      "line": 84,
+      "end_line": 84,
+      "callee": "getattr",
+      "enclosing": "_exclusion_sets",
+      "expression": "getattr(cfg.step1, \"exclude_exts\", None)"
+    },
+    {
+      "line": 86,
+      "end_line": 86,
+      "callee": "getattr",
+      "enclosing": "_exclusion_sets",
+      "expression": "getattr(cfg.step1, \"exclude_globs\", None)"
+    },
+    {
+      "line": 112,
+      "end_line": 112,
+      "callee": "str(Path(repo_root)).replace",
+      "enclosing": "_norm_rel",
+      "expression": "str(Path(repo_root)).replace(\"\\\\\", \"/\")"
+    },
+    {
+      "line": 113,
+      "end_line": 113,
+      "callee": "str(Path(repo_root).resolve()).replace",
+      "enclosing": "_norm_rel",
+      "expression": "str(Path(repo_root).resolve()).replace(\"\\\\\", \"/\")"
+    },
+    {
+      "line": 198,
+      "end_line": 198,
+      "callee": "'/'.join",
+      "enclosing": "_walk_repo._rule_hit",
+      "expression": "\"/\".join(parts[:hit_idx + 1])"
+    },
+    {
+      "line": 212,
+      "end_line": 212,
+      "callee": "str",
+      "enclosing": "_walk_repo",
+      "expression": "str(p.relative_to(root))"
+    },
+    {
+      "line": 217,
+      "end_line": 217,
+      "callee": "p.resolve",
+      "enclosing": "_walk_repo",
+      "expression": "p.resolve(strict=False)"
+    },
+    {
+      "line": 231,
+      "end_line": 231,
+      "callee": "bucket.get",
+      "enclosing": "_walk_repo",
+      "expression": "bucket.get(key, 0)"
+    },
+    {
+      "line": 235,
+      "end_line": 235,
+      "callee": "skipped_symlink_targets.get",
+      "enclosing": "_walk_repo",
+      "expression": "skipped_symlink_targets.get(rel, 0)"
+    },
+    {
+      "line": 238,
+      "end_line": 238,
+      "callee": "p.stat",
+      "enclosing": "_walk_repo",
+      "expression": "p.stat()"
+    },
+    {
+      "line": 240,
+      "end_line": 240,
+      "callee": "skipped_size.append",
+      "enclosing": "_walk_repo",
+      "expression": "skipped_size.append((rel, sz))"
+    },
+    {
+      "line": 243,
+      "end_line": 244,
+      "callee": "_errlog.log",
+      "enclosing": "_walk_repo",
+      "expression": "_errlog.log(\"s1\", rel, _stat_err, reason=\"stat_failed\",\n                        note=\"file excluded from scan scope\")"
+    },
+    {
+      "line": 117,
+      "end_line": 117,
+      "callee": "len",
+      "enclosing": "_norm_rel",
+      "expression": "len(r)"
+    },
+    {
+      "line": 133,
+      "end_line": 133,
+      "callee": "Path",
+      "enclosing": "resolve_inventory_path",
+      "expression": "Path(repo_root)"
+    },
+    {
+      "line": 157,
+      "end_line": 157,
+      "callee": "sorted",
+      "enclosing": "scope_after",
+      "expression": "sorted(base_dirs | {d.lower() for d in dirs})"
+    },
+    {
+      "line": 158,
+      "end_line": 158,
+      "callee": "sorted",
+      "enclosing": "scope_after",
+      "expression": "sorted(base_exts | set(exts))"
+    },
+    {
+      "line": 191,
+      "end_line": 191,
+      "callee": "enumerate",
+      "enclosing": "_walk_repo._rule_hit",
+      "expression": "enumerate(parts[:-1])"
+    },
+    {
+      "line": 212,
+      "end_line": 212,
+      "callee": "p.relative_to",
+      "enclosing": "_walk_repo",
+      "expression": "p.relative_to(root)"
+    },
+    {
+      "line": 218,
+      "end_line": 218,
+      "callee": "tgt.is_relative_to",
+      "enclosing": "_walk_repo",
+      "expression": "tgt.is_relative_to(root_resolved)"
+    },
+    {
+      "line": 220,
+      "end_line": 220,
+      "callee": "tgt.relative_to(root_resolved).as_posix",
+      "enclosing": "_walk_repo",
+      "expression": "tgt.relative_to(root_resolved).as_posix()"
+    },
+    {
+      "line": 223,
+      "end_line": 224,
+      "callee": "_errlog.log",
+      "enclosing": "_walk_repo",
+      "expression": "_errlog.log(\"s1\", rel, _sym_err, reason=\"symlink_resolve_failed\",\n                            note=\"treated as escaping — file excluded from scope\")"
+    },
+    {
+      "line": 226,
+      "end_line": 226,
+      "callee": "skipped_symlinks.get",
+      "enclosing": "_walk_repo",
+      "expression": "skipped_symlinks.get(rel, 0)"
+    },
+    {
+      "line": 83,
+      "end_line": 83,
+      "callee": "getattr",
+      "enclosing": "_exclusion_sets",
+      "expression": "getattr(cfg.step1, \"exclude_dirs\", None)"
+    },
+    {
+      "line": 112,
+      "end_line": 112,
+      "callee": "str",
+      "enclosing": "_norm_rel",
+      "expression": "str(Path(repo_root))"
+    },
+    {
+      "line": 113,
+      "end_line": 113,
+      "callee": "str",
+      "enclosing": "_norm_rel",
+      "expression": "str(Path(repo_root).resolve())"
+    },
+    {
+      "line": 159,
+      "end_line": 159,
+      "callee": "list",
+      "enclosing": "scope_after",
+      "expression": "list(base_globs)"
+    },
+    {
+      "line": 159,
+      "end_line": 159,
+      "callee": "list",
+      "enclosing": "scope_after",
+      "expression": "list(globs)"
+    },
+    {
+      "line": 161,
+      "end_line": 161,
+      "callee": "getattr",
+      "enclosing": "scope_after",
+      "expression": "getattr(cfg.step1, \"max_file_kb\", 1024)"
+    },
+    {
+      "line": 201,
+      "end_line": 201,
+      "callee": "name.endswith",
+      "enclosing": "_walk_repo._rule_hit",
+      "expression": "name.endswith(e)"
+    },
+    {
+      "line": 112,
+      "end_line": 112,
+      "callee": "Path",
+      "enclosing": "_norm_rel",
+      "expression": "Path(repo_root)"
+    },
+    {
+      "line": 113,
+      "end_line": 113,
+      "callee": "Path(repo_root).resolve",
+      "enclosing": "_norm_rel",
+      "expression": "Path(repo_root).resolve()"
+    },
+    {
+      "line": 158,
+      "end_line": 158,
+      "callee": "set",
+      "enclosing": "scope_after",
+      "expression": "set(exts)"
+    },
+    {
+      "line": 192,
+      "end_line": 192,
+      "callee": "part.lower",
+      "enclosing": "_walk_repo._rule_hit",
+      "expression": "part.lower()"
+    },
+    {
+      "line": 195,
+      "end_line": 195,
+      "callee": "_has_target_build_marker",
+      "enclosing": "_walk_repo._rule_hit",
+      "expression": "_has_target_build_marker(root, parts[:i])"
+    },
+    {
+      "line": 220,
+      "end_line": 220,
+      "callee": "tgt.relative_to",
+      "enclosing": "_walk_repo",
+      "expression": "tgt.relative_to(root_resolved)"
+    },
+    {
+      "line": 157,
+      "end_line": 157,
+      "callee": "d.lower",
+      "enclosing": "scope_after",
+      "expression": "d.lower()"
+    },
+    {
+      "line": 194,
+      "end_line": 194,
+      "callee": "part.lower",
+      "enclosing": "_walk_repo._rule_hit",
+      "expression": "part.lower()"
+    },
+    {
+      "line": 201,
+      "end_line": 201,
+      "callee": "Path",
+      "enclosing": "_walk_repo._rule_hit",
+      "expression": "Path(name)"
+    },
+    {
+      "line": 113,
+      "end_line": 113,
+      "callee": "Path",
+      "enclosing": "_norm_rel",
+      "expression": "Path(repo_root)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 16,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 18,
+      "source_expression": "import fnmatch",
+      "targets": [
+        "fnmatch"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "import re",
+      "targets": [
+        "re"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "from collections.abc import Collection",
+      "targets": [
+        "collections.abc",
+        "collections.abc.Collection"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "from pathlib import Path",
+      "targets": [
+        "pathlib",
+        "pathlib.Path"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "from types import SimpleNamespace",
+      "targets": [
+        "types",
+        "types.SimpleNamespace"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 24,
+      "source_expression": "from vvaharness.util import console, logs",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.console",
+        "vvaharness.util.logs"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/console.py",
+        "vvaharness/util/logs.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 25,
+      "source_expression": "from vvaharness.util import errlog as _errlog",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.errlog"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/errlog.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

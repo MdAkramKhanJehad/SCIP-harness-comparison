@@ -1,0 +1,586 @@
+# vvaharness/backends/llm/sdk.py
+
+The `sdk` route: Anthropic Messages API through the `anthropic` client library, with the same `prompt()` and `agentic()` surface as the `cli` route. `prompt()` is one streamed request with a retry ladder (parameter drops, authentication, transients, one doubled-budget truncation retry). `agentic()` is a raw read-only tool loop (Read, Glob, Grep plus caller tools) capped at 40 turns by default, with a structured-output submit tool, a forced final answer when the turn cap is reached, and delegation to the Claude Agent SDK whenever a mutating tool or any tool the local loop cannot run is requested. The module also decides where prompt-cache markers may be placed.
+
+Source: `vvaharness/backends/llm/sdk.py` (lines 1-1684)
+Executor: mixed (the code builds and checks each request; the model does the reasoning and chooses the tool calls)
+Called from: `vvaharness/backends/llm/registry.py` (dispatch for `via: sdk`); stages reach it through `callModel({ route: "sdk", ... })`
+
+## Client, credentials, and transport
+
+// src: vvaharness/backends/llm/sdk.py:109-119
+_AUTH_STATUS_RX = /unauthorized|invalid[_ ]api[_ ]key|invalid[^\n]{0,24}\btoken\b|\btoken\b[^\n]{0,24}(?:expired|invalid|revoked)|authentication[_ ]failed/i
+  // bounded, so a 400 "invalid_request_error ... prompt is too long" is not read as an authentication error; \btoken\b so max_tokens rejections are not authentication
+_AUTH_MAX_RETRIES_SDK = 3
+_AUTH_BACKOFF_SDK = (2, 4, 8)   // seconds
+
+// src: vvaharness/backends/llm/sdk.py:129-186
+SdkConfig defaults {
+  api_key: null; base_url: null; verify_ssl: true; ca_cert: null; client_cert: null; no_proxy: null
+  allow_api_key_fallback: false   // the `sdk` route borrows the shared ANTHROPIC key only when it is the sole backend
+  cache_min_block_tokens: null     // null = use the published per-model minimum
+  cache_route: "auto"              // "auto" detects from base_url and fails closed; anthropic, vertex, bedrock declare; "none" forces no markers
+  cache_markers: "on"
+}
+// abstracted: configure() (lines 146-186) stores non-empty arguments into the configuration under a lock and drops the cached client. An unquoted YAML `off` for cache_route reads as "none"; an unrecognized cache_route warns CACHE_ROUTE_UNKNOWN and falls back to "auto" (it only gates an optimization).
+
+// src: vvaharness/backends/llm/sdk.py:204-269
+fn _get_client():executor=code {
+  // lazy, thread-safe singleton (s4 and s6 run in a thread pool)
+  kw = { max_retries: 2 }
+  // two retry layers on purpose: the library retries 2 times, the wrapper ladder 3 times, so the worst case is 3x3 = 9 sends per prompt() call, matching the `deepagents` route. Only the wrapper sees a transient reported inside an HTTP 200 body
+  key = config.api_key || environment ANTHROPIC_SDK_API_KEY
+  if (!key && config.allow_api_key_fallback) { key = environment ANTHROPIC_API_KEY || ANTHROPIC_AUTH_TOKEN }
+  require key => throw AuthenticationError("no sdk credential resolved: set ANTHROPIC_SDK_API_KEY or `sdk.api_key` in your config. ANTHROPIC_API_KEY is accepted only when sdk/deepagents are the sole backends in the profile (sdk.allow_api_key_fallback), so it is deliberately NOT read here — an ambient key must never silently bill a run whose via:cli roles authenticate as someone else.", backend="sdk")
+    // the client library would otherwise read ANTHROPIC_API_KEY from the environment by itself; the harness fails closed instead
+  if (config.base_url) kw.base_url = config.base_url
+  kw += tls.anthropic_auth_kwargs(key); _client_default_betas = its "anthropic-beta" default header or ""   // only OAuth sets one ("oauth-2025-04-20")
+  if (config.ca_cert path is missing) { warn TLS_CA_FALLBACK; ca = null }
+  verify = ca || config.verify_ssl
+  if (verify == false) { tls.warn_verify_disabled(...) }
+  verify = _mtls_verify(verify)   // src: sdk.py:189-201 — load a configured client certificate chain onto an explicit TLS context (never cert=)
+  if (verify != true) kw.http_client = DefaultHttpxClient(verify)
+  return anthropic.Anthropic(...kw) under tls.scoped_no_proxy_env(config.no_proxy)   // external: anthropic client library
+}
+
+## Prompt-cache marker gate
+
+// src: vvaharness/backends/llm/sdk.py:17-20, 272-293
+// A cache marker is placed only where all three gates agree: the route accepts `cache_control` (_cache_route), the kill switch is on (cache_markers), and the cumulative prefix clears the model minimum (_cache_prefix_meets_minimum).
+_CACHE_CONTROL_ROUTES = ("anthropic", "vertex")   // "bedrock" and "unknown" never get markers
+_BEDROCK_HOST_RX = /(?:^|\.)bedrock[a-z0-9-]*(?:\.[a-z0-9-]+)*\.amazonaws\.com$/i
+_VERTEX_HOST_RX = /(?:^|[.-])aiplatform\.googleapis\.com$/i
+_ANTHROPIC_HOST_RX = /(?:^|\.)anthropic\.com$/i
+
+// src: vvaharness/backends/llm/sdk.py:301-348
+fn _cache_route(client, config?, emit_note = true):executor=code {
+  forced = lowercase(config.cache_route || "auto")   // false reads as "none"
+  if (forced == "none") return "unknown"
+  if (forced in ["anthropic", "vertex", "bedrock"]) return forced   // an explicit setting beats detection
+  host = hostname of (client.base_url || config.base_url)
+  match (host) {
+    case empty => return "anthropic"
+    case matches _BEDROCK_HOST_RX => return "bedrock"
+    case matches _VERTEX_HOST_RX => return "vertex"
+    case matches _ANTHROPIC_HOST_RX => return "anthropic"
+    default => {
+      if (emit_note) warn once "[sdk] note: prompt caching is enabled by default, but the configured endpoint is not recognised as Anthropic, Vertex or Bedrock (route classification: unknown), so cache markers are withheld and prompt tokens are billed uncached on this route. If the gateway is Anthropic-Messages-compatible, set `cache_route: anthropic` in your config to enable prompt caching. This affects cost only; scan results are unchanged."
+      return "unknown"
+    }
+  }
+}
+
+// src: vvaharness/backends/llm/sdk.py:356-393 — table 361-368, _cache_min_tokens_for 371-381, _cache_prefix_meets_minimum 388-393
+_CACHE_MIN_TOKENS_TABLE = [   // first match wins
+  (/opus-5|fable-5/i, 512),
+  (/opus-4[-.]?[56]|haiku-4[-.]?5/i, 4096),
+  (/opus-4[-.]?7|haiku-3[-.]?5/i, 2048),
+  (/opus-4|sonnet-[45]/i, 1024)
+]
+_CACHE_MIN_TOKENS_FALLBACK = 4096   // an unseen model gets the largest published minimum
+fn _cache_min_tokens_for(model):executor=code {
+  if (config.cache_min_block_tokens != null) return max(0, config.cache_min_block_tokens)   // 0 disables the size gate
+  return first table floor matching model, else 4096
+}
+fn _cache_prefix_meets_minimum(text, model, preceding = ""):executor=code {
+  return (estimate_tokens(preceding) + estimate_tokens(text)) * cache.CACHE_EST_MARGIN >= _cache_min_tokens_for(model)   // external value: vvaharness/backends/llm/cache.py
+}
+
+// src: vvaharness/backends/llm/sdk.py:396-435
+fn _build_cache_prefix_content(client, cache_prefix, user_prompt, model, preceding = ""):executor=code {
+  if (!cache_prefix) return user_prompt
+  route = if (cache markers enabled && _cache_route(client) in _CACHE_CONTROL_ROUTES && _cache_prefix_meets_minimum(cache_prefix, model, preceding)) that route else null
+  if (user_prompt is a block list) return [{ text: cache_prefix, cache_control: ephemeral if route && user_prompt non-empty }, ...user_prompt]
+  if (route && user_prompt) return [{ text: cache_prefix, cache_control: ephemeral }, { text: user_prompt }]
+  return cache_prefix + user_prompt   // prefix still leads, so an implicit cache can still hit
+}
+
+// src: vvaharness/backends/llm/sdk.py:438-455
+fn _build_system_content(client, system_prompt, model, tools_text = ""):executor=code {
+  // tool schemas render ahead of the system block, so they count toward the cumulative minimum
+  if (cache markers enabled && _cache_route(client) in _CACHE_CONTROL_ROUTES && _cache_prefix_meets_minimum(system_prompt, model, preceding=tools_text)) {
+    return [{ type: "text", text: system_prompt, cache_control: ephemeral }]
+  }
+  return system_prompt
+}
+
+// src: vvaharness/backends/llm/sdk.py:466-471
+fn _bank_usage(msg):executor=code {
+  usage = msg.usage as a dictionary or null
+  cache.note_unparsed_cache_keys(usage, via="sdk"); TOKENS.add(usage)   // a call with no usage still counts
+  return usage
+}
+
+## Parameter memories and transient classification
+
+// src: vvaharness/backends/llm/sdk.py:476-490
+_ATTEMPTS_CEILING = 6   // ceiling on total prompt() attempts after bounded extra-send grants
+_NO_TEMP_MODELS = set(); _NO_THINK_MODELS = set()
+_NO_TOOL_CHOICE_MODELS = set()   // models that rejected a FORCED tool_choice; for the rest of the run the submit tool is advertised but not forced
+_WARNED_DROPS = set()
+_NO_TEMP_RX = /opus-4[-.]?([7-9]|\d{2,})|opus-[5-9]|sonnet-[5-9]|haiku-[5-9]/i
+
+// src: vvaharness/backends/llm/sdk.py:493-506
+fn _warn_max_budget_unenforced(fn, max_budget_usd):executor=code {
+  if (max_budget_usd != null) warn once "WARN [sdk]: max_budget_usd=$max_budget_usd is accepted by $fn() but not enforced on this route -- no spend cap is applied here; max_turns is the bound that applies instead. Route this role via: cli for an enforced budget."
+}
+
+// src: vvaharness/backends/llm/sdk.py:509-527
+fn _supports_temperature(model):executor=code { return model not in _NO_TEMP_MODELS && !(_NO_TEMP_RX matches model) }
+fn _beta_headers(betas):executor=code {
+  if (!betas) return null
+  return { "anthropic-beta": client default betas joined with each new beta }   // a per-request header REPLACES the default, so the OAuth beta is merged back in
+}
+
+// src: vvaharness/backends/llm/sdk.py:530-549
+fn _is_transient_sdk(error):executor=code {
+  if (error.status_code in RETRYABLE_STATUS) return true
+  if (error.status_code in [401, 403]) return false   // prose may not promote an explicit authentication status
+  body = rejection_text(error)   // drops a pydantic echo of the request, so a prompt naming "rate limit" cannot make a 422 transient
+  return RATE_LIMIT_TRANSIENT_RX matches body || SERVER_ERROR_TRANSIENT_RX matches body
+}
+
+// src: vvaharness/backends/llm/sdk.py:1041-1045
+fn _auth_failure_sdk(error):executor=code {
+  return error.status_code == 401 || (_AUTH_STATUS_RX matches rejection_text(error) && error.status_code not in RETRYABLE_STATUS)
+  // a retryable status beats authentication prose: a 503 saying "authentication_failed" is an outage
+}
+
+## Structured output, refusal, tool forcing
+
+// src: vvaharness/backends/llm/sdk.py:560-581
+fn _extract_response_model(response_model, msg, model):executor=code {
+  for each tool_use block b in msg.content where b.name == "emit_structured_response" {
+    try return response_model.model_validate(b.input)
+    catch e => throw StructuredOutputRejected("Anthropic SDK call to $model: 'emit_structured_response' reply failed validation: $e", finish=msg.stop_reason)
+  }
+  throw StructuredOutputRejected("Anthropic SDK call to $model ended without calling 'emit_structured_response' (stop_reason=$finish).", finish=msg.stop_reason)
+  // both shapes raise the one marker the stage-level retry (dispatch_or_retry_unforced) recovers from
+}
+
+// src: vvaharness/backends/llm/sdk.py:584-594
+fn _raise_if_refused(msg, tag):executor=code {
+  // stop_reason is this route's whole refusal seam; callers bank usage first
+  if (msg.stop_reason == "refusal") throw model_refusal(route="sdk", stage=tag, category=msg.stop_details.category)
+}
+
+// src: vvaharness/backends/llm/sdk.py:597-617
+fn _effort_thinking_kwargs(model, effort):executor=code {
+  if (effort == null || model in _NO_THINK_MODELS) return {}
+  return deepagents.options.model_building._anthropic_thinking_kwargs(effort)   // external to this batch: the shared effort-to-thinking mapping also used by `via: deepagents`
+}
+fn _forcing_blocked(model, thinking):executor=code {
+  // adaptive thinking accepts a forced tool_choice; only manual "enabled" thinking is limited to auto or none
+  return model in _NO_TOOL_CHOICE_MODELS || thinking.type == "enabled"
+}
+
+// src: vvaharness/backends/llm/sdk.py:620-631
+fn _warn_tool_choice_dropped_for_thinking(model, effort):executor=code {
+  warn once per model "WARN [sdk]: $model has effort=$effort with manual (`enabled`) thinking and a response_model -- manual thinking allows only tool_choice auto/none (adaptive thinking would accept the forcing), so tool_choice is left at its default (auto) for this model. The structured-output tool is still advertised and validated when called, the system prompt asks for it by name, and a prose reply is re-asked once in-session (agentic) or retried once without effort by the calling stage (prompt)."
+  COUNTERS.bump("sdk_tool_choice_dropped_for_thinking")
+}
+
+// src: vvaharness/backends/llm/sdk.py:634-660
+fn _unforce_rejected_tool_choice(kw, e, low, client, model, system_prompt, response_model, tools_text = ""):executor=code {
+  if (!("tool_choice" in kw && low contains "tool_choice" && (e.status_code in PARAM_REJECTION_STATUS || is_gateway_wrapped_param_rejection(e)))) return false
+  _NO_TOOL_CHOICE_MODELS.add(model)   // a model rule: holds for the rest of the run
+  warn once "WARN [sdk]: $model rejected a forced `tool_choice` (status=$status) — retrying with the tool advertised but not forced. Structured output is no longer GUARANTEED for this model; a reply that skips the tool fails loudly rather than shipping unvalidated."
+  remove kw.tool_choice
+  if (response_model) { kw.system = _build_system_content(client, with_submit_instruction(system_prompt, response_model), model, tools_text) }
+  return true
+}
+
+// src: vvaharness/backends/llm/sdk.py:663-675
+fn _reforce_tool_choice(kw, tool_choice, client, model, system_prompt, response_model, tools_text = ""):executor=code {
+  if (response_model == null || model in _NO_TOOL_CHOICE_MODELS) return
+  kw.tool_choice = tool_choice
+  kw.system = if (system_prompt) _build_system_content(client, system_prompt, model, tools_text) else removed   // byte-identical to a never-unforced request
+}
+
+## prompt(): single request, no tools except the submit tool
+
+// src: vvaharness/backends/llm/sdk.py:678-988
+fn prompt(user_prompt, model, cache_prefix?, system_prompt?, max_tokens?, temperature?, thinking_budget?, betas?, json_schema?, output_format = "text", cwd?, max_budget_usd?, timeout?, tag?, response_model?, effort?):executor=mixed {
+  // json_schema, output_format and cwd are accepted and ignored, so the dispatcher can pass `cli` calls through
+  _warn_max_budget_unenforced("prompt", max_budget_usd)
+  client = _get_client()
+  max_tok = max_tokens || 16000
+
+  // src: sdk.py:705-763 — request assembly
+  effort_kw = _effort_thinking_kwargs(model, effort)
+  forced = response_model != null && !_forcing_blocked(model, effort_kw.thinking)
+  system_text = if (response_model && !forced) with_submit_instruction(system_prompt, response_model) else system_prompt
+  user_content = _build_cache_prefix_content(client, cache_prefix, user_prompt, model, preceding=system_text)
+  kw = { model, max_tokens: max_tok, messages: [{ role: "user", content: user_content }] }
+  if (response_model) {
+    kw.tools = [response_model_tool(response_model)]
+    if (forced) { kw.tool_choice = { type: "tool", name: "emit_structured_response" } }
+    else if (model not in _NO_TOOL_CHOICE_MODELS) { _warn_tool_choice_dropped_for_thinking(model, effort) }
+  }
+  if (_beta_headers(betas)) kw.extra_headers = _beta_headers(betas)
+  if (thinking_budget && model not in _NO_THINK_MODELS) {
+    // legacy: thinking_budget never reaches the wire; it turns adaptive thinking on and sizes headroom
+    if (max_tok <= thinking_budget) { max_tok = thinking_budget + 8000; kw.max_tokens = max_tok }
+    kw.thinking = { type: "adaptive" }; temperature = null
+  }
+  if (effort_kw) { kw += effort_kw; temperature = null }   // Anthropic rejects temperature alongside thinking
+  if (temperature != null) {
+    if (_supports_temperature(model)) { kw.extra_body.temperature = temperature }
+    else { _NO_TEMP_MODELS.add(model) }   // dropped for this and later calls; models matching _NO_TEMP_RX never send it
+  }
+  if (system_text) kw.system = _build_system_content(client, system_text, model)
+
+  request_timeout = effort_scaled_seconds(timeout || DEFAULT_REQUEST_TIMEOUT_SECONDS, effort, kind=REQUEST)   // a disabled session timeout must not disable this per-request hang stop
+  session_t0 = now; session_budget = request_timeout
+
+  // src: sdk.py:785-958 — retry ladder
+  attempts = 3; retry_wait = 60; auth_attempt = 0; msg = null
+  trunc_retried = false; trunc_retry_at = 0
+  attempt = 0
+  while (attempt < attempts) {   // attempts is read live so a parameter drop on the last attempt can grant one bounded extra send
+    attempt += 1
+    try {
+      send = turn_options(session_t0, session_budget, request_timeout)
+      msg = callModel({ role: tag, route: "sdk", system: kw.system, prompt: kw.messages, tools: kw.tools, limits: { max_tokens: kw.max_tokens, timeout: send.timeout }, output: if (response_model) response_model else "text" })
+        // streamed so a 64k max_tokens does not trip the HTTP timeout; _drain_within_deadline closes the stream at the wall-clock deadline
+      note_budget_use(elapsed, request_timeout, effort)
+      if (finish_truncated(msg.stop_reason)) {
+        clipped_usage = _bank_usage(msg)   // the clipped attempt was paid for
+        retry_at = if (trunc_retried) null else truncation_retry_max(kw.max_tokens, cap=MODEL_MAX_OUTPUT_TOKENS)
+        if (retry_at != null) {
+          if (attempt == attempts && attempts < _ATTEMPTS_CEILING) attempts += 1
+          if (attempt < attempts) {
+            trunc_retried = true; trunc_retry_at = retry_at
+            COUNTERS.bump(TRUNCATED_RETRY_ATTEMPTED_COUNTER); errlog "VVAH-E005 warning: reply truncated at max_tokens=...; retrying once at $retry_at" (recovered)
+            kw.max_tokens = retry_at; msg = null; continue
+          }
+        }
+        throw cli._truncation_error(requested=max_tok, retried=trunc_retry_at, tag, retry_at, produced=clipped_usage.output_tokens)   // VVAH-E005
+      }
+      if (trunc_retried) COUNTERS.bump(TRUNCATED_RETRY_RECOVERED_COUNTER)
+      break
+    }
+    catch anthropic.APIStatusError e => {
+      low = lowercase(rejection_text(e))
+      match (e) {
+        // order of the arms is deliberate
+        case "temperature" in kw.extra_body && low contains "temperature" && status in PARAM_REJECTION_STATUS => {
+          _NO_TEMP_MODELS.add(model); remove temperature
+          if (attempt == attempts && attempts < _ATTEMPTS_CEILING) attempts += 1
+          continue
+        }
+        case _unforce_rejected_tool_choice(kw, e, low, ...) => {   // before the thinking arm: such a 400 often names both parameters
+          if (attempt == attempts && attempts < _ATTEMPTS_CEILING) attempts += 1
+          continue
+        }
+        case "thinking" in kw && low contains "thinking" && status in PARAM_REJECTION_STATUS => {
+          unsupported = low contains any of ["not supported", "unexpected", "adaptive", "unrecognized", "unknown"]
+          if (unsupported) _NO_THINK_MODELS.add(model)   // otherwise dropped for this request only
+          remove kw.thinking
+          if (effort_kw) { remove kw.output_config; _reforce_tool_choice(kw, { type: "tool", name: "emit_structured_response" }, ...) }
+          if (attempt == attempts && attempts < _ATTEMPTS_CEILING) attempts += 1
+          continue
+        }
+        case _auth_failure_sdk(e) => {   // VVAH-E001, checked before the transient arm
+          if (auth_attempt < _AUTH_MAX_RETRIES_SDK && attempt < attempts) {
+            wait = _AUTH_BACKOFF_SDK[min(auth_attempt, 2)]
+            require wait_overrun(wait, ...) == null => throw CallTimeoutError
+            sleep(wait); auth_attempt += 1; continue
+          }
+          throw AuthenticationError(redact(body) first 400 characters, status_code, backend="sdk")
+        }
+        case _is_transient_sdk(e) && attempt < attempts => {
+          wait = jittered_delay(retry_wait)   // flat 60 seconds, jittered: a body inside HTTP 200 carries no retry-after
+          require wait_overrun(wait, ...) == null => throw CallTimeoutError
+          sleep(wait); continue
+        }
+        default => throw RuntimeError("Anthropic SDK call failed (status=..., model=$model): <redacted body>")
+      }
+    }
+    catch anthropic.APIConnectionError or httpx2.TransportError e => {
+      if (is_timeout_failure(e)) throw call_timeout_error(stage=tag, route="sdk", budget_s=request_timeout, effort, cause_text="Anthropic SDK request exceeded ${request_timeout}s")
+      if (proxy_error(e, backend="sdk")) throw that ProxyError   // VVAH-E002, never retried
+      if (attempt < attempts) {
+        wait = jittered_delay(retry_wait)
+        require wait_overrun(wait, ...) == null => throw CallTimeoutError
+        sleep(wait); continue
+      }
+      throw RuntimeError("Anthropic SDK connection error after $attempts attempts ... hint: this is a network/TLS/DNS/proxy failure ...")
+    }
+  }
+  require msg != null => throw RuntimeError("Anthropic SDK call to $model exhausted all retries without a successful response (every attempt hit a parameter-drop retry) ...")
+
+  // src: sdk.py:967-988
+  usage = _bank_usage(msg)
+  _raise_if_refused(msg, tag)   // after banking: a refusal mid-stream is billed
+  text = if (response_model) _extract_response_model(response_model, msg, model).model_dump_json() else concatenated text blocks
+  check_response_quality(trim(text), stage=tag, output_tokens=output_tokens_for_gate(usage))   // external: vvaharness/util/response_quality.py
+  return trim(text)
+}
+
+// src: vvaharness/backends/llm/sdk.py:1048-1065
+fn _drain_within_deadline(stream, deadline, stage, effort, budget_s):executor=code {
+  // the per-request timeout bounds each read, so a trickle of small chunks could run forever; the clock is checked between chunks
+  for each event in stream {
+    if (now >= deadline) { close stream; throw call_timeout_error(stage, route="sdk", budget_s, effort, cause_text="sdk stream exceeded its ${budget_s}s wall-clock budget") }
+  }
+  return stream.get_final_message()
+}
+
+## agentic(): raw read-only tool loop
+
+// src: vvaharness/backends/llm/sdk.py:993-994
+_AGENTIC_MAX_TOK = AGENTIC_MAX_TOKENS   // 16000
+_AGENTIC_MAX_TURNS = 40
+
+// src: vvaharness/backends/llm/sdk.py:1175-1199
+_EVICTED_MARK = "[evicted to fit context]"
+_CTX_OVERFLOW_RX = /context.?length|context length|exceed.*(?:token|limit)|too long/i
+fn _shrink_history(messages):executor=code {
+  // evict the OLDEST tool_result whose text is longer than 1200 characters and not yet evicted
+  for each tool_result block b in messages, oldest first {
+    if (b.content is a string && length(b.content) > 1200 && !b.content ends with _EVICTED_MARK) {
+      b.content = first 800 characters + "\n…" + _EVICTED_MARK
+      return true
+    }
+  }
+  return false
+}
+
+// abstracted: _assistant_blocks (lines 997-1016) serializes response blocks back for the next turn, dropping empty text blocks and any cache_control; _with_cache_marker (lines 1019-1038) strips markers from history and puts one ephemeral marker on the last content block when markers are enabled and the route is in _CACHE_CONTROL_ROUTES. Neither changes a decision.
+
+// src: vvaharness/backends/llm/sdk.py:1202-1684
+fn agentic(user_prompt, model, system_prompt?, allowed_tools?, cwd, max_budget_usd?, permission_mode = "auto", max_turns?, timeout?, tag?, extra_tools?, extra_dispatch?, response_model?, max_output_tokens?, submit_guard?, exhausted_tools?, effort?):executor=mixed {
+  turns_cap = if (max_turns) int(max_turns) else _AGENTIC_MAX_TURNS   // 40
+  out_cap = if (max_output_tokens) int(max_output_tokens) else _AGENTIC_MAX_TOK   // 16000 per turn
+  allowed = if (allowed_tools == null) DEFAULT_READ_TOOLS else allowed_tools   // an empty list means no local tools at all
+
+  // src: sdk.py:1250-1277 — tool gate and delegation
+  require "Bash" not in allowed => throw ValueError("sdk.agentic: `Bash` is forbidden on `via: sdk`; remove it from allowed_tools or switch that role to `via: cli`.")
+  [ok, missing] = tools.supported(allowed)   // external to this batch: vvaharness/backends/llm/tools.py
+  if (missing) {
+    require !extra_tools => throw ValueError("sdk.agentic: extra_tools cannot be combined with mutating/Bash tools that route to the Claude Agent SDK ($missing)")
+    return agent_sdk.agentic(user_prompt, model, system_prompt, allowed_tools=allowed, cwd, max_budget_usd, permission_mode, max_turns, tag, timeout, effort)
+    // mutating tools run inside the Agent SDK's cwd-confined permission sandbox; that path enforces max_budget_usd and timeout. See backends/llm/agent_sdk.sudo
+  }
+  _warn_max_budget_unenforced("agentic", max_budget_usd)   // only the raw loop drops it; permission_mode is accepted and unused
+  client = _get_client()
+
+  // src: sdk.py:1285-1289 — two clocks
+  request_timeout = effort_scaled_seconds(DEFAULT_REQUEST_TIMEOUT_SECONDS, effort, kind=REQUEST)   // bounds a call in flight
+  session_budget = if (timeout) effort_scaled_seconds(timeout, effort, kind=SESSION) else null   // stops the loop from STARTING a turn past its budget
+  session_t0 = now
+
+  // src: sdk.py:1290-1320 — request assembly
+  tools = [...tools.anthropic_schemas_for(ok), ...extra_tools]
+  if (response_model) tools += response_model_tool(response_model)
+  base_kw = { model, max_tokens: out_cap, tools } + _effort_thinking_kwargs(model, effort)
+  system_text = system_prompt
+  if (response_model) {
+    if (!_forcing_blocked(model, base_kw.thinking)) { base_kw.tool_choice = { type: "any" } }   // only advisory on some 5.x models
+    else {
+      if (model not in _NO_TOOL_CHOICE_MODELS) _warn_tool_choice_dropped_for_thinking(model, effort)
+      system_text = with_submit_instruction(system_prompt, response_model)
+    }
+  }
+  tools_text = JSON of tools
+  if (system_text) base_kw.system = _build_system_content(client, system_text, model, tools_text)
+  messages = [{ role: "user", content: [{ type: "text", text: user_prompt }] }]
+
+  tool_calls_total = 0
+  submit_rejects = 0     // bounded by STRUCTURED_REASK_MAX independently of the turn budget
+  schema_nudged = false  // one in-session prose re-ask per call
+  withdrawn = {}
+
+  // src: sdk.py:1337-1564 — the turn loop
+  for each turn in 1..turns_cap {
+    require !(session_budget && now - session_t0 >= session_budget) => throw call_timeout_error(stage=tag, route="sdk", budget_s=session_budget, effort, cause_text="session clock exceeded ${session_budget}s before turn $turn")
+
+    // src: sdk.py:1343-1350 — out-of-loop tool withdrawal (mirrors ToolCallBudget on `via: deepagents`)
+    if (exhausted_tools) {
+      newly = exhausted_tools() - withdrawn
+      if (newly) { withdrawn = withdrawn union newly; base_kw.tools = base_kw.tools without names in withdrawn }
+    }
+
+    // src: sdk.py:1351-1445 — one turn with its own retry ladder
+    msg = null; transients = 0; shrinks = 0
+    while (msg == null) {
+      try {
+        send = turn_options(session_t0, session_budget, request_timeout)
+        msg = callModel({ role: tag, route: "sdk", system: base_kw.system, prompt: messages with one tail cache marker, tools: base_kw.tools, limits: { max_tokens: out_cap, turns: turns_cap, timeout: send.timeout, session: session_budget }, output: "assistant message (text or tool_use blocks)" })
+        note_budget_use(elapsed, request_timeout, effort)
+      }
+      catch anthropic.APIStatusError e => {
+        low = lowercase(rejection_text(e))
+        match (e) {
+          case _auth_failure_sdk(e) => throw AuthenticationError(redacted message first 400 characters, status_code, backend="sdk")   // authentication first; no authentication retry inside the loop
+          case status in PARAM_REJECTION_STATUS && _CTX_OVERFLOW_RX matches low && shrinks < 16 && _shrink_history(messages) => { shrinks += 1; continue }   // bounded at 16 evictions per turn
+          case _unforce_rejected_tool_choice(base_kw, e, low, ..., tools_text) => continue
+          case status in PARAM_REJECTION_STATUS && "thinking" in base_kw && low contains "thinking" => {
+            if (low contains any of ["not supported", "unexpected", "adaptive", "unrecognized", "unknown"]) _NO_THINK_MODELS.add(model)
+            remove base_kw.thinking and base_kw.output_config
+            _reforce_tool_choice(base_kw, { type: "any" }, ...)
+            continue
+          }
+          case _is_transient_sdk(e) && transients < 4 => {
+            transients += 1
+            wait = jittered_delay(min(60, 20 * transients))   // 20, 40, 60, 60 seconds before jitter
+            require wait_overrun(wait, ...) == null => throw CallTimeoutError
+            sleep(wait); continue
+          }
+          default => throw RuntimeError("Anthropic SDK agentic call failed (status=..., model=$model, turn=$turn): ...")
+        }
+      }
+      catch anthropic.APIConnectionError or httpx2.TransportError e => {
+        if (is_timeout_failure(e)) throw call_timeout_error(stage=tag, route="sdk", budget_s=request_timeout, effort, cause_text="Anthropic SDK agentic call exceeded ${request_timeout}s (turn=$turn)")
+        if (proxy_error(e, backend="sdk")) throw that ProxyError
+        if (transients < 4) {
+          transients += 1; wait = jittered_delay(min(60, 20 * transients))
+          require wait_overrun(wait, ...) == null => throw CallTimeoutError
+          sleep(wait); continue
+        }
+        throw RuntimeError("Anthropic SDK agentic connection error (model=$model, turn=$turn): ...")
+      }
+    }
+    TOKENS.add(msg.usage)
+
+    // src: sdk.py:1452-1466
+    if (finish_truncated(msg.stop_reason)) {
+      [msg, override] = _check_agentic_stop(msg, client, messages, call_kw=base_kw, model, tag, requested=out_cap, response_model, dispatchable=true, effort, request_timeout, session_t0, session_budget)
+      if (override != null) return override
+      // msg may now be a completed tool_use; it falls through to dispatch
+    }
+    _raise_if_refused(msg, tag)   // after the truncation check, so a refusal on the doubled retry is caught too
+
+    // src: sdk.py:1467-1487 — no tool call: the session ends, unless a structured reply came back as prose
+    if (msg.stop_reason != "tool_use") {
+      text = trimmed concatenated text blocks
+      if (response_model && !schema_nudged && turn < turns_cap) {   // never on the last turn
+        schema_nudged = true; COUNTERS.bump("llm_structured_prose_reask")
+        append the assistant blocks (only if they include text or tool_use)
+        append user message STRUCTURED_PROSE_REASK
+        continue   // the re-ask spends the next turn
+      }
+      return text
+      // preserved: with response_model set, prose after the one re-ask is returned as the final text, not raised; the stage parser decides
+    }
+
+    // src: sdk.py:1489-1564 — dispatch every tool_use block of this turn, in order
+    messages.append({ role: "assistant", content: _assistant_blocks(msg.content) })
+    results = []
+    for each tool_use block b in msg.content {
+      if (response_model && b.name == "emit_structured_response") {
+        try validated = response_model.model_validate(b.input)
+        catch exc => {
+          submit_rejects += 1; COUNTERS.bump("llm_structured_submit_rejected")
+          if (submit_rejects >= STRUCTURED_REASK_MAX) {   // 2
+            errlog "emit_structured_response rejected $submit_rejects time(s); raw submit returned" (reason "llm_structured_reask_gave_up", recovered)
+            return JSON of b.input   // the raw, unvalidated submit; the stage's own parser decides
+          }
+          results.append(tool_result(b.id, "Rejected: <first 600 characters of the error>. Fix the named fields and call the tool again."))
+          continue
+        }
+        if (submit_guard) {
+          hold_text = submit_guard()   // out-of-loop EvidenceGate, bounded by the gate's own max_rejections
+          if (hold_text != null) { results.append(tool_result(b.id, hold_text)); continue }
+        }
+        return validated.model_dump_json()
+        // preserved: tool_use blocks after an accepted submit in the same turn are never run
+      }
+      tool_calls_total += 1
+      out = if (extra_dispatch) extra_dispatch(b.name, b.input) else null   // a caller tool; the caller logs and caps it. null defers
+      if (out == null && b.name not in ok) { out = tools.UNGRANTED_TOOL_ERROR with name }   // an ungranted local tool never runs, whatever name the model emits
+      if (out == null) { out = tools.cap_tool_result(tools.execute(b.name, b.input, cwd)) }   // external to this batch: vvaharness/backends/llm/tools.py
+      results.append(tool_result(b.id, out))
+    }
+    messages.append({ role: "user", content: results })
+  }
+
+  // src: sdk.py:1566-1599 — turn cap reached: one forced final answer
+  warn LLM_TURN_CAP_EXHAUSTED; COUNTERS.bump("llm_turn_cap_exhausted")
+  if (response_model) { messages.append(user text SDK_FORCED_FINAL_SUBMIT) } else { messages.append(user text SDK_FORCED_FINAL_TEXT) }
+  // src: sdk.py:1587-1599
+  final_kw = base_kw without its tools, then final_kw.tools = tools   // the ORIGINAL advertised list: the API requires tools when tool_choice is set
+  // preserved: tools withdrawn by exhausted_tools during the loop are advertised again on the forced-final call (tool_choice none/forced submit means none should run)
+  match (true) {
+    case response_model == null => final_kw.tool_choice = { type: "none" }   // never withheld: every model accepts it
+    case _forcing_blocked(model, final_kw.thinking) => remove final_kw.tool_choice
+    default => final_kw.tool_choice = { type: "tool", name: "emit_structured_response" }
+  }
+
+  // src: sdk.py:1603-1667 — forced-final retry ladder
+  final_transients = 0
+  loop {
+    try {
+      msg = callModel({ role: tag, route: "sdk", system: final_kw.system, prompt: messages, tools: final_kw.tools, limits: { max_tokens: out_cap, tool_choice: final_kw.tool_choice }, output: if (response_model) response_model else "text" })
+      break
+    }
+    catch anthropic.APIStatusError e => match (e) {
+      case _auth_failure_sdk(e) => throw AuthenticationError
+      case _unforce_rejected_tool_choice(final_kw, e, ...) => continue   // bounded: the memory removes tool_choice
+      case _is_transient_sdk(e) && final_transients < 4 => { final_transients += 1; wait = jittered_delay(min(60, 20 * final_transients)); require wait_overrun(...) == null => throw CallTimeoutError; sleep(wait); continue }
+      default => throw RuntimeError("Anthropic SDK agentic forced-final failed ...")
+    }
+    catch connection or transport error e => {
+      if (is_timeout_failure(e)) throw call_timeout_error(...)
+      if (proxy_error(e, backend="sdk")) throw that ProxyError
+      if (final_transients < 4) { final_transients += 1; wait = jittered_delay(min(60, 20 * final_transients)); require wait_overrun(...) == null => throw CallTimeoutError; sleep(wait); continue }
+      throw RuntimeError("Anthropic SDK agentic forced-final connection error ...")
+    }
+  }
+  TOKENS.add(msg.usage)
+  [msg, override] = _check_agentic_stop(msg, ..., call_kw=final_kw, requested=out_cap, response_model, dispatchable=false, ...)
+  if (override != null) return override
+  _raise_if_refused(msg, tag)
+  if (response_model) return _extract_response_model(response_model, msg, model).model_dump_json()   // raises StructuredOutputRejected on prose
+  return trimmed concatenated text blocks
+}
+
+// prompt-src: vvaharness/backends/llm/sdk.py:1571-1586
+SDK_FORCED_FINAL_SUBMIT {
+  Constraints {
+    "Tool budget exhausted. Call emit_structured_response now with your best answer based on what you have read so far."
+  }
+}
+SDK_FORCED_FINAL_TEXT {
+  Constraints {
+    "Tool budget exhausted. Reply now with your final answer based on what you have read so far; do not call any tool."
+  }
+}
+
+// prompt-src: vvaharness/backends/llm/sdk.py:1518-1523
+SDK_SUBMIT_REJECTED_RESULT {
+  // tool result sent back for a submit that failed schema validation
+  Constraints {
+    "Rejected: $error_first_600_characters. Fix the named fields and call the tool again."
+  }
+}
+
+// src: vvaharness/backends/llm/sdk.py:1068-1172
+fn _check_agentic_stop(msg, client, messages, call_kw, model, tag, requested, response_model?, dispatchable = false, effort?, request_timeout?, session_t0?, session_budget?):executor=mixed {
+  if (!finish_truncated(msg.stop_reason)) return [msg, null]
+  retry_at = truncation_retry_max(requested, cap=MODEL_MAX_OUTPUT_TOKENS)
+  // src: sdk.py:1079-1088, 1167-1172 — exactly one doubled-budget resend; none when already at the model output cap
+  if (retry_at == null) {
+    COUNTERS.bump(TRUNCATED_REPLIES_COUNTER)
+    throw TruncatedResponseError("agentic reply hit the output-token budget ... already at the model output cap ...; no useful retry", requested, retried=0)
+  }
+  COUNTERS.bump(TRUNCATED_RETRY_ATTEMPTED_COUNTER); errlog "VVAH-E005 warning: agentic reply truncated at max_tokens=$requested; retrying once at $retry_at" (recovered)
+  try {
+    retried = callModel({ role: tag, route: "sdk", prompt: messages, tools: call_kw.tools, limits: { max_tokens: retry_at }, output: "same as the clipped call" })   // exactly one resend, no transient retry
+  }
+  // src: sdk.py:1100-1136
+  catch anthropic.APIStatusError e => match (e) {
+    case _auth_failure_sdk(e) => throw AuthenticationError
+    case status in PARAM_REJECTION_STATUS && _CTX_OVERFLOW_RX matches => { COUNTERS.bump(TRUNCATED_REPLIES_COUNTER); throw TruncatedResponseError("... the doubled-budget retry would overflow the context window; no useful retry", retried=0) }
+    default => throw RuntimeError("Anthropic SDK agentic truncation-retry failed ...")
+  }
+  catch connection or transport error e => { timeout => throw call_timeout_error(cause_text="Anthropic SDK agentic truncation-retry exceeded ${request_timeout}s"); proxy => throw ProxyError; otherwise throw RuntimeError }
+  TOKENS.add(retried.usage)
+  if (finish_truncated(retried.stop_reason)) { COUNTERS.bump(TRUNCATED_REPLIES_COUNTER); throw TruncatedResponseError("agentic reply still hit the output-token budget after the doubled retry", retried=retry_at) }
+  undispatched_call = retried.stop_reason == "tool_use" && !dispatchable
+  require !(undispatched_call && response_model == null) => throw TruncatedResponseError("agentic reply's doubled-budget retry unexpectedly requested a tool call; refusing to guess ...")
+  COUNTERS.bump(TRUNCATED_RETRY_RECOVERED_COUNTER)
+  if (undispatched_call && response_model) return [retried, _extract_response_model(response_model, retried, model).model_dump_json()]
+  return [retried, null]
+}

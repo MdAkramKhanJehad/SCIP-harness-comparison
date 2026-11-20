@@ -1,0 +1,178 @@
+# vvaharness/pipeline/stages/s6/outcomes.py
+
+Stage 6's output contract (a verdict per finding that can also correct the finding's CWE and line, confirm repeat sites, and report new weaknesses; field descriptions are model-facing instructions) and the code that parses replies, classifies each verdict into a bucket by the confidence gate, and applies the verdict to the finding.
+
+Source: `vvaharness/pipeline/stages/s6/outcomes.py` (lines 1-365)
+Executor: code (schema field descriptions are instructions to the model)
+Called from: `vvaharness/pipeline/stages/s6/session.py` verify_batch; `vvaharness/pipeline/stages/s6_verify.py` _Sink
+
+// ---------- schemas ----------
+
+// src: vvaharness/pipeline/stages/s6/outcomes.py:39-128
+// prompt-src: vvaharness/pipeline/stages/s6/outcomes.py:39-126
+VerificationOutcome {
+  finding_id: String    // "Echo the FINDING id you were given, verbatim."
+  verdict: "TRUE_POSITIVE" | "FALSE_POSITIVE" | "INCONCLUSIVE"
+  confidence: Number    // 0..10
+  reason: String        // "Why, in one or two sentences. Required for every verdict."
+  corrected_cwe: String = ""
+  corrected_line_start: Number = 0
+  confirmed_repeat_lines: [Number] = []
+  cvss_vector: String = ""
+  control_absence: Boolean = false
+  channel: String = "main"
+  reframed: Boolean = false
+  additional_findings: [InvestigatedFinding] = []   // the Stage 4 finding schema, s4/outcomes.sudo
+  replayed: Boolean = false   // harness-only, hidden from the model's schema; verify_batch overwrites whatever the model sent
+
+  Constraints {
+    verdict: "TRUE_POSITIVE = the weakness is real and reachable. FALSE_POSITIVE = you read the code and it does not hold; name the control or fact that refutes it in `reason`. INCONCLUSIVE = you could not reach the evidence either way. Use it — it is recorded as undetermined and is the honest answer, where a guessed FALSE_POSITIVE silently deletes a finding nobody will look at again."
+    confidence: "0-10 on the evidence you actually saw. This is a hard gate: a TRUE_POSITIVE below the configured floor is dropped as unconfirmed, so do not deflate a finding you confirmed, and do not inflate one you did not."
+    corrected_cwe: "Set this when the weakness is REAL but the reported CWE is wrong" ... "Use it with verdict TRUE_POSITIVE: the defect stands, only its label was off." "Leave empty when the reported CWE is right."
+    corrected_line_start: "Set this when the weakness is REAL but reported at the wrong line — the line of the DANGEROUS STATEMENT ITSELF, never the enclosing def/class/decorator header. Use it with TRUE_POSITIVE. Leave 0 when the reported line already IS the sink."
+    confirmed_repeat_lines: "Lines in this same file where you verified the IDENTICAL defect and which are NOT already one of the findings in this session." ... "A line already listed above is ignored — say the ones nobody filed."
+    cvss_vector: "A CVSS 3.1 base vector, e.g. 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H'. Empty string if you cannot justify one — never invent metrics to fill it."
+    control_absence: "True when this finding describes a missing or absent control — a check, gate, limit or protection that is not there — rather than a value, privilege, or reachable state an attacker takes forward." ... "When unsure, leave false."
+    channel: "'posture' when the finding describes how the artifact is built or deployed — container, CI, or dependency hygiene — rather than a defect in the application's own code; otherwise 'main'." ... "When unsure, leave 'main'."
+    reframed: "Set true ONLY when a reframe duty in the system prompt instructed you to: you refuted the finding's framing but confirmed the underlying exposure and relabelled it via corrected_cwe. Leave false otherwise."
+    additional_findings: "DISTINCT weaknesses you noticed in this file while verifying, which the finding above does not cover." ... "Same evidence bar as the verdict: report what you can point at, not what could conceivably be wrong. Empty is fine and common."
+  }
+
+  // src: :52-72 — confidence is clamped by the code instead of failing the batch
+  require confidence is a number in 0..10 => a "N/10" string reads as N; a finite value is truncated to an integer and clamped to 0..10; +infinity becomes 10, -infinity or NaN becomes 0; any change counted in s6_confidence_clamped; a non-numeric value still fails validation
+  // src: :109-120
+  require control_absence and reframed are booleans => coerced, falling back to false
+  require channel == "posture" (case-insensitive, trimmed) => otherwise "main"
+}
+
+// src: vvaharness/pipeline/stages/s6/outcomes.py:131-135
+// prompt-src: vvaharness/pipeline/stages/s6/outcomes.py:131-135
+VerificationOutcomes {
+  outcomes: [VerificationOutcome]
+  Constraints {
+    "ONE entry per FINDING you were given, each echoing that finding's own id. A finding you omit is recorded as unverified, which drops it — so judge every one, including the ones you are refuting."
+  }
+  // preserved: the description says an omitted finding is "dropped"; the code first resubmits omitted members of a multi-finding batch as singletons, and records a still-missing one as VERIFY_ERROR (s6_verify.sudo)
+}
+
+// ---------- parsing ----------
+
+// src: vvaharness/pipeline/stages/s6/outcomes.py:159-168
+fn parse_outcomes(raw):executor=code {
+  // direct VerificationOutcomes, then salvaged from prose with extract_json, then a bare single VerificationOutcome
+  for each attempt in [_validate_direct, _validate_salvaged, _validate_lone] { parsed = attempt(raw); if (parsed) return parsed }
+  COUNTERS.bump(if (raw stripped is non-empty && does not end with "}") "s6_outcome_truncated" else "s6_outcome_malformed")
+  return null
+}
+
+// src: vvaharness/pipeline/stages/s6/outcomes.py:171-186
+fn split_batch_reply(raw, finding_ids):executor=code {
+  parsed = parse_outcomes(raw)
+  if (parsed == null) return {}
+  by_id = {}
+  for each outcome in parsed.outcomes {
+    require outcome.finding_id in finding_ids => COUNTERS.bump("s6_batch_finding_id_invented"); skip
+    by_id[outcome.finding_id] = outcome   // a later duplicate overwrites
+  }
+  COUNTERS.bump("s6_batch_finding_omitted", length(finding_ids) - length(by_id))
+  return by_id
+}
+
+// src: vvaharness/pipeline/stages/s6/outcomes.py:190-198
+fn remap_reason_ids(reason, display):executor=code {
+  return reason with each standalone batch-local token matching /(?<![\w./$-])f\d+\b(?!\.\w)/ replaced by display[token] ("file:line"), unknown ids left as written
+}
+
+// ---------- classification and application ----------
+
+// src: vvaharness/pipeline/stages/s6/outcomes.py:262-276
+fn classify(outcome, min_confidence):executor=code {
+  // a tool-free replay is lossy: its low-confidence refutation must not delete the finding unseen
+  if (outcome.replayed && outcome.verdict == "FALSE_POSITIVE" && outcome.confidence < min_confidence) return "INCONCLUSIVE"
+  if (outcome.verdict == "INCONCLUSIVE") return "INCONCLUSIVE"
+  if (outcome.verdict == "FALSE_POSITIVE") return "FALSE_POSITIVE"   // any confidence
+  if (outcome.confidence < min_confidence) return "UNCONFIRMED"    // min_confidence = knob("step6_verify.min_confidence", default=7)
+  return "TRUE_POSITIVE"
+}
+
+// src: vvaharness/pipeline/stages/s6/outcomes.py:304-338
+fn apply_outcome(f, outcome, reserve?, stamps=true, reframe=false, max_line?, clone_repeats=true):executor=code {
+  update = _verdict_fields(outcome) + _corrections(f, outcome, max_line)
+  if (stamps) update += _trait_stamps(outcome)
+  primary = copy of f with update
+  if (outcome.verdict != "TRUE_POSITIVE") return [primary]
+  // preserved: corrections and clones key on the model's verdict, not on the bucket, so an UNCONFIRMED TRUE_POSITIVE still carries its corrections (reserve is null for it, so no line is claimed)
+  if (reserve == null) reserve = line => true
+  else if (primary.line_start != f.line_start) reserve(primary.line_start)   // claim the corrected line so a sibling's repeat there reads as already filed
+  if (reframe && outcome.reframed) return [primary]   // a reframed verdict relabels, so it ships alone
+  if (!clone_repeats) return [primary]                // re-verify wave: repeats counted and discarded
+  extra = _new_repeat_lines(primary, outcome, reserve, max_line)
+  // a repeat site is a point, not a span copy; refs and snippet name the primary's line, so they are cleared
+  return [primary, ...for each n in extra: copy of primary with line_start = n, line_end = n, is_repeat_clone = true, code_snippet = "", sink_ref = null, source_ref = null, backfilled_refs = [], pre_anchor_line = 0]
+}
+
+// src: vvaharness/pipeline/stages/s6/outcomes.py:243-259
+fn _verdict_fields(outcome):executor=code {
+  vector = outcome.cvss_vector trimmed or null
+  score = if (vector) cvss_score(vector) else null   // external to this batch: report/cvss
+  // a real weakness scored zero-impact must not rank last by that 0.0: ship it unscored
+  if (outcome.verdict == "TRUE_POSITIVE" && vector && score == 0.0) { vector = null; score = null }
+  return {
+    verdict: if (outcome.verdict == "INCONCLUSIVE") null else outcome.verdict,   // Finding.verdict has no INCONCLUSIVE slot
+    verdict_confidence: outcome.confidence, verdict_reason: outcome.reason,
+    cvss_vector: vector, cvss_score: score, cvss_rating: if (score != null) cvss_rating(score) else null
+  }
+}
+
+// src: vvaharness/pipeline/stages/s6/outcomes.py:201-228
+fn _corrections(f, outcome, max_line?):executor=code {
+  fixed = {}
+  cwe = norm_cwe(outcome.corrected_cwe)
+  if (cwe && cwe != f.cwe) fixed.cwe = cwe
+  line = outcome.corrected_line_start
+  if (line > 0 && line != f.line_start) {
+    if (f.pre_anchor_line > 0 && line == f.pre_anchor_line) { /* refused: it would undo Stage 5's re-anchor off the header */ }
+    else if (max_line != null && line > max_line) { /* ignored: beyond end of file */ }
+    else { fixed.line_start = line; fixed.line_end = max(f.line_end, line); fixed.pre_anchor_line = 0 }   // Stage 7 then judges the corrected line
+  }
+  // the only bound on line_end (Stage 5's gate judges only line_start)
+  if (max_line != null && (fixed.line_end or f.line_end) > max_line) fixed.line_end = max_line
+  return fixed
+}
+
+// src: vvaharness/pipeline/stages/s6/outcomes.py:231-240
+fn _trait_stamps(outcome):executor=code {
+  // only non-default values are written, so a missing stamp keeps the Finding's defaults
+  return { control_absence: true if outcome.control_absence } + { channel: "posture" if outcome.channel == "posture" }
+}
+
+// src: vvaharness/pipeline/stages/s6/outcomes.py:279-301
+fn _new_repeat_lines(primary, outcome, reserve, max_line?):executor=code {
+  fresh = []
+  for each n in sorted distinct outcome.confirmed_repeat_lines {
+    if (n <= 0 || n == primary.line_start) continue
+    if (max_line != null && n > max_line) continue   // beyond end of file
+    if (!reserve(n)) continue                        // already filed anywhere in the stage
+    fresh += n
+  }
+  return fresh
+}
+
+// src: vvaharness/pipeline/stages/s6/outcomes.py:341-359
+fn discovered(outcome, parent, repo_root, inventory):executor=code {
+  // fanned out as Stage 4 fans out its own, whatever the parent's verdict
+  if (outcome.additional_findings is empty) return []
+  chunk = "${parent.chunk_id or "s6"}+s6"   // "+s6" and origin s6_discovered exclude these from the Stage 5 ledger, raw counts and SARIF
+  out = []
+  for each extra in outcome.additional_findings, out += s4.outcomes.fan_out(extra, chunk, [parent.cwe] if parent.cwe else [], repo_root, inventory);
+  // preserved: fan_out is called without cfg here, so knob("step4.max_extra_cwes", default=2) always reads its default of 2
+  return each with verdict = "TRUE_POSITIVE", verdict_confidence = outcome.confidence, verdict_reason = "found while verifying ${parent.file}:${parent.line_start}", origin = "s6_discovered"
+  // no CVSS on these (source comment: "no CVSS")
+}
+
+// src: vvaharness/pipeline/stages/s6/outcomes.py:362-365
+fn unverified(f, detail):executor=code {
+  return copy of f with verdict = null, verdict_confidence = 0, verdict_reason = detail   // a lost reply reads as undetermined, not clean
+}
+
+// abstracted: outcomes.py:138-156 (the three validators wrap pydantic validation and return null on failure); counters throughout.

@@ -1,0 +1,2285 @@
+{
+  "source": "vvaharness/remediation_agent/runner.py",
+  "sha256": "9098362e3493e881bc2365e90ea74dc3f36d2e6b71f1be3ad47012aedde54e72",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"The per-finding processing loop: :func:`process_targets` walks each finding through ``plugin_runner.apply_plugin`` and checkpoints the result.\"\"\"\nfrom __future__ import annotations\nfrom vvaharness.util import logs\n\nfrom collections.abc import MutableMapping\nfrom enum import Enum\nfrom pathlib import Path\n\nfrom vvaharness.backends.llm.registry import resolve as resolve_model\nfrom vvaharness.models import RemediationKind\nfrom vvaharness.orchestrator.artifacts import artifact_dir\nfrom vvaharness.orchestrator.checkpoints import (\n    REMEDIATE_PREFIX,\n    load_ckpt,\n    save_ckpt,\n    step_key_for,\n)\nfrom vvaharness.remediation_agent import policy as _policy\nfrom vvaharness.remediation_agent.discovery import Layout\nfrom vvaharness.remediation_agent.options import RemediateOptions\nfrom vvaharness.remediation_agent.plugin_runner import (\n    ENGINE_ID,\n    apply_plugin,\n    checkpoint_record,\n    engine_model,\n)\nfrom vvaharness.remediation_agent.target import RemediationTarget\nfrom vvaharness.report.redact import redact\nfrom vvaharness.util import console\nfrom vvaharness.util.status import stage\nfrom vvaharness.util.events import Event\n\nlog = logs.get_logger(__name__)\n\n__all__ = [\"model_banner\", \"process_targets\", \"remediate_one\", \"step_key_of\"]\n\n\nclass _Result(Enum):\n    FIXED = \"fixed\"\n    NOT_FIXED = \"not fixed\"\n    FAILED = \"failed\"\n\n\ndef _result_for_kind(kind: RemediationKind | str | None, *,\n                     diff_captured: bool | None = None) -> _Result:\n    \"\"\"Classify a completed attempt by what the harness proved it did.\"\"\"\n    value = kind.value if isinstance(kind, RemediationKind) else kind\n    # Absent diff proof keeps legacy resume behaviour, but a PROVEN no-diff attempt is never fixed\n    if diff_captured is False:\n        return _Result.NOT_FIXED\n    return (_Result.FIXED\n            if value in (RemediationKind.EDITS_APPLIED.value,\n                         RemediationKind.PULL_REQUEST.value)\n            else _Result.NOT_FIXED)\n\n\ndef model_banner(cfg) -> str:\n    \"\"\"One-line description of the model/backend doing remediation.\"\"\"\n    try:\n        mid, via, _ = resolve_model(cfg.models.remediate)\n        return f\"{mid} [{via}]\"\n    except Exception:  # noqa: BLE001 — banner is best-effort only\n        return \"unknown\"\n\n\ndef step_key_of(target: RemediationTarget, cfg) -> str:\n    \"\"\"The resume-checkpoint step key for *target*, computable before the engine runs so nothing comes from the attempt being skipped.\"\"\"\n    # Read at call time rather than bound at import, so a late-stamped version is still keyed on.\n    from vvaharness import __version__\n\n    model, backend = engine_model(cfg)\n    return step_key_for(REMEDIATE_PREFIX, engine_id=ENGINE_ID,\n                        engine_version=__version__, case_id=target.case_id,\n                        model=model, backend=backend)\n\n\ndef _finding_identity(target: RemediationTarget) -> str:\n    \"\"\"The identity recorded IN the checkpoint (the ``case_id``), so a hit can be checked against it before a skip proves WHICH finding it covers.\"\"\"\n    return target.case_id\n\n\ndef remediate_one(target: RemediationTarget, *, idx: int, total: int, layout: Layout,\n                  cfg, repo_path: Path, opts: RemediateOptions,\n                  policy_ctx=None, _results: list[_Result] | None = None) -> bool:\n    \"\"\"Process a single finding: skip-if-cached (resume), otherwise run the agent and checkpoint the result; one bad finding never aborts the run — EXCEPT a symlinked artefact directory, which is tampering evidence and is let through to the caller rather than silently skipped (``UnsafeArtifactDir`` is deliberately not in the ``except`` below).\"\"\"\n    label = redact(target.label)\n    step = step_key_of(target, cfg)\n    fid = _finding_identity(target)\n\n    # Skip only when a checkpoint exists AND its finding identity matches — existence alone isn't proof of completion.\n    if opts.resume:\n        cached = load_ckpt(layout.ckpt_dir, layout.run_id, step)\n        if isinstance(cached, dict) and cached.get(\"finding_id\") == fid:\n            cached_result = _result_for_kind(\n                cached.get(\"kind\"), diff_captured=cached.get(\"diff_captured\"))\n            with stage(f\"{label} — cached\", n=idx, total=total) as progress:\n                if cached_result is _Result.NOT_FIXED:\n                    progress.mark_incomplete(\"not fixed\")\n            if _results is not None:\n                _results.append(cached_result)\n            return True\n\n    # Raises UnsafeArtifactDir, uncaught, on a symlinked <slug> — same \"raised, not worked\n    # around\" posture as prepare_layout and _run_remediation's security-remediation guard.\n    out_dir = artifact_dir(layout.rem_dir, target.slug)\n\n    try:\n        # Verbose stays plain; else stage()'s TTY gate keeps spinners out of redirected S10 logs\n        animate = False if opts.verbose else None\n        with stage(label, n=idx, total=total, animate=animate) as progress:\n            remediation = apply_plugin(target, out_dir, cfg=cfg, repo=repo_path,\n                                       mode=opts.mode, verbose=opts.verbose,\n                                       policy_ctx=policy_ctx)\n            # Bind the finding identity into the checkpoint so a later --resume can authenticate it.\n            record = {**checkpoint_record(target, out_dir, remediation),\n                      \"finding_id\": fid}\n            save_ckpt(layout.ckpt_dir, layout.run_id, step, record)\n            result = _result_for_kind(\n                remediation.kind, diff_captured=bool(remediation.diff))\n            if result is _Result.NOT_FIXED:\n                progress.mark_incomplete(\"not fixed\")\n        if _results is not None:\n            _results.append(result)\n        return True\n    except Exception as e:  # noqa: BLE001 — one bad finding shouldn't abort\n        log.warning(Event.REMEDIATION_FINDING_FAILED, finding=target.index, detail=redact(str(e)))\n        if _results is not None:\n            _results.append(_Result.FAILED)\n        return False\n\n\ndef process_targets(targets: list[RemediationTarget], *, layout: Layout, cfg,\n                    repo_path: Path, opts: RemediateOptions,\n                    report: Path | None = None,\n                    progress: MutableMapping[str, int] | None = None) -> int:\n    \"\"\"Walk *targets* sequentially, remediating each; returns exit code 0 when all were processed.\"\"\"\n    total = len(targets)\n\n    # No-op unless step_remediate.enforce_policy is true.\n    policy_ctx = _policy.build_context(cfg, repo_path)\n    if policy_ctx.enabled:\n        console.write(\"  [Remediation Agent] policy gate ENABLED \"\n                      \"(deny-list + playbook + diff post-gate)\")\n    results: list[_Result] = []\n    processed_ok = [\n        remediate_one(target, idx=i, total=total, layout=layout, cfg=cfg,\n                      repo_path=repo_path, opts=opts, policy_ctx=policy_ctx,\n                      _results=results)\n        for i, target in enumerate(targets, start=1)\n    ]\n    fixed = results.count(_Result.FIXED)\n    not_fixed = results.count(_Result.NOT_FIXED)\n    failed = results.count(_Result.FAILED)\n    processed = sum(processed_ok)\n    if progress is not None:\n        # Failures count as not_fixed: consumers rely on attempted == fixed + not_fixed\n        progress.update(\n            attempted=total,\n            fixed=fixed,\n            not_fixed=total - fixed,\n        )\n    failure_note = f\", {failed} failed\" if failed else \"\"\n    outcome = \"fail\" if failed else (\"warn\" if not_fixed else \"ok\")\n    console.mark(outcome, f\"{processed}/{total} findings processed — \"\n                 f\"{fixed}/{total} fixed, {not_fixed} not fixed{failure_note}\",\n                 lead=\"\\n\")\n    # Best-effort — never fails the run.\n    from vvaharness.remediation_agent.report_augment import augment_reports\n    augment_reports(repo_path, report)\n    return 0 if failed == 0 else 1\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/remediation_agent/runner.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "The per-finding processing loop: :func:`process_targets` walks each finding through ``plugin_runner.apply_plugin`` and checkpoints the result.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_60_4": {
+      "source": "vvaharness/remediation_agent/runner.py",
+      "line_start": 60,
+      "line_end": 60,
+      "value": "Classify a completed attempt by what the harness proved it did.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_72_4": {
+      "source": "vvaharness/remediation_agent/runner.py",
+      "line_start": 72,
+      "line_end": 72,
+      "value": "One-line description of the model/backend doing remediation.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_75_15": {
+      "source": "vvaharness/remediation_agent/runner.py",
+      "line_start": 75,
+      "line_end": 75,
+      "source_expression": "f\"{mid} [{via}]\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_81_4": {
+      "source": "vvaharness/remediation_agent/runner.py",
+      "line_start": 81,
+      "line_end": 81,
+      "value": "The resume-checkpoint step key for *target*, computable before the engine runs so nothing comes from the attempt being skipped.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_92_4": {
+      "source": "vvaharness/remediation_agent/runner.py",
+      "line_start": 92,
+      "line_end": 92,
+      "value": "The identity recorded IN the checkpoint (the ``case_id``), so a hit can be checked against it before a skip proves WHICH finding it covers.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_99_4": {
+      "source": "vvaharness/remediation_agent/runner.py",
+      "line_start": 99,
+      "line_end": 99,
+      "value": "Process a single finding: skip-if-cached (resume), otherwise run the agent and checkpoint the result; one bad finding never aborts the run — EXCEPT a symlinked artefact directory, which is tampering evidence and is let through to the caller rather than silently skipped (``UnsafeArtifactDir`` is deliberately not in the ``except`` below).",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_110_23": {
+      "source": "vvaharness/remediation_agent/runner.py",
+      "line_start": 110,
+      "line_end": 110,
+      "source_expression": "f\"{label} — cached\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_150_4": {
+      "source": "vvaharness/remediation_agent/runner.py",
+      "line_start": 150,
+      "line_end": 150,
+      "value": "Walk *targets* sequentially, remediating each; returns exit code 0 when all were processed.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_176_19": {
+      "source": "vvaharness/remediation_agent/runner.py",
+      "line_start": 176,
+      "line_end": 176,
+      "source_expression": "f\", {failed} failed\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_178_26": {
+      "source": "vvaharness/remediation_agent/runner.py",
+      "line_start": 178,
+      "line_end": 179,
+      "source_expression": "f\"{processed}/{total} findings processed — \"\n                 f\"{fixed}/{total} fixed, {not_fixed} not fixed{failure_note}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_180_22": {
+      "source": "vvaharness/remediation_agent/runner.py",
+      "line_start": 180,
+      "line_end": 180,
+      "value": "\n",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "The per-finding processing loop: :func:`process_targets` walks each finding through ``plugin_runner.apply_plugin`` and checkpoints the result.",
+      "context": "literal"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 11,
+      "value": "model_banner",
+      "context": "literal"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 27,
+      "value": "process_targets",
+      "context": "literal"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 46,
+      "value": "remediate_one",
+      "context": "literal"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 63,
+      "value": "step_key_of",
+      "context": "literal"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 12,
+      "value": "fixed",
+      "context": "literal"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 16,
+      "value": "not fixed",
+      "context": "literal"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 13,
+      "value": "failed",
+      "context": "literal"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 4,
+      "value": "Classify a completed attempt by what the harness proved it did.",
+      "context": "literal"
+    },
+    {
+      "line_start": 72,
+      "line_end": 72,
+      "column": 4,
+      "value": "One-line description of the model/backend doing remediation.",
+      "context": "literal"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 4,
+      "value": "The resume-checkpoint step key for *target*, computable before the engine runs so nothing comes from the attempt being skipped.",
+      "context": "literal"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 4,
+      "value": "The identity recorded IN the checkpoint (the ``case_id``), so a hit can be checked against it before a skip proves WHICH finding it covers.",
+      "context": "literal"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 4,
+      "value": "Process a single finding: skip-if-cached (resume), otherwise run the agent and checkpoint the result; one bad finding never aborts the run — EXCEPT a symlinked artefact directory, which is tampering evidence and is let through to the caller rather than silently skipped (``UnsafeArtifactDir`` is deliberately not in the ``except`` below).",
+      "context": "literal"
+    },
+    {
+      "line_start": 150,
+      "line_end": 150,
+      "column": 4,
+      "value": "Walk *targets* sequentially, remediating each; returns exit code 0 when all were processed.",
+      "context": "literal"
+    },
+    {
+      "line_start": 176,
+      "line_end": 176,
+      "column": 55,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 14,
+      "value": "fail",
+      "context": "literal"
+    },
+    {
+      "line_start": 75,
+      "line_end": 75,
+      "column": 22,
+      "value": " [",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 75,
+      "line_end": 75,
+      "column": 29,
+      "value": "]",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 15,
+      "value": "unknown",
+      "context": "literal"
+    },
+    {
+      "line_start": 156,
+      "line_end": 157,
+      "column": 22,
+      "value": "  [Remediation Agent] policy gate ENABLED (deny-list + playbook + diff post-gate)",
+      "context": "literal"
+    },
+    {
+      "line_start": 176,
+      "line_end": 176,
+      "column": 21,
+      "value": ", ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 176,
+      "line_end": 176,
+      "column": 31,
+      "value": " failed",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 37,
+      "value": "warn",
+      "context": "literal"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 62,
+      "value": "ok",
+      "context": "literal"
+    },
+    {
+      "line_start": 178,
+      "line_end": 178,
+      "column": 39,
+      "value": "/",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 178,
+      "line_end": 178,
+      "column": 47,
+      "value": " findings processed — ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 26,
+      "value": "/",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 34,
+      "value": " fixed, ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 53,
+      "value": " not fixed",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 22,
+      "value": "\n",
+      "context": "literal"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 22,
+      "value": "finding_id",
+      "context": "literal"
+    },
+    {
+      "line_start": 107,
+      "line_end": 107,
+      "column": 51,
+      "value": "finding_id",
+      "context": "literal"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 27,
+      "value": "kind",
+      "context": "literal"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 41,
+      "value": "not fixed",
+      "context": "literal"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 61,
+      "value": "diff_captured",
+      "context": "literal"
+    },
+    {
+      "line_start": 110,
+      "line_end": 110,
+      "column": 32,
+      "value": " — cached",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 112,
+      "line_end": 112,
+      "column": 45,
+      "value": "not fixed",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 62,
+      "text": "# Absent diff proof keeps legacy resume behaviour, but a PROVEN no-diff attempt is never fixed"
+    },
+    {
+      "line": 76,
+      "text": "# noqa: BLE001 — banner is best-effort only"
+    },
+    {
+      "line": 82,
+      "text": "# Read at call time rather than bound at import, so a late-stamped version is still keyed on."
+    },
+    {
+      "line": 104,
+      "text": "# Skip only when a checkpoint exists AND its finding identity matches — existence alone isn't proof of completion."
+    },
+    {
+      "line": 117,
+      "text": "# Raises UnsafeArtifactDir, uncaught, on a symlinked <slug> — same \"raised, not worked"
+    },
+    {
+      "line": 118,
+      "text": "# around\" posture as prepare_layout and _run_remediation's security-remediation guard."
+    },
+    {
+      "line": 122,
+      "text": "# Verbose stays plain; else stage()'s TTY gate keeps spinners out of redirected S10 logs"
+    },
+    {
+      "line": 128,
+      "text": "# Bind the finding identity into the checkpoint so a later --resume can authenticate it."
+    },
+    {
+      "line": 139,
+      "text": "# noqa: BLE001 — one bad finding shouldn't abort"
+    },
+    {
+      "line": 153,
+      "text": "# No-op unless step_remediate.enforce_policy is true."
+    },
+    {
+      "line": 170,
+      "text": "# Failures count as not_fixed: consumers rely on attempted == fixed + not_fixed"
+    },
+    {
+      "line": 181,
+      "text": "# Best-effort — never fails the run."
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 23,
+      "line_end": 23,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 26,
+      "line_end": 31,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 32,
+      "line_end": 32,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 33,
+      "line_end": 33,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 34,
+      "line_end": 34,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 35,
+      "line_end": 40,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 41,
+      "line_end": 41,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 42,
+      "line_end": 42,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 43,
+      "line_end": 43,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 44,
+      "line_end": 44,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 45,
+      "line_end": 45,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "Assign",
+      "line_start": 47,
+      "line_end": 47,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "Assign",
+      "line_start": 49,
+      "line_end": 49,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 10
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 52,
+      "line_end": 55,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 11
+    },
+    {
+      "kind": "Assign",
+      "line_start": 53,
+      "line_end": 53,
+      "column": 4,
+      "owner": "_Result",
+      "representation_line": 16
+    },
+    {
+      "kind": "Assign",
+      "line_start": 54,
+      "line_end": 54,
+      "column": 4,
+      "owner": "_Result",
+      "representation_line": 16
+    },
+    {
+      "kind": "Assign",
+      "line_start": 55,
+      "line_end": 55,
+      "column": 4,
+      "owner": "_Result",
+      "representation_line": 16
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 58,
+      "line_end": 68,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 18
+    },
+    {
+      "kind": "Expr",
+      "line_start": 60,
+      "line_end": 60,
+      "column": 4,
+      "owner": "_result_for_kind",
+      "representation_line": 24
+    },
+    {
+      "kind": "Assign",
+      "line_start": 61,
+      "line_end": 61,
+      "column": 4,
+      "owner": "_result_for_kind",
+      "representation_line": 24
+    },
+    {
+      "kind": "If",
+      "line_start": 63,
+      "line_end": 64,
+      "column": 4,
+      "owner": "_result_for_kind",
+      "representation_line": 25
+    },
+    {
+      "kind": "Return",
+      "line_start": 64,
+      "line_end": 64,
+      "column": 8,
+      "owner": "_result_for_kind",
+      "representation_line": 27
+    },
+    {
+      "kind": "Return",
+      "line_start": 65,
+      "line_end": 68,
+      "column": 4,
+      "owner": "_result_for_kind",
+      "representation_line": 30
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 71,
+      "line_end": 77,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 34
+    },
+    {
+      "kind": "Expr",
+      "line_start": 72,
+      "line_end": 72,
+      "column": 4,
+      "owner": "model_banner",
+      "representation_line": 40
+    },
+    {
+      "kind": "Try",
+      "line_start": 73,
+      "line_end": 77,
+      "column": 4,
+      "owner": "model_banner",
+      "representation_line": 41
+    },
+    {
+      "kind": "Assign",
+      "line_start": 74,
+      "line_end": 74,
+      "column": 8,
+      "owner": "model_banner",
+      "representation_line": 44
+    },
+    {
+      "kind": "Return",
+      "line_start": 75,
+      "line_end": 75,
+      "column": 8,
+      "owner": "model_banner",
+      "representation_line": 45
+    },
+    {
+      "kind": "Return",
+      "line_start": 77,
+      "line_end": 77,
+      "column": 8,
+      "owner": "model_banner",
+      "representation_line": 50
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 80,
+      "line_end": 88,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 55
+    },
+    {
+      "kind": "Expr",
+      "line_start": 81,
+      "line_end": 81,
+      "column": 4,
+      "owner": "step_key_of",
+      "representation_line": 61
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 83,
+      "line_end": 83,
+      "column": 4,
+      "owner": "step_key_of",
+      "representation_line": 61
+    },
+    {
+      "kind": "Assign",
+      "line_start": 85,
+      "line_end": 85,
+      "column": 4,
+      "owner": "step_key_of",
+      "representation_line": 61
+    },
+    {
+      "kind": "Return",
+      "line_start": 86,
+      "line_end": 88,
+      "column": 4,
+      "owner": "step_key_of",
+      "representation_line": 62
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 91,
+      "line_end": 93,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 66
+    },
+    {
+      "kind": "Expr",
+      "line_start": 92,
+      "line_end": 92,
+      "column": 4,
+      "owner": "_finding_identity",
+      "representation_line": 72
+    },
+    {
+      "kind": "Return",
+      "line_start": 93,
+      "line_end": 93,
+      "column": 4,
+      "owner": "_finding_identity",
+      "representation_line": 73
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 96,
+      "line_end": 143,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 77
+    },
+    {
+      "kind": "Expr",
+      "line_start": 99,
+      "line_end": 99,
+      "column": 4,
+      "owner": "remediate_one",
+      "representation_line": 83
+    },
+    {
+      "kind": "Assign",
+      "line_start": 100,
+      "line_end": 100,
+      "column": 4,
+      "owner": "remediate_one",
+      "representation_line": 83
+    },
+    {
+      "kind": "Assign",
+      "line_start": 101,
+      "line_end": 101,
+      "column": 4,
+      "owner": "remediate_one",
+      "representation_line": 83
+    },
+    {
+      "kind": "Assign",
+      "line_start": 102,
+      "line_end": 102,
+      "column": 4,
+      "owner": "remediate_one",
+      "representation_line": 83
+    },
+    {
+      "kind": "If",
+      "line_start": 105,
+      "line_end": 115,
+      "column": 4,
+      "owner": "remediate_one",
+      "representation_line": 84
+    },
+    {
+      "kind": "Assign",
+      "line_start": 106,
+      "line_end": 106,
+      "column": 8,
+      "owner": "remediate_one",
+      "representation_line": 87
+    },
+    {
+      "kind": "If",
+      "line_start": 107,
+      "line_end": 115,
+      "column": 8,
+      "owner": "remediate_one",
+      "representation_line": 88
+    },
+    {
+      "kind": "Assign",
+      "line_start": 108,
+      "line_end": 109,
+      "column": 12,
+      "owner": "remediate_one",
+      "representation_line": 91
+    },
+    {
+      "kind": "With",
+      "line_start": 110,
+      "line_end": 112,
+      "column": 12,
+      "owner": "remediate_one",
+      "representation_line": 92
+    },
+    {
+      "kind": "If",
+      "line_start": 111,
+      "line_end": 112,
+      "column": 16,
+      "owner": "remediate_one",
+      "representation_line": 94
+    },
+    {
+      "kind": "Expr",
+      "line_start": 112,
+      "line_end": 112,
+      "column": 20,
+      "owner": "remediate_one",
+      "representation_line": 97
+    },
+    {
+      "kind": "If",
+      "line_start": 113,
+      "line_end": 114,
+      "column": 12,
+      "owner": "remediate_one",
+      "representation_line": 101
+    },
+    {
+      "kind": "Expr",
+      "line_start": 114,
+      "line_end": 114,
+      "column": 16,
+      "owner": "remediate_one",
+      "representation_line": 104
+    },
+    {
+      "kind": "Return",
+      "line_start": 115,
+      "line_end": 115,
+      "column": 12,
+      "owner": "remediate_one",
+      "representation_line": 106
+    },
+    {
+      "kind": "Assign",
+      "line_start": 119,
+      "line_end": 119,
+      "column": 4,
+      "owner": "remediate_one",
+      "representation_line": 111
+    },
+    {
+      "kind": "Try",
+      "line_start": 121,
+      "line_end": 143,
+      "column": 4,
+      "owner": "remediate_one",
+      "representation_line": 112
+    },
+    {
+      "kind": "Assign",
+      "line_start": 123,
+      "line_end": 123,
+      "column": 8,
+      "owner": "remediate_one",
+      "representation_line": 115
+    },
+    {
+      "kind": "With",
+      "line_start": 124,
+      "line_end": 135,
+      "column": 8,
+      "owner": "remediate_one",
+      "representation_line": 116
+    },
+    {
+      "kind": "Assign",
+      "line_start": 125,
+      "line_end": 127,
+      "column": 12,
+      "owner": "remediate_one",
+      "representation_line": 119
+    },
+    {
+      "kind": "Assign",
+      "line_start": 129,
+      "line_end": 130,
+      "column": 12,
+      "owner": "remediate_one",
+      "representation_line": 119
+    },
+    {
+      "kind": "Expr",
+      "line_start": 131,
+      "line_end": 131,
+      "column": 12,
+      "owner": "remediate_one",
+      "representation_line": 119
+    },
+    {
+      "kind": "Assign",
+      "line_start": 132,
+      "line_end": 133,
+      "column": 12,
+      "owner": "remediate_one",
+      "representation_line": 119
+    },
+    {
+      "kind": "If",
+      "line_start": 134,
+      "line_end": 135,
+      "column": 12,
+      "owner": "remediate_one",
+      "representation_line": 120
+    },
+    {
+      "kind": "Expr",
+      "line_start": 135,
+      "line_end": 135,
+      "column": 16,
+      "owner": "remediate_one",
+      "representation_line": 123
+    },
+    {
+      "kind": "If",
+      "line_start": 136,
+      "line_end": 137,
+      "column": 8,
+      "owner": "remediate_one",
+      "representation_line": 127
+    },
+    {
+      "kind": "Expr",
+      "line_start": 137,
+      "line_end": 137,
+      "column": 12,
+      "owner": "remediate_one",
+      "representation_line": 130
+    },
+    {
+      "kind": "Return",
+      "line_start": 138,
+      "line_end": 138,
+      "column": 8,
+      "owner": "remediate_one",
+      "representation_line": 132
+    },
+    {
+      "kind": "Expr",
+      "line_start": 140,
+      "line_end": 140,
+      "column": 8,
+      "owner": "remediate_one",
+      "representation_line": 138
+    },
+    {
+      "kind": "If",
+      "line_start": 141,
+      "line_end": 142,
+      "column": 8,
+      "owner": "remediate_one",
+      "representation_line": 139
+    },
+    {
+      "kind": "Expr",
+      "line_start": 142,
+      "line_end": 142,
+      "column": 12,
+      "owner": "remediate_one",
+      "representation_line": 142
+    },
+    {
+      "kind": "Return",
+      "line_start": 143,
+      "line_end": 143,
+      "column": 8,
+      "owner": "remediate_one",
+      "representation_line": 144
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 146,
+      "line_end": 184,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 149
+    },
+    {
+      "kind": "Expr",
+      "line_start": 150,
+      "line_end": 150,
+      "column": 4,
+      "owner": "process_targets",
+      "representation_line": 155
+    },
+    {
+      "kind": "Assign",
+      "line_start": 151,
+      "line_end": 151,
+      "column": 4,
+      "owner": "process_targets",
+      "representation_line": 155
+    },
+    {
+      "kind": "Assign",
+      "line_start": 154,
+      "line_end": 154,
+      "column": 4,
+      "owner": "process_targets",
+      "representation_line": 155
+    },
+    {
+      "kind": "If",
+      "line_start": 155,
+      "line_end": 157,
+      "column": 4,
+      "owner": "process_targets",
+      "representation_line": 156
+    },
+    {
+      "kind": "Expr",
+      "line_start": 156,
+      "line_end": 157,
+      "column": 8,
+      "owner": "process_targets",
+      "representation_line": 159
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 158,
+      "line_end": 158,
+      "column": 4,
+      "owner": "process_targets",
+      "representation_line": 162
+    },
+    {
+      "kind": "Assign",
+      "line_start": 159,
+      "line_end": 164,
+      "column": 4,
+      "owner": "process_targets",
+      "representation_line": 162
+    },
+    {
+      "kind": "Assign",
+      "line_start": 165,
+      "line_end": 165,
+      "column": 4,
+      "owner": "process_targets",
+      "representation_line": 162
+    },
+    {
+      "kind": "Assign",
+      "line_start": 166,
+      "line_end": 166,
+      "column": 4,
+      "owner": "process_targets",
+      "representation_line": 162
+    },
+    {
+      "kind": "Assign",
+      "line_start": 167,
+      "line_end": 167,
+      "column": 4,
+      "owner": "process_targets",
+      "representation_line": 162
+    },
+    {
+      "kind": "Assign",
+      "line_start": 168,
+      "line_end": 168,
+      "column": 4,
+      "owner": "process_targets",
+      "representation_line": 164
+    },
+    {
+      "kind": "If",
+      "line_start": 169,
+      "line_end": 175,
+      "column": 4,
+      "owner": "process_targets",
+      "representation_line": 165
+    },
+    {
+      "kind": "Expr",
+      "line_start": 171,
+      "line_end": 175,
+      "column": 8,
+      "owner": "process_targets",
+      "representation_line": 168
+    },
+    {
+      "kind": "Assign",
+      "line_start": 176,
+      "line_end": 176,
+      "column": 4,
+      "owner": "process_targets",
+      "representation_line": 171
+    },
+    {
+      "kind": "Assign",
+      "line_start": 177,
+      "line_end": 177,
+      "column": 4,
+      "owner": "process_targets",
+      "representation_line": 171
+    },
+    {
+      "kind": "Expr",
+      "line_start": 178,
+      "line_end": 180,
+      "column": 4,
+      "owner": "process_targets",
+      "representation_line": 171
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 182,
+      "line_end": 182,
+      "column": 4,
+      "owner": "process_targets",
+      "representation_line": 171
+    },
+    {
+      "kind": "Expr",
+      "line_start": 183,
+      "line_end": 183,
+      "column": 4,
+      "owner": "process_targets",
+      "representation_line": 171
+    },
+    {
+      "kind": "Return",
+      "line_start": 184,
+      "line_end": 184,
+      "column": 4,
+      "owner": "process_targets",
+      "representation_line": 172
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 6,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='logs', ctx=Load()), attr='get_logger', ctx=Load()), args=[Name(id='__name__', ctx=Load())], keywords=[])",
+      "rendered": "logs.get_logger(__name__)"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 10,
+      "kind": "List",
+      "original_ast": "List(elts=[Constant(value='model_banner'), Constant(value='process_targets'), Constant(value='remediate_one'), Constant(value='step_key_of')], ctx=Load())",
+      "rendered": "['model_banner', 'process_targets', 'remediate_one', 'step_key_of']"
+    },
+    {
+      "line_start": 52,
+      "line_end": 52,
+      "column": 14,
+      "kind": "Name",
+      "original_ast": "Name(id='Enum', ctx=Load())",
+      "rendered": "Enum"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 12,
+      "kind": "Constant",
+      "original_ast": "Constant(value='fixed')",
+      "rendered": "'fixed'"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 16,
+      "kind": "Constant",
+      "original_ast": "Constant(value='not fixed')",
+      "rendered": "'not fixed'"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 13,
+      "kind": "Constant",
+      "original_ast": "Constant(value='failed')",
+      "rendered": "'failed'"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 12,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='kind', ctx=Load()), Name(id='RemediationKind', ctx=Load())], keywords=[]), body=Attribute(value=Name(id='kind', ctx=Load()), attr='value', ctx=Load()), orelse=Name(id='kind', ctx=Load()))",
+      "rendered": "kind.value if isinstance(kind, RemediationKind) else kind"
+    },
+    {
+      "line_start": 63,
+      "line_end": 63,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='diff_captured', ctx=Load()), ops=[Is()], comparators=[Constant(value=False)])",
+      "rendered": "diff_captured is False"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 15,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='_Result', ctx=Load()), attr='NOT_FIXED', ctx=Load())",
+      "rendered": "_Result.NOT_FIXED"
+    },
+    {
+      "line_start": 65,
+      "line_end": 68,
+      "column": 12,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=Name(id='value', ctx=Load()), ops=[In()], comparators=[Tuple(elts=[Attribute(value=Attribute(value=Name(id='RemediationKind', ctx=Load()), attr='EDITS_APPLIED', ctx=Load()), attr='value', ctx=Load()), Attribute(value=Attribute(value=Name(id='RemediationKind', ctx=Load()), attr='PULL_REQUEST', ctx=Load()), attr='value', ctx=Load())], ctx=Load())]), body=Attribute(value=Name(id='_Result', ctx=Load()), attr='FIXED', ctx=Load()), orelse=Attribute(value=Name(id='_Result', ctx=Load()), attr='NOT_FIXED', ctx=Load()))",
+      "rendered": "_Result.FIXED if value in (RemediationKind.EDITS_APPLIED.value, RemediationKind.PULL_REQUEST.value) else _Result.NOT_FIXED"
+    },
+    {
+      "line_start": 74,
+      "line_end": 74,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='resolve_model', ctx=Load()), args=[Attribute(value=Attribute(value=Name(id='cfg', ctx=Load()), attr='models', ctx=Load()), attr='remediate', ctx=Load())], keywords=[])",
+      "rendered": "resolve_model(cfg.models.remediate)"
+    },
+    {
+      "line_start": 75,
+      "line_end": 75,
+      "column": 15,
+      "kind": "JoinedStr",
+      "original_ast": "JoinedStr(values=[FormattedValue(value=Name(id='mid', ctx=Load()), conversion=-1), Constant(value=' ['), FormattedValue(value=Name(id='via', ctx=Load()), conversion=-1), Constant(value=']')])",
+      "rendered": "source_template_75_15"
+    },
+    {
+      "line_start": 76,
+      "line_end": 76,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value='unknown')",
+      "rendered": "'unknown'"
+    },
+    {
+      "line_start": 85,
+      "line_end": 85,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='engine_model', ctx=Load()), args=[Name(id='cfg', ctx=Load())], keywords=[])",
+      "rendered": "engine_model(cfg)"
+    },
+    {
+      "line_start": 86,
+      "line_end": 88,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='step_key_for', ctx=Load()), args=[Name(id='REMEDIATE_PREFIX', ctx=Load())], keywords=[keyword(arg='engine_id', value=Name(id='ENGINE_ID', ctx=Load())), keyword(arg='engine_version', value=Name(id='__version__', ctx=Load())), keyword(arg='case_id', value=Attribute(value=Name(id='target', ctx=Load()), attr='case_id', ctx=Load())), keyword(arg='model', value=Name(id='model', ctx=Load())), keyword(arg='backend', value=Name(id='backend', ctx=Load()))])",
+      "rendered": "step_key_for(REMEDIATE_PREFIX, engine_id=ENGINE_ID, engine_version=__version__, case_id=target.case_id, model=model, backend=backend)"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 11,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='target', ctx=Load()), attr='case_id', ctx=Load())",
+      "rendered": "target.case_id"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='redact', ctx=Load()), args=[Attribute(value=Name(id='target', ctx=Load()), attr='label', ctx=Load())], keywords=[])",
+      "rendered": "redact(target.label)"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='step_key_of', ctx=Load()), args=[Name(id='target', ctx=Load()), Name(id='cfg', ctx=Load())], keywords=[])",
+      "rendered": "step_key_of(target, cfg)"
+    },
+    {
+      "line_start": 102,
+      "line_end": 102,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_finding_identity', ctx=Load()), args=[Name(id='target', ctx=Load())], keywords=[])",
+      "rendered": "_finding_identity(target)"
+    },
+    {
+      "line_start": 105,
+      "line_end": 105,
+      "column": 7,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='opts', ctx=Load()), attr='resume', ctx=Load())",
+      "rendered": "opts.resume"
+    },
+    {
+      "line_start": 106,
+      "line_end": 106,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='load_ckpt', ctx=Load()), args=[Attribute(value=Name(id='layout', ctx=Load()), attr='ckpt_dir', ctx=Load()), Attribute(value=Name(id='layout', ctx=Load()), attr='run_id', ctx=Load()), Name(id='step', ctx=Load())], keywords=[])",
+      "rendered": "load_ckpt(layout.ckpt_dir, layout.run_id, step)"
+    },
+    {
+      "line_start": 107,
+      "line_end": 107,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='cached', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[]), Compare(left=Call(func=Attribute(value=Name(id='cached', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='finding_id')], keywords=[]), ops=[Eq()], comparators=[Name(id='fid', ctx=Load())])])",
+      "rendered": "isinstance(cached, dict) and cached.get('finding_id') == fid"
+    },
+    {
+      "line_start": 108,
+      "line_end": 109,
+      "column": 28,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_result_for_kind', ctx=Load()), args=[Call(func=Attribute(value=Name(id='cached', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='kind')], keywords=[])], keywords=[keyword(arg='diff_captured', value=Call(func=Attribute(value=Name(id='cached', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='diff_captured')], keywords=[]))])",
+      "rendered": "_result_for_kind(cached.get('kind'), diff_captured=cached.get('diff_captured'))"
+    },
+    {
+      "line_start": 110,
+      "line_end": 110,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='stage', ctx=Load()), args=[JoinedStr(values=[FormattedValue(value=Name(id='label', ctx=Load()), conversion=-1), Constant(value=' — cached')])], keywords=[keyword(arg='n', value=Name(id='idx', ctx=Load())), keyword(arg='total', value=Name(id='total', ctx=Load()))])",
+      "rendered": "stage(source_template_110_23, n=idx, total=total)"
+    },
+    {
+      "line_start": 111,
+      "line_end": 111,
+      "column": 19,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='cached_result', ctx=Load()), ops=[Is()], comparators=[Attribute(value=Name(id='_Result', ctx=Load()), attr='NOT_FIXED', ctx=Load())])",
+      "rendered": "cached_result is _Result.NOT_FIXED"
+    },
+    {
+      "line_start": 112,
+      "line_end": 112,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='progress', ctx=Load()), attr='mark_incomplete', ctx=Load()), args=[Constant(value='not fixed')], keywords=[])",
+      "rendered": "progress.mark_incomplete('not fixed')"
+    },
+    {
+      "line_start": 113,
+      "line_end": 113,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='_results', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "_results is not None"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_results', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='cached_result', ctx=Load())], keywords=[])",
+      "rendered": "_results.append(cached_result)"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 119,
+      "line_end": 119,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='artifact_dir', ctx=Load()), args=[Attribute(value=Name(id='layout', ctx=Load()), attr='rem_dir', ctx=Load()), Attribute(value=Name(id='target', ctx=Load()), attr='slug', ctx=Load())], keywords=[])",
+      "rendered": "artifact_dir(layout.rem_dir, target.slug)"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 18,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Attribute(value=Name(id='opts', ctx=Load()), attr='verbose', ctx=Load()), body=Constant(value=False), orelse=Constant(value=None))",
+      "rendered": "False if opts.verbose else None"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='stage', ctx=Load()), args=[Name(id='label', ctx=Load())], keywords=[keyword(arg='n', value=Name(id='idx', ctx=Load())), keyword(arg='total', value=Name(id='total', ctx=Load())), keyword(arg='animate', value=Name(id='animate', ctx=Load()))])",
+      "rendered": "stage(label, n=idx, total=total, animate=animate)"
+    },
+    {
+      "line_start": 125,
+      "line_end": 127,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='apply_plugin', ctx=Load()), args=[Name(id='target', ctx=Load()), Name(id='out_dir', ctx=Load())], keywords=[keyword(arg='cfg', value=Name(id='cfg', ctx=Load())), keyword(arg='repo', value=Name(id='repo_path', ctx=Load())), keyword(arg='mode', value=Attribute(value=Name(id='opts', ctx=Load()), attr='mode', ctx=Load())), keyword(arg='verbose', value=Attribute(value=Name(id='opts', ctx=Load()), attr='verbose', ctx=Load())), keyword(arg='policy_ctx', value=Name(id='policy_ctx', ctx=Load()))])",
+      "rendered": "apply_plugin(target, out_dir, cfg=cfg, repo=repo_path, mode=opts.mode, verbose=opts.verbose, policy_ctx=policy_ctx)"
+    },
+    {
+      "line_start": 129,
+      "line_end": 130,
+      "column": 21,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[None, Constant(value='finding_id')], values=[Call(func=Name(id='checkpoint_record', ctx=Load()), args=[Name(id='target', ctx=Load()), Name(id='out_dir', ctx=Load()), Name(id='remediation', ctx=Load())], keywords=[]), Name(id='fid', ctx=Load())])",
+      "rendered": "{**checkpoint_record(target, out_dir, remediation), 'finding_id': fid}"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='save_ckpt', ctx=Load()), args=[Attribute(value=Name(id='layout', ctx=Load()), attr='ckpt_dir', ctx=Load()), Attribute(value=Name(id='layout', ctx=Load()), attr='run_id', ctx=Load()), Name(id='step', ctx=Load()), Name(id='record', ctx=Load())], keywords=[])",
+      "rendered": "save_ckpt(layout.ckpt_dir, layout.run_id, step, record)"
+    },
+    {
+      "line_start": 132,
+      "line_end": 133,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_result_for_kind', ctx=Load()), args=[Attribute(value=Name(id='remediation', ctx=Load()), attr='kind', ctx=Load())], keywords=[keyword(arg='diff_captured', value=Call(func=Name(id='bool', ctx=Load()), args=[Attribute(value=Name(id='remediation', ctx=Load()), attr='diff', ctx=Load())], keywords=[]))])",
+      "rendered": "_result_for_kind(remediation.kind, diff_captured=bool(remediation.diff))"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 15,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='result', ctx=Load()), ops=[Is()], comparators=[Attribute(value=Name(id='_Result', ctx=Load()), attr='NOT_FIXED', ctx=Load())])",
+      "rendered": "result is _Result.NOT_FIXED"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='progress', ctx=Load()), attr='mark_incomplete', ctx=Load()), args=[Constant(value='not fixed')], keywords=[])",
+      "rendered": "progress.mark_incomplete('not fixed')"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='_results', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "_results is not None"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_results', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='result', ctx=Load())], keywords=[])",
+      "rendered": "_results.append(result)"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Attribute(value=Name(id='Event', ctx=Load()), attr='REMEDIATION_FINDING_FAILED', ctx=Load())], keywords=[keyword(arg='finding', value=Attribute(value=Name(id='target', ctx=Load()), attr='index', ctx=Load())), keyword(arg='detail', value=Call(func=Name(id='redact', ctx=Load()), args=[Call(func=Name(id='str', ctx=Load()), args=[Name(id='e', ctx=Load())], keywords=[])], keywords=[]))])",
+      "rendered": "log.warning(Event.REMEDIATION_FINDING_FAILED, finding=target.index, detail=redact(str(e)))"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='_results', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "_results is not None"
+    },
+    {
+      "line_start": 142,
+      "line_end": 142,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_results', ctx=Load()), attr='append', ctx=Load()), args=[Attribute(value=Name(id='_Result', ctx=Load()), attr='FAILED', ctx=Load())], keywords=[])",
+      "rendered": "_results.append(_Result.FAILED)"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 151,
+      "line_end": 151,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='len', ctx=Load()), args=[Name(id='targets', ctx=Load())], keywords=[])",
+      "rendered": "len(targets)"
+    },
+    {
+      "line_start": 154,
+      "line_end": 154,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_policy', ctx=Load()), attr='build_context', ctx=Load()), args=[Name(id='cfg', ctx=Load()), Name(id='repo_path', ctx=Load())], keywords=[])",
+      "rendered": "_policy.build_context(cfg, repo_path)"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 7,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='policy_ctx', ctx=Load()), attr='enabled', ctx=Load())",
+      "rendered": "policy_ctx.enabled"
+    },
+    {
+      "line_start": 156,
+      "line_end": 157,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[Constant(value='  [Remediation Agent] policy gate ENABLED (deny-list + playbook + diff post-gate)')], keywords=[])",
+      "rendered": "console.write('  [Remediation Agent] policy gate ENABLED (deny-list + playbook + diff post-gate)')"
+    },
+    {
+      "line_start": 158,
+      "line_end": 158,
+      "column": 29,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 159,
+      "line_end": 164,
+      "column": 19,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Call(func=Name(id='remediate_one', ctx=Load()), args=[Name(id='target', ctx=Load())], keywords=[keyword(arg='idx', value=Name(id='i', ctx=Load())), keyword(arg='total', value=Name(id='total', ctx=Load())), keyword(arg='layout', value=Name(id='layout', ctx=Load())), keyword(arg='cfg', value=Name(id='cfg', ctx=Load())), keyword(arg='repo_path', value=Name(id='repo_path', ctx=Load())), keyword(arg='opts', value=Name(id='opts', ctx=Load())), keyword(arg='policy_ctx', value=Name(id='policy_ctx', ctx=Load())), keyword(arg='_results', value=Name(id='results', ctx=Load()))]), generators=[comprehension(target=Tuple(elts=[Name(id='i', ctx=Store()), Name(id='target', ctx=Store())], ctx=Store()), iter=Call(func=Name(id='enumerate', ctx=Load()), args=[Name(id='targets', ctx=Load())], keywords=[keyword(arg='start', value=Constant(value=1))]), ifs=[], is_async=0)])",
+      "rendered": "[remediate_one(target, idx=i, total=total, layout=layout, cfg=cfg, repo_path=repo_path, opts=opts, policy_ctx=policy_ctx, _results=results) for i, target in enumerate(targets, start=1)]"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='results', ctx=Load()), attr='count', ctx=Load()), args=[Attribute(value=Name(id='_Result', ctx=Load()), attr='FIXED', ctx=Load())], keywords=[])",
+      "rendered": "results.count(_Result.FIXED)"
+    },
+    {
+      "line_start": 166,
+      "line_end": 166,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='results', ctx=Load()), attr='count', ctx=Load()), args=[Attribute(value=Name(id='_Result', ctx=Load()), attr='NOT_FIXED', ctx=Load())], keywords=[])",
+      "rendered": "results.count(_Result.NOT_FIXED)"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='results', ctx=Load()), attr='count', ctx=Load()), args=[Attribute(value=Name(id='_Result', ctx=Load()), attr='FAILED', ctx=Load())], keywords=[])",
+      "rendered": "results.count(_Result.FAILED)"
+    },
+    {
+      "line_start": 168,
+      "line_end": 168,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sum', ctx=Load()), args=[Name(id='processed_ok', ctx=Load())], keywords=[])",
+      "rendered": "sum(processed_ok)"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='progress', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "progress is not None"
+    },
+    {
+      "line_start": 171,
+      "line_end": 175,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='progress', ctx=Load()), attr='update', ctx=Load()), args=[], keywords=[keyword(arg='attempted', value=Name(id='total', ctx=Load())), keyword(arg='fixed', value=Name(id='fixed', ctx=Load())), keyword(arg='not_fixed', value=BinOp(left=Name(id='total', ctx=Load()), op=Sub(), right=Name(id='fixed', ctx=Load())))])",
+      "rendered": "progress.update(attempted=total, fixed=fixed, not_fixed=total - fixed)"
+    },
+    {
+      "line_start": 176,
+      "line_end": 176,
+      "column": 19,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='failed', ctx=Load()), body=JoinedStr(values=[Constant(value=', '), FormattedValue(value=Name(id='failed', ctx=Load()), conversion=-1), Constant(value=' failed')]), orelse=Constant(value=''))",
+      "rendered": "source_template_176_19 if failed else ''"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 14,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='failed', ctx=Load()), body=Constant(value='fail'), orelse=IfExp(test=Name(id='not_fixed', ctx=Load()), body=Constant(value='warn'), orelse=Constant(value='ok')))",
+      "rendered": "'fail' if failed else 'warn' if not_fixed else 'ok'"
+    },
+    {
+      "line_start": 178,
+      "line_end": 180,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='mark', ctx=Load()), args=[Name(id='outcome', ctx=Load()), JoinedStr(values=[FormattedValue(value=Name(id='processed', ctx=Load()), conversion=-1), Constant(value='/'), FormattedValue(value=Name(id='total', ctx=Load()), conversion=-1), Constant(value=' findings processed — '), FormattedValue(value=Name(id='fixed', ctx=Load()), conversion=-1), Constant(value='/'), FormattedValue(value=Name(id='total', ctx=Load()), conversion=-1), Constant(value=' fixed, '), FormattedValue(value=Name(id='not_fixed', ctx=Load()), conversion=-1), Constant(value=' not fixed'), FormattedValue(value=Name(id='failure_note', ctx=Load()), conversion=-1)])], keywords=[keyword(arg='lead', value=Constant(value='\\n'))])",
+      "rendered": "console.mark(outcome, source_template_178_26, lead=source_literal_180_22)"
+    },
+    {
+      "line_start": 183,
+      "line_end": 183,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='augment_reports', ctx=Load()), args=[Name(id='repo_path', ctx=Load()), Name(id='report', ctx=Load())], keywords=[])",
+      "rendered": "augment_reports(repo_path, report)"
+    },
+    {
+      "line_start": 184,
+      "line_end": 184,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=Name(id='failed', ctx=Load()), ops=[Eq()], comparators=[Constant(value=0)]), body=Constant(value=0), orelse=Constant(value=1))",
+      "rendered": "0 if failed == 0 else 1"
+    }
+  ],
+  "calls": [
+    {
+      "line": 47,
+      "end_line": 47,
+      "callee": "logs.get_logger",
+      "enclosing": "module initialization",
+      "expression": "logs.get_logger(__name__)"
+    },
+    {
+      "line": 85,
+      "end_line": 85,
+      "callee": "engine_model",
+      "enclosing": "step_key_of",
+      "expression": "engine_model(cfg)"
+    },
+    {
+      "line": 86,
+      "end_line": 88,
+      "callee": "step_key_for",
+      "enclosing": "step_key_of",
+      "expression": "step_key_for(REMEDIATE_PREFIX, engine_id=ENGINE_ID,\n                        engine_version=__version__, case_id=target.case_id,\n                        model=model, backend=backend)"
+    },
+    {
+      "line": 100,
+      "end_line": 100,
+      "callee": "redact",
+      "enclosing": "remediate_one",
+      "expression": "redact(target.label)"
+    },
+    {
+      "line": 101,
+      "end_line": 101,
+      "callee": "step_key_of",
+      "enclosing": "remediate_one",
+      "expression": "step_key_of(target, cfg)"
+    },
+    {
+      "line": 102,
+      "end_line": 102,
+      "callee": "_finding_identity",
+      "enclosing": "remediate_one",
+      "expression": "_finding_identity(target)"
+    },
+    {
+      "line": 119,
+      "end_line": 119,
+      "callee": "artifact_dir",
+      "enclosing": "remediate_one",
+      "expression": "artifact_dir(layout.rem_dir, target.slug)"
+    },
+    {
+      "line": 151,
+      "end_line": 151,
+      "callee": "len",
+      "enclosing": "process_targets",
+      "expression": "len(targets)"
+    },
+    {
+      "line": 154,
+      "end_line": 154,
+      "callee": "_policy.build_context",
+      "enclosing": "process_targets",
+      "expression": "_policy.build_context(cfg, repo_path)"
+    },
+    {
+      "line": 165,
+      "end_line": 165,
+      "callee": "results.count",
+      "enclosing": "process_targets",
+      "expression": "results.count(_Result.FIXED)"
+    },
+    {
+      "line": 166,
+      "end_line": 166,
+      "callee": "results.count",
+      "enclosing": "process_targets",
+      "expression": "results.count(_Result.NOT_FIXED)"
+    },
+    {
+      "line": 167,
+      "end_line": 167,
+      "callee": "results.count",
+      "enclosing": "process_targets",
+      "expression": "results.count(_Result.FAILED)"
+    },
+    {
+      "line": 168,
+      "end_line": 168,
+      "callee": "sum",
+      "enclosing": "process_targets",
+      "expression": "sum(processed_ok)"
+    },
+    {
+      "line": 178,
+      "end_line": 180,
+      "callee": "console.mark",
+      "enclosing": "process_targets",
+      "expression": "console.mark(outcome, f\"{processed}/{total} findings processed — \"\n                 f\"{fixed}/{total} fixed, {not_fixed} not fixed{failure_note}\",\n                 lead=\"\\n\")"
+    },
+    {
+      "line": 183,
+      "end_line": 183,
+      "callee": "augment_reports",
+      "enclosing": "process_targets",
+      "expression": "augment_reports(repo_path, report)"
+    },
+    {
+      "line": 61,
+      "end_line": 61,
+      "callee": "isinstance",
+      "enclosing": "_result_for_kind",
+      "expression": "isinstance(kind, RemediationKind)"
+    },
+    {
+      "line": 74,
+      "end_line": 74,
+      "callee": "resolve_model",
+      "enclosing": "model_banner",
+      "expression": "resolve_model(cfg.models.remediate)"
+    },
+    {
+      "line": 106,
+      "end_line": 106,
+      "callee": "load_ckpt",
+      "enclosing": "remediate_one",
+      "expression": "load_ckpt(layout.ckpt_dir, layout.run_id, step)"
+    },
+    {
+      "line": 156,
+      "end_line": 157,
+      "callee": "console.write",
+      "enclosing": "process_targets",
+      "expression": "console.write(\"  [Remediation Agent] policy gate ENABLED \"\n                      \"(deny-list + playbook + diff post-gate)\")"
+    },
+    {
+      "line": 160,
+      "end_line": 162,
+      "callee": "remediate_one",
+      "enclosing": "process_targets",
+      "expression": "remediate_one(target, idx=i, total=total, layout=layout, cfg=cfg,\n                      repo_path=repo_path, opts=opts, policy_ctx=policy_ctx,\n                      _results=results)"
+    },
+    {
+      "line": 171,
+      "end_line": 175,
+      "callee": "progress.update",
+      "enclosing": "process_targets",
+      "expression": "progress.update(\n            attempted=total,\n            fixed=fixed,\n            not_fixed=total - fixed,\n        )"
+    },
+    {
+      "line": 107,
+      "end_line": 107,
+      "callee": "isinstance",
+      "enclosing": "remediate_one",
+      "expression": "isinstance(cached, dict)"
+    },
+    {
+      "line": 108,
+      "end_line": 109,
+      "callee": "_result_for_kind",
+      "enclosing": "remediate_one",
+      "expression": "_result_for_kind(\n                cached.get(\"kind\"), diff_captured=cached.get(\"diff_captured\"))"
+    },
+    {
+      "line": 124,
+      "end_line": 124,
+      "callee": "stage",
+      "enclosing": "remediate_one",
+      "expression": "stage(label, n=idx, total=total, animate=animate)"
+    },
+    {
+      "line": 125,
+      "end_line": 127,
+      "callee": "apply_plugin",
+      "enclosing": "remediate_one",
+      "expression": "apply_plugin(target, out_dir, cfg=cfg, repo=repo_path,\n                                       mode=opts.mode, verbose=opts.verbose,\n                                       policy_ctx=policy_ctx)"
+    },
+    {
+      "line": 131,
+      "end_line": 131,
+      "callee": "save_ckpt",
+      "enclosing": "remediate_one",
+      "expression": "save_ckpt(layout.ckpt_dir, layout.run_id, step, record)"
+    },
+    {
+      "line": 132,
+      "end_line": 133,
+      "callee": "_result_for_kind",
+      "enclosing": "remediate_one",
+      "expression": "_result_for_kind(\n                remediation.kind, diff_captured=bool(remediation.diff))"
+    },
+    {
+      "line": 137,
+      "end_line": 137,
+      "callee": "_results.append",
+      "enclosing": "remediate_one",
+      "expression": "_results.append(result)"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "log.warning",
+      "enclosing": "remediate_one",
+      "expression": "log.warning(Event.REMEDIATION_FINDING_FAILED, finding=target.index, detail=redact(str(e)))"
+    },
+    {
+      "line": 163,
+      "end_line": 163,
+      "callee": "enumerate",
+      "enclosing": "process_targets",
+      "expression": "enumerate(targets, start=1)"
+    },
+    {
+      "line": 107,
+      "end_line": 107,
+      "callee": "cached.get",
+      "enclosing": "remediate_one",
+      "expression": "cached.get(\"finding_id\")"
+    },
+    {
+      "line": 109,
+      "end_line": 109,
+      "callee": "cached.get",
+      "enclosing": "remediate_one",
+      "expression": "cached.get(\"kind\")"
+    },
+    {
+      "line": 110,
+      "end_line": 110,
+      "callee": "stage",
+      "enclosing": "remediate_one",
+      "expression": "stage(f\"{label} — cached\", n=idx, total=total)"
+    },
+    {
+      "line": 114,
+      "end_line": 114,
+      "callee": "_results.append",
+      "enclosing": "remediate_one",
+      "expression": "_results.append(cached_result)"
+    },
+    {
+      "line": 129,
+      "end_line": 129,
+      "callee": "checkpoint_record",
+      "enclosing": "remediate_one",
+      "expression": "checkpoint_record(target, out_dir, remediation)"
+    },
+    {
+      "line": 135,
+      "end_line": 135,
+      "callee": "progress.mark_incomplete",
+      "enclosing": "remediate_one",
+      "expression": "progress.mark_incomplete(\"not fixed\")"
+    },
+    {
+      "line": 142,
+      "end_line": 142,
+      "callee": "_results.append",
+      "enclosing": "remediate_one",
+      "expression": "_results.append(_Result.FAILED)"
+    },
+    {
+      "line": 109,
+      "end_line": 109,
+      "callee": "cached.get",
+      "enclosing": "remediate_one",
+      "expression": "cached.get(\"diff_captured\")"
+    },
+    {
+      "line": 112,
+      "end_line": 112,
+      "callee": "progress.mark_incomplete",
+      "enclosing": "remediate_one",
+      "expression": "progress.mark_incomplete(\"not fixed\")"
+    },
+    {
+      "line": 133,
+      "end_line": 133,
+      "callee": "bool",
+      "enclosing": "remediate_one",
+      "expression": "bool(remediation.diff)"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "redact",
+      "enclosing": "remediate_one",
+      "expression": "redact(str(e))"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "str",
+      "enclosing": "remediate_one",
+      "expression": "str(e)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 16,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 17,
+      "source_expression": "from vvaharness.util import logs",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.logs"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/logs.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 19,
+      "source_expression": "from collections.abc import MutableMapping",
+      "targets": [
+        "collections.abc",
+        "collections.abc.MutableMapping"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "from enum import Enum",
+      "targets": [
+        "enum",
+        "enum.Enum"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "from pathlib import Path",
+      "targets": [
+        "pathlib",
+        "pathlib.Path"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 23,
+      "source_expression": "from vvaharness.backends.llm.registry import resolve as resolve_model",
+      "targets": [
+        "vvaharness.backends.llm.registry",
+        "vvaharness.backends.llm.registry.resolve"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/llm/registry.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 24,
+      "source_expression": "from vvaharness.models import RemediationKind",
+      "targets": [
+        "vvaharness.models",
+        "vvaharness.models.RemediationKind"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 25,
+      "source_expression": "from vvaharness.orchestrator.artifacts import artifact_dir",
+      "targets": [
+        "vvaharness.orchestrator.artifacts",
+        "vvaharness.orchestrator.artifacts.artifact_dir"
+      ],
+      "local_source_paths": [
+        "vvaharness/orchestrator/artifacts.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 26,
+      "source_expression": "from vvaharness.orchestrator.checkpoints import REMEDIATE_PREFIX, load_ckpt, save_ckpt, step_key_for",
+      "targets": [
+        "vvaharness.orchestrator.checkpoints",
+        "vvaharness.orchestrator.checkpoints.REMEDIATE_PREFIX",
+        "vvaharness.orchestrator.checkpoints.load_ckpt",
+        "vvaharness.orchestrator.checkpoints.save_ckpt",
+        "vvaharness.orchestrator.checkpoints.step_key_for"
+      ],
+      "local_source_paths": [
+        "vvaharness/orchestrator/checkpoints.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 32,
+      "source_expression": "from vvaharness.remediation_agent import policy as _policy",
+      "targets": [
+        "vvaharness.remediation_agent",
+        "vvaharness.remediation_agent.policy"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/__init__.py",
+        "vvaharness/remediation_agent/policy/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 33,
+      "source_expression": "from vvaharness.remediation_agent.discovery import Layout",
+      "targets": [
+        "vvaharness.remediation_agent.discovery",
+        "vvaharness.remediation_agent.discovery.Layout"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/discovery.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 34,
+      "source_expression": "from vvaharness.remediation_agent.options import RemediateOptions",
+      "targets": [
+        "vvaharness.remediation_agent.options",
+        "vvaharness.remediation_agent.options.RemediateOptions"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/options.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 35,
+      "source_expression": "from vvaharness.remediation_agent.plugin_runner import ENGINE_ID, apply_plugin, checkpoint_record, engine_model",
+      "targets": [
+        "vvaharness.remediation_agent.plugin_runner",
+        "vvaharness.remediation_agent.plugin_runner.ENGINE_ID",
+        "vvaharness.remediation_agent.plugin_runner.apply_plugin",
+        "vvaharness.remediation_agent.plugin_runner.checkpoint_record",
+        "vvaharness.remediation_agent.plugin_runner.engine_model"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/plugin_runner/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 41,
+      "source_expression": "from vvaharness.remediation_agent.target import RemediationTarget",
+      "targets": [
+        "vvaharness.remediation_agent.target",
+        "vvaharness.remediation_agent.target.RemediationTarget"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/target.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 42,
+      "source_expression": "from vvaharness.report.redact import redact",
+      "targets": [
+        "vvaharness.report.redact",
+        "vvaharness.report.redact.redact"
+      ],
+      "local_source_paths": [
+        "vvaharness/report/redact.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 43,
+      "source_expression": "from vvaharness.util import console",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.console"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/console.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 44,
+      "source_expression": "from vvaharness.util.status import stage",
+      "targets": [
+        "vvaharness.util.status",
+        "vvaharness.util.status.stage"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/status.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 45,
+      "source_expression": "from vvaharness.util.events import Event",
+      "targets": [
+        "vvaharness.util.events",
+        "vvaharness.util.events.Event"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/events.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 83,
+      "source_expression": "from vvaharness import __version__",
+      "targets": [
+        "vvaharness",
+        "vvaharness.__version__"
+      ],
+      "local_source_paths": [
+        "vvaharness/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 182,
+      "source_expression": "from vvaharness.remediation_agent.report_augment import augment_reports",
+      "targets": [
+        "vvaharness.remediation_agent.report_augment",
+        "vvaharness.remediation_agent.report_augment.augment_reports"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/report_augment/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

@@ -1,0 +1,312 @@
+# vvaharness/pipeline/stages/s4/session.py
+
+One agentic deep-dive session per unit (or per batch of units): the native-tool allow list, the graph and CWE knowledge tools with their budgets, the planning middleware and the evidence gate on the outcome tool, the model call itself with its deadline and replay fallback, one bounded JSON-repair re-ask, and the per-session finding cap and same-site deduplication.
+
+Source: `vvaharness/pipeline/stages/s4/session.py` (lines 1-514)
+Executor: mixed
+Called from: `vvaharness/pipeline/stages/s4_deepdive.py` run and _submit_batch
+
+// src: vvaharness/pipeline/stages/s4/session.py:366-376
+fn investigate_unit(unit, ctx, repo_root, cfg, stats?):executor=code {
+  require !cli.aborted() => throw RuntimeError("aborted by user (Ctrl-C)")
+  line_bucket = knob("step4.line_bucket", default=10)
+  findings = _investigate_unit_once(unit, ctx, repo_root, cfg)
+  [deduped, merged] = _dedup_by_key(findings, line_bucket)
+  if (stats != null) stats.merged = merged
+  return deduped
+}
+
+// src: vvaharness/pipeline/stages/s4/session.py:243-337
+fn _investigate_unit_once(unit, ctx, repo_root, cfg):executor=mixed {
+  code = _load_code(unit, repo_root, cfg.step4)
+  via = resolve_model(knob("models.deepdive")).via
+  response_model = if (via in RESPONSE_MODEL_VIAS) InvestigationOutcome else null   // structured output only on routes that honour it
+  degenerate_stand_down_counted = [false]   // fresh per unit, not per attempt, so the stand-down counter bumps once per unit
+  tag = "s4 ${unit.id}"
+  graph = _graph_tools_registered(ctx, cfg)   // one value for system, first-turn and planner prompts
+  effort = knob("step4.effort", default=null)
+  tools = deepdive_tools(cfg)
+
+  // src: :260-275 — rebuilt per attempt: budgets and the gate are stateful
+  fn _dispatch(drop_thinking):executor=mixed {
+    [tool_builder, fact_tools, middleware] = _tool_setup(ctx, cfg.step4, cfg=cfg, degenerate_stand_down_counted, tag, graph)
+    initial = s4.prompts.build_initial_prompt(unit, code, _cap_int(cfg.step4, "max_model_calls", 0), graph)
+    transcript = new Transcript; middleware += RecordTranscript(transcript)
+    session_id = pinned_session("s4", unit.id)   // external to this batch: pipeline/stages/replay
+    return _deadline_bounded(
+      call = () => _agentic(initial, tool_builder, fact_tools, middleware, session_id, drop_thinking),
+      replay = () => _replay_call(initial, transcript, cfg, repo_root, tag, response_model),
+      cfg, tag, session_id)
+  }
+
+  // src: :277-302
+  fn _agentic(initial, tool_builder, fact_tools, middleware, session_id, drop_thinking):executor=model {
+    callModel({
+      role: "deepdive",
+      route: resolve_model(knob("models.deepdive")).via,   // dispatched through backends/llm/deepagents.dispatch_agentic
+      system: s4.prompts.build_system_prompt(shell=knob("step4.bash", default=false), graph),
+      cache_prefix: s4_deepdive._build_shared_context_block(ctx) or null,
+      prompt: initial,   // S4 initial prompt, see s4/prompts.sudo build_initial_prompt
+      tools: [
+        ...tools,                     // native allow list, default ["Read", "Glob", "Grep"]
+        ...fact_tools,                // graph tools (graph_tool_names()); plus CweGuidance and the other KB_TOOL_NAMES when step4.cwe_tools (default true)
+        "write_todos",                // from the planner middleware when step4.planning (default true)
+        "execute",                    // shell, only when knob("step4.bash", default=false)
+        skill files under .vvaharness/skills  // skill_root = inject_skills(repo_root) when knob("step4.skills", default=true)
+      ],
+      limits: {
+        max_turns: _cap_int(cfg.step4, "max_turns", 15),
+        max_output_tokens: knob("step4.max_tokens", default=64000),
+        timeout: _session_timeout(cfg, if (drop_thinking) null else effort),
+        effort: if (drop_thinking) null else effort,
+        middleware   // tool budgets, model-call budget, evidence gate, transcript recorder
+      },
+      output: response_model   // InvestigationOutcome on structured routes, else free text parsed afterwards
+    })
+  }
+
+  // src: :304-307 — one resend without the effort tier when the reply was a schema rejection or an at-cap clip; one identical resend of a first ModelRefusal when allowed
+  raw = dispatch_or_retry_unforced(_dispatch, unit.id, stage="s4",
+          effort=deepagents.droppable_effort(knob("models.deepdive"), effort, agentic=true),
+          resend_refusal=refusal_resend_allowed(cfg, knob("models.deepdive")))   // external to this batch: util/response_quality, backends/llm/models
+  [findings, by_unit] = s4.outcomes.reduce_outcomes([unit], { [unit.id]: raw }, cfg, repo_root, inventory=set(ctx.all_files))
+
+  // src: :310-332 — one bounded repair re-ask when the primary reply did not parse
+  if (by_unit[unit.id] == "failed") {
+    errlog.log("s4", unit.id, "primary reply did not parse as an InvestigationOutcome", reason="s4_outcome_repair_attempted", recovered=true)
+    repaired = callModel({
+      role: "deepdive", route: resolve_model(knob("models.deepdive")).via,   // deepagents.dispatch_prompt, no tools
+      prompt: _repair_prompt(raw, unit.id),
+      tools: [],
+      limits: { max_tokens: knob("step4.max_tokens", default=64000) },   // full budget: the repair re-emits the whole outcome
+      output: response_model
+    })
+    [findings, by_unit] = s4.outcomes.reduce_outcomes([unit], { [unit.id]: repaired }, cfg, repo_root, inventory=set(ctx.all_files))
+  }
+  // src: :333-335
+  require by_unit[unit.id] != "failed" => throw RuntimeError("s4-deepdive: ${unit.id}'s session reply did not parse as an InvestigationOutcome, even after repair")
+  return _cap_findings(unit.id, findings, cfg)
+}
+
+// src: vvaharness/pipeline/stages/s4/session.py:186-193
+// prompt-src: vvaharness/pipeline/stages/s4/session.py:187-193
+_repair_prompt {
+  $raw; $unit_id
+  Constraints {
+    "REPAIR TASK: the previous reply was supposed to be a JSON object matching the InvestigationOutcome schema (unit_id, verdict, rationale, findings[]) but failed to parse."
+    "Return ONLY the corrected JSON object."
+    "`unit_id` MUST be exactly $unit_id."   // $unit_id is inserted as a Python repr, in single quotes
+    "Preserve every finding and fact already present."
+    then "--- ORIGINAL REPLY ---" followed by $raw
+  }
+}
+
+// src: vvaharness/pipeline/stages/s4/session.py:462-514
+fn investigate_batch(batch, ctx, repo_root, cfg, stats?):executor=mixed {
+  ids = ids of batch
+  raw = _batch_reply(batch, ctx, repo_root, cfg)
+  per_unit = s4.outcomes.split_batch_reply(raw, ids)
+  // src: :471-493 — one bounded repair when nothing in the shared reply parsed
+  if (per_unit is empty) {
+    errlog.log("s4", "batch[${length(batch)}] ${batch[0].id}", "shared session reply did not parse as InvestigationOutcomes", reason="s4_batch_repair_attempted", recovered=true)
+    repaired = callModel({
+      role: "deepdive", route: resolve_model(knob("models.deepdive")).via,   // deepagents.dispatch_prompt, no tools
+      prompt: _batch_repair_prompt(raw, ids),
+      tools: [],
+      limits: { max_tokens: knob("step4.max_tokens", default=64000) },
+      output: if (via in RESPONSE_MODEL_VIAS) InvestigationOutcomes else null
+    })
+    per_unit = s4.outcomes.split_batch_reply(repaired, ids)
+  }
+  require per_unit is non-empty => throw RuntimeError("s4-deepdive: the shared session for $ids returned no parseable InvestigationOutcomes, even after repair")
+  [findings, by_unit] = s4.outcomes.reduce_outcomes(batch, per_unit, cfg, repo_root, inventory=set(ctx.all_files))
+  out = every batch unit id -> []
+  for each f in findings, out[f.chunk_id] += f;
+  // src: :502-510 — the same cap and dedup as the single-unit path, per member
+  line_bucket = knob("step4.line_bucket", default=10)
+  for each u in batch {
+    capped = _cap_findings(u.id, out[u.id], cfg)
+    [out[u.id], merged_by_unit[u.id]] = _dedup_by_key(capped, line_bucket)
+  }
+  if (stats != null) stats.merged_by_unit = merged_by_unit
+  // abstracted: :511-513 counters s4_batch_member_uninvestigated / s4_batch_member_failed
+  return [out, by_unit]   // by_unit carries "uninvestigated" / "failed" for a member the reply omitted or that did not parse
+}
+
+// src: vvaharness/pipeline/stages/s4/session.py:389-459
+fn _batch_reply(batch, ctx, repo_root, cfg):executor=mixed {
+  files = distinct files across batch, first-seen order
+  // inline only when step4.inline_source is on AND no member is LARGE
+  code = if (knob("step4.inline_source", default=false) && no unit in batch is UnitSize.LARGE) s4_deepdive._load_files_full(files, repo_root) else null
+  response_model = if (via in RESPONSE_MODEL_VIAS) InvestigationOutcomes else null
+  degenerate_stand_down_counted = [false]   // fresh per batch
+  tag = "s4 batch[${length(batch)}] ${batch[0].id}"
+  graph = _graph_tools_registered(ctx, cfg)
+  effort = knob("step4.effort", default=null)
+  tools = deepdive_tools(cfg)
+
+  fn _dispatch(drop_thinking):executor=mixed {
+    // outcome tool is InvestigationOutcomes and the model-call budget grows by one per extra member
+    [tool_builder, fact_tools, middleware] = _tool_setup(ctx, cfg.step4, "InvestigationOutcomes", length(batch), cfg=cfg, degenerate_stand_down_counted, tag, graph)
+    initial = s4.prompts.build_batch_prompt(batch, code, length(files), _cap_int(cfg.step4, "max_model_calls", 0), graph)
+    transcript = new Transcript; middleware += RecordTranscript(transcript)
+    session_id = pinned_session("s4", batch[0].id)
+    return _deadline_bounded(call = () => callModel({
+        role: "deepdive", route: resolve_model(knob("models.deepdive")).via,
+        system: s4.prompts.build_system_prompt(shell=knob("step4.bash", default=false), graph),
+        cache_prefix: s4_deepdive._build_shared_context_block(ctx) or null,
+        prompt: initial,
+        tools: [...tools, ...fact_tools, "write_todos" (if planning), "execute" (if step4.bash), skills (if step4.skills)],
+        limits: { max_turns: _cap_int(cfg.step4, "max_turns", 15), max_output_tokens: knob("step4.max_tokens", default=64000),
+                  timeout: _session_timeout(cfg, if (drop_thinking) null else effort), effort: if (drop_thinking) null else effort, middleware },
+        output: response_model
+      }),
+      replay = () => _replay_call(initial, transcript, cfg, repo_root, tag, response_model),
+      cfg, tag, session_id)
+  }
+  return dispatch_or_retry_unforced(_dispatch, "batch[${length(batch)}] ${batch[0].id}", stage="s4",
+           effort=deepagents.droppable_effort(knob("models.deepdive"), effort, agentic=true),
+           resend_refusal=refusal_resend_allowed(cfg, knob("models.deepdive")))
+}
+
+// src: vvaharness/pipeline/stages/s4/session.py:379-386
+// prompt-src: vvaharness/pipeline/stages/s4/session.py:380-386
+_batch_repair_prompt {
+  $raw; $unit_ids
+  Constraints {
+    "REPAIR TASK: the previous reply was supposed to be a JSON object {\"outcomes\": [...]} holding one InvestigationOutcome (unit_id, verdict, rationale, findings[]) for EACH of these units, but failed to parse."
+    "Return ONLY the corrected JSON object."
+    "The `unit_id` values MUST be exactly these, one entry each: $unit_ids."
+    "Preserve every finding and fact already present."
+    then "--- ORIGINAL REPLY ---" followed by $raw
+  }
+}
+
+// ---------- tool set and middleware ----------
+
+// src: vvaharness/pipeline/stages/s4/session.py:83-88
+fn deepdive_tools(cfg):executor=code {
+  // without an allow list the cli bridge would send `--tools ""` and the plain cli leg would have no jail at all
+  return validate_detection_tools(knob("step4.allowed_tools", default=["Read", "Glob", "Grep"]), config_key="step4.allowed_tools", via=resolve_model(knob("models.deepdive")).via)
+  // external to this batch (backends/llm/models): on any route except "cli", require every tool is in DEFAULT_READ_TOOLS => throw ValueError (a mutating tool on via sdk could modify the scanned repository)
+}
+
+// src: vvaharness/pipeline/stages/s4/session.py:156-175
+fn _tool_setup(ctx, s4, outcome="InvestigationOutcome", members=1, cfg?, degenerate_stand_down_counted?, tag="", graph=true):executor=code {
+  builders = [build_graph_tool_builder(ctx)]
+  names = graph_tool_names()
+  middleware = [_budget(s4, "graph_tool_budget", graph_tool_names(), "s4_graph_tool_budget_exhausted")]
+  // preserved: the graph tool builder, names and budget are composed even when `graph` is false; here `graph` only changes the planner wording
+  // settled: with ctx.graph_handle null the builder still returns the reader tools but zero graph tools (_graph_tools returns []); the graph tool names and budget stay registered with no callable behind them
+  // src: vvaharness/codegraph/tools.py:310-329
+  if (knob("step4.cwe_tools", default=true)) {
+    builders += build_kb_tool_builder(); names += KB_TOOL_NAMES
+    middleware += _budget(s4, "cwe_tool_budget", KB_TOOL_NAMES, "s4_cwe_tool_budget_exhausted")
+  }
+  middleware += [_planner(s4, graph), _gate(s4, ctx, cfg, degenerate_stand_down_counted), _call_budget(s4, outcome, members, tag)]
+  return [compose_tool_builders(builders), names, middleware without nulls]
+}
+
+// src: vvaharness/pipeline/stages/s4/session.py:91-96
+fn _budget(s4, key, names, counter):executor=code {
+  limit = _cap_int(s4, key, 6)   // step4.graph_tool_budget and step4.cwe_tool_budget both default to 6
+  if (limit <= 0) return null    // unmetered
+  return ToolCallBudget(names, limit, counter)
+  require calls to the metered tools in one session <= limit   // enforced by the ToolCallBudget middleware (external to this batch)
+}
+
+// src: vvaharness/pipeline/stages/s4/session.py:99-113
+fn _call_budget(s4, outcome, members=1, tag=""):executor=code {
+  limit = _cap_int(s4, "max_model_calls", 0)
+  if (limit <= 0) return null   // unmetered
+  return ModelCallBudget(limit = limit + max(0, members - 1), outcome_tools=[outcome], counter="s4_model_call_budget_final_turn", raise_when_exhausted=true, stage=tag)
+  // on the last allowed call every tool except the outcome tool is withdrawn; exhausting the budget raises
+}
+
+// src: vvaharness/pipeline/stages/s4/session.py:116-119
+fn _graph_tools_registered(ctx, cfg?):executor=code {
+  // the ONE predicate every graph-naming prompt is gated on
+  return ctx.graph_handle != null && !graph_is_degenerate(ctx, cfg)
+}
+
+// src: vvaharness/pipeline/stages/s4/session.py:122-127
+fn _planner(s4, graph=true):executor=code {
+  if (!knob("step4.planning", default=true)) return null
+  return TodoListMiddleware(system_prompt=s4.prompts.build_plan_system_prompt(graph), tool_description=s4.prompts.PLAN_TOOL_DESCRIPTION)   // external: langchain middleware offering write_todos
+}
+
+// src: vvaharness/pipeline/stages/s4/session.py:130-153
+fn _gate(s4, ctx, cfg?, degenerate_stand_down_counted?):executor=code {
+  if (!knob("step4.planning", default=true) || !knob("step4.evidence_gate", default=true)) return null
+  declared = knob("step4.require_graph", default=true)
+  degenerate = declared && graph_is_degenerate(ctx, cfg)
+  if (degenerate) {
+    warn "step4.require_graph is on but the code graph is absent or degenerate ... standing the graph-tool requirement down; the todo-list gate still applies."   // once per process
+    COUNTERS.bump("evidence_gate_stood_down_degenerate_graph") once per unit (shared flag)
+  }
+  required = if (declared && !degenerate) GRAPH_TOOL_NAMES else []
+  return EvidenceGate(max_rejections=_cap_int(s4, "evidence_gate_refusals", 3), counter="s4_evidence_gate_rejected", required_tools=required)
+  // EvidenceGate (external to this batch): require every todo is completed and every required graph tool has run before the outcome tool is accepted => the call is refused and handed back, up to max_rejections times
+}
+
+// src: vvaharness/pipeline/stages/s4/session.py:178-183
+fn _load_code(unit, repo_root, s4):executor=code {
+  if (unit.size == UnitSize.LARGE || !knob("step4.inline_source", default=false)) return null
+  return s4_deepdive._load_files_full(unit.files, repo_root)
+}
+
+// ---------- deadline and replay ----------
+
+// src: vvaharness/pipeline/stages/s4/session.py:197-209
+_REPLAY_EFFORT = "low"   // the replay restates a transcript; it needs the smallest reasoning budget
+fn _deadline_seconds(cfg):executor=code { return knob("step4.deadline", default=0) as integer }   // 0 = no clock
+fn _session_timeout(cfg, effort):executor=code {
+  return deadline_bound(null, _deadline_seconds(cfg), effort, via=resolve_model(knob("models.deepdive")).via)   // external to this batch: pipeline/stages/replay; stops the route session before step4.deadline abandons it
+}
+
+// src: vvaharness/pipeline/stages/s4/session.py:212-222
+fn _deadline_bounded(call, replay, cfg, tag, session_id):executor=code {
+  seconds = _deadline_seconds(cfg)
+  try return run_with_deadline(call, seconds, stage=tag, effort=_REPLAY_EFFORT);
+  catch CallTimeoutError => {
+    // resume the same session for its outcome, falling back to the tool-free replay
+    return resume_or_replay(session_id, replay, model=knob("models.deepdive"), cfg, instruction=S4_REPLAY_INSTRUCTION, stage="s4", tag, timeout=_cap_int(cfg.step4, "resume_timeout", 60))
+  }
+  // settled: resume_or_replay always tries _resume_agentic first; ModelRefusal re-raises, any other exception calls replay(); the pinned session is released either way
+  // src: vvaharness/pipeline/stages/replay.py:312-336
+}
+
+// src: vvaharness/pipeline/stages/s4/session.py:225-240
+fn _replay_call(prompt_text, transcript, cfg, repo_root, tag, response_model):executor=model {
+  COUNTERS.bump("s4_deadline_replay")
+  callModel({
+    role: "deepdive", route: resolve_model(knob("models.deepdive")).via,   // deepagents.dispatch_prompt
+    prompt: replay_prompt(transcript, prompt_text, instruction=S4_REPLAY_INSTRUCTION, stage="s4"),   // prompt text lives in pipeline/stages/replay (outside this batch)
+    tools: [],   // tool-free re-ask
+    limits: { max_tokens: _cap_int(cfg.step4, "replay_max_tokens", 16000), timeout: _cap_int(cfg.step4, "replay_timeout", 60), effort: "low" },
+    output: response_model
+  })
+}
+
+// ---------- per-session guards ----------
+
+// src: vvaharness/pipeline/stages/s4/session.py:340-350
+fn _cap_findings(unit_id, findings, cfg):executor=code {
+  cap = knob("step4.max_findings_per_run", default=null)
+  if (cap && length(findings) > cap) {
+    // caps ONE session, in emission order (Finding has no confidence to rank by)
+    COUNTERS.bump("s4_findings_truncated", length(findings) - cap)
+    warn S4_FINDINGS_CAPPED
+    findings = first cap findings
+  }
+  return findings
+}
+
+// src: vvaharness/pipeline/stages/s4/session.py:353-363
+fn _dedup_by_key(findings, line_bucket):executor=code {
+  // first-seen wins: Stage 4 sets no confidence, so every finding carries the 0.5 default
+  by_key = first finding per f.canonical_key(line_bucket)
+  merged = length(findings) - length(by_key)
+  if (merged > 0) COUNTERS.bump("s4_unit_key_deduped", merged)
+  return [values of by_key, merged]
+}

@@ -1,0 +1,166 @@
+# vvaharness/util/response_quality.py
+
+The degenerate-response gate (error code VVAH-E003) applied to model backend return values, plus the shared classifiers that decide whether a failed model call is retried: structured-output rejection, truncation, refusal, timeout, dropped connection, and deterministic failure. Also the wrapper that resends a rejected or clipped call once without the effort tier.
+
+Source: `vvaharness/util/response_quality.py` (lines 1-396)
+Executor: code
+Called from: model backends (`vvaharness/backends/llm/cli/`, `sdk.py`, `openai.py`, `deepagents.py`, `cli_mcp.py`) and stage sessions (`vvaharness/pipeline/stages/s2/session.py`, `s4/session.py`, `s6/session.py`, `s7/session.py`, `s8/session.py`)
+
+// src: vvaharness/util/response_quality.py:53-64
+_DEFAULT_MIN_CHARS = 150
+_DEFAULT_MIN_TOKENS = 30
+_DEGENERATE_MAX_CONSECUTIVE = 3
+_RAW_HEAD_CHARS = 300   // reply head written to the error log for a degenerate reply
+State {
+  _consecutive: Map(stage -> Number)   // consecutive degenerate replies per stage, under one lock
+  _stage_floors: Map(stage -> (min_chars | null, min_tokens | null))   // per-stage overrides; null keeps that axis' default
+}
+
+// src: vvaharness/util/response_quality.py:67-70
+fn reset_counters():executor=code {
+  clear _consecutive   // called between repositories in batch runs
+}
+
+// src: vvaharness/util/response_quality.py:73-94
+fn stage_floors(stage, min_chars?, min_tokens?):executor=code {
+  // context manager: sets _stage_floors[stage] for the duration of the block
+  constraint OnEveryExit { restore the previous override for stage, or remove it if there was none }
+}
+
+// src: vvaharness/util/response_quality.py:99-111
+fn output_tokens_for_gate(usage):executor=code {
+  // "Absent vs zero: None = not measured, 0 IS degenerate"
+  if (usage == null || usage.output_tokens == null) return null
+  return integer(usage.output_tokens), or null when it is not numeric
+}
+
+// src: vvaharness/util/response_quality.py:114-186
+fn check_response_quality(text, stage="", min_chars?, output_tokens?, expected_markers?):executor=code {
+  [ov_chars, ov_tokens] = _stage_floors[stage] or (null, null)
+  if (min_chars == null) min_chars = if (ov_chars != null) ov_chars else _DEFAULT_MIN_CHARS   // an explicit argument beats the stage override
+  min_tokens = if (ov_tokens != null) ov_tokens else _DEFAULT_MIN_TOKENS            // no per-call token argument
+  stripped = trim(text or "")
+  reasons = []
+  if (length of stripped < min_chars) append "response too short (N chars, threshold=min_chars)"
+  if (output_tokens != null && output_tokens < min_tokens) append "output token count too low (N tokens, threshold=min_tokens)"
+  if (expected_markers && some marker is not a substring of stripped) append "expected marker(s) absent: [...]"
+
+  if (reasons is empty) { remove _consecutive[stage]; return }   // a good reply resets the streak
+
+  count = _consecutive[stage] + 1; _consecutive[stage] = count
+  if (count < _DEGENERATE_MAX_CONSECUTIVE) {
+    // the first and second degenerate replies in a row are accepted and returned to the caller
+    warn RESPONSE_DEGENERATE_ACCEPTED (VVAH-E003, "count/3")
+    errlog.log(stage or "quality", stage or "response_quality", "VVAH-E003 warning (count/3): reasons",
+      error_code=DegenerateResponseError.error_code, raw_head=first 300 characters of redact(stripped), recovered=true)
+    // redaction happens before the 300-character cut, so a credential is never bisected past a pattern
+    return
+  }
+  _consecutive[stage] = 1   // reset to 1, so the next two degenerate replies warn again before the next raise
+  throw DegenerateResponseError(reasons, stage, response_len, threshold = if (character axis failed) min_chars else 0, consecutive=count)
+  // preserved: the streak counter is keyed by stage name only, shared by every worker thread of that stage; three degenerate replies from three different units in a row still trip the error
+}
+
+// src: vvaharness/util/response_quality.py:191-207
+StructuredOutputRejected {
+  // marker exception: a non-deepagents backend's own forced-tool extraction rejected the reply
+  message
+  finish: String | null   // the rejected final's end marker (for example Anthropic stop_reason)
+}
+_STRUCTURED_OUTPUT_FAILURE_NAMES = ("StructuredOutputValidationError", "OutputParserException", "StructuredOutputRejected")
+
+// src: vvaharness/util/response_quality.py:210-224
+fn is_structured_output_failure(exc):executor=code {
+  // walk explicit cause, else implicit context, cycle-guarded by identity
+  for each link cur {
+    if (cur is GuardrailBlocked) return false   // "A refusal/guardrail link is final: a resend repeats the blocked prompt"
+    if (class name of cur in _STRUCTURED_OUTPUT_FAILURE_NAMES) return true
+    if (message of cur contains any of those names) return true   // matched by name to keep langchain out of imports
+  }
+  return false
+}
+
+// src: vvaharness/util/response_quality.py:227-229
+fn is_truncated_without_retry(exc):executor=code {
+  return exc is TruncatedResponseError (VVAH-E005) && !exc.retried   // the route could not retry at a larger budget
+}
+
+// src: vvaharness/util/response_quality.py:233-259
+_FAILURE_DETAIL_CHARS = 300; _FINISH_MARKER_CHARS = 40
+fn structured_failure_detail(exc):executor=code {
+  chain = exception_chain(exc)
+  link = first link whose class name is a structured-failure name, else the root
+  cause = "LinkType: link" plus " <- RootType: root" when the root adds text
+  detail = first 300 characters of redacted cause
+  for each c in chain {
+    finish = c.finish, or reply_finish(c.ai_message.response_metadata)
+    if (finish) return ["$detail; finish=<first 40 characters of redacted finish>", finish_truncated(finish)]
+  }
+  return [detail, false]   // second value: whether the rejected final hit its output budget
+}
+
+// src: vvaharness/util/response_quality.py:262-290
+fn _resending_refusal_once(dispatch, label, stage, allowed?):executor=code {
+  left = 1   // ONE identical resend of the first ModelRefusal across all sends of this wrapper
+  return send(drop_thinking) {
+    try return dispatch(drop_thinking);
+    catch ModelRefusal refused => {
+      require left > 0 && (allowed == null || allowed()) => rethrow refused   // read at refusal time: an abandoned caller does not pay for a second session
+      left -= 1
+    }
+    COUNTERS.bump(REFUSAL_RETRY_ATTEMPTED_COUNTER)
+    warn MODEL_REFUSAL_RESEND; errlog.log(stage, label, refused, reason="refusal_retry_attempted", recovered=true)
+    raw = dispatch(drop_thinking)   // outside the catch: a second refusal propagates unchained
+    COUNTERS.bump(REFUSAL_RETRY_RECOVERED_COUNTER)
+    return raw
+  }
+}
+
+// src: vvaharness/util/response_quality.py:293-332
+fn dispatch_or_retry_unforced(dispatch, label, stage, may_retry?, effort?, resend_refusal=false, may_resend_refusal?):executor=code {
+  // A schema rejection, or an at-cap clip the backend could not retry larger, gets ONE resend with the effort tier dropped (drop_thinking=true)
+  if (resend_refusal) dispatch = _resending_refusal_once(dispatch, label, stage, allowed=may_resend_refusal)
+  try return dispatch(drop_thinking=false);
+  catch exc => {
+    clipped = effort != null && is_truncated_without_retry(exc)
+    require clipped || is_structured_output_failure(exc) => rethrow exc
+    require may_retry == null || may_retry() => rethrow exc
+    [detail, cut_off] = structured_failure_detail(exc)
+  }
+  kind = if (clipped) "truncated" else "structured"
+  COUNTERS.bump("${stage}_${kind}_retry_attempted")
+  if (cut_off) COUNTERS.bump("llm_structured_retry_truncated")
+  warn REPLY_CLIPPED_RETRY or STRUCTURED_REPLY_REJECTED_RETRY
+  raw = dispatch(drop_thinking=true)   // outside the catch: a failed resend carries no chain to the first failure
+  COUNTERS.bump("${stage}_${kind}_retry_recovered")
+  return raw
+}
+
+// src: vvaharness/util/response_quality.py:338-362
+_TIMEOUT_FAILURE_NAMES = {"TimeoutExpired", "APITimeoutError", "TimeoutException", "ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout"}
+fn is_timeout_failure(exc):executor=code {
+  // types only, never message text
+  for each link cur (explicit cause, else context; cycle-guarded) {
+    if (cur is GuardrailBlocked) return false   // a timeout split would resend the blocked prompt
+    if (cur is TimeoutError || class name of cur in _TIMEOUT_FAILURE_NAMES) return true
+  }
+  return false
+}
+
+// src: vvaharness/util/response_quality.py:365-386
+_CONNECTION_FAILURE_NAMES = {"APIConnectionError", "ModelConnectionError", "TransportError"}
+fn is_connection_failure(exc):executor=code {
+  if (is_timeout_failure(exc)) return false
+  connection = false
+  for each link cur (explicit cause, else context; cycle-guarded) {
+    if (cur has an integer status_code) return false   // an HTTP status is never a dropped connection
+    if (any class in cur's class hierarchy is named in _CONNECTION_FAILURE_NAMES) connection = true
+  }
+  return connection
+}
+
+// src: vvaharness/util/response_quality.py:389-396
+fn is_deterministic_failure(exc):executor=code {
+  // will fail the same way on every retry
+  return any link of exception_chain(exc) is AuthenticationError | ProxyError | ToolStateNotRoundTrippedError | HarnessCLINotFoundError
+}

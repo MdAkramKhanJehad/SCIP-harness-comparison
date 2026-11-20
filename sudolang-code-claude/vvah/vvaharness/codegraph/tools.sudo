@@ -1,0 +1,138 @@
+# vvaharness/codegraph/tools.py
+
+Read-only graph-query tools over `ctx.graph_handle` that Stages 2, 4 and 6 offer to models (built-in tools plus plugin tools such as Semgrep's). Each tool returns an answer, including a usable error dictionary, instead of raising; results are capped. The tool builder adds these graph tools after the generic file-reader tools, gated on the session's fact tools.
+
+Source: `vvaharness/codegraph/tools.py` (lines 1-334)
+Executor: code (the tools run as code when a model invokes them)
+Called from: Stages 2, 4 and 6 (build_graph_tool_builder, graph_tool_names), `vvaharness/plugins/semgrep/plugin.py` (register_graph_tools via the plugin set)
+
+// src: vvaharness/codegraph/tools.py:33-38 — caps
+_CONTEXT_LIMITS = { candidate_limit: 5, group_limit: 8, call_depth: 2, max_nodes: 60, max_edges: 120, max_paths: 8 }
+_IMPACT_LIMITS = { candidate_limit: 5, max_depth: 4, max_nodes: 80, max_edges: 160, max_paths: 10 }
+_REF_CAP = 20    // entity references returned per list
+_PATH_CAP = 6    // call paths returned
+
+// src: vvaharness/codegraph/tools.py:40-54 — each query returns at most 25 rows
+_NEIGHBORS_QUERY = "MATCH (fn {name: $function, filePath: $file})-[:CALLS]->(callee) RETURN DISTINCT callee.filePath AS file, callee.name AS name LIMIT 25"
+_CALLERS_QUERY   = "MATCH (caller)-[:CALLS]->(fn {name: $function, filePath: $file}) RETURN DISTINCT caller.filePath AS file, caller.name AS name LIMIT 25"
+_IMPORTERS_QUERY = "MATCH (importer:File)-[:IMPORTS]->(target:File {filePath: $file}) RETURN DISTINCT importer.filePath AS path LIMIT 25"
+
+// src: vvaharness/codegraph/tools.py:57-83
+fn _qname(row):executor=code { return "file::name" when both are strings, else "" }
+fn _ref(entity):executor=code { return "path::name" when both exist, else name or path }
+fn _refs(entities):executor=code { return non-empty _ref values, first _REF_CAP }
+fn _paths(paths):executor=code { return first _PATH_CAP paths, each " -> ".join(_refs(path nodes)) }
+fn _selector(file, symbol, line?):executor=code { return SymbolSelector(symbol || file, file_path=file, line) }   // external: context_graph_sdk
+
+// src: vvaharness/codegraph/tools.py:86-100 — errors are returned to the model, not raised
+fn _resolve_error(file, symbol, error):executor=code {
+  hint = if (error is SymbolAmbiguousError)
+    "several symbols named '$symbol' exist in $file. Pass `line` to pick the one you mean, or name the enclosing class or function so the name is unique."
+  else
+    "the graph holds no symbol '$symbol' in $file. It indexes functions, methods and classes — not module-level statements, templates or config. Pass the enclosing function's exact name, or fall back to Grep for this location."
+  return { error: "<ErrorType>: <message>", hint }
+}
+fn _cypher_error(error):executor=code { return { error: "<ErrorType>: <message>" } }
+
+// src: vvaharness/codegraph/tools.py:103-127 — every tool result bumps exactly one counter
+fn _count_result(result):executor=code {
+  if (result is a dict containing "error") COUNTERS.bump("graph_tool_result_error")
+  else if (result is null, an empty list, or a dict whose list values are all empty) COUNTERS.bump("graph_tool_result_empty")
+  else COUNTERS.bump("graph_tool_result_hit")
+}
+
+// src: vvaharness/codegraph/tools.py:130-140
+fn _community_files(ctx):executor=code { return { m.name: m.files for each m in ctx.modules } }
+GraphToolContext { handle: GraphHandle; ctx: ContextPackage }   // frozen
+
+// ---------- the model-facing tools (tool descriptions are the docstrings, quoted exactly) ----------
+
+// src: vvaharness/codegraph/tools.py:143-165
+GraphContext {
+  description: "Callers, callees, imports, implementors and call paths of *symbol* in *file*, in one call. Prefer this over GraphNeighbors. `file` is the exact repo-relative path; `symbol` is the bare defined name, not `Class.method`, a route, or a template; `line` disambiguates a name defined more than once in the file."
+  fn GraphContext(file, symbol, line=null):executor=code {
+    try res = handle.graph.context(_selector(file, symbol, line), limits=_CONTEXT_LIMITS);   // external: context_graph_sdk
+    catch error => return _resolve_error(file, symbol, error)
+    return { symbol: _ref(res.symbol), callers: _refs(res.callers), callees: _refs(res.callees), imports: _refs(res.imports),
+             implementors: _refs(res.implementors), call_paths: _paths(res.call_paths) }
+  }
+}
+
+// src: vvaharness/codegraph/tools.py:168-196
+GraphImpact {
+  description: "Transitive reachability of *symbol*: direction \"upstream\" = everything that can reach it (an empty result means nothing calls it, so it is an entry point or dead code), \"downstream\" = everything it reaches. `file` is the exact repo-relative path; `symbol` is the bare defined name, not `Class.method`, a route, or a template; `line` disambiguates a name defined more than once in the file."
+  fn GraphImpact(file, symbol, direction="upstream", line=null):executor=code {
+    want = if (lowercase(direction) starts with "down") DOWNSTREAM else UPSTREAM   // anything else reads as upstream
+    try res = handle.graph.impact(_selector(file, symbol, line), want, limits=_IMPACT_LIMITS);
+    catch error => return _resolve_error(file, symbol, error)
+    affected = _refs(res.affected)
+    return { symbol: _ref(res.symbol), direction: want, affected, reachable: affected is non-empty,
+             note: if (affected is empty && want == UPSTREAM) "nothing in the graph reaches this symbol — it is an entry point, dispatched by a framework, or unreachable" else "",
+             paths: _paths(res.paths) }
+  }
+}
+
+// src: vvaharness/codegraph/tools.py:199-223 — two single-MATCH queries (an OPTIONAL MATCH composite cartesian-products into QueryTimeoutError)
+GraphNeighbors {
+  description: "Direct callers and callees of *function* defined in *file*. `file` is the exact repo-relative path; `function` is the bare defined name, not `Class.method`."
+  fn GraphNeighbors(file, function):executor=code {
+    try callees = _qname of each row of cypher(_NEIGHBORS_QUERY); catch error => return _cypher_error(error)
+    try callers = _qname of each row of cypher(_CALLERS_QUERY); catch error => return { callees (non-empty), ..._cypher_error(error) }   // callees kept alongside the error
+    return { callees: non-empty callees, callers: non-empty callers }
+  }
+}
+
+// src: vvaharness/codegraph/tools.py:226-238 — touches no graph, only ctx.modules
+GraphCommunityOf {
+  description: "Which module/community *file* belongs to, or None if unmapped. `file` is the exact repo-relative path."
+  fn GraphCommunityOf(file):executor=code { return the first module name whose files contain file, else null }
+}
+
+// src: vvaharness/codegraph/tools.py:241-254
+GraphImporters {
+  description: "Files that import *file* — a trust-boundary signal, not a function-reachability check. `file` is the exact repo-relative path."
+  fn GraphImporters(file):executor=code {
+    try rows = cypher(_IMPORTERS_QUERY, { file }); catch error => return _cypher_error(error)
+    return string paths of rows
+  }
+}
+
+// src: vvaharness/codegraph/tools.py:257-271
+GraphSinksInCommunity {
+  description: "Unsafe sinks whose file belongs to *community*."
+  fn GraphSinksInCommunity(community):executor=code {
+    files = _community_files(ctx)[community] || []
+    return for each s in ctx.unsafe_sinks where s.file in files: { file, line, function }   // uncapped
+  }
+}
+
+// src: vvaharness/codegraph/tools.py:274-287 — insertion order fixes the build order
+GRAPH_TOOLS = { GraphContext, GraphImpact, GraphNeighbors, GraphCommunityOf, GraphImporters, GraphSinksInCommunity }
+GRAPH_TOOL_NAMES = keys of GRAPH_TOOLS   // built-ins only; stages must call graph_tool_names()
+_PLUGIN_TOOLS = {}
+
+// src: vvaharness/codegraph/tools.py:292-307
+fn register_graph_tools(tools):executor=code {
+  for each (name, build) in tools {
+    require name not in GRAPH_TOOLS && name not in _PLUGIN_TOOLS => throw "graph tool already registered: $name"
+    _PLUGIN_TOOLS[name] = build
+  }
+  // must run before any stage opens a session, since tool names are read then
+}
+fn clear_plugin_graph_tools():executor=code { _PLUGIN_TOOLS = {} }
+fn graph_tool_names():executor=code { return GRAPH_TOOL_NAMES + keys of _PLUGIN_TOOLS }   // a call, so late registration is still seen
+
+// src: vvaharness/codegraph/tools.py:310-317
+fn _graph_tools(ctx, allowed):executor=code {
+  if (ctx.graph_handle == null) return []   // no graph, no graph tools
+  return for each (name, build) in GRAPH_TOOLS then _PLUGIN_TOOLS where name in allowed: build(GraphToolContext(handle, ctx))
+}
+
+// src: vvaharness/codegraph/tools.py:320-329
+fn build_graph_tool_builder(ctx):executor=code {
+  return (options, allowed_tools) => {
+    reader_tools = backends.harness.deepagents.tools.build_tools(options, allowed_tools)   // generic reader tools; outside this batch
+    return reader_tools + _graph_tools(ctx, set(options.fact_tools))
+    // gated on options.fact_tools, not allowed_tools: streaming.py strips fact-tool names out of allowed_tools, so gating on that alone would build nothing
+  }
+}

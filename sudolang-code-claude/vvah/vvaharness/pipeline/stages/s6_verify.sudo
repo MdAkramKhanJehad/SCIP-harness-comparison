@@ -1,0 +1,383 @@
+# vvaharness/pipeline/stages/s6_verify.py
+
+Stage 6 ("Step 6 — Verify"), adversarial verification. Findings are grouped by file into batched agentic sessions and run in a bounded daemon thread pool. Each outcome is routed by verdict and confidence into the verified list or a drop bucket; failed batches split into single-finding retries by failure kind; a wall-clock ceiling abandons stuck batches. Weaknesses a session discovers on its own are admitted, then re-verified independently in a second wave. Only verified findings continue to Stage 7.
+
+Source: `vvaharness/pipeline/stages/s6_verify.py` (lines 1-883)
+Executor: mixed (this module is code; each batch's session in `s6/session.sudo` is a model call)
+Called from: `vvaharness/orchestrator/scan.py` scan_repo (Stage 6 block, when exploit verification is not active)
+
+// src: vvaharness/pipeline/stages/s6_verify.py:83-89
+_HEARTBEAT_SECS = 60.0            // heartbeat and ceiling-check wake interval; not a configuration knob
+_UNIFORM_CONFIDENCE_MIN = 12      // verdicts needed before "all at one score" is a signal
+_REPLAYED_LABEL = "[replayed] "   // marks a verdict reached by replaying a deadline-killed session tool-free
+
+// src: vvaharness/pipeline/stages/s6_verify.py:150-233
+fn run(findings, ctx, cfg, run_id=""):executor=code {
+  progress = _S6Progress(length(findings), cfg, run_id)   // abstracted: optional atomic JSON progress file under the state directory when step6_verify.progress_file (src: :546-606)
+  if (findings is empty) { progress.finish(); return [[], []] }
+
+  parallel = knob("step6_verify.parallel", default=5)
+  min_conf = knob("step6_verify.min_confidence", default=7)
+  split_retry = knob("step6_verify.split_retry", default=true)
+  via = resolve_model(knob("models.verify")).via
+  tool_timeout_s = knob("step6_verify.tool_timeout_s", default=null)   // deepagents route only
+  // src: :165-168 — fail closed before the pool: on any route except "cli" every allowed tool must be read-only
+  tools = validate_detection_tools(knob("step6_verify.allowed_tools", default=null), config_key="step6_verify.allowed_tools", via)
+  // external to this batch (backends/llm/models): require on a non-cli route every tool is in DEFAULT_READ_TOOLS => throw ValueError
+
+  verified = []; dropped = []
+  items = s6.batching.label(findings)   // ("f0", finding), ("f1", finding), ...
+  batches = s6.batching.plan_batches(items, _cap_int(cfg.step6_verify, "batch_size", 12))
+  cache = _file_cache(ctx.repo_root, cfg)
+  sink = _Sink(verified, dropped, progress, min_conf,
+               filed = s6.batching.filed_lines(items),
+               seen = { f.canonical_key() for each finding },
+               repo_root = ctx.repo_root,
+               stamps = knob("step6_verify.trait_stamps", default=true),
+               reframe = knob("step6_verify.reframe_enabled", default=false),
+               inventory = if (ctx.all_files) set(ctx.all_files) else null,
+               line_count = cache.line_count, read_lines = cache.lines)
+
+  // src: :190-193 — the pool sweep is a backstop and must never fire before the backend clock it backs up
+  cli_effort = cli._effective_effort(null)
+  ceiling = s6.batching.sweep_ceiling_secs(cfg.step6_verify, via, cli_effort)
+  tier = s6.batching.sweep_effort(cfg.step6_verify, via, cli_effort)
+  // src: :195-201 — tool read timeouts patched process-wide for the whole pool when step6_verify.tool_timeout_s is set
+  timeout_override = if (tool_timeout_s == null) nothing else patched_read_timeouts(tool_timeout_s)   // external: vendor deepagents filesystem options
+
+  // src: :204-217 — one pool and one try/finally across both waves
+  with timeout_override {
+    ex = _DaemonPool(max_workers=parallel)
+    constraint OnEveryExit {
+      ex.shutdown(wait=false, cancel_futures=true)   // a ceiling-stalled worker must not block the stage; daemon threads cannot block process exit
+    }
+    // wave 1's still-running abandoned batches ("captives") feed wave 2's capacity accounting
+    captive = _run_wave(batches, ctx, cfg, tools, sink, ex, split_retry, ceiling, parallel, sweep_tier=tier)
+    _reverify_discoveries(ctx, cfg, tools, sink, ex, captive, split_retry, ceiling, parallel, sweep_tier=tier)
+  }
+  // abstracted: :219-231 counts of TRUE_POSITIVE, FALSE_POSITIVE, UNCONFIRMED, GUARDRAIL_BLOCKED, INCONCLUSIVE, VERIFY_ERROR logged
+  _flag_uniform_confidence(sink.confidences, min_conf)
+  return [verified, dropped]
+}
+
+// src: vvaharness/pipeline/stages/s6_verify.py:236-247
+fn _flag_uniform_confidence(confidences, min_confidence):executor=code {
+  n = total verdicts
+  if (n < 12 || more than one distinct confidence value) return
+  COUNTERS.bump("s6_confidence_uniform", n)
+  warn S6_UNIFORM_CONFIDENCE   // "admitted every TRUE_POSITIVE" if value >= min_confidence else "dropped every TRUE_POSITIVE as UNCONFIRMED"; logged only
+}
+
+// src: vvaharness/pipeline/stages/s6_verify.py:250-280
+fn _reverify_discoveries(ctx, cfg, tools, sink, ex, captive, split_retry, ceiling, parallel, sweep_tier):executor=code {
+  to_reverify = sink.verified where origin == "s6_discovered"
+  if (to_reverify is empty) return
+  // filter IN PLACE so the caller's `verified` alias stays current; sink.seen still blocks re-minting the same keys
+  sink.verified = sink.verified where origin != "s6_discovered"
+  items = s6.batching.label(to_reverify)   // fresh f0.. ids for this wave
+  batches = s6.batching.plan_batches(items, _cap_int(cfg.step6_verify, "batch_size", 12))
+  sink.mint_discoveries = false                       // a discovery's own discoveries are counted and discarded
+  sink.progress.widen_total(length(to_reverify))
+  for each f in to_reverify, sink.filed[f.file] += f.line_start;   // pre-file every site so a peer batch's "confirmed repeat" cannot ship a duplicate
+  sink.clone_repeats = false                          // the scan ledger assumes one row per s6_discovered finding
+  constraint OnEveryExit { sink.mint_discoveries = true; sink.clone_repeats = true }
+  // abort_on_guardrail off: raising would discard wave 1's FALSE_POSITIVE audit rows
+  _run_wave(batches, ctx, cfg, tools, sink, ex, captive, split_retry, ceiling, parallel, sweep_tier, abort_on_guardrail=false)
+  // a discovery judged anything other than TRUE_POSITIVE here goes to a drop bucket; it no longer ships
+}
+
+// src: vvaharness/pipeline/stages/s6_verify.py:283-543
+fn _run_wave(batches, ctx, cfg, tools, sink, ex, split_retry, ceiling, parallel, sweep_tier, captive=[], abort_on_guardrail=true):executor=code {
+  guardrail_hits = 0
+  guardrailGate = max(3, parallel)   // src: :291
+  started = {}     // batch index -> monotonic start time, set by its own worker when it begins
+  abandoned = {}   // batch index -> event; a captive worker reads it before a repair so a resolved batch issues no fresh billed call
+  refusal_resend = refusal_resend_allowed(cfg, knob("models.verify"))   // Anthropic routes with refusal_retries > 0 only
+
+  // src: :298-308
+  fn _submit(idx, batch, refusal_child=false):executor=code {
+    flag = abandoned[idx] (created if missing)
+    resend = refusal_resend && length(batch) == 1 && !refusal_child   // a refused batch splits rather than resends; its singletons are the resend
+    return ex.submit(() => { started[idx] = now; return s6.session.verify_batch(batch, ctx, cfg, tools, abandoned=flag.is_set, resend_refusal=resend) })
+  }
+
+  runConcurrently(batches, workers=parallel, fn=_submit):order=completion   // _DaemonPool: FIFO queue, at most `parallel` daemon threads
+  futs = future -> (idx, batch) for every batch; pending = all futures
+  next_idx = length(batches); total_submitted = length(batches)
+
+  // src: :317-341
+  fn _split_and_resubmit(batch, e, counter, reason_prefix, label, refusal_child=false):executor=code {
+    COUNTERS.bump(counter)
+    for each (fid, f) in batch {
+      errlog.log("s6-verify", "$reason_prefix#$fid", e, recovered=true)   // a failed retry logs its own row
+      cidx = next_idx; next_idx += 1; total_submitted += 1
+      fut2 = _submit(cidx, [(fid, f)], refusal_child)
+      futs[fut2] = (cidx, [(fid, f)]); pending += fut2
+    }
+    return the new indices
+  }
+
+  resolved = set()                       // a batch index is resolved exactly once (result, raise or ceiling); later results are discarded
+  structured_split_children = set()
+  structured_singleton_retried = set()   // bounds the structured retry to once per finding
+  timeout_split_retried = set()          // once per finding
+  member_children = set()
+  member_resubmitted = set()             // once per batch
+  fn _timeout_splittable(idx, batch):executor=code { return split_retry && length(batch) > 1 && idx not in timeout_split_retried && !cli.aborted() }
+  fn _timeout_split(batch, e):executor=code { timeout_split_retried += _split_and_resubmit(batch, e, counter="s6_batch_timeout_split", reason_prefix="timeout-split", label="TIMEOUT") }
+
+  captive = copy of captive
+  captive_full_since = null
+  quiet_since = now
+  wake = if (ceiling > 0) min(60, ceiling) else 60   // wake on the shorter interval, or a 30-second ceiling would be enforced at 60
+
+  try {
+    while (pending is not empty) {
+      done = wait(pending, timeout=wake, return_when=FIRST_COMPLETED)
+
+      // ----- results -----
+      // src: :372-480
+      for each fut in done {
+        pending -= fut
+        (idx, batch) = futs[fut]
+        if (idx in resolved) continue   // single-resolution rule
+        resolved += idx; quiet_since = now
+        try outcomes = fut.result();
+        catch error => match (error) {
+          // src: :382-417
+          case GuardrailBlocked => {
+            [guardrail_hits, gate_label] = guardrail_gate_hit(error, guardrail_hits, guardrailGate)   // a ModelRefusal never counts toward the gate
+            // checked BEFORE the split decision so cumulative hits trip the breaker on schedule
+            if (abort_on_guardrail && guardrail_hits >= guardrailGate && sink.verified is empty) {
+              cli.abort()
+              throw RuntimeError("s6-verify: $guardrail_hits cumulative guardrail blocks with zero successes — aborting run.")
+            }
+            if (error is ModelRefusal) {
+              // on an Anthropic route a refused batch splits once so siblings of the one flagged member still get verdicts; flagged content is never re-sent to an OpenAI-compatible gateway
+              if (refusal_resend && split_retry && length(batch) > 1 && !cli.aborted()) {
+                _split_and_resubmit(batch, error, counter="s6_batch_refusal_split", reason_prefix="refusal-split", label="REFUSED", refusal_child=true)
+                continue
+              }
+              sink.fail(batch, "GUARDRAIL_BLOCKED", error); continue
+            }
+            if (split_retry && length(batch) > 1 && !cli.aborted()) {
+              _split_and_resubmit(batch, error, counter="s6_batch_guardrail_split", reason_prefix="guardrail-split", label="GUARDRAIL-BLOCKED")
+              continue
+            }
+            sink.fail(batch, "GUARDRAIL_BLOCKED", error); continue
+          }
+          // src: :418-428 — one retry deep: a singleton has no split left
+          case TruncatedResponseError => {
+            if (split_retry && length(batch) > 1 && !cli.aborted()) {
+              _split_and_resubmit(batch, error, counter="s6_batch_truncated_split", reason_prefix="truncated-split", label="TRUNCATED")
+              continue
+            }
+            sink.fail(batch, "VERIFY_ERROR", error); continue
+          }
+          // src: :429-458
+          default => {
+            // a structured-output failure is a batch-shape failure the split cures
+            if (split_retry && is_structured_output_failure(error) && idx not in structured_singleton_retried && !cli.aborted()) {
+              // preserved: no length(batch) > 1 test here, so an original single-finding batch is resubmitted once as a singleton
+              COUNTERS.bump("s6_structured_retry_attempted", length(batch))
+              new = _split_and_resubmit(batch, error, counter="s6_batch_structured_split", reason_prefix="structured-split", label="STRUCTURED-OUTPUT REJECTED")
+              structured_split_children += new; structured_singleton_retried += new
+              continue
+            }
+            // out of clock is a batch-size failure like truncation
+            if (is_timeout_failure(error) && _timeout_splittable(idx, batch)) { _timeout_split(batch, error); continue }
+            // any other failure splits too, unless it would fail the same way again or the run is being torn down
+            if (split_retry && length(batch) > 1 && !is_deterministic_failure(error) && !cli.aborted()) {
+              _split_and_resubmit(batch, error, counter="s6_batch_generic_split", reason_prefix="generic-split", label="ERROR")
+              continue
+            }
+            sink.fail(batch, "VERIFY_ERROR", error); continue
+          }
+        }
+        // src: :459-480 — every member the reply omitted (all of them included) resubmits as a fresh singleton judgement
+        missing = members of batch whose id is not in outcomes
+        skip = set()
+        if (split_retry && missing is not empty && length(batch) > 1 && idx not in member_resubmitted && !cli.aborted()) {
+          COUNTERS.bump("s6_outcome_members_resubmitted", length(missing))
+          new = _split_and_resubmit(missing, RuntimeError("verifier omitted ${length(missing)} of ${length(batch)} members"), counter="s6_batch_members_split", reason_prefix="members-split", label="MEMBERS OMITTED")
+          member_resubmitted += new; member_children += new
+          skip = ids of missing
+        }
+        sink.accept(batch, outcomes, skip)
+        // abstracted: :477-480 recovery counters for structured-split and member-split children
+      }
+
+      // ----- wall-clock ceiling sweep -----
+      // src: :481-527
+      if (ceiling > 0) {
+        for each fut in pending {
+          (idx, batch) = futs[fut]
+          begun = started[idx]
+          if (begun == null || now - begun <= ceiling) continue   // a queued batch has spent none of its own clock
+          resolved += idx; pending -= fut; captive += fut
+          abandoned[idx].set()   // its late result will be discarded and it skips any repair call
+          COUNTERS.bump("s6_batch_ceiling_expired")
+          err = call_timeout_error(stage="s6", route="stage-ceiling", budget_s=ceiling, effort=sweep_tier, cause_text="batch exceeded step6_verify.batch_wall_clock_ceiling (${ceiling}s)")
+          if (_timeout_splittable(idx, batch)) _timeout_split(batch, err)   // children each get a full ceiling; the parent stays resolved, abandoned and captive
+          else sink.fail(batch, "VERIFY_ERROR", err)
+        }
+        captive = captive where not done   // pruned first, or a queue about to run would be written off
+        // src: :510-527 — all workers held by abandoned batches must persist for a further ceiling before queued batches are failed
+        if (length(captive) >= parallel && pending is not empty) {
+          if (captive_full_since == null) captive_full_since = now
+          else if (now - captive_full_since >= ceiling) {
+            for each fut in pending {
+              (idx, batch) = futs[fut]
+              if (fut.cancel()) {   // succeeds only for a never-started batch
+                resolved += idx; pending -= fut
+                COUNTERS.bump("s6_batch_never_started")
+                sink.fail(batch, "VERIFY_ERROR", TimeoutError("batch never started: all $parallel worker(s) held by ceiling-expired batches for ${ceiling}s"))
+              }
+            }
+          }
+        } else {
+          captive_full_since = null
+        }
+      }
+      // abstracted: :528-535 one heartbeat console line per silent 60-second wake
+    }
+  }
+  // src: :536-541
+  catch (KeyboardInterrupt or SystemExit) => {
+    cli.abort()   // kills running verifier processes
+    throw         // the caller's OnEveryExit cancels and shuts the pool down
+  }
+  return captive where not done   // a stale future would start the next wave's captive count above reality
+}
+
+// ---------- routing judged findings ----------
+
+// src: vvaharness/pipeline/stages/s6_verify.py:685-717
+_Sink {
+  verified; dropped; progress; min_confidence
+  mint_discoveries = true   // off in the re-verify wave
+  clone_repeats = true      // off in the re-verify wave
+  stamps; reframe
+  inventory                 // Stage 5's coordinate gate re-applied to post-Stage-5 replies; null skips it, as Stage 5 does
+  repo_root; line_count; read_lines
+  filed                     // file -> lines already filed, shared and mutable across the stage
+  seen                      // canonical keys already present
+  confidences = Counter()   // every judged score, for the uniform-confidence check
+  lock                      // guards filed and seen
+
+  // src: vvaharness/pipeline/stages/s6_verify.py:719-728
+  fn _reserver(file):executor=code {
+    return line => under lock: if (line in filed[file]) false else { add line; true }   // check and claim in one step, so two sessions cannot file the same new line
+  }
+
+  // src: vvaharness/pipeline/stages/s6_verify.py:730-740
+  fn fail(batch, reason, exc):executor=code {
+    detail = first 200 characters of redact(str(exc))   // redacted before the cut, since slicing can bisect a secret
+    for each (fid, f) in batch { errlog.log("s6-verify", "${lowercase reason}#$fid", exc); dropped += _drop(f, reason, detail) }
+  }
+
+  // src: vvaharness/pipeline/stages/s6_verify.py:742-756
+  fn accept(batch, outcomes, skip=[]):executor=code {
+    display = fid -> "${member.file}:${member.line_start}" for this batch   // includes skipped members, so a cited sibling still resolves
+    for each (fid, f) in batch {
+      if (fid in skip) continue   // resubmitted; its verdict lands with its child
+      outcome = outcomes[fid]
+      if (outcome == null) { _undetermined(fid, f); continue }
+      _judged(f, outcome, display)
+      _discoveries(f, outcome)
+    }
+  }
+
+  // src: vvaharness/pipeline/stages/s6_verify.py:758-766
+  fn _undetermined(fid, f):executor=code {
+    // an absent verdict is undetermined: FALSE_POSITIVE would flatter the confirmation rate
+    detail = "verifier returned no verdict for this finding"
+    errlog.log("s6-verify", "no-outcome#$fid", detail)
+    dropped += _drop(s6.outcomes.unverified(f, detail), "VERIFY_ERROR", detail)
+  }
+
+  // src: vvaharness/pipeline/stages/s6_verify.py:768-821
+  fn _judged(f, outcome, display={}):executor=code {
+    bucket = s6.outcomes.classify(outcome, min_confidence)
+    // src: :773-782 — a refutation whose premise ("X is not imported" / "X is not defined") the code contradicts is held as INCONCLUSIVE, not retried
+    if (bucket == "FALSE_POSITIVE") {
+      module = _premise_contradicted(outcome.reason, f.file, inventory, read_lines)
+      if (module) {
+        errlog.log("s6-verify", "${f.file}:${f.line_start}", "false-positive premise contradicted by the code", reason="s6_fp_premise_contradicted", module)
+        bucket = "INCONCLUSIVE"
+      }
+    }
+    confidences[outcome.confidence] += 1
+    // lines are reserved only for a finding that ships, or a discarded clone would block a real repeat
+    results = s6.outcomes.apply_outcome(f, outcome,
+                reserve = if (bucket == "TRUE_POSITIVE") _reserver(f.file) else null,
+                stamps, reframe, max_line = line_count(f.file), clone_repeats)
+    label = if (outcome.replayed) "[replayed] " else ""
+    for each r in results {
+      r.verdict_reason = s6.outcomes.remap_reason_ids(r.verdict_reason, display)   // batch-local fN ids become file:line in the report
+      if (label && bucket == "TRUE_POSITIVE") r.verdict_reason = label + r.verdict_reason
+    }
+    if (bucket == "TRUE_POSITIVE") {
+      verified += results   // primary plus any repeat-site clones
+      // abstracted: :810-815 counters for confirmations without a CVSS vector and shipped replayed verdicts
+      return
+    }
+    detail = if (bucket == "UNCONFIRMED") "verifier confidence ${outcome.confidence}/10 below gate $min_confidence" else outcome.reason
+    dropped += _drop(results[0], bucket, label + detail)   // bucket is FALSE_POSITIVE, UNCONFIRMED or INCONCLUSIVE
+  }
+
+  // src: vvaharness/pipeline/stages/s6_verify.py:832-871
+  fn _discoveries(f, outcome):executor=code {
+    if (!mint_discoveries) return   // re-verify wave: counted (s6_finding_discovered_reverify_discarded) and discarded, so discoveries cannot chain
+    if (outcome.replayed && outcome.additional_findings) {
+      warn "dropped $n discovery(ies) a replayed verdict ... proposed — a tool-free replay cannot ground a new finding"   // once
+      return
+    }
+    require outcome.confidence >= min_confidence => COUNTERS.bump("s6_finding_discovered_unconfirmed", n); return
+    // preserved: the floor uses the parent verdict's confidence, and discoveries are admitted whatever the parent's verdict (FALSE_POSITIVE included)
+    for each extra in s6.outcomes.discovered(outcome, f, repo_root, inventory = inventory or []) {
+      require _in_repo(extra) => COUNTERS.bump("s6_finding_discovered_out_of_repo"); skip   // a fabricated path must not ship
+      require extra.canonical_key() not in seen (checked and added under lock) => COUNTERS.bump("s6_finding_discovered_duplicate"); skip
+      verified += extra   // origin "s6_discovered"; re-verified in _reverify_discoveries
+    }
+  }
+
+  // src: vvaharness/pipeline/stages/s6_verify.py:823-830
+  fn _in_repo(f):executor=code {
+    if (inventory == null) return true
+    if (f.file not in inventory) return false
+    eof = line_count(f.file)
+    return eof != null && 1 <= f.line_start <= eof
+  }
+}
+
+// ---------- false-positive premise check ----------
+
+// src: vvaharness/pipeline/stages/s6_verify.py:619-636
+// _PREMISE_IMPORT_RX: "<module> is not imported" / "isn't imported" / "is never imported" / "never imported" (optionally quoted, optionally followed by " module"), or a negated import ("not|never|no|without|missing" + optional "a/an" + "import(s|ed|ing)" + optional "of|for" + module)
+// _PREMISE_DEFINED_RX: "<name> is undefined" / "is not defined"
+_PREMISE_PROSE_STOPWORDS = ["is", "module", "the", "this", "that", "it", "which", "name", "variable", "function", "class", "method"]
+
+// src: vvaharness/pipeline/stages/s6_verify.py:663-682
+fn _premise_contradicted(reason, finding_file, inventory, read_lines):executor=code {
+  found = _premise_module(reason)   // first match of the import pattern (from-import also contradicts), then the defined pattern (only a direct import contradicts); stopwords skipped (src: :639-649)
+  if (found == null) return null
+  [module, allow_from] = found
+  // a resolved module file wins; an unresolved module (standard library, or no inventory) falls back to the finding's own file
+  target = _resolve_module_file(module, inventory) or finding_file   // inventory entry equal to or ending in "/<module path>.py" or "/<module path>/__init__.py" (src: :652-660)
+  lines = read_lines(target)
+  if (lines is empty) return null
+  pattern = if (allow_from) line start + "import <module>" or "from <module>" else line start + "import <module>"
+  return if (some line matches pattern) module else null
+}
+
+// src: vvaharness/pipeline/stages/s6_verify.py:144-147
+fn _file_cache(repo_root, cfg):executor=code {
+  return s5.enrich.FileCache(repo_root, max_kb=knob("step1.max_file_kb", default=1024))   // Stage 5's cap and path safety
+}
+
+// src: vvaharness/pipeline/stages/s6_verify.py:92-141
+// _DaemonPool: an Executor of up to max_workers daemon threads on a FIFO queue (not ThreadPoolExecutor, whose exit hook joins every worker); a thread is started per submit up to the bound, with no idle reuse; shutdown(cancel_futures=true) cancels queued items; a captive batch keeps its thread slot, which the ceiling sweep counts
+// require max_workers > 0 => throw ValueError("max_workers must be greater than 0")
+
+// abstracted: s6_verify.py:546-606 (_S6Progress atomic progress-file writer), 609-611 (_ids), 874-883 (_drop builds a DroppedFinding from file, line, vuln_class, title, chunk_id, reason, detail).

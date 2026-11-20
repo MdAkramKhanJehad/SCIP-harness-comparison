@@ -1,0 +1,126 @@
+# vvaharness/backends/harness/claude/client.py
+
+`ClaudeHarness`: the Claude Agent SDK implementation of the `Harness` interface, used for the `cli` and `sdk` routes. It runs one-shot and streaming sessions, enforces the streaming wall-clock deadline, maps SDK errors to harness errors, and attaches persona reports (submitted through the fact server, or scraped from subagent transcripts as a fallback) to the terminal result.
+
+Source: `vvaharness/backends/harness/claude/client.py` (lines 1-279)
+Executor: mixed (code builds the session and checks its end; the model works inside the session)
+Called from: `vvaharness/backends/harness/registry.py` _make_claude (lines 28-33)
+
+// src: vvaharness/backends/harness/claude/client.py:140-184
+fn ClaudeHarness.run_oneshot(prompt, options: OneShotOptions):executor=mixed {
+  if (options.cache_prefix) prompt = options.cache_prefix + prompt   // no cache-marker seam on this path; the prefix is plain content
+  sdk_opts = claude.options.build_oneshot_sdk_options(options)
+  try {
+    result = callModel({ role: caller-chosen, route: "cli" | "sdk", system: options.system_prompt, prompt,
+      tools: options.tool_policy.allowed_tools (deny: disallowed_tools),
+      limits: { max_turns: options.max_turns },   // default 15
+      output: options.output_schema or options.response_model })
+    // reads messages until the first ResultMessage, then stops
+    structured = claude.translate.validate_structured(result.structured_output, options.response_model)
+    TOKENS.add(result.usage, usd=result.total_cost_usd)   // once per session: usage is cumulative
+  }
+  catch CLINotFoundError => throw HarnessCLINotFoundError("Claude CLI binary not found")
+  catch (ProcessError | CLIConnectionError | CLIJSONDecodeError | MessageParseError) as e => throw _wrap_sdk_error(e)
+  return OneShotResult({ is_error, subtype, result_text, structured, usage, total_cost_usd })
+  // preserved: no timeout is applied on the one-shot path in this file
+}
+
+// src: vvaharness/backends/harness/claude/client.py:186-279
+fn ClaudeHarness.run_streaming(prompt, options: StreamingOptions):executor=mixed {
+  // src: client.py:191-198 — the fact server is installed only when the caller passes fact tool specs (Stage 11 validation does)
+  [fact_server, fact_tool_names, collector] = [null, [], null]
+  if (options.fact_tool_specs) {
+    [fact_server, fact_tool_names, collector] = claude.facts.build_fact_mcp(options.fact_tool_specs, report_model=_persona_report_model())
+  }
+  sdk_opts = claude.options.build_streaming_sdk_options(options, fact_server, fact_tool_names)
+  if (options.cache_prefix) prompt = options.cache_prefix + prompt
+
+  // src: client.py:222-277 — returned as an asynchronous message stream
+  expired = false
+  try {
+    session = callModel({ role: caller-chosen, route: "cli" | "sdk", system: options.system_prompt, prompt,
+      tools: options.tool_policy.allowed_tools + fact_tool_names,   // plus subagent definitions options.agents, and can_use_tool = options.permissions when set (see options.sudo)
+      limits: { max_turns: options.max_turns, max_budget_usd: options.max_budget_usd, timeout: options.timeout },
+      output: options.output_schema or options.response_model })
+    if (options.timeout) {
+      deadline = now + options.timeout   // one shared instant; only each await for the next message is bounded, never the time the caller holds a yielded message
+      loop {
+        try message = next message from session, bounded by deadline
+        catch StopAsyncIteration => break
+        catch TimeoutError => {
+          require our own deadline expired => throw   // a TimeoutError raised inside the session is re-raised
+          expired = true; break
+        }
+        for each translated in _translate_message(message), emit(translated)
+      }
+      if (expired) {
+        session.interrupt()   // errors suppressed
+        drain remaining messages for at most TIMEOUT_STOP_GRACE_SECONDS   // 20 seconds (src: vvaharness/backends/llm/models.py:292); a timeout here is suppressed
+      }
+    } else {
+      for each message in session, for each translated in _translate_message(message), emit(translated)
+    }
+  }
+  catch CLINotFoundError => throw HarnessCLINotFoundError("Claude CLI binary not found")
+  catch (ProcessError | CLIConnectionError | CLIJSONDecodeError | MessageParseError) as e => throw _wrap_sdk_error(e)
+  // src: client.py:272-277 — raised after the session context has closed cleanly
+  if (expired) throw call_timeout_error({ stage: options.graph_name, route: "claude", budget_s: options.timeout, effort: options.effort, cause_text: "claude session exceeded ${options.timeout}s" })
+}
+
+// src: vvaharness/backends/harness/claude/client.py:203-220
+fn _translate_message(message):executor=code {
+  for each translated in claude.translate.translate(message, options.response_model) {
+    if (translated is HarnessResult) {
+      persona_dicts = if (collector) collector.reports else []   // validated at submission; preferred
+      expected = if (options.agents) length(options.agents) else 1
+      if (length(persona_dicts) < expected && translated.session_id) {
+        // fallback: scrape transcripts only for personas that did not submit
+        persona_dicts = _merge_persona_reports(persona_dicts, _extract_sdk_persona_reports(translated.session_id, options.cwd))
+      }
+      if (persona_dicts) translated.state = { sdk_persona_reports: persona_dicts }
+    }
+  }
+  return translated list
+}
+
+// src: vvaharness/backends/harness/claude/client.py:69-111
+fn _extract_sdk_persona_reports(session_id, cwd):executor=code {
+  if (claude_agent_sdk lacks list_subagents / get_subagent_messages) return []   // external: claude_agent_sdk
+  try {
+    for each agent_id in list_subagents(session_id, cwd) {
+      messages = get_subagent_messages(session_id, agent_id, cwd)
+      if (!messages) continue
+      for each msg in messages, newest first {
+        text = first text block of msg
+        block = text between the first "```json" and the next "```"
+        if (no such block) continue   // look at the next older message
+        try data = parse JSON(block)
+        // the newest message carrying a ```json block is the only one examined, whether or not it parses
+        if (data is a dict with keys "persona" and "gates" && (persona, tracking_id) not seen) { keep data }
+        break
+      }
+    }
+  }
+  catch any error => return []
+  return kept reports
+}
+
+// src: vvaharness/backends/harness/claude/client.py:114-120
+fn _merge_persona_reports(submitted, scraped):executor=code {
+  return submitted + (scraped where (persona, tracking_id) not among submitted)
+}
+
+// src: vvaharness/backends/harness/claude/client.py:123-134
+fn _wrap_sdk_error(e):executor=code {
+  match (e) {
+    case ProcessError => HarnessProcessError(str(e), exit_code=e.exit_code, stderr=e.stderr)
+    case first matching pair in claude.models.SDK_ERROR_MAP => mapped harness type(str(e))
+    default => e   // unchanged
+  }
+}
+
+// src: vvaharness/backends/harness/claude/client.py:57-66
+fn _persona_report_model():executor=code {
+  try return vvaharness.validation.models.persona_report.PersonaReport
+  catch any error => return null   // the submit tool is then not built
+}

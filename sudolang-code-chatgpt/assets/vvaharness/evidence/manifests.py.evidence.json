@@ -1,0 +1,2569 @@
+{
+  "source": "vvaharness/evidence/manifests.py",
+  "sha256": "4134ceb515aec640fe6cea858f6ffaae308c3bbc47fd99d6fa0ff4d24c714112",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Build/dependency manifests: bounded walk, per-format structural truncation, aggregate cap.\"\"\"\nfrom __future__ import annotations\n\nimport json\nimport tomllib\nfrom pathlib import Path\n\nfrom vvaharness.evidence._grouping import _round_robin_select\nfrom vvaharness.evidence.read import _cap_text, _contained, _read_capped\nfrom vvaharness.scope import _DEFAULT_EXCLUDE_DIRS, _has_target_build_marker\nfrom vvaharness.util import logs\n\nlog = logs.get_logger(__name__)\n\n_MANIFEST_CANDIDATES = (\n    \"package.json\", \"pom.xml\", \"build.gradle\", \"build.gradle.kts\",\n    \"setup.py\", \"pyproject.toml\", \"requirements.txt\",\n    \"go.mod\", \"Cargo.toml\", \"Gemfile\", \"composer.json\",\n    \"Dockerfile\", \"docker-compose.yml\", \"docker-compose.yaml\",\n    \".csproj\",\n)\n\n# Raw pre-parse ceiling; the USEFUL cap (manifest_cap) applies to the structurally-extracted text.\n_MANIFEST_RAW_CEILING = 500_000\n\n_PACKAGE_JSON_KEYS = (\"name\", \"version\", \"dependencies\", \"devDependencies\",\n                     \"peerDependencies\", \"require\", \"require-dev\", \"scripts\")\n_PYPROJECT_PROJECT_KEYS = (\"name\", \"version\", \"dependencies\", \"optional-dependencies\")\n\n\ndef _truncate_package_json(raw: str, cap: int) -> str | None:\n    \"\"\"Keep only the name/version/dependency keys of a package.json-shaped manifest.\"\"\"\n    try:\n        data = json.loads(raw)\n    except Exception:\n        log.debug(\"manifest structural truncation: unparseable JSON\", exc_info=True)\n        return None\n    if not isinstance(data, dict):\n        return None\n    keep = {k: v for k, v in data.items() if k in _PACKAGE_JSON_KEYS}\n    return _cap_text(json.dumps(keep, indent=2, sort_keys=True), cap) if keep else None\n\n\ndef _pyproject_keep(data: dict) -> dict:\n    \"\"\"The `[project]` and Poetry dependency tables, the two Python framework-detection signals.\"\"\"\n    keep: dict = {}\n    project = data.get(\"project\") if isinstance(data, dict) else None\n    if isinstance(project, dict):\n        sub = {k: v for k, v in project.items() if k in _PYPROJECT_PROJECT_KEYS}\n        if sub:\n            keep[\"project\"] = sub\n    tool = data.get(\"tool\") if isinstance(data, dict) else None\n    poetry = tool.get(\"poetry\") if isinstance(tool, dict) else None\n    if isinstance(poetry, dict) and \"dependencies\" in poetry:\n        keep[\"tool\"] = {\"poetry\": {\"dependencies\": poetry[\"dependencies\"]}}\n    return keep\n\n\ndef _truncate_pyproject_toml(raw: str, cap: int) -> str | None:\n    \"\"\"tomllib, not json.loads: pyproject is TOML, and its deps drive Python framework detection.\"\"\"\n    try:\n        data = tomllib.loads(raw)\n    except Exception:\n        log.debug(\"manifest structural truncation: unparseable TOML\", exc_info=True)\n        return None\n    keep = _pyproject_keep(data)\n    return _cap_text(json.dumps(keep, indent=2, sort_keys=True, default=str), cap) if keep else None\n\n\n_TRUNCATORS = {\n    \"package.json\": _truncate_package_json,\n    \"composer.json\": _truncate_package_json,\n    \"pyproject.toml\": _truncate_pyproject_toml,\n}\n\n\ndef _structural_truncate(kind: str, raw: str, cap: int) -> str:\n    \"\"\"Keep a manifest's dependency section, not a blind prefix; falls back to a plain cap.\"\"\"\n    truncate = _TRUNCATORS.get(kind)\n    kept = truncate(raw, cap) if truncate else None\n    return kept if kept is not None else _cap_text(raw, cap)\n\n\ndef _apply_manifest_total_cap(manifests: list[tuple[str, str]],\n                              total_cap: int) -> list[tuple[str, str]]:\n    \"\"\"Aggregate cap across every manifest, applied after each file's own truncation cap.\"\"\"\n    out: list[tuple[str, str]] = []\n    remaining = total_cap\n    for name, text in manifests:\n        if remaining <= 0:\n            break\n        if len(text) > remaining:\n            text = _cap_text(text, remaining)\n        out.append((name, text))\n        remaining -= len(text)\n    return out\n\n\ndef _dir_manifest_hits(root: Path, d: Path) -> dict[str, list[Path]]:\n    \"\"\"Manifest candidates directly inside `d`, containment-checked, grouped by candidate name.\"\"\"\n    hits: dict[str, list[Path]] = {}\n    for name in _MANIFEST_CANDIDATES:\n        candidates = sorted(d.glob(f\"*{name}\")) if name.startswith(\".\") else [d / name]\n        for p in candidates:\n            # A manifest-named link can target any in-root file (.git/config, a key); S2 is unredacted\n            if p.is_symlink():\n                continue\n            if p.is_file() and _contained(root, p) is not None:\n                hits.setdefault(name, []).append(p)\n    return hits\n\n\ndef _walkable_children(d: Path) -> list[Path]:\n    \"\"\"Subdirectories eligible for the manifest walk: not excluded, not a symlink.\n\n    Mirrors s1_preprocess's ``target/`` carve-out (see\n    ``vvaharness.scope.walk._has_target_build_marker``): a directory literally\n    named ``target`` is only excluded when a Maven/Gradle/Cargo/sbt/Leiningen\n    build marker sits in `d`, so this walk never disagrees with the production\n    one about what counts as build output vs. app code.\n    \"\"\"\n    try:\n        children = sorted(c for c in d.iterdir() if c.is_dir())\n    except OSError:\n        return []\n    return [\n        c for c in children\n        if not c.is_symlink()\n        and (\n            c.name not in _DEFAULT_EXCLUDE_DIRS\n            or (c.name == \"target\" and not _has_target_build_marker(d, []))\n        )\n    ]\n\n\ndef _walk_for_manifests(root: Path, d: Path, depth: int, max_depth: int,\n                        hits_by_kind: dict[str, list[Path]]) -> None:\n    \"\"\"Depth-bounded walk honouring s1's exclusion set; never descends into a symlinked dir.\"\"\"\n    for name, paths in _dir_manifest_hits(root, d).items():\n        hits_by_kind.setdefault(name, []).extend(paths)\n    if depth >= max_depth:\n        return\n    for child in _walkable_children(d):\n        _walk_for_manifests(root, child, depth + 1, max_depth, hits_by_kind)\n\n\ndef _find_manifests(root: Path, max_depth: int, max_total: int,\n                    max_per_kind: int) -> list[tuple[str, Path]]:\n    \"\"\"Bounded search, deduped per kind, then breadth-first across kinds up to `max_total`.\"\"\"\n    hits_by_kind: dict[str, list[Path]] = {}\n    _walk_for_manifests(root, root, 0, max_depth, hits_by_kind)\n    for kind in hits_by_kind:\n        hits_by_kind[kind] = hits_by_kind[kind][:max_per_kind]\n    ordered_kinds = [k for k in _MANIFEST_CANDIDATES if k in hits_by_kind]\n    return _round_robin_select(hits_by_kind, max_total, keys=ordered_kinds)\n\n\ndef _manifest_relpath(root: Path, p: Path) -> str:\n    try:\n        return str(p.relative_to(root)).replace(\"\\\\\", \"/\")\n    except ValueError:\n        return str(p)\n\n\ndef gather_manifests(root: Path, walk_bounds: tuple[int, int, int],\n                     manifest_cap: int, manifest_total_cap: int) -> list[tuple[str, str]]:\n    \"\"\"Find, read, structurally truncate, and aggregate-cap the manifest block.\"\"\"\n    max_depth, max_total, max_per_kind = walk_bounds\n    manifests_struct: list[tuple[str, str]] = []\n    for kind, p in _find_manifests(root, max_depth, max_total, max_per_kind):\n        raw = _read_capped(root, p, _MANIFEST_RAW_CEILING)\n        if not raw:\n            continue\n        relpath = _manifest_relpath(root, p)\n        manifests_struct.append((relpath, _structural_truncate(kind, raw, manifest_cap)))\n    return _apply_manifest_total_cap(manifests_struct, manifest_total_cap)\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/evidence/manifests.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "Build/dependency manifests: bounded walk, per-format structural truncation, aggregate cap.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_46_4": {
+      "source": "vvaharness/evidence/manifests.py",
+      "line_start": 46,
+      "line_end": 46,
+      "value": "Keep only the name/version/dependency keys of a package.json-shaped manifest.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_59_4": {
+      "source": "vvaharness/evidence/manifests.py",
+      "line_start": 59,
+      "line_end": 59,
+      "value": "The `[project]` and Poetry dependency tables, the two Python framework-detection signals.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_74_4": {
+      "source": "vvaharness/evidence/manifests.py",
+      "line_start": 74,
+      "line_end": 74,
+      "value": "tomllib, not json.loads: pyproject is TOML, and its deps drive Python framework detection.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_92_4": {
+      "source": "vvaharness/evidence/manifests.py",
+      "line_start": 92,
+      "line_end": 92,
+      "value": "Keep a manifest's dependency section, not a blind prefix; falls back to a plain cap.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_100_4": {
+      "source": "vvaharness/evidence/manifests.py",
+      "line_start": 100,
+      "line_end": 100,
+      "value": "Aggregate cap across every manifest, applied after each file's own truncation cap.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_114_4": {
+      "source": "vvaharness/evidence/manifests.py",
+      "line_start": 114,
+      "line_end": 114,
+      "value": "Manifest candidates directly inside `d`, containment-checked, grouped by candidate name.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_117_35": {
+      "source": "vvaharness/evidence/manifests.py",
+      "line_start": 117,
+      "line_end": 117,
+      "source_expression": "f\"*{name}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_128_4": {
+      "source": "vvaharness/evidence/manifests.py",
+      "line_start": 128,
+      "line_end": 135,
+      "value": "Subdirectories eligible for the manifest walk: not excluded, not a symlink.\n\n    Mirrors s1_preprocess's ``target/`` carve-out (see\n    ``vvaharness.scope.walk._has_target_build_marker``): a directory literally\n    named ``target`` is only excluded when a Maven/Gradle/Cargo/sbt/Leiningen\n    build marker sits in `d`, so this walk never disagrees with the production\n    one about what counts as build output vs. app code.\n    ",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_152_4": {
+      "source": "vvaharness/evidence/manifests.py",
+      "line_start": 152,
+      "line_end": 152,
+      "value": "Depth-bounded walk honouring s1's exclusion set; never descends into a symlinked dir.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_163_4": {
+      "source": "vvaharness/evidence/manifests.py",
+      "line_start": 163,
+      "line_end": 163,
+      "value": "Bounded search, deduped per kind, then breadth-first across kinds up to `max_total`.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_181_4": {
+      "source": "vvaharness/evidence/manifests.py",
+      "line_start": 181,
+      "line_end": 181,
+      "value": "Find, read, structurally truncate, and aggregate-cap the manifest block.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "Build/dependency manifests: bounded walk, per-format structural truncation, aggregate cap.",
+      "context": "literal"
+    },
+    {
+      "line_start": 30,
+      "line_end": 30,
+      "column": 4,
+      "value": "package.json",
+      "context": "literal"
+    },
+    {
+      "line_start": 30,
+      "line_end": 30,
+      "column": 20,
+      "value": "pom.xml",
+      "context": "literal"
+    },
+    {
+      "line_start": 30,
+      "line_end": 30,
+      "column": 31,
+      "value": "build.gradle",
+      "context": "literal"
+    },
+    {
+      "line_start": 30,
+      "line_end": 30,
+      "column": 47,
+      "value": "build.gradle.kts",
+      "context": "literal"
+    },
+    {
+      "line_start": 31,
+      "line_end": 31,
+      "column": 4,
+      "value": "setup.py",
+      "context": "literal"
+    },
+    {
+      "line_start": 31,
+      "line_end": 31,
+      "column": 16,
+      "value": "pyproject.toml",
+      "context": "literal"
+    },
+    {
+      "line_start": 31,
+      "line_end": 31,
+      "column": 34,
+      "value": "requirements.txt",
+      "context": "literal"
+    },
+    {
+      "line_start": 32,
+      "line_end": 32,
+      "column": 4,
+      "value": "go.mod",
+      "context": "literal"
+    },
+    {
+      "line_start": 32,
+      "line_end": 32,
+      "column": 14,
+      "value": "Cargo.toml",
+      "context": "literal"
+    },
+    {
+      "line_start": 32,
+      "line_end": 32,
+      "column": 28,
+      "value": "Gemfile",
+      "context": "literal"
+    },
+    {
+      "line_start": 32,
+      "line_end": 32,
+      "column": 39,
+      "value": "composer.json",
+      "context": "literal"
+    },
+    {
+      "line_start": 33,
+      "line_end": 33,
+      "column": 4,
+      "value": "Dockerfile",
+      "context": "literal"
+    },
+    {
+      "line_start": 33,
+      "line_end": 33,
+      "column": 18,
+      "value": "docker-compose.yml",
+      "context": "literal"
+    },
+    {
+      "line_start": 33,
+      "line_end": 33,
+      "column": 40,
+      "value": "docker-compose.yaml",
+      "context": "literal"
+    },
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 4,
+      "value": ".csproj",
+      "context": "literal"
+    },
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 22,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 30,
+      "value": "version",
+      "context": "literal"
+    },
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 41,
+      "value": "dependencies",
+      "context": "literal"
+    },
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 57,
+      "value": "devDependencies",
+      "context": "literal"
+    },
+    {
+      "line_start": 41,
+      "line_end": 41,
+      "column": 21,
+      "value": "peerDependencies",
+      "context": "literal"
+    },
+    {
+      "line_start": 41,
+      "line_end": 41,
+      "column": 41,
+      "value": "require",
+      "context": "literal"
+    },
+    {
+      "line_start": 41,
+      "line_end": 41,
+      "column": 52,
+      "value": "require-dev",
+      "context": "literal"
+    },
+    {
+      "line_start": 41,
+      "line_end": 41,
+      "column": 67,
+      "value": "scripts",
+      "context": "literal"
+    },
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 27,
+      "value": "name",
+      "context": "literal"
+    },
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 35,
+      "value": "version",
+      "context": "literal"
+    },
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 46,
+      "value": "dependencies",
+      "context": "literal"
+    },
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 62,
+      "value": "optional-dependencies",
+      "context": "literal"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 4,
+      "value": "Keep only the name/version/dependency keys of a package.json-shaped manifest.",
+      "context": "literal"
+    },
+    {
+      "line_start": 59,
+      "line_end": 59,
+      "column": 4,
+      "value": "The `[project]` and Poetry dependency tables, the two Python framework-detection signals.",
+      "context": "literal"
+    },
+    {
+      "line_start": 74,
+      "line_end": 74,
+      "column": 4,
+      "value": "tomllib, not json.loads: pyproject is TOML, and its deps drive Python framework detection.",
+      "context": "literal"
+    },
+    {
+      "line_start": 85,
+      "line_end": 85,
+      "column": 4,
+      "value": "package.json",
+      "context": "literal"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 4,
+      "value": "composer.json",
+      "context": "literal"
+    },
+    {
+      "line_start": 87,
+      "line_end": 87,
+      "column": 4,
+      "value": "pyproject.toml",
+      "context": "literal"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 4,
+      "value": "Keep a manifest's dependency section, not a blind prefix; falls back to a plain cap.",
+      "context": "literal"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 4,
+      "value": "Aggregate cap across every manifest, applied after each file's own truncation cap.",
+      "context": "literal"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 4,
+      "value": "Manifest candidates directly inside `d`, containment-checked, grouped by candidate name.",
+      "context": "literal"
+    },
+    {
+      "line_start": 128,
+      "line_end": 135,
+      "column": 4,
+      "value": "Subdirectories eligible for the manifest walk: not excluded, not a symlink.\n\n    Mirrors s1_preprocess's ``target/`` carve-out (see\n    ``vvaharness.scope.walk._has_target_build_marker``): a directory literally\n    named ``target`` is only excluded when a Maven/Gradle/Cargo/sbt/Leiningen\n    build marker sits in `d`, so this walk never disagrees with the production\n    one about what counts as build output vs. app code.\n    ",
+      "context": "literal"
+    },
+    {
+      "line_start": 152,
+      "line_end": 152,
+      "column": 4,
+      "value": "Depth-bounded walk honouring s1's exclusion set; never descends into a symlinked dir.",
+      "context": "literal"
+    },
+    {
+      "line_start": 163,
+      "line_end": 163,
+      "column": 4,
+      "value": "Bounded search, deduped per kind, then breadth-first across kinds up to `max_total`.",
+      "context": "literal"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 4,
+      "value": "Find, read, structurally truncate, and aggregate-cap the manifest block.",
+      "context": "literal"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 23,
+      "value": "project",
+      "context": "literal"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 20,
+      "value": "tool",
+      "context": "literal"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 22,
+      "value": "poetry",
+      "context": "literal"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 36,
+      "value": "dependencies",
+      "context": "literal"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 13,
+      "value": "tool",
+      "context": "literal"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 24,
+      "value": "poetry",
+      "context": "literal"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 48,
+      "value": "\\",
+      "context": "literal"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 54,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 50,
+      "line_end": 50,
+      "column": 18,
+      "value": "manifest structural truncation: unparseable JSON",
+      "context": "literal"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 17,
+      "value": "project",
+      "context": "literal"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 35,
+      "value": "dependencies",
+      "context": "literal"
+    },
+    {
+      "line_start": 78,
+      "line_end": 78,
+      "column": 18,
+      "value": "manifest structural truncation: unparseable TOML",
+      "context": "literal"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 67,
+      "value": ".",
+      "context": "literal"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 58,
+      "value": "dependencies",
+      "context": "literal"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 37,
+      "value": "*",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 145,
+      "line_end": 145,
+      "column": 26,
+      "value": "target",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 37,
+      "text": "# Raw pre-parse ceiling; the USEFUL cap (manifest_cap) applies to the structurally-extracted text."
+    },
+    {
+      "line": 119,
+      "text": "# A manifest-named link can target any in-root file (.git/config, a key); S2 is unredacted"
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 18,
+      "line_end": 18,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 23,
+      "line_end": 23,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "Assign",
+      "line_start": 27,
+      "line_end": 27,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "Assign",
+      "line_start": 29,
+      "line_end": 35,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 38,
+      "line_end": 38,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 40,
+      "line_end": 41,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 42,
+      "line_end": 42,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 45,
+      "line_end": 55,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 7
+    },
+    {
+      "kind": "Expr",
+      "line_start": 46,
+      "line_end": 46,
+      "column": 4,
+      "owner": "_truncate_package_json",
+      "representation_line": 13
+    },
+    {
+      "kind": "Try",
+      "line_start": 47,
+      "line_end": 51,
+      "column": 4,
+      "owner": "_truncate_package_json",
+      "representation_line": 14
+    },
+    {
+      "kind": "Assign",
+      "line_start": 48,
+      "line_end": 48,
+      "column": 8,
+      "owner": "_truncate_package_json",
+      "representation_line": 17
+    },
+    {
+      "kind": "Expr",
+      "line_start": 50,
+      "line_end": 50,
+      "column": 8,
+      "owner": "_truncate_package_json",
+      "representation_line": 22
+    },
+    {
+      "kind": "Return",
+      "line_start": 51,
+      "line_end": 51,
+      "column": 8,
+      "owner": "_truncate_package_json",
+      "representation_line": 23
+    },
+    {
+      "kind": "If",
+      "line_start": 52,
+      "line_end": 53,
+      "column": 4,
+      "owner": "_truncate_package_json",
+      "representation_line": 26
+    },
+    {
+      "kind": "Return",
+      "line_start": 53,
+      "line_end": 53,
+      "column": 8,
+      "owner": "_truncate_package_json",
+      "representation_line": 28
+    },
+    {
+      "kind": "Assign",
+      "line_start": 54,
+      "line_end": 54,
+      "column": 4,
+      "owner": "_truncate_package_json",
+      "representation_line": 32
+    },
+    {
+      "kind": "Return",
+      "line_start": 55,
+      "line_end": 55,
+      "column": 4,
+      "owner": "_truncate_package_json",
+      "representation_line": 33
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 58,
+      "line_end": 70,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 37
+    },
+    {
+      "kind": "Expr",
+      "line_start": 59,
+      "line_end": 59,
+      "column": 4,
+      "owner": "_pyproject_keep",
+      "representation_line": 43
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 60,
+      "line_end": 60,
+      "column": 4,
+      "owner": "_pyproject_keep",
+      "representation_line": 43
+    },
+    {
+      "kind": "Assign",
+      "line_start": 61,
+      "line_end": 61,
+      "column": 4,
+      "owner": "_pyproject_keep",
+      "representation_line": 43
+    },
+    {
+      "kind": "If",
+      "line_start": 62,
+      "line_end": 65,
+      "column": 4,
+      "owner": "_pyproject_keep",
+      "representation_line": 44
+    },
+    {
+      "kind": "Assign",
+      "line_start": 63,
+      "line_end": 63,
+      "column": 8,
+      "owner": "_pyproject_keep",
+      "representation_line": 47
+    },
+    {
+      "kind": "If",
+      "line_start": 64,
+      "line_end": 65,
+      "column": 8,
+      "owner": "_pyproject_keep",
+      "representation_line": 48
+    },
+    {
+      "kind": "Assign",
+      "line_start": 65,
+      "line_end": 65,
+      "column": 12,
+      "owner": "_pyproject_keep",
+      "representation_line": 51
+    },
+    {
+      "kind": "Assign",
+      "line_start": 66,
+      "line_end": 66,
+      "column": 4,
+      "owner": "_pyproject_keep",
+      "representation_line": 55
+    },
+    {
+      "kind": "Assign",
+      "line_start": 67,
+      "line_end": 67,
+      "column": 4,
+      "owner": "_pyproject_keep",
+      "representation_line": 55
+    },
+    {
+      "kind": "If",
+      "line_start": 68,
+      "line_end": 69,
+      "column": 4,
+      "owner": "_pyproject_keep",
+      "representation_line": 56
+    },
+    {
+      "kind": "Assign",
+      "line_start": 69,
+      "line_end": 69,
+      "column": 8,
+      "owner": "_pyproject_keep",
+      "representation_line": 59
+    },
+    {
+      "kind": "Return",
+      "line_start": 70,
+      "line_end": 70,
+      "column": 4,
+      "owner": "_pyproject_keep",
+      "representation_line": 61
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 73,
+      "line_end": 81,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 65
+    },
+    {
+      "kind": "Expr",
+      "line_start": 74,
+      "line_end": 74,
+      "column": 4,
+      "owner": "_truncate_pyproject_toml",
+      "representation_line": 71
+    },
+    {
+      "kind": "Try",
+      "line_start": 75,
+      "line_end": 79,
+      "column": 4,
+      "owner": "_truncate_pyproject_toml",
+      "representation_line": 72
+    },
+    {
+      "kind": "Assign",
+      "line_start": 76,
+      "line_end": 76,
+      "column": 8,
+      "owner": "_truncate_pyproject_toml",
+      "representation_line": 75
+    },
+    {
+      "kind": "Expr",
+      "line_start": 78,
+      "line_end": 78,
+      "column": 8,
+      "owner": "_truncate_pyproject_toml",
+      "representation_line": 80
+    },
+    {
+      "kind": "Return",
+      "line_start": 79,
+      "line_end": 79,
+      "column": 8,
+      "owner": "_truncate_pyproject_toml",
+      "representation_line": 81
+    },
+    {
+      "kind": "Assign",
+      "line_start": 80,
+      "line_end": 80,
+      "column": 4,
+      "owner": "_truncate_pyproject_toml",
+      "representation_line": 85
+    },
+    {
+      "kind": "Return",
+      "line_start": 81,
+      "line_end": 81,
+      "column": 4,
+      "owner": "_truncate_pyproject_toml",
+      "representation_line": 86
+    },
+    {
+      "kind": "Assign",
+      "line_start": 84,
+      "line_end": 88,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 91
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 91,
+      "line_end": 95,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 92
+    },
+    {
+      "kind": "Expr",
+      "line_start": 92,
+      "line_end": 92,
+      "column": 4,
+      "owner": "_structural_truncate",
+      "representation_line": 98
+    },
+    {
+      "kind": "Assign",
+      "line_start": 93,
+      "line_end": 93,
+      "column": 4,
+      "owner": "_structural_truncate",
+      "representation_line": 98
+    },
+    {
+      "kind": "Assign",
+      "line_start": 94,
+      "line_end": 94,
+      "column": 4,
+      "owner": "_structural_truncate",
+      "representation_line": 98
+    },
+    {
+      "kind": "Return",
+      "line_start": 95,
+      "line_end": 95,
+      "column": 4,
+      "owner": "_structural_truncate",
+      "representation_line": 99
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 98,
+      "line_end": 110,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 103
+    },
+    {
+      "kind": "Expr",
+      "line_start": 100,
+      "line_end": 100,
+      "column": 4,
+      "owner": "_apply_manifest_total_cap",
+      "representation_line": 109
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 101,
+      "line_end": 101,
+      "column": 4,
+      "owner": "_apply_manifest_total_cap",
+      "representation_line": 109
+    },
+    {
+      "kind": "Assign",
+      "line_start": 102,
+      "line_end": 102,
+      "column": 4,
+      "owner": "_apply_manifest_total_cap",
+      "representation_line": 109
+    },
+    {
+      "kind": "For",
+      "line_start": 103,
+      "line_end": 109,
+      "column": 4,
+      "owner": "_apply_manifest_total_cap",
+      "representation_line": 110
+    },
+    {
+      "kind": "If",
+      "line_start": 104,
+      "line_end": 105,
+      "column": 8,
+      "owner": "_apply_manifest_total_cap",
+      "representation_line": 112
+    },
+    {
+      "kind": "Break",
+      "line_start": 105,
+      "line_end": 105,
+      "column": 12,
+      "owner": "_apply_manifest_total_cap",
+      "representation_line": 114
+    },
+    {
+      "kind": "If",
+      "line_start": 106,
+      "line_end": 107,
+      "column": 8,
+      "owner": "_apply_manifest_total_cap",
+      "representation_line": 117
+    },
+    {
+      "kind": "Assign",
+      "line_start": 107,
+      "line_end": 107,
+      "column": 12,
+      "owner": "_apply_manifest_total_cap",
+      "representation_line": 120
+    },
+    {
+      "kind": "Expr",
+      "line_start": 108,
+      "line_end": 108,
+      "column": 8,
+      "owner": "_apply_manifest_total_cap",
+      "representation_line": 123
+    },
+    {
+      "kind": "AugAssign",
+      "line_start": 109,
+      "line_end": 109,
+      "column": 8,
+      "owner": "_apply_manifest_total_cap",
+      "representation_line": 123
+    },
+    {
+      "kind": "Return",
+      "line_start": 110,
+      "line_end": 110,
+      "column": 4,
+      "owner": "_apply_manifest_total_cap",
+      "representation_line": 125
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 113,
+      "line_end": 124,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 129
+    },
+    {
+      "kind": "Expr",
+      "line_start": 114,
+      "line_end": 114,
+      "column": 4,
+      "owner": "_dir_manifest_hits",
+      "representation_line": 135
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 115,
+      "line_end": 115,
+      "column": 4,
+      "owner": "_dir_manifest_hits",
+      "representation_line": 135
+    },
+    {
+      "kind": "For",
+      "line_start": 116,
+      "line_end": 123,
+      "column": 4,
+      "owner": "_dir_manifest_hits",
+      "representation_line": 136
+    },
+    {
+      "kind": "Assign",
+      "line_start": 117,
+      "line_end": 117,
+      "column": 8,
+      "owner": "_dir_manifest_hits",
+      "representation_line": 139
+    },
+    {
+      "kind": "For",
+      "line_start": 118,
+      "line_end": 123,
+      "column": 8,
+      "owner": "_dir_manifest_hits",
+      "representation_line": 140
+    },
+    {
+      "kind": "If",
+      "line_start": 120,
+      "line_end": 121,
+      "column": 12,
+      "owner": "_dir_manifest_hits",
+      "representation_line": 142
+    },
+    {
+      "kind": "Continue",
+      "line_start": 121,
+      "line_end": 121,
+      "column": 16,
+      "owner": "_dir_manifest_hits",
+      "representation_line": 144
+    },
+    {
+      "kind": "If",
+      "line_start": 122,
+      "line_end": 123,
+      "column": 12,
+      "owner": "_dir_manifest_hits",
+      "representation_line": 147
+    },
+    {
+      "kind": "Expr",
+      "line_start": 123,
+      "line_end": 123,
+      "column": 16,
+      "owner": "_dir_manifest_hits",
+      "representation_line": 150
+    },
+    {
+      "kind": "Return",
+      "line_start": 124,
+      "line_end": 124,
+      "column": 4,
+      "owner": "_dir_manifest_hits",
+      "representation_line": 154
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 127,
+      "line_end": 147,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 158
+    },
+    {
+      "kind": "Expr",
+      "line_start": 128,
+      "line_end": 135,
+      "column": 4,
+      "owner": "_walkable_children",
+      "representation_line": 164
+    },
+    {
+      "kind": "Try",
+      "line_start": 136,
+      "line_end": 139,
+      "column": 4,
+      "owner": "_walkable_children",
+      "representation_line": 165
+    },
+    {
+      "kind": "Assign",
+      "line_start": 137,
+      "line_end": 137,
+      "column": 8,
+      "owner": "_walkable_children",
+      "representation_line": 168
+    },
+    {
+      "kind": "Return",
+      "line_start": 139,
+      "line_end": 139,
+      "column": 8,
+      "owner": "_walkable_children",
+      "representation_line": 172
+    },
+    {
+      "kind": "Return",
+      "line_start": 140,
+      "line_end": 147,
+      "column": 4,
+      "owner": "_walkable_children",
+      "representation_line": 175
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 150,
+      "line_end": 158,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 179
+    },
+    {
+      "kind": "Expr",
+      "line_start": 152,
+      "line_end": 152,
+      "column": 4,
+      "owner": "_walk_for_manifests",
+      "representation_line": 185
+    },
+    {
+      "kind": "For",
+      "line_start": 153,
+      "line_end": 154,
+      "column": 4,
+      "owner": "_walk_for_manifests",
+      "representation_line": 186
+    },
+    {
+      "kind": "Expr",
+      "line_start": 154,
+      "line_end": 154,
+      "column": 8,
+      "owner": "_walk_for_manifests",
+      "representation_line": 189
+    },
+    {
+      "kind": "If",
+      "line_start": 155,
+      "line_end": 156,
+      "column": 4,
+      "owner": "_walk_for_manifests",
+      "representation_line": 191
+    },
+    {
+      "kind": "Return",
+      "line_start": 156,
+      "line_end": 156,
+      "column": 8,
+      "owner": "_walk_for_manifests",
+      "representation_line": 193
+    },
+    {
+      "kind": "For",
+      "line_start": 157,
+      "line_end": 158,
+      "column": 4,
+      "owner": "_walk_for_manifests",
+      "representation_line": 196
+    },
+    {
+      "kind": "Expr",
+      "line_start": 158,
+      "line_end": 158,
+      "column": 8,
+      "owner": "_walk_for_manifests",
+      "representation_line": 199
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 161,
+      "line_end": 169,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 203
+    },
+    {
+      "kind": "Expr",
+      "line_start": 163,
+      "line_end": 163,
+      "column": 4,
+      "owner": "_find_manifests",
+      "representation_line": 209
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 164,
+      "line_end": 164,
+      "column": 4,
+      "owner": "_find_manifests",
+      "representation_line": 209
+    },
+    {
+      "kind": "Expr",
+      "line_start": 165,
+      "line_end": 165,
+      "column": 4,
+      "owner": "_find_manifests",
+      "representation_line": 209
+    },
+    {
+      "kind": "For",
+      "line_start": 166,
+      "line_end": 167,
+      "column": 4,
+      "owner": "_find_manifests",
+      "representation_line": 210
+    },
+    {
+      "kind": "Assign",
+      "line_start": 167,
+      "line_end": 167,
+      "column": 8,
+      "owner": "_find_manifests",
+      "representation_line": 213
+    },
+    {
+      "kind": "Assign",
+      "line_start": 168,
+      "line_end": 168,
+      "column": 4,
+      "owner": "_find_manifests",
+      "representation_line": 216
+    },
+    {
+      "kind": "Return",
+      "line_start": 169,
+      "line_end": 169,
+      "column": 4,
+      "owner": "_find_manifests",
+      "representation_line": 217
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 172,
+      "line_end": 176,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 221
+    },
+    {
+      "kind": "Try",
+      "line_start": 173,
+      "line_end": 176,
+      "column": 4,
+      "owner": "_manifest_relpath",
+      "representation_line": 226
+    },
+    {
+      "kind": "Return",
+      "line_start": 174,
+      "line_end": 174,
+      "column": 8,
+      "owner": "_manifest_relpath",
+      "representation_line": 228
+    },
+    {
+      "kind": "Return",
+      "line_start": 176,
+      "line_end": 176,
+      "column": 8,
+      "owner": "_manifest_relpath",
+      "representation_line": 233
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 179,
+      "line_end": 190,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 238
+    },
+    {
+      "kind": "Expr",
+      "line_start": 181,
+      "line_end": 181,
+      "column": 4,
+      "owner": "gather_manifests",
+      "representation_line": 244
+    },
+    {
+      "kind": "Assign",
+      "line_start": 182,
+      "line_end": 182,
+      "column": 4,
+      "owner": "gather_manifests",
+      "representation_line": 244
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 183,
+      "line_end": 183,
+      "column": 4,
+      "owner": "gather_manifests",
+      "representation_line": 244
+    },
+    {
+      "kind": "For",
+      "line_start": 184,
+      "line_end": 189,
+      "column": 4,
+      "owner": "gather_manifests",
+      "representation_line": 245
+    },
+    {
+      "kind": "Assign",
+      "line_start": 185,
+      "line_end": 185,
+      "column": 8,
+      "owner": "gather_manifests",
+      "representation_line": 248
+    },
+    {
+      "kind": "If",
+      "line_start": 186,
+      "line_end": 187,
+      "column": 8,
+      "owner": "gather_manifests",
+      "representation_line": 249
+    },
+    {
+      "kind": "Continue",
+      "line_start": 187,
+      "line_end": 187,
+      "column": 12,
+      "owner": "gather_manifests",
+      "representation_line": 251
+    },
+    {
+      "kind": "Assign",
+      "line_start": 188,
+      "line_end": 188,
+      "column": 8,
+      "owner": "gather_manifests",
+      "representation_line": 255
+    },
+    {
+      "kind": "Expr",
+      "line_start": 189,
+      "line_end": 189,
+      "column": 8,
+      "owner": "gather_manifests",
+      "representation_line": 255
+    },
+    {
+      "kind": "Return",
+      "line_start": 190,
+      "line_end": 190,
+      "column": 4,
+      "owner": "gather_manifests",
+      "representation_line": 257
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 27,
+      "line_end": 27,
+      "column": 6,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='logs', ctx=Load()), attr='get_logger', ctx=Load()), args=[Name(id='__name__', ctx=Load())], keywords=[])",
+      "rendered": "logs.get_logger(__name__)"
+    },
+    {
+      "line_start": 29,
+      "line_end": 35,
+      "column": 23,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value='package.json'), Constant(value='pom.xml'), Constant(value='build.gradle'), Constant(value='build.gradle.kts'), Constant(value='setup.py'), Constant(value='pyproject.toml'), Constant(value='requirements.txt'), Constant(value='go.mod'), Constant(value='Cargo.toml'), Constant(value='Gemfile'), Constant(value='composer.json'), Constant(value='Dockerfile'), Constant(value='docker-compose.yml'), Constant(value='docker-compose.yaml'), Constant(value='.csproj')], ctx=Load())",
+      "rendered": "('package.json', 'pom.xml', 'build.gradle', 'build.gradle.kts', 'setup.py', 'pyproject.toml', 'requirements.txt', 'go.mod', 'Cargo.toml', 'Gemfile', 'composer.json', 'Dockerfile', 'docker-compose.yml', 'docker-compose.yaml', '.csproj')"
+    },
+    {
+      "line_start": 38,
+      "line_end": 38,
+      "column": 24,
+      "kind": "Constant",
+      "original_ast": "Constant(value=500000)",
+      "rendered": "500000"
+    },
+    {
+      "line_start": 40,
+      "line_end": 41,
+      "column": 21,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value='name'), Constant(value='version'), Constant(value='dependencies'), Constant(value='devDependencies'), Constant(value='peerDependencies'), Constant(value='require'), Constant(value='require-dev'), Constant(value='scripts')], ctx=Load())",
+      "rendered": "('name', 'version', 'dependencies', 'devDependencies', 'peerDependencies', 'require', 'require-dev', 'scripts')"
+    },
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 26,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value='name'), Constant(value='version'), Constant(value='dependencies'), Constant(value='optional-dependencies')], ctx=Load())",
+      "rendered": "('name', 'version', 'dependencies', 'optional-dependencies')"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='json', ctx=Load()), attr='loads', ctx=Load()), args=[Name(id='raw', ctx=Load())], keywords=[])",
+      "rendered": "json.loads(raw)"
+    },
+    {
+      "line_start": 49,
+      "line_end": 49,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 50,
+      "line_end": 50,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='debug', ctx=Load()), args=[Constant(value='manifest structural truncation: unparseable JSON')], keywords=[keyword(arg='exc_info', value=Constant(value=True))])",
+      "rendered": "log.debug('manifest structural truncation: unparseable JSON', exc_info=True)"
+    },
+    {
+      "line_start": 51,
+      "line_end": 51,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 52,
+      "line_end": 52,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='data', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[]))",
+      "rendered": "not isinstance(data, dict)"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 54,
+      "line_end": 54,
+      "column": 11,
+      "kind": "DictComp",
+      "original_ast": "DictComp(key=Name(id='k', ctx=Load()), value=Name(id='v', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='k', ctx=Store()), Name(id='v', ctx=Store())], ctx=Store()), iter=Call(func=Attribute(value=Name(id='data', ctx=Load()), attr='items', ctx=Load()), args=[], keywords=[]), ifs=[Compare(left=Name(id='k', ctx=Load()), ops=[In()], comparators=[Name(id='_PACKAGE_JSON_KEYS', ctx=Load())])], is_async=0)])",
+      "rendered": "{k: v for k, v in data.items() if k in _PACKAGE_JSON_KEYS}"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='keep', ctx=Load()), body=Call(func=Name(id='_cap_text', ctx=Load()), args=[Call(func=Attribute(value=Name(id='json', ctx=Load()), attr='dumps', ctx=Load()), args=[Name(id='keep', ctx=Load())], keywords=[keyword(arg='indent', value=Constant(value=2)), keyword(arg='sort_keys', value=Constant(value=True))]), Name(id='cap', ctx=Load())], keywords=[]), orelse=Constant(value=None))",
+      "rendered": "_cap_text(json.dumps(keep, indent=2, sort_keys=True), cap) if keep else None"
+    },
+    {
+      "line_start": 60,
+      "line_end": 60,
+      "column": 17,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 61,
+      "line_end": 61,
+      "column": 14,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='data', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[]), body=Call(func=Attribute(value=Name(id='data', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='project')], keywords=[]), orelse=Constant(value=None))",
+      "rendered": "data.get('project') if isinstance(data, dict) else None"
+    },
+    {
+      "line_start": 62,
+      "line_end": 62,
+      "column": 7,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='project', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[])",
+      "rendered": "isinstance(project, dict)"
+    },
+    {
+      "line_start": 63,
+      "line_end": 63,
+      "column": 14,
+      "kind": "DictComp",
+      "original_ast": "DictComp(key=Name(id='k', ctx=Load()), value=Name(id='v', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='k', ctx=Store()), Name(id='v', ctx=Store())], ctx=Store()), iter=Call(func=Attribute(value=Name(id='project', ctx=Load()), attr='items', ctx=Load()), args=[], keywords=[]), ifs=[Compare(left=Name(id='k', ctx=Load()), ops=[In()], comparators=[Name(id='_PYPROJECT_PROJECT_KEYS', ctx=Load())])], is_async=0)])",
+      "rendered": "{k: v for k, v in project.items() if k in _PYPROJECT_PROJECT_KEYS}"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='sub', ctx=Load())",
+      "rendered": "sub"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 30,
+      "kind": "Name",
+      "original_ast": "Name(id='sub', ctx=Load())",
+      "rendered": "sub"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='data', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[]), body=Call(func=Attribute(value=Name(id='data', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='tool')], keywords=[]), orelse=Constant(value=None))",
+      "rendered": "data.get('tool') if isinstance(data, dict) else None"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 13,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='tool', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[]), body=Call(func=Attribute(value=Name(id='tool', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='poetry')], keywords=[]), orelse=Constant(value=None))",
+      "rendered": "tool.get('poetry') if isinstance(tool, dict) else None"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='poetry', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[]), Compare(left=Constant(value='dependencies'), ops=[In()], comparators=[Name(id='poetry', ctx=Load())])])",
+      "rendered": "isinstance(poetry, dict) and 'dependencies' in poetry"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 23,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='poetry')], values=[Dict(keys=[Constant(value='dependencies')], values=[Subscript(value=Name(id='poetry', ctx=Load()), slice=Constant(value='dependencies'), ctx=Load())])])",
+      "rendered": "{'poetry': {'dependencies': poetry['dependencies']}}"
+    },
+    {
+      "line_start": 70,
+      "line_end": 70,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='keep', ctx=Load())",
+      "rendered": "keep"
+    },
+    {
+      "line_start": 76,
+      "line_end": 76,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='tomllib', ctx=Load()), attr='loads', ctx=Load()), args=[Name(id='raw', ctx=Load())], keywords=[])",
+      "rendered": "tomllib.loads(raw)"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 78,
+      "line_end": 78,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='debug', ctx=Load()), args=[Constant(value='manifest structural truncation: unparseable TOML')], keywords=[keyword(arg='exc_info', value=Constant(value=True))])",
+      "rendered": "log.debug('manifest structural truncation: unparseable TOML', exc_info=True)"
+    },
+    {
+      "line_start": 79,
+      "line_end": 79,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_pyproject_keep', ctx=Load()), args=[Name(id='data', ctx=Load())], keywords=[])",
+      "rendered": "_pyproject_keep(data)"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='keep', ctx=Load()), body=Call(func=Name(id='_cap_text', ctx=Load()), args=[Call(func=Attribute(value=Name(id='json', ctx=Load()), attr='dumps', ctx=Load()), args=[Name(id='keep', ctx=Load())], keywords=[keyword(arg='indent', value=Constant(value=2)), keyword(arg='sort_keys', value=Constant(value=True)), keyword(arg='default', value=Name(id='str', ctx=Load()))]), Name(id='cap', ctx=Load())], keywords=[]), orelse=Constant(value=None))",
+      "rendered": "_cap_text(json.dumps(keep, indent=2, sort_keys=True, default=str), cap) if keep else None"
+    },
+    {
+      "line_start": 84,
+      "line_end": 88,
+      "column": 14,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='package.json'), Constant(value='composer.json'), Constant(value='pyproject.toml')], values=[Name(id='_truncate_package_json', ctx=Load()), Name(id='_truncate_package_json', ctx=Load()), Name(id='_truncate_pyproject_toml', ctx=Load())])",
+      "rendered": "{'package.json': _truncate_package_json, 'composer.json': _truncate_package_json, 'pyproject.toml': _truncate_pyproject_toml}"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_TRUNCATORS', ctx=Load()), attr='get', ctx=Load()), args=[Name(id='kind', ctx=Load())], keywords=[])",
+      "rendered": "_TRUNCATORS.get(kind)"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='truncate', ctx=Load()), body=Call(func=Name(id='truncate', ctx=Load()), args=[Name(id='raw', ctx=Load()), Name(id='cap', ctx=Load())], keywords=[]), orelse=Constant(value=None))",
+      "rendered": "truncate(raw, cap) if truncate else None"
+    },
+    {
+      "line_start": 95,
+      "line_end": 95,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=Name(id='kept', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), body=Name(id='kept', ctx=Load()), orelse=Call(func=Name(id='_cap_text', ctx=Load()), args=[Name(id='raw', ctx=Load()), Name(id='cap', ctx=Load())], keywords=[]))",
+      "rendered": "kept if kept is not None else _cap_text(raw, cap)"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 33,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 102,
+      "line_end": 102,
+      "column": 16,
+      "kind": "Name",
+      "original_ast": "Name(id='total_cap', ctx=Load())",
+      "rendered": "total_cap"
+    },
+    {
+      "line_start": 103,
+      "line_end": 103,
+      "column": 22,
+      "kind": "Name",
+      "original_ast": "Name(id='manifests', ctx=Load())",
+      "rendered": "manifests"
+    },
+    {
+      "line_start": 104,
+      "line_end": 104,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='remaining', ctx=Load()), ops=[LtE()], comparators=[Constant(value=0)])",
+      "rendered": "remaining <= 0"
+    },
+    {
+      "line_start": 106,
+      "line_end": 106,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='text', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Name(id='remaining', ctx=Load())])",
+      "rendered": "len(text) > remaining"
+    },
+    {
+      "line_start": 107,
+      "line_end": 107,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_cap_text', ctx=Load()), args=[Name(id='text', ctx=Load()), Name(id='remaining', ctx=Load())], keywords=[])",
+      "rendered": "_cap_text(text, remaining)"
+    },
+    {
+      "line_start": 108,
+      "line_end": 108,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='out', ctx=Load()), attr='append', ctx=Load()), args=[Tuple(elts=[Name(id='name', ctx=Load()), Name(id='text', ctx=Load())], ctx=Load())], keywords=[])",
+      "rendered": "out.append((name, text))"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 8,
+      "kind": "AugAssign",
+      "original_ast": "AugAssign(target=Name(id='remaining', ctx=Store()), op=Sub(), value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='text', ctx=Load())], keywords=[]))",
+      "rendered": "remaining -= len(text)"
+    },
+    {
+      "line_start": 110,
+      "line_end": 110,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='out', ctx=Load())",
+      "rendered": "out"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 34,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 16,
+      "kind": "Name",
+      "original_ast": "Name(id='_MANIFEST_CANDIDATES', ctx=Load())",
+      "rendered": "_MANIFEST_CANDIDATES"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 21,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Attribute(value=Name(id='name', ctx=Load()), attr='startswith', ctx=Load()), args=[Constant(value='.')], keywords=[]), body=Call(func=Name(id='sorted', ctx=Load()), args=[Call(func=Attribute(value=Name(id='d', ctx=Load()), attr='glob', ctx=Load()), args=[JoinedStr(values=[Constant(value='*'), FormattedValue(value=Name(id='name', ctx=Load()), conversion=-1)])], keywords=[])], keywords=[]), orelse=List(elts=[BinOp(left=Name(id='d', ctx=Load()), op=Div(), right=Name(id='name', ctx=Load()))], ctx=Load()))",
+      "rendered": "sorted(d.glob(source_template_117_35)) if name.startswith('.') else [d / name]"
+    },
+    {
+      "line_start": 118,
+      "line_end": 118,
+      "column": 17,
+      "kind": "Name",
+      "original_ast": "Name(id='candidates', ctx=Load())",
+      "rendered": "candidates"
+    },
+    {
+      "line_start": 120,
+      "line_end": 120,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='p', ctx=Load()), attr='is_symlink', ctx=Load()), args=[], keywords=[])",
+      "rendered": "p.is_symlink()"
+    },
+    {
+      "line_start": 122,
+      "line_end": 122,
+      "column": 15,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Call(func=Attribute(value=Name(id='p', ctx=Load()), attr='is_file', ctx=Load()), args=[], keywords=[]), Compare(left=Call(func=Name(id='_contained', ctx=Load()), args=[Name(id='root', ctx=Load()), Name(id='p', ctx=Load())], keywords=[]), ops=[IsNot()], comparators=[Constant(value=None)])])",
+      "rendered": "p.is_file() and _contained(root, p) is not None"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Name(id='hits', ctx=Load()), attr='setdefault', ctx=Load()), args=[Name(id='name', ctx=Load()), List(elts=[], ctx=Load())], keywords=[]), attr='append', ctx=Load()), args=[Name(id='p', ctx=Load())], keywords=[])",
+      "rendered": "hits.setdefault(name, []).append(p)"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='hits', ctx=Load())",
+      "rendered": "hits"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[GeneratorExp(elt=Name(id='c', ctx=Load()), generators=[comprehension(target=Name(id='c', ctx=Store()), iter=Call(func=Attribute(value=Name(id='d', ctx=Load()), attr='iterdir', ctx=Load()), args=[], keywords=[]), ifs=[Call(func=Attribute(value=Name(id='c', ctx=Load()), attr='is_dir', ctx=Load()), args=[], keywords=[])], is_async=0)])], keywords=[])",
+      "rendered": "sorted((c for c in d.iterdir() if c.is_dir()))"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='OSError', ctx=Load())",
+      "rendered": "OSError"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 15,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 140,
+      "line_end": 147,
+      "column": 11,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='c', ctx=Load()), generators=[comprehension(target=Name(id='c', ctx=Store()), iter=Name(id='children', ctx=Load()), ifs=[BoolOp(op=And(), values=[UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='c', ctx=Load()), attr='is_symlink', ctx=Load()), args=[], keywords=[])), BoolOp(op=Or(), values=[Compare(left=Attribute(value=Name(id='c', ctx=Load()), attr='name', ctx=Load()), ops=[NotIn()], comparators=[Name(id='_DEFAULT_EXCLUDE_DIRS', ctx=Load())]), BoolOp(op=And(), values=[Compare(left=Attribute(value=Name(id='c', ctx=Load()), attr='name', ctx=Load()), ops=[Eq()], comparators=[Constant(value='target')]), UnaryOp(op=Not(), operand=Call(func=Name(id='_has_target_build_marker', ctx=Load()), args=[Name(id='d', ctx=Load()), List(elts=[], ctx=Load())], keywords=[]))])])])], is_async=0)])",
+      "rendered": "[c for c in children if not c.is_symlink() and (c.name not in _DEFAULT_EXCLUDE_DIRS or (c.name == 'target' and (not _has_target_build_marker(d, []))))]"
+    },
+    {
+      "line_start": 153,
+      "line_end": 153,
+      "column": 23,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Name(id='_dir_manifest_hits', ctx=Load()), args=[Name(id='root', ctx=Load()), Name(id='d', ctx=Load())], keywords=[]), attr='items', ctx=Load()), args=[], keywords=[])",
+      "rendered": "_dir_manifest_hits(root, d).items()"
+    },
+    {
+      "line_start": 154,
+      "line_end": 154,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Attribute(value=Name(id='hits_by_kind', ctx=Load()), attr='setdefault', ctx=Load()), args=[Name(id='name', ctx=Load()), List(elts=[], ctx=Load())], keywords=[]), attr='extend', ctx=Load()), args=[Name(id='paths', ctx=Load())], keywords=[])",
+      "rendered": "hits_by_kind.setdefault(name, []).extend(paths)"
+    },
+    {
+      "line_start": 155,
+      "line_end": 155,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='depth', ctx=Load()), ops=[GtE()], comparators=[Name(id='max_depth', ctx=Load())])",
+      "rendered": "depth >= max_depth"
+    },
+    {
+      "line_start": 157,
+      "line_end": 157,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_walkable_children', ctx=Load()), args=[Name(id='d', ctx=Load())], keywords=[])",
+      "rendered": "_walkable_children(d)"
+    },
+    {
+      "line_start": 158,
+      "line_end": 158,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_walk_for_manifests', ctx=Load()), args=[Name(id='root', ctx=Load()), Name(id='child', ctx=Load()), BinOp(left=Name(id='depth', ctx=Load()), op=Add(), right=Constant(value=1)), Name(id='max_depth', ctx=Load()), Name(id='hits_by_kind', ctx=Load())], keywords=[])",
+      "rendered": "_walk_for_manifests(root, child, depth + 1, max_depth, hits_by_kind)"
+    },
+    {
+      "line_start": 164,
+      "line_end": 164,
+      "column": 42,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 165,
+      "line_end": 165,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_walk_for_manifests', ctx=Load()), args=[Name(id='root', ctx=Load()), Name(id='root', ctx=Load()), Constant(value=0), Name(id='max_depth', ctx=Load()), Name(id='hits_by_kind', ctx=Load())], keywords=[])",
+      "rendered": "_walk_for_manifests(root, root, 0, max_depth, hits_by_kind)"
+    },
+    {
+      "line_start": 166,
+      "line_end": 166,
+      "column": 16,
+      "kind": "Name",
+      "original_ast": "Name(id='hits_by_kind', ctx=Load())",
+      "rendered": "hits_by_kind"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 29,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Subscript(value=Name(id='hits_by_kind', ctx=Load()), slice=Name(id='kind', ctx=Load()), ctx=Load()), slice=Slice(upper=Name(id='max_per_kind', ctx=Load())), ctx=Load())",
+      "rendered": "hits_by_kind[kind][:max_per_kind]"
+    },
+    {
+      "line_start": 168,
+      "line_end": 168,
+      "column": 20,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='k', ctx=Load()), generators=[comprehension(target=Name(id='k', ctx=Store()), iter=Name(id='_MANIFEST_CANDIDATES', ctx=Load()), ifs=[Compare(left=Name(id='k', ctx=Load()), ops=[In()], comparators=[Name(id='hits_by_kind', ctx=Load())])], is_async=0)])",
+      "rendered": "[k for k in _MANIFEST_CANDIDATES if k in hits_by_kind]"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_round_robin_select', ctx=Load()), args=[Name(id='hits_by_kind', ctx=Load()), Name(id='max_total', ctx=Load())], keywords=[keyword(arg='keys', value=Name(id='ordered_kinds', ctx=Load()))])",
+      "rendered": "_round_robin_select(hits_by_kind, max_total, keys=ordered_kinds)"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Call(func=Name(id='str', ctx=Load()), args=[Call(func=Attribute(value=Name(id='p', ctx=Load()), attr='relative_to', ctx=Load()), args=[Name(id='root', ctx=Load())], keywords=[])], keywords=[]), attr='replace', ctx=Load()), args=[Constant(value='\\\\'), Constant(value='/')], keywords=[])",
+      "rendered": "str(p.relative_to(root)).replace('\\\\', '/')"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='ValueError', ctx=Load())",
+      "rendered": "ValueError"
+    },
+    {
+      "line_start": 176,
+      "line_end": 176,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='str', ctx=Load()), args=[Name(id='p', ctx=Load())], keywords=[])",
+      "rendered": "str(p)"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 41,
+      "kind": "Name",
+      "original_ast": "Name(id='walk_bounds', ctx=Load())",
+      "rendered": "walk_bounds"
+    },
+    {
+      "line_start": 183,
+      "line_end": 183,
+      "column": 46,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 184,
+      "line_end": 184,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_find_manifests', ctx=Load()), args=[Name(id='root', ctx=Load()), Name(id='max_depth', ctx=Load()), Name(id='max_total', ctx=Load()), Name(id='max_per_kind', ctx=Load())], keywords=[])",
+      "rendered": "_find_manifests(root, max_depth, max_total, max_per_kind)"
+    },
+    {
+      "line_start": 185,
+      "line_end": 185,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_read_capped', ctx=Load()), args=[Name(id='root', ctx=Load()), Name(id='p', ctx=Load()), Name(id='_MANIFEST_RAW_CEILING', ctx=Load())], keywords=[])",
+      "rendered": "_read_capped(root, p, _MANIFEST_RAW_CEILING)"
+    },
+    {
+      "line_start": 186,
+      "line_end": 186,
+      "column": 11,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='raw', ctx=Load()))",
+      "rendered": "not raw"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_manifest_relpath', ctx=Load()), args=[Name(id='root', ctx=Load()), Name(id='p', ctx=Load())], keywords=[])",
+      "rendered": "_manifest_relpath(root, p)"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='manifests_struct', ctx=Load()), attr='append', ctx=Load()), args=[Tuple(elts=[Name(id='relpath', ctx=Load()), Call(func=Name(id='_structural_truncate', ctx=Load()), args=[Name(id='kind', ctx=Load()), Name(id='raw', ctx=Load()), Name(id='manifest_cap', ctx=Load())], keywords=[])], ctx=Load())], keywords=[])",
+      "rendered": "manifests_struct.append((relpath, _structural_truncate(kind, raw, manifest_cap)))"
+    },
+    {
+      "line_start": 190,
+      "line_end": 190,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_apply_manifest_total_cap', ctx=Load()), args=[Name(id='manifests_struct', ctx=Load()), Name(id='manifest_total_cap', ctx=Load())], keywords=[])",
+      "rendered": "_apply_manifest_total_cap(manifests_struct, manifest_total_cap)"
+    }
+  ],
+  "calls": [
+    {
+      "line": 27,
+      "end_line": 27,
+      "callee": "logs.get_logger",
+      "enclosing": "module initialization",
+      "expression": "logs.get_logger(__name__)"
+    },
+    {
+      "line": 62,
+      "end_line": 62,
+      "callee": "isinstance",
+      "enclosing": "_pyproject_keep",
+      "expression": "isinstance(project, dict)"
+    },
+    {
+      "line": 80,
+      "end_line": 80,
+      "callee": "_pyproject_keep",
+      "enclosing": "_truncate_pyproject_toml",
+      "expression": "_pyproject_keep(data)"
+    },
+    {
+      "line": 93,
+      "end_line": 93,
+      "callee": "_TRUNCATORS.get",
+      "enclosing": "_structural_truncate",
+      "expression": "_TRUNCATORS.get(kind)"
+    },
+    {
+      "line": 153,
+      "end_line": 153,
+      "callee": "_dir_manifest_hits(root, d).items",
+      "enclosing": "_walk_for_manifests",
+      "expression": "_dir_manifest_hits(root, d).items()"
+    },
+    {
+      "line": 157,
+      "end_line": 157,
+      "callee": "_walkable_children",
+      "enclosing": "_walk_for_manifests",
+      "expression": "_walkable_children(d)"
+    },
+    {
+      "line": 165,
+      "end_line": 165,
+      "callee": "_walk_for_manifests",
+      "enclosing": "_find_manifests",
+      "expression": "_walk_for_manifests(root, root, 0, max_depth, hits_by_kind)"
+    },
+    {
+      "line": 169,
+      "end_line": 169,
+      "callee": "_round_robin_select",
+      "enclosing": "_find_manifests",
+      "expression": "_round_robin_select(hits_by_kind, max_total, keys=ordered_kinds)"
+    },
+    {
+      "line": 184,
+      "end_line": 184,
+      "callee": "_find_manifests",
+      "enclosing": "gather_manifests",
+      "expression": "_find_manifests(root, max_depth, max_total, max_per_kind)"
+    },
+    {
+      "line": 190,
+      "end_line": 190,
+      "callee": "_apply_manifest_total_cap",
+      "enclosing": "gather_manifests",
+      "expression": "_apply_manifest_total_cap(manifests_struct, manifest_total_cap)"
+    },
+    {
+      "line": 48,
+      "end_line": 48,
+      "callee": "json.loads",
+      "enclosing": "_truncate_package_json",
+      "expression": "json.loads(raw)"
+    },
+    {
+      "line": 52,
+      "end_line": 52,
+      "callee": "isinstance",
+      "enclosing": "_truncate_package_json",
+      "expression": "isinstance(data, dict)"
+    },
+    {
+      "line": 55,
+      "end_line": 55,
+      "callee": "_cap_text",
+      "enclosing": "_truncate_package_json",
+      "expression": "_cap_text(json.dumps(keep, indent=2, sort_keys=True), cap)"
+    },
+    {
+      "line": 61,
+      "end_line": 61,
+      "callee": "isinstance",
+      "enclosing": "_pyproject_keep",
+      "expression": "isinstance(data, dict)"
+    },
+    {
+      "line": 61,
+      "end_line": 61,
+      "callee": "data.get",
+      "enclosing": "_pyproject_keep",
+      "expression": "data.get(\"project\")"
+    },
+    {
+      "line": 66,
+      "end_line": 66,
+      "callee": "isinstance",
+      "enclosing": "_pyproject_keep",
+      "expression": "isinstance(data, dict)"
+    },
+    {
+      "line": 66,
+      "end_line": 66,
+      "callee": "data.get",
+      "enclosing": "_pyproject_keep",
+      "expression": "data.get(\"tool\")"
+    },
+    {
+      "line": 67,
+      "end_line": 67,
+      "callee": "isinstance",
+      "enclosing": "_pyproject_keep",
+      "expression": "isinstance(tool, dict)"
+    },
+    {
+      "line": 67,
+      "end_line": 67,
+      "callee": "tool.get",
+      "enclosing": "_pyproject_keep",
+      "expression": "tool.get(\"poetry\")"
+    },
+    {
+      "line": 68,
+      "end_line": 68,
+      "callee": "isinstance",
+      "enclosing": "_pyproject_keep",
+      "expression": "isinstance(poetry, dict)"
+    },
+    {
+      "line": 76,
+      "end_line": 76,
+      "callee": "tomllib.loads",
+      "enclosing": "_truncate_pyproject_toml",
+      "expression": "tomllib.loads(raw)"
+    },
+    {
+      "line": 81,
+      "end_line": 81,
+      "callee": "_cap_text",
+      "enclosing": "_truncate_pyproject_toml",
+      "expression": "_cap_text(json.dumps(keep, indent=2, sort_keys=True, default=str), cap)"
+    },
+    {
+      "line": 94,
+      "end_line": 94,
+      "callee": "truncate",
+      "enclosing": "_structural_truncate",
+      "expression": "truncate(raw, cap)"
+    },
+    {
+      "line": 95,
+      "end_line": 95,
+      "callee": "_cap_text",
+      "enclosing": "_structural_truncate",
+      "expression": "_cap_text(raw, cap)"
+    },
+    {
+      "line": 108,
+      "end_line": 108,
+      "callee": "out.append",
+      "enclosing": "_apply_manifest_total_cap",
+      "expression": "out.append((name, text))"
+    },
+    {
+      "line": 109,
+      "end_line": 109,
+      "callee": "len",
+      "enclosing": "_apply_manifest_total_cap",
+      "expression": "len(text)"
+    },
+    {
+      "line": 137,
+      "end_line": 137,
+      "callee": "sorted",
+      "enclosing": "_walkable_children",
+      "expression": "sorted(c for c in d.iterdir() if c.is_dir())"
+    },
+    {
+      "line": 154,
+      "end_line": 154,
+      "callee": "hits_by_kind.setdefault(name, []).extend",
+      "enclosing": "_walk_for_manifests",
+      "expression": "hits_by_kind.setdefault(name, []).extend(paths)"
+    },
+    {
+      "line": 158,
+      "end_line": 158,
+      "callee": "_walk_for_manifests",
+      "enclosing": "_walk_for_manifests",
+      "expression": "_walk_for_manifests(root, child, depth + 1, max_depth, hits_by_kind)"
+    },
+    {
+      "line": 174,
+      "end_line": 174,
+      "callee": "str(p.relative_to(root)).replace",
+      "enclosing": "_manifest_relpath",
+      "expression": "str(p.relative_to(root)).replace(\"\\\\\", \"/\")"
+    },
+    {
+      "line": 185,
+      "end_line": 185,
+      "callee": "_read_capped",
+      "enclosing": "gather_manifests",
+      "expression": "_read_capped(root, p, _MANIFEST_RAW_CEILING)"
+    },
+    {
+      "line": 188,
+      "end_line": 188,
+      "callee": "_manifest_relpath",
+      "enclosing": "gather_manifests",
+      "expression": "_manifest_relpath(root, p)"
+    },
+    {
+      "line": 189,
+      "end_line": 189,
+      "callee": "manifests_struct.append",
+      "enclosing": "gather_manifests",
+      "expression": "manifests_struct.append((relpath, _structural_truncate(kind, raw, manifest_cap)))"
+    },
+    {
+      "line": 50,
+      "end_line": 50,
+      "callee": "log.debug",
+      "enclosing": "_truncate_package_json",
+      "expression": "log.debug(\"manifest structural truncation: unparseable JSON\", exc_info=True)"
+    },
+    {
+      "line": 54,
+      "end_line": 54,
+      "callee": "data.items",
+      "enclosing": "_truncate_package_json",
+      "expression": "data.items()"
+    },
+    {
+      "line": 55,
+      "end_line": 55,
+      "callee": "json.dumps",
+      "enclosing": "_truncate_package_json",
+      "expression": "json.dumps(keep, indent=2, sort_keys=True)"
+    },
+    {
+      "line": 78,
+      "end_line": 78,
+      "callee": "log.debug",
+      "enclosing": "_truncate_pyproject_toml",
+      "expression": "log.debug(\"manifest structural truncation: unparseable TOML\", exc_info=True)"
+    },
+    {
+      "line": 81,
+      "end_line": 81,
+      "callee": "json.dumps",
+      "enclosing": "_truncate_pyproject_toml",
+      "expression": "json.dumps(keep, indent=2, sort_keys=True, default=str)"
+    },
+    {
+      "line": 106,
+      "end_line": 106,
+      "callee": "len",
+      "enclosing": "_apply_manifest_total_cap",
+      "expression": "len(text)"
+    },
+    {
+      "line": 107,
+      "end_line": 107,
+      "callee": "_cap_text",
+      "enclosing": "_apply_manifest_total_cap",
+      "expression": "_cap_text(text, remaining)"
+    },
+    {
+      "line": 117,
+      "end_line": 117,
+      "callee": "name.startswith",
+      "enclosing": "_dir_manifest_hits",
+      "expression": "name.startswith(\".\")"
+    },
+    {
+      "line": 117,
+      "end_line": 117,
+      "callee": "sorted",
+      "enclosing": "_dir_manifest_hits",
+      "expression": "sorted(d.glob(f\"*{name}\"))"
+    },
+    {
+      "line": 120,
+      "end_line": 120,
+      "callee": "p.is_symlink",
+      "enclosing": "_dir_manifest_hits",
+      "expression": "p.is_symlink()"
+    },
+    {
+      "line": 153,
+      "end_line": 153,
+      "callee": "_dir_manifest_hits",
+      "enclosing": "_walk_for_manifests",
+      "expression": "_dir_manifest_hits(root, d)"
+    },
+    {
+      "line": 176,
+      "end_line": 176,
+      "callee": "str",
+      "enclosing": "_manifest_relpath",
+      "expression": "str(p)"
+    },
+    {
+      "line": 63,
+      "end_line": 63,
+      "callee": "project.items",
+      "enclosing": "_pyproject_keep",
+      "expression": "project.items()"
+    },
+    {
+      "line": 117,
+      "end_line": 117,
+      "callee": "d.glob",
+      "enclosing": "_dir_manifest_hits",
+      "expression": "d.glob(f\"*{name}\")"
+    },
+    {
+      "line": 122,
+      "end_line": 122,
+      "callee": "p.is_file",
+      "enclosing": "_dir_manifest_hits",
+      "expression": "p.is_file()"
+    },
+    {
+      "line": 123,
+      "end_line": 123,
+      "callee": "hits.setdefault(name, []).append",
+      "enclosing": "_dir_manifest_hits",
+      "expression": "hits.setdefault(name, []).append(p)"
+    },
+    {
+      "line": 154,
+      "end_line": 154,
+      "callee": "hits_by_kind.setdefault",
+      "enclosing": "_walk_for_manifests",
+      "expression": "hits_by_kind.setdefault(name, [])"
+    },
+    {
+      "line": 174,
+      "end_line": 174,
+      "callee": "str",
+      "enclosing": "_manifest_relpath",
+      "expression": "str(p.relative_to(root))"
+    },
+    {
+      "line": 189,
+      "end_line": 189,
+      "callee": "_structural_truncate",
+      "enclosing": "gather_manifests",
+      "expression": "_structural_truncate(kind, raw, manifest_cap)"
+    },
+    {
+      "line": 122,
+      "end_line": 122,
+      "callee": "_contained",
+      "enclosing": "_dir_manifest_hits",
+      "expression": "_contained(root, p)"
+    },
+    {
+      "line": 137,
+      "end_line": 137,
+      "callee": "d.iterdir",
+      "enclosing": "_walkable_children",
+      "expression": "d.iterdir()"
+    },
+    {
+      "line": 137,
+      "end_line": 137,
+      "callee": "c.is_dir",
+      "enclosing": "_walkable_children",
+      "expression": "c.is_dir()"
+    },
+    {
+      "line": 142,
+      "end_line": 142,
+      "callee": "c.is_symlink",
+      "enclosing": "_walkable_children",
+      "expression": "c.is_symlink()"
+    },
+    {
+      "line": 174,
+      "end_line": 174,
+      "callee": "p.relative_to",
+      "enclosing": "_manifest_relpath",
+      "expression": "p.relative_to(root)"
+    },
+    {
+      "line": 123,
+      "end_line": 123,
+      "callee": "hits.setdefault",
+      "enclosing": "_dir_manifest_hits",
+      "expression": "hits.setdefault(name, [])"
+    },
+    {
+      "line": 145,
+      "end_line": 145,
+      "callee": "_has_target_build_marker",
+      "enclosing": "_walkable_children",
+      "expression": "_has_target_build_marker(d, [])"
+    }
+  ],
+  "imports": [
+    {
+      "line": 16,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 18,
+      "source_expression": "import json",
+      "targets": [
+        "json"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "import tomllib",
+      "targets": [
+        "tomllib"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "from pathlib import Path",
+      "targets": [
+        "pathlib",
+        "pathlib.Path"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "from vvaharness.evidence._grouping import _round_robin_select",
+      "targets": [
+        "vvaharness.evidence._grouping",
+        "vvaharness.evidence._grouping._round_robin_select"
+      ],
+      "local_source_paths": [
+        "vvaharness/evidence/_grouping.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 23,
+      "source_expression": "from vvaharness.evidence.read import _cap_text, _contained, _read_capped",
+      "targets": [
+        "vvaharness.evidence.read",
+        "vvaharness.evidence.read._cap_text",
+        "vvaharness.evidence.read._contained",
+        "vvaharness.evidence.read._read_capped"
+      ],
+      "local_source_paths": [
+        "vvaharness/evidence/read.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 24,
+      "source_expression": "from vvaharness.scope import _DEFAULT_EXCLUDE_DIRS, _has_target_build_marker",
+      "targets": [
+        "vvaharness.scope",
+        "vvaharness.scope._DEFAULT_EXCLUDE_DIRS",
+        "vvaharness.scope._has_target_build_marker"
+      ],
+      "local_source_paths": [
+        "vvaharness/scope/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 25,
+      "source_expression": "from vvaharness.util import logs",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.logs"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/logs.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

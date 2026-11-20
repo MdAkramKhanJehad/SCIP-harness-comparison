@@ -1,0 +1,4163 @@
+{
+  "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+  "sha256": "4905cf525b2bee8af49e150a96e3460a4f29b6b76f3546271dc126e7653c0551",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"remediation_agent.plugin_runner.run — the harness guards, and the engine they wrap.\"\"\"\nfrom __future__ import annotations\n\nfrom collections.abc import Callable\nfrom dataclasses import dataclass, field\nfrom datetime import UTC, datetime\nfrom pathlib import Path\nfrom typing import Any\n\nfrom vvaharness.models import (\n    LLM_REGISTRY,\n    Provenance,\n    Remediation,\n    RemediationEvidence,\n    RemediationKind,\n    finalize,\n)\nfrom vvaharness.remediation_agent import artifacts\nfrom vvaharness.remediation_agent import policy as _policy\nfrom vvaharness.remediation_agent.artifacts.diff import _norm_path\nfrom vvaharness.remediation_agent.models import Gates, RemediationVerdict, to_evidence\nfrom vvaharness.remediation_agent.target import RemediationTarget\nfrom vvaharness.util import console\nfrom vvaharness.util.tokens import TOKENS, Spend, reported_between\n\n__all__ = [\n    \"Amended\",\n    \"EngineRequest\",\n    \"GuardedCall\",\n    \"apply_plugin\",\n    \"call_with_guards\",\n    \"checkpoint_record\",\n    \"engine_model\",\n    \"harness_amend\",\n]\n\n#: Engine identity stamped on every attempt this module produces.\nENGINE_ID = \"vvaharness.remediation_agent\"\n\n\n@dataclass(frozen=True)\nclass EngineRequest:\n    \"\"\"One finding handed to a remediation engine, with the run context it needs.\"\"\"\n\n    target: RemediationTarget\n    repo: Path\n    mode: str\n    cfg: Any\n    verbose: bool = False\n    policy_ctx: Any = None\n\n    @property\n    def enforce(self) -> bool:\n        \"\"\"True when a policy context is present AND switched on.\"\"\"\n        return self.policy_ctx is not None and getattr(self.policy_ctx, \"enabled\", False)\n\n\n@dataclass(frozen=True)\nclass GuardedCall:\n    \"\"\"What the guards observed around one engine call; ``pre`` is ``None`` on the denied path.\"\"\"\n\n    verdict: RemediationVerdict\n    snapshot: dict[str, str | None] = field(default_factory=dict)\n    pre: Any = None\n    meta: dict = field(default_factory=dict)\n    denied: bool = False\n    started: datetime | None = None\n    spend_before: Spend = Spend()\n    pre_call_dirty: tuple[str, ...] = ()\n\n\n@dataclass(frozen=True)\nclass Amended:\n    \"\"\"The harness's own account of an attempt, overriding the engine's self-report.\"\"\"\n\n    remediation: Remediation\n    reverted_paths: tuple[str, ...] = ()\n    meta: dict = field(default_factory=dict)\n\n\ndef call_with_guards(fn: Callable[..., Any], request: EngineRequest) -> GuardedCall:\n    \"\"\"Run *fn* behind the harness's pre-call guards (policy gate, then snapshot) and return what they saw.\"\"\"\n    from vvaharness.remediation_agent import plugin_runner as _pr\n\n    started = datetime.now(UTC)\n    spend_before = TOKENS.spend()\n    meta = _base_meta(request, started)\n    pre = _policy.pre_decision(request.policy_ctx, request.target) if request.enforce else None\n    if request.verbose:\n        _trace_policy(request, pre)\n    if pre is not None and not pre.allowed:\n        return _denied(request, pre, meta, started, spend_before)\n    # Content baseline BEFORE the engine runs: lets _engine_failed tell this call's own\n    # in-flight edit apart from an earlier case's accepted fix on the same path.\n    pre_call_dirty = artifacts.changed_files_whole_tree(request.repo)\n    pre_call_snapshot = artifacts.snapshot_files(request.repo, pre_call_dirty)\n    snapshot = artifacts.snapshot_files(request.repo, _snapshot_targets(request))\n    try:\n        raw = _call_engine(fn, request, pre)\n    except Exception as exc:  # noqa: BLE001 — a timeout/crash is a case outcome, not a bug\n        return _engine_failed(request, exc, pre_call_dirty, pre_call_snapshot,\n                              snapshot, pre, meta, started, spend_before)\n    return GuardedCall(verdict=_pr._coerce_verdict(raw, request.target),\n                       snapshot=snapshot, pre=pre, meta=meta, started=started,\n                       spend_before=spend_before,\n                       pre_call_dirty=tuple(pre_call_dirty))\n\n\ndef _engine_failed(request: EngineRequest, exc: Exception, pre_call_dirty: list[str],\n                   pre_call_snapshot: dict[str, str | None],\n                   snapshot: dict[str, str | None], pre: Any, meta: dict,\n                   started: datetime, spend_before: Spend) -> GuardedCall:\n    \"\"\"The engine call itself raised: revert whatever changed since *pre_call_snapshot* (by content, restoring to that snapshot rather than HEAD, so an earlier case's still-uncommitted fix on the same path survives) so the half-applied edit isn't mistaken for a real fix.\"\"\"\n    now_dirty = artifacts.changed_files_whole_tree(request.repo)\n    new_untracked = [f for f in now_dirty if f not in set(pre_call_dirty)]\n    changed_during_call = artifacts.changed_since_snapshot(request.repo, pre_call_snapshot)\n    to_revert = list(dict.fromkeys([*changed_during_call, *new_untracked]))\n    reverted = (_policy.revert_files(request.repo, to_revert, pre_call_snapshot)\n               if to_revert else [])\n    detail = getattr(exc, \"stderr\", None) or str(exc)\n    console.write(\n        f\"    [guard] engine call failed for finding {request.target.index} \"\n        f\"({type(exc).__name__}: {detail}); reverted {len(reverted)} in-flight edit(s)\")\n    verdict = RemediationVerdict(\n        finding_index=request.target.index, verdict=\"Not Fixed\", gates=Gates(),\n        changes=[], summary=f\"remediation session failed: {type(exc).__name__}: {exc}\")\n    # An empty baseline reads every pre-existing forbidden file (all of .git) as this call's edit\n    return GuardedCall(verdict=verdict, snapshot=snapshot, pre=pre, meta=meta,\n                       started=started, spend_before=spend_before)\n\n\ndef harness_amend(remediation: RemediationVerdict, snapshot: dict[str, str | None], *,\n                  request: EngineRequest, pre: Any = None, denied: bool = False,\n                  started: datetime | None = None,\n                  spend_before: Spend = Spend(),\n                  pre_call_dirty: tuple[str, ...] = ()) -> Amended:\n    \"\"\"Replace the engine's self-report with what the harness can prove, reading the whole working tree rather than the reported ``changes``.\"\"\"\n    reverted: tuple[str, ...] = ()\n    meta: dict = {}\n    if pre is not None:\n        post = _policy.enforce_post(request.policy_ctx, request.target, remediation, pre,\n                                    repo=request.repo, before_snapshot=snapshot)\n        reverted = tuple(post.reverted)\n        meta = _post_meta(pre, post)\n    diff = artifacts.derive_diff(request.repo, snapshot,\n                                 [c.file for c in remediation.changes if c.file])\n    evidence = to_evidence(remediation, provenance=_provenance(\n        request, denied=denied, started=started, spend_before=spend_before))\n    # The harness supplies mode, diff and file list; the engine couldn't know the first two and is unreliable on the third.\n    contract = finalize(evidence, mode=request.mode, diff=diff,\n                        files_touched=_files_touched(request.repo, evidence, snapshot,\n                                                     pre_call_dirty))\n    meta = _reconcile_post_meta(meta, contract)\n    return Amended(remediation=contract, reverted_paths=reverted, meta=meta)\n\n\ndef _reconcile_post_meta(meta: dict, remediation: Remediation) -> dict:\n    \"\"\"Prevent the policy audit label from contradicting persisted evidence.\"\"\"\n    # Pre-gate denials and post-gate reverts already carry a stronger reason; permitted patches only\n    if meta.get(\"policy_action\") != \"patch\" or meta.get(\"policy_reverted\"):\n        return meta\n    no_action = remediation.kind in (\n        RemediationKind.NO_ACTION, RemediationKind.ALREADY_RESOLVED)\n    if remediation.diff and not no_action:\n        return meta\n    reason = \"no_diff_captured\" if not remediation.diff else \"remediation_not_applied\"\n    reconciled = {\n        **meta,\n        \"policy_reason\": reason,\n        \"final_verdict\": \"REJECT\",\n    }\n    if meta.get(\"policy_reason\") != reason:\n        reconciled[\"policy_pre_reason\"] = meta.get(\"policy_reason\", \"\")\n    return reconciled\n\n\ndef apply_plugin(target: RemediationTarget, out_dir: Path, *, cfg, repo: Path,\n                 mode: str = \"fix\", verbose: bool = False,\n                 policy_ctx=None) -> Remediation:\n    \"\"\"Remediate one *target* through the guards and persist its artefacts.\"\"\"\n    from vvaharness.remediation_agent import plugin_runner as _pr\n\n    request = EngineRequest(target=target, repo=Path(repo), mode=mode, cfg=cfg,\n                            verbose=verbose, policy_ctx=policy_ctx)\n    guarded = call_with_guards(_pr._invoke, request)\n    amended = harness_amend(guarded.verdict, guarded.snapshot,\n                            request=request, pre=guarded.pre, denied=guarded.denied,\n                            started=guarded.started, spend_before=guarded.spend_before,\n                            pre_call_dirty=guarded.pre_call_dirty)\n    artifacts.write_case(out_dir, guarded.verdict, amended.remediation,\n                         meta={**guarded.meta, **amended.meta}, target=target,\n                         reverted_paths=amended.reverted_paths)\n    return amended.remediation\n\n\ndef checkpoint_record(target: RemediationTarget, out_dir: Path,\n                      remediation: Remediation) -> dict:\n    \"\"\"The small JSON record ``--resume`` stores for one processed finding; deliberately not the whole ``Remediation``.\"\"\"\n    disposition = remediation.disposition\n    return {\n        \"finding_index\": target.index,\n        \"artifact_dir\": str(out_dir),\n        \"kind\": remediation.kind.value,\n        \"disposition\": disposition.value if disposition is not None else None,\n        \"diff_captured\": bool(remediation.diff),\n    }\n\n\ndef _files_touched(repo: Path, evidence: RemediationEvidence,\n                   snapshot: dict[str, str | None],\n                   pre_call_dirty: tuple[str, ...] = ()) -> tuple[str, ...]:\n    \"\"\"What actually changed under *repo* during THIS case — proven where possible (git status against the pre-case baseline, then snapshot), never merely claimed by the engine.\"\"\"\n    proven = artifacts.changed_files_whole_tree(repo)\n    if proven:\n        # Drop any path already dirty before this call UNLESS this case's own snapshot\n        # proves it changed further by content -- a real edit still gets credited.\n        pre_norm = {_norm_path(f) for f in pre_call_dirty}\n        changed_this_case = ({_norm_path(f) for f in artifacts.changed_since_snapshot(repo, snapshot)}\n                             if snapshot else set())\n        proven = [f for f in proven\n                 if _norm_path(f) not in pre_norm or _norm_path(f) in changed_this_case]\n        return tuple(proven)\n    from_snapshot = artifacts.changed_since_snapshot(repo, snapshot)\n    claimed = [c.file for c in evidence.changes if _resolves(repo, c.file)]\n    return tuple(dict.fromkeys([*from_snapshot, *claimed]))\n\n\ndef _resolves(repo: Path, ref: str) -> bool:\n    \"\"\"True when *ref* names a real file confined to *repo*.\"\"\"\n    if not ref:\n        return False\n    resolved = artifacts._safe_repo_path(repo, ref)\n    return resolved is not None and resolved.is_file()\n\n\ndef _base_meta(request: EngineRequest, started: datetime) -> dict:\n    \"\"\"Display-only context the summary renderer and the audit sidecar carry.\"\"\"\n    return {\n        \"severity\": request.target.severity,\n        \"title\": request.target.title,\n        \"file\": request.target.file,\n        \"mode\": request.mode,\n        \"generated\": started.isoformat(),\n    }\n\n\ndef _post_meta(pre: Any, post: Any) -> dict:\n    \"\"\"The audit trail of one post-gate pass, for the evidence sidecar.\"\"\"\n    reason = post.reason or pre.decision.reason\n    meta = {\n        \"policy_action\": pre.decision.action.value,\n        \"policy_reason\": reason,\n        \"final_verdict\": post.final_verdict,\n    }\n    if post.reason:\n        meta[\"policy_pre_reason\"] = pre.decision.reason\n    if post.reverted:\n        meta[\"policy_reverted\"] = post.reverted\n        meta[\"policy_matched_globs\"] = post.matched_globs\n    return meta\n\n\ndef _trace_policy(request: EngineRequest, pre: Any) -> None:\n    \"\"\"Surface the policy decision + resolved playbook strategy under --verbose.\"\"\"\n    from vvaharness.remediation_agent import plugin_runner as _pr\n\n    if pre is not None:\n        _pr._dump_policy(request.target, pre)\n        return\n    console.write(f\"    [policy] enforcement disabled \"\n                  f\"(step_remediate.enforce_policy=false) — no policy gate or \"\n                  f\"playbook strategy injected for finding {request.target.index}\")\n\n\ndef _denied(request: EngineRequest, pre: Any, meta: dict, started: datetime,\n            spend_before: Spend) -> GuardedCall:\n    \"\"\"Short-circuit a policy-denied finding to guidance: no model call, no tokens.\"\"\"\n    verdict = _policy.guidance_verdict(request.policy_ctx, request.target, pre)\n    console.write(f\"    [policy] pre-gate guidance-only for finding \"\n                  f\"{request.target.index} ({pre.decision.reason}) — agent skipped\")\n    return GuardedCall(\n        verdict=verdict,\n        meta={**meta, \"policy_action\": pre.decision.action.value,\n              \"policy_reason\": pre.decision.reason, \"final_verdict\": \"REJECT\"},\n        denied=True,\n        started=started,\n        spend_before=spend_before,\n    )\n\n\ndef _snapshot_targets(request: EngineRequest) -> list[str]:\n    \"\"\"Return files needed to prove and, when necessary, revert S10 edits.\"\"\"\n    targets = [request.target.file] if request.target.file else []\n    # Workflow refs are judged PRE-EDIT; every workflow needs a rollback baseline even if omitted\n    targets.extend(_policy.workflow_snapshot_paths(request.repo))\n    if not request.enforce:\n        return targets\n    gate = getattr(request.policy_ctx, \"gate\", None)\n    patterns = ([*getattr(gate, \"forbid_patch_paths\", []),\n                 *getattr(gate, \"deny_paths\", [])] if gate else [])\n    return list(dict.fromkeys(\n        [*targets, *_policy.worktree_forbidden_matches(request.repo, patterns)]))\n\n\ndef _call_engine(fn: Callable[..., Any], request: EngineRequest, pre: Any) -> Any:\n    \"\"\"Invoke the engine seam, passing the policy context only on the enforced path.\"\"\"\n    if pre is not None:\n        return fn(request.target, request.cfg, request.repo, request.mode,\n                  request.verbose, pre=pre, ctx=request.policy_ctx)\n    return fn(request.target, request.cfg, request.repo, request.mode, request.verbose)\n\n\ndef _provenance(request: EngineRequest, *, denied: bool = False,\n                started: datetime | None = None,\n                spend_before: Spend = Spend()) -> Provenance:\n    \"\"\"Stamp who produced this attempt; ``engine_version`` is load-bearing since it's hashed into the resume checkpoint key.\"\"\"\n    from vvaharness import __version__\n\n    # Denied = refused before any token was spent, so naming a model would assert a call that never happened.\n    model, backend = (\"\", \"\") if denied else engine_model(request.cfg)\n    usd, turns = (0.0, 0) if denied else reported_between(spend_before, TOKENS.spend())\n    return Provenance(engine=ENGINE_ID, engine_version=__version__,\n                      model=model, backend=backend, started=started,\n                      ended=datetime.now(UTC) if started else None,\n                      usd=usd, turns=turns)\n\n\ndef engine_model(cfg) -> tuple[str, str]:\n    \"\"\"Resolve (model id, backend) for the remediate role; public because ``runner.step_key_of`` hashes the same pair into the resume key.\"\"\"\n    from vvaharness.backends.llm.registry import resolve as resolve_model\n\n    try:\n        mid, via, _ = resolve_model(cfg.models.remediate)\n    except Exception:  # noqa: BLE001 — provenance is attribution, never a hard failure\n        return \"\", \"\"\n    # Registry-qualified: bare \"cli\" is a subprocess here and an in-process SDK in validation.\n    return str(mid), f\"{LLM_REGISTRY}:{via}\"\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "remediation_agent.plugin_runner.run — the harness guards, and the engine they wrap.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_57_4": {
+      "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+      "line_start": 57,
+      "line_end": 57,
+      "value": "One finding handed to a remediation engine, with the run context it needs.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_68_8": {
+      "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+      "line_start": 68,
+      "line_end": 68,
+      "value": "True when a policy context is present AND switched on.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_74_4": {
+      "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+      "line_start": 74,
+      "line_end": 74,
+      "value": "What the guards observed around one engine call; ``pre`` is ``None`` on the denied path.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_88_4": {
+      "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+      "line_start": 88,
+      "line_end": 88,
+      "value": "The harness's own account of an attempt, overriding the engine's self-report.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_96_4": {
+      "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+      "line_start": 96,
+      "line_end": 96,
+      "value": "Run *fn* behind the harness's pre-call guards (policy gate, then snapshot) and return what they saw.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_127_4": {
+      "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+      "line_start": 127,
+      "line_end": 127,
+      "value": "The engine call itself raised: revert whatever changed since *pre_call_snapshot* (by content, restoring to that snapshot rather than HEAD, so an earlier case's still-uncommitted fix on the same path survives) so the half-applied edit isn't mistaken for a real fix.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_136_8": {
+      "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+      "line_start": 136,
+      "line_end": 137,
+      "source_expression": "f\"    [guard] engine call failed for finding {request.target.index} \"\n        f\"({type(exc).__name__}: {detail}); reverted {len(reverted)} in-flight edit(s)\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_140_28": {
+      "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+      "line_start": 140,
+      "line_end": 140,
+      "source_expression": "f\"remediation session failed: {type(exc).__name__}: {exc}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_151_4": {
+      "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+      "line_start": 151,
+      "line_end": 151,
+      "value": "Replace the engine's self-report with what the harness can prove, reading the whole working tree rather than the reported ``changes``.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_172_4": {
+      "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+      "line_start": 172,
+      "line_end": 172,
+      "value": "Prevent the policy audit label from contradicting persisted evidence.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_194_4": {
+      "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+      "line_start": 194,
+      "line_end": 194,
+      "value": "Remediate one *target* through the guards and persist its artefacts.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_212_4": {
+      "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+      "line_start": 212,
+      "line_end": 212,
+      "value": "The small JSON record ``--resume`` stores for one processed finding; deliberately not the whole ``Remediation``.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_226_4": {
+      "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+      "line_start": 226,
+      "line_end": 226,
+      "value": "What actually changed under *repo* during THIS case — proven where possible (git status against the pre-case baseline, then snapshot), never merely claimed by the engine.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_243_4": {
+      "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+      "line_start": 243,
+      "line_end": 243,
+      "value": "True when *ref* names a real file confined to *repo*.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_251_4": {
+      "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+      "line_start": 251,
+      "line_end": 251,
+      "value": "Display-only context the summary renderer and the audit sidecar carry.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_262_4": {
+      "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+      "line_start": 262,
+      "line_end": 262,
+      "value": "The audit trail of one post-gate pass, for the evidence sidecar.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_278_4": {
+      "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+      "line_start": 278,
+      "line_end": 278,
+      "value": "Surface the policy decision + resolved playbook strategy under --verbose.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_284_18": {
+      "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+      "line_start": 284,
+      "line_end": 286,
+      "source_expression": "f\"    [policy] enforcement disabled \"\n                  f\"(step_remediate.enforce_policy=false) — no policy gate or \"\n                  f\"playbook strategy injected for finding {request.target.index}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_291_4": {
+      "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+      "line_start": 291,
+      "line_end": 291,
+      "value": "Short-circuit a policy-denied finding to guidance: no model call, no tokens.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_293_18": {
+      "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+      "line_start": 293,
+      "line_end": 294,
+      "source_expression": "f\"    [policy] pre-gate guidance-only for finding \"\n                  f\"{request.target.index} ({pre.decision.reason}) — agent skipped\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_306_4": {
+      "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+      "line_start": 306,
+      "line_end": 306,
+      "value": "Return files needed to prove and, when necessary, revert S10 edits.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_320_4": {
+      "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+      "line_start": 320,
+      "line_end": 320,
+      "value": "Invoke the engine seam, passing the policy context only on the enforced path.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_330_4": {
+      "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+      "line_start": 330,
+      "line_end": 330,
+      "value": "Stamp who produced this attempt; ``engine_version`` is load-bearing since it's hashed into the resume checkpoint key.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_343_4": {
+      "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+      "line_start": 343,
+      "line_end": 343,
+      "value": "Resolve (model id, backend) for the remediate role; public because ``runner.step_key_of`` hashes the same pair into the resume key.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_351_21": {
+      "source": "vvaharness/remediation_agent/plugin_runner/run.py",
+      "line_start": 351,
+      "line_end": 351,
+      "source_expression": "f\"{LLM_REGISTRY}:{via}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "remediation_agent.plugin_runner.run — the harness guards, and the engine they wrap.",
+      "context": "literal"
+    },
+    {
+      "line_start": 52,
+      "line_end": 52,
+      "column": 12,
+      "value": "vvaharness.remediation_agent",
+      "context": "literal"
+    },
+    {
+      "line_start": 41,
+      "line_end": 41,
+      "column": 4,
+      "value": "Amended",
+      "context": "literal"
+    },
+    {
+      "line_start": 42,
+      "line_end": 42,
+      "column": 4,
+      "value": "EngineRequest",
+      "context": "literal"
+    },
+    {
+      "line_start": 43,
+      "line_end": 43,
+      "column": 4,
+      "value": "GuardedCall",
+      "context": "literal"
+    },
+    {
+      "line_start": 44,
+      "line_end": 44,
+      "column": 4,
+      "value": "apply_plugin",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 4,
+      "value": "call_with_guards",
+      "context": "literal"
+    },
+    {
+      "line_start": 46,
+      "line_end": 46,
+      "column": 4,
+      "value": "checkpoint_record",
+      "context": "literal"
+    },
+    {
+      "line_start": 47,
+      "line_end": 47,
+      "column": 4,
+      "value": "engine_model",
+      "context": "literal"
+    },
+    {
+      "line_start": 48,
+      "line_end": 48,
+      "column": 4,
+      "value": "harness_amend",
+      "context": "literal"
+    },
+    {
+      "line_start": 57,
+      "line_end": 57,
+      "column": 4,
+      "value": "One finding handed to a remediation engine, with the run context it needs.",
+      "context": "literal"
+    },
+    {
+      "line_start": 74,
+      "line_end": 74,
+      "column": 4,
+      "value": "What the guards observed around one engine call; ``pre`` is ``None`` on the denied path.",
+      "context": "literal"
+    },
+    {
+      "line_start": 88,
+      "line_end": 88,
+      "column": 4,
+      "value": "The harness's own account of an attempt, overriding the engine's self-report.",
+      "context": "literal"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 4,
+      "value": "Run *fn* behind the harness's pre-call guards (policy gate, then snapshot) and return what they saw.",
+      "context": "literal"
+    },
+    {
+      "line_start": 127,
+      "line_end": 127,
+      "column": 4,
+      "value": "The engine call itself raised: revert whatever changed since *pre_call_snapshot* (by content, restoring to that snapshot rather than HEAD, so an earlier case's still-uncommitted fix on the same path survives) so the half-applied edit isn't mistaken for a real fix.",
+      "context": "literal"
+    },
+    {
+      "line_start": 151,
+      "line_end": 151,
+      "column": 4,
+      "value": "Replace the engine's self-report with what the harness can prove, reading the whole working tree rather than the reported ``changes``.",
+      "context": "literal"
+    },
+    {
+      "line_start": 172,
+      "line_end": 172,
+      "column": 4,
+      "value": "Prevent the policy audit label from contradicting persisted evidence.",
+      "context": "literal"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 29,
+      "value": "fix",
+      "context": "literal"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 4,
+      "value": "Remediate one *target* through the guards and persist its artefacts.",
+      "context": "literal"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 4,
+      "value": "The small JSON record ``--resume`` stores for one processed finding; deliberately not the whole ``Remediation``.",
+      "context": "literal"
+    },
+    {
+      "line_start": 226,
+      "line_end": 226,
+      "column": 4,
+      "value": "What actually changed under *repo* during THIS case — proven where possible (git status against the pre-case baseline, then snapshot), never merely claimed by the engine.",
+      "context": "literal"
+    },
+    {
+      "line_start": 243,
+      "line_end": 243,
+      "column": 4,
+      "value": "True when *ref* names a real file confined to *repo*.",
+      "context": "literal"
+    },
+    {
+      "line_start": 251,
+      "line_end": 251,
+      "column": 4,
+      "value": "Display-only context the summary renderer and the audit sidecar carry.",
+      "context": "literal"
+    },
+    {
+      "line_start": 262,
+      "line_end": 262,
+      "column": 4,
+      "value": "The audit trail of one post-gate pass, for the evidence sidecar.",
+      "context": "literal"
+    },
+    {
+      "line_start": 278,
+      "line_end": 278,
+      "column": 4,
+      "value": "Surface the policy decision + resolved playbook strategy under --verbose.",
+      "context": "literal"
+    },
+    {
+      "line_start": 291,
+      "line_end": 291,
+      "column": 4,
+      "value": "Short-circuit a policy-denied finding to guidance: no model call, no tokens.",
+      "context": "literal"
+    },
+    {
+      "line_start": 306,
+      "line_end": 306,
+      "column": 4,
+      "value": "Return files needed to prove and, when necessary, revert S10 edits.",
+      "context": "literal"
+    },
+    {
+      "line_start": 320,
+      "line_end": 320,
+      "column": 4,
+      "value": "Invoke the engine seam, passing the policy context only on the enforced path.",
+      "context": "literal"
+    },
+    {
+      "line_start": 330,
+      "line_end": 330,
+      "column": 4,
+      "value": "Stamp who produced this attempt; ``engine_version`` is load-bearing since it's hashed into the resume checkpoint key.",
+      "context": "literal"
+    },
+    {
+      "line_start": 343,
+      "line_end": 343,
+      "column": 4,
+      "value": "Resolve (model id, backend) for the remediate role; public because ``runner.step_key_of`` hashes the same pair into the resume key.",
+      "context": "literal"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 8,
+      "value": "True when a policy context is present AND switched on.",
+      "context": "literal"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 13,
+      "value": "no_diff_captured",
+      "context": "literal"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 61,
+      "value": "remediation_not_applied",
+      "context": "literal"
+    },
+    {
+      "line_start": 183,
+      "line_end": 183,
+      "column": 8,
+      "value": "policy_reason",
+      "context": "literal"
+    },
+    {
+      "line_start": 184,
+      "line_end": 184,
+      "column": 8,
+      "value": "final_verdict",
+      "context": "literal"
+    },
+    {
+      "line_start": 184,
+      "line_end": 184,
+      "column": 25,
+      "value": "REJECT",
+      "context": "literal"
+    },
+    {
+      "line_start": 215,
+      "line_end": 215,
+      "column": 8,
+      "value": "finding_index",
+      "context": "literal"
+    },
+    {
+      "line_start": 216,
+      "line_end": 216,
+      "column": 8,
+      "value": "artifact_dir",
+      "context": "literal"
+    },
+    {
+      "line_start": 217,
+      "line_end": 217,
+      "column": 8,
+      "value": "kind",
+      "context": "literal"
+    },
+    {
+      "line_start": 218,
+      "line_end": 218,
+      "column": 8,
+      "value": "disposition",
+      "context": "literal"
+    },
+    {
+      "line_start": 219,
+      "line_end": 219,
+      "column": 8,
+      "value": "diff_captured",
+      "context": "literal"
+    },
+    {
+      "line_start": 253,
+      "line_end": 253,
+      "column": 8,
+      "value": "severity",
+      "context": "literal"
+    },
+    {
+      "line_start": 254,
+      "line_end": 254,
+      "column": 8,
+      "value": "title",
+      "context": "literal"
+    },
+    {
+      "line_start": 255,
+      "line_end": 255,
+      "column": 8,
+      "value": "file",
+      "context": "literal"
+    },
+    {
+      "line_start": 256,
+      "line_end": 256,
+      "column": 8,
+      "value": "mode",
+      "context": "literal"
+    },
+    {
+      "line_start": 257,
+      "line_end": 257,
+      "column": 8,
+      "value": "generated",
+      "context": "literal"
+    },
+    {
+      "line_start": 265,
+      "line_end": 265,
+      "column": 8,
+      "value": "policy_action",
+      "context": "literal"
+    },
+    {
+      "line_start": 266,
+      "line_end": 266,
+      "column": 8,
+      "value": "policy_reason",
+      "context": "literal"
+    },
+    {
+      "line_start": 267,
+      "line_end": 267,
+      "column": 8,
+      "value": "final_verdict",
+      "context": "literal"
+    },
+    {
+      "line_start": 312,
+      "line_end": 312,
+      "column": 39,
+      "value": "gate",
+      "context": "literal"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 26,
+      "value": "stderr",
+      "context": "literal"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 10,
+      "value": "    [guard] engine call failed for finding ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 136,
+      "line_end": 137,
+      "column": 75,
+      "value": " (",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 31,
+      "value": ": ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 41,
+      "value": "); reverted ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 68,
+      "value": " in-flight edit(s)",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 52,
+      "value": "Not Fixed",
+      "context": "literal"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 36,
+      "value": "patch",
+      "context": "literal"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 56,
+      "value": "policy_reverted",
+      "context": "literal"
+    },
+    {
+      "line_start": 186,
+      "line_end": 186,
+      "column": 16,
+      "value": "policy_reason",
+      "context": "literal"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 19,
+      "value": "policy_pre_reason",
+      "context": "literal"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 51,
+      "value": "policy_reason",
+      "context": "literal"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 68,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 270,
+      "line_end": 270,
+      "column": 13,
+      "value": "policy_pre_reason",
+      "context": "literal"
+    },
+    {
+      "line_start": 272,
+      "line_end": 272,
+      "column": 13,
+      "value": "policy_reverted",
+      "context": "literal"
+    },
+    {
+      "line_start": 273,
+      "line_end": 273,
+      "column": 13,
+      "value": "policy_matched_globs",
+      "context": "literal"
+    },
+    {
+      "line_start": 284,
+      "line_end": 286,
+      "column": 20,
+      "value": "    [policy] enforcement disabled (step_remediate.enforce_policy=false) — no policy gate or playbook strategy injected for finding ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 293,
+      "line_end": 293,
+      "column": 20,
+      "value": "    [policy] pre-gate guidance-only for finding ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 294,
+      "line_end": 294,
+      "column": 42,
+      "value": " (",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 294,
+      "line_end": 294,
+      "column": 65,
+      "value": ") — agent skipped",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 334,
+      "line_end": 334,
+      "column": 22,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 334,
+      "line_end": 334,
+      "column": 26,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 351,
+      "line_end": 351,
+      "column": 37,
+      "value": ":",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 72,
+      "value": "enabled",
+      "context": "literal"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 30,
+      "value": "remediation session failed: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 78,
+      "value": ": ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 16,
+      "value": "policy_action",
+      "context": "literal"
+    },
+    {
+      "line_start": 297,
+      "line_end": 297,
+      "column": 22,
+      "value": "policy_action",
+      "context": "literal"
+    },
+    {
+      "line_start": 298,
+      "line_end": 298,
+      "column": 14,
+      "value": "policy_reason",
+      "context": "literal"
+    },
+    {
+      "line_start": 298,
+      "line_end": 298,
+      "column": 52,
+      "value": "final_verdict",
+      "context": "literal"
+    },
+    {
+      "line_start": 298,
+      "line_end": 298,
+      "column": 69,
+      "value": "REJECT",
+      "context": "literal"
+    },
+    {
+      "line_start": 349,
+      "line_end": 349,
+      "column": 15,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 349,
+      "line_end": 349,
+      "column": 19,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 313,
+      "line_end": 313,
+      "column": 32,
+      "value": "forbid_patch_paths",
+      "context": "literal"
+    },
+    {
+      "line_start": 314,
+      "line_end": 314,
+      "column": 32,
+      "value": "deny_paths",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 51,
+      "text": "#: Engine identity stamped on every attempt this module produces."
+    },
+    {
+      "line": 107,
+      "text": "# Content baseline BEFORE the engine runs: lets _engine_failed tell this call's own"
+    },
+    {
+      "line": 108,
+      "text": "# in-flight edit apart from an earlier case's accepted fix on the same path."
+    },
+    {
+      "line": 114,
+      "text": "# noqa: BLE001 — a timeout/crash is a case outcome, not a bug"
+    },
+    {
+      "line": 141,
+      "text": "# An empty baseline reads every pre-existing forbidden file (all of .git) as this call's edit"
+    },
+    {
+      "line": 163,
+      "text": "# The harness supplies mode, diff and file list; the engine couldn't know the first two and is unreliable on the third."
+    },
+    {
+      "line": 173,
+      "text": "# Pre-gate denials and post-gate reverts already carry a stronger reason; permitted patches only"
+    },
+    {
+      "line": 229,
+      "text": "# Drop any path already dirty before this call UNLESS this case's own snapshot"
+    },
+    {
+      "line": 230,
+      "text": "# proves it changed further by content -- a real edit still gets credited."
+    },
+    {
+      "line": 308,
+      "text": "# Workflow refs are judged PRE-EDIT; every workflow needs a rollback baseline even if omitted"
+    },
+    {
+      "line": 333,
+      "text": "# Denied = refused before any token was spent, so naming a model would assert a call that never happened."
+    },
+    {
+      "line": 348,
+      "text": "# noqa: BLE001 — provenance is attribution, never a hard failure"
+    },
+    {
+      "line": 350,
+      "text": "# Registry-qualified: bare \"cli\" is a subprocess here and an in-process SDK in validation."
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 18,
+      "line_end": 18,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 21,
+      "line_end": 21,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 31,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 32,
+      "line_end": 32,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 33,
+      "line_end": 33,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 34,
+      "line_end": 34,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 35,
+      "line_end": 35,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 36,
+      "line_end": 36,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 37,
+      "line_end": 37,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 38,
+      "line_end": 38,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 40,
+      "line_end": 49,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "Assign",
+      "line_start": 52,
+      "line_end": 52,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 56,
+      "line_end": 69,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 9
+    },
+    {
+      "kind": "Expr",
+      "line_start": 57,
+      "line_end": 57,
+      "column": 4,
+      "owner": "EngineRequest",
+      "representation_line": 17
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 59,
+      "line_end": 59,
+      "column": 4,
+      "owner": "EngineRequest",
+      "representation_line": 17
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 60,
+      "line_end": 60,
+      "column": 4,
+      "owner": "EngineRequest",
+      "representation_line": 17
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 61,
+      "line_end": 61,
+      "column": 4,
+      "owner": "EngineRequest",
+      "representation_line": 17
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 62,
+      "line_end": 62,
+      "column": 4,
+      "owner": "EngineRequest",
+      "representation_line": 17
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 63,
+      "line_end": 63,
+      "column": 4,
+      "owner": "EngineRequest",
+      "representation_line": 19
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 64,
+      "line_end": 64,
+      "column": 4,
+      "owner": "EngineRequest",
+      "representation_line": 19
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 67,
+      "line_end": 69,
+      "column": 4,
+      "owner": "EngineRequest",
+      "representation_line": 20
+    },
+    {
+      "kind": "Expr",
+      "line_start": 68,
+      "line_end": 68,
+      "column": 8,
+      "owner": "EngineRequest.enforce",
+      "representation_line": 29
+    },
+    {
+      "kind": "Return",
+      "line_start": 69,
+      "line_end": 69,
+      "column": 8,
+      "owner": "EngineRequest.enforce",
+      "representation_line": 30
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 73,
+      "line_end": 83,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 37
+    },
+    {
+      "kind": "Expr",
+      "line_start": 74,
+      "line_end": 74,
+      "column": 4,
+      "owner": "GuardedCall",
+      "representation_line": 45
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 76,
+      "line_end": 76,
+      "column": 4,
+      "owner": "GuardedCall",
+      "representation_line": 45
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 77,
+      "line_end": 77,
+      "column": 4,
+      "owner": "GuardedCall",
+      "representation_line": 45
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 78,
+      "line_end": 78,
+      "column": 4,
+      "owner": "GuardedCall",
+      "representation_line": 45
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 79,
+      "line_end": 79,
+      "column": 4,
+      "owner": "GuardedCall",
+      "representation_line": 45
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 80,
+      "line_end": 80,
+      "column": 4,
+      "owner": "GuardedCall",
+      "representation_line": 47
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 81,
+      "line_end": 81,
+      "column": 4,
+      "owner": "GuardedCall",
+      "representation_line": 47
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 82,
+      "line_end": 82,
+      "column": 4,
+      "owner": "GuardedCall",
+      "representation_line": 47
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 83,
+      "line_end": 83,
+      "column": 4,
+      "owner": "GuardedCall",
+      "representation_line": 47
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 87,
+      "line_end": 92,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 50
+    },
+    {
+      "kind": "Expr",
+      "line_start": 88,
+      "line_end": 88,
+      "column": 4,
+      "owner": "Amended",
+      "representation_line": 58
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 90,
+      "line_end": 90,
+      "column": 4,
+      "owner": "Amended",
+      "representation_line": 58
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 91,
+      "line_end": 91,
+      "column": 4,
+      "owner": "Amended",
+      "representation_line": 58
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 92,
+      "line_end": 92,
+      "column": 4,
+      "owner": "Amended",
+      "representation_line": 58
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 95,
+      "line_end": 120,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 61
+    },
+    {
+      "kind": "Expr",
+      "line_start": 96,
+      "line_end": 96,
+      "column": 4,
+      "owner": "call_with_guards",
+      "representation_line": 67
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 97,
+      "line_end": 97,
+      "column": 4,
+      "owner": "call_with_guards",
+      "representation_line": 67
+    },
+    {
+      "kind": "Assign",
+      "line_start": 99,
+      "line_end": 99,
+      "column": 4,
+      "owner": "call_with_guards",
+      "representation_line": 67
+    },
+    {
+      "kind": "Assign",
+      "line_start": 100,
+      "line_end": 100,
+      "column": 4,
+      "owner": "call_with_guards",
+      "representation_line": 67
+    },
+    {
+      "kind": "Assign",
+      "line_start": 101,
+      "line_end": 101,
+      "column": 4,
+      "owner": "call_with_guards",
+      "representation_line": 67
+    },
+    {
+      "kind": "Assign",
+      "line_start": 102,
+      "line_end": 102,
+      "column": 4,
+      "owner": "call_with_guards",
+      "representation_line": 69
+    },
+    {
+      "kind": "If",
+      "line_start": 103,
+      "line_end": 104,
+      "column": 4,
+      "owner": "call_with_guards",
+      "representation_line": 70
+    },
+    {
+      "kind": "Expr",
+      "line_start": 104,
+      "line_end": 104,
+      "column": 8,
+      "owner": "call_with_guards",
+      "representation_line": 73
+    },
+    {
+      "kind": "If",
+      "line_start": 105,
+      "line_end": 106,
+      "column": 4,
+      "owner": "call_with_guards",
+      "representation_line": 75
+    },
+    {
+      "kind": "Return",
+      "line_start": 106,
+      "line_end": 106,
+      "column": 8,
+      "owner": "call_with_guards",
+      "representation_line": 77
+    },
+    {
+      "kind": "Assign",
+      "line_start": 109,
+      "line_end": 109,
+      "column": 4,
+      "owner": "call_with_guards",
+      "representation_line": 81
+    },
+    {
+      "kind": "Assign",
+      "line_start": 110,
+      "line_end": 110,
+      "column": 4,
+      "owner": "call_with_guards",
+      "representation_line": 81
+    },
+    {
+      "kind": "Assign",
+      "line_start": 111,
+      "line_end": 111,
+      "column": 4,
+      "owner": "call_with_guards",
+      "representation_line": 81
+    },
+    {
+      "kind": "Try",
+      "line_start": 112,
+      "line_end": 116,
+      "column": 4,
+      "owner": "call_with_guards",
+      "representation_line": 82
+    },
+    {
+      "kind": "Assign",
+      "line_start": 113,
+      "line_end": 113,
+      "column": 8,
+      "owner": "call_with_guards",
+      "representation_line": 85
+    },
+    {
+      "kind": "Return",
+      "line_start": 115,
+      "line_end": 116,
+      "column": 8,
+      "owner": "call_with_guards",
+      "representation_line": 89
+    },
+    {
+      "kind": "Return",
+      "line_start": 117,
+      "line_end": 120,
+      "column": 4,
+      "owner": "call_with_guards",
+      "representation_line": 92
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 123,
+      "line_end": 143,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 96
+    },
+    {
+      "kind": "Expr",
+      "line_start": 127,
+      "line_end": 127,
+      "column": 4,
+      "owner": "_engine_failed",
+      "representation_line": 102
+    },
+    {
+      "kind": "Assign",
+      "line_start": 128,
+      "line_end": 128,
+      "column": 4,
+      "owner": "_engine_failed",
+      "representation_line": 102
+    },
+    {
+      "kind": "Assign",
+      "line_start": 129,
+      "line_end": 129,
+      "column": 4,
+      "owner": "_engine_failed",
+      "representation_line": 102
+    },
+    {
+      "kind": "Assign",
+      "line_start": 130,
+      "line_end": 130,
+      "column": 4,
+      "owner": "_engine_failed",
+      "representation_line": 102
+    },
+    {
+      "kind": "Assign",
+      "line_start": 131,
+      "line_end": 131,
+      "column": 4,
+      "owner": "_engine_failed",
+      "representation_line": 102
+    },
+    {
+      "kind": "Assign",
+      "line_start": 132,
+      "line_end": 133,
+      "column": 4,
+      "owner": "_engine_failed",
+      "representation_line": 104
+    },
+    {
+      "kind": "Assign",
+      "line_start": 134,
+      "line_end": 134,
+      "column": 4,
+      "owner": "_engine_failed",
+      "representation_line": 104
+    },
+    {
+      "kind": "Expr",
+      "line_start": 135,
+      "line_end": 137,
+      "column": 4,
+      "owner": "_engine_failed",
+      "representation_line": 104
+    },
+    {
+      "kind": "Assign",
+      "line_start": 138,
+      "line_end": 140,
+      "column": 4,
+      "owner": "_engine_failed",
+      "representation_line": 104
+    },
+    {
+      "kind": "Return",
+      "line_start": 142,
+      "line_end": 143,
+      "column": 4,
+      "owner": "_engine_failed",
+      "representation_line": 105
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 146,
+      "line_end": 168,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 109
+    },
+    {
+      "kind": "Expr",
+      "line_start": 151,
+      "line_end": 151,
+      "column": 4,
+      "owner": "harness_amend",
+      "representation_line": 115
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 152,
+      "line_end": 152,
+      "column": 4,
+      "owner": "harness_amend",
+      "representation_line": 115
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 153,
+      "line_end": 153,
+      "column": 4,
+      "owner": "harness_amend",
+      "representation_line": 115
+    },
+    {
+      "kind": "If",
+      "line_start": 154,
+      "line_end": 158,
+      "column": 4,
+      "owner": "harness_amend",
+      "representation_line": 116
+    },
+    {
+      "kind": "Assign",
+      "line_start": 155,
+      "line_end": 156,
+      "column": 8,
+      "owner": "harness_amend",
+      "representation_line": 119
+    },
+    {
+      "kind": "Assign",
+      "line_start": 157,
+      "line_end": 157,
+      "column": 8,
+      "owner": "harness_amend",
+      "representation_line": 119
+    },
+    {
+      "kind": "Assign",
+      "line_start": 158,
+      "line_end": 158,
+      "column": 8,
+      "owner": "harness_amend",
+      "representation_line": 119
+    },
+    {
+      "kind": "Assign",
+      "line_start": 159,
+      "line_end": 160,
+      "column": 4,
+      "owner": "harness_amend",
+      "representation_line": 122
+    },
+    {
+      "kind": "Assign",
+      "line_start": 161,
+      "line_end": 162,
+      "column": 4,
+      "owner": "harness_amend",
+      "representation_line": 122
+    },
+    {
+      "kind": "Assign",
+      "line_start": 164,
+      "line_end": 166,
+      "column": 4,
+      "owner": "harness_amend",
+      "representation_line": 122
+    },
+    {
+      "kind": "Assign",
+      "line_start": 167,
+      "line_end": 167,
+      "column": 4,
+      "owner": "harness_amend",
+      "representation_line": 122
+    },
+    {
+      "kind": "Return",
+      "line_start": 168,
+      "line_end": 168,
+      "column": 4,
+      "owner": "harness_amend",
+      "representation_line": 123
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 171,
+      "line_end": 188,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 127
+    },
+    {
+      "kind": "Expr",
+      "line_start": 172,
+      "line_end": 172,
+      "column": 4,
+      "owner": "_reconcile_post_meta",
+      "representation_line": 133
+    },
+    {
+      "kind": "If",
+      "line_start": 174,
+      "line_end": 175,
+      "column": 4,
+      "owner": "_reconcile_post_meta",
+      "representation_line": 134
+    },
+    {
+      "kind": "Return",
+      "line_start": 175,
+      "line_end": 175,
+      "column": 8,
+      "owner": "_reconcile_post_meta",
+      "representation_line": 136
+    },
+    {
+      "kind": "Assign",
+      "line_start": 176,
+      "line_end": 177,
+      "column": 4,
+      "owner": "_reconcile_post_meta",
+      "representation_line": 140
+    },
+    {
+      "kind": "If",
+      "line_start": 178,
+      "line_end": 179,
+      "column": 4,
+      "owner": "_reconcile_post_meta",
+      "representation_line": 141
+    },
+    {
+      "kind": "Return",
+      "line_start": 179,
+      "line_end": 179,
+      "column": 8,
+      "owner": "_reconcile_post_meta",
+      "representation_line": 143
+    },
+    {
+      "kind": "Assign",
+      "line_start": 180,
+      "line_end": 180,
+      "column": 4,
+      "owner": "_reconcile_post_meta",
+      "representation_line": 147
+    },
+    {
+      "kind": "Assign",
+      "line_start": 181,
+      "line_end": 185,
+      "column": 4,
+      "owner": "_reconcile_post_meta",
+      "representation_line": 147
+    },
+    {
+      "kind": "If",
+      "line_start": 186,
+      "line_end": 187,
+      "column": 4,
+      "owner": "_reconcile_post_meta",
+      "representation_line": 148
+    },
+    {
+      "kind": "Assign",
+      "line_start": 187,
+      "line_end": 187,
+      "column": 8,
+      "owner": "_reconcile_post_meta",
+      "representation_line": 151
+    },
+    {
+      "kind": "Return",
+      "line_start": 188,
+      "line_end": 188,
+      "column": 4,
+      "owner": "_reconcile_post_meta",
+      "representation_line": 153
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 191,
+      "line_end": 207,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 157
+    },
+    {
+      "kind": "Expr",
+      "line_start": 194,
+      "line_end": 194,
+      "column": 4,
+      "owner": "apply_plugin",
+      "representation_line": 163
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 195,
+      "line_end": 195,
+      "column": 4,
+      "owner": "apply_plugin",
+      "representation_line": 163
+    },
+    {
+      "kind": "Assign",
+      "line_start": 197,
+      "line_end": 198,
+      "column": 4,
+      "owner": "apply_plugin",
+      "representation_line": 163
+    },
+    {
+      "kind": "Assign",
+      "line_start": 199,
+      "line_end": 199,
+      "column": 4,
+      "owner": "apply_plugin",
+      "representation_line": 163
+    },
+    {
+      "kind": "Assign",
+      "line_start": 200,
+      "line_end": 203,
+      "column": 4,
+      "owner": "apply_plugin",
+      "representation_line": 163
+    },
+    {
+      "kind": "Expr",
+      "line_start": 204,
+      "line_end": 206,
+      "column": 4,
+      "owner": "apply_plugin",
+      "representation_line": 165
+    },
+    {
+      "kind": "Return",
+      "line_start": 207,
+      "line_end": 207,
+      "column": 4,
+      "owner": "apply_plugin",
+      "representation_line": 166
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 210,
+      "line_end": 220,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 170
+    },
+    {
+      "kind": "Expr",
+      "line_start": 212,
+      "line_end": 212,
+      "column": 4,
+      "owner": "checkpoint_record",
+      "representation_line": 176
+    },
+    {
+      "kind": "Assign",
+      "line_start": 213,
+      "line_end": 213,
+      "column": 4,
+      "owner": "checkpoint_record",
+      "representation_line": 176
+    },
+    {
+      "kind": "Return",
+      "line_start": 214,
+      "line_end": 220,
+      "column": 4,
+      "owner": "checkpoint_record",
+      "representation_line": 177
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 223,
+      "line_end": 239,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 181
+    },
+    {
+      "kind": "Expr",
+      "line_start": 226,
+      "line_end": 226,
+      "column": 4,
+      "owner": "_files_touched",
+      "representation_line": 187
+    },
+    {
+      "kind": "Assign",
+      "line_start": 227,
+      "line_end": 227,
+      "column": 4,
+      "owner": "_files_touched",
+      "representation_line": 187
+    },
+    {
+      "kind": "If",
+      "line_start": 228,
+      "line_end": 236,
+      "column": 4,
+      "owner": "_files_touched",
+      "representation_line": 188
+    },
+    {
+      "kind": "Assign",
+      "line_start": 231,
+      "line_end": 231,
+      "column": 8,
+      "owner": "_files_touched",
+      "representation_line": 191
+    },
+    {
+      "kind": "Assign",
+      "line_start": 232,
+      "line_end": 233,
+      "column": 8,
+      "owner": "_files_touched",
+      "representation_line": 191
+    },
+    {
+      "kind": "Assign",
+      "line_start": 234,
+      "line_end": 235,
+      "column": 8,
+      "owner": "_files_touched",
+      "representation_line": 191
+    },
+    {
+      "kind": "Return",
+      "line_start": 236,
+      "line_end": 236,
+      "column": 8,
+      "owner": "_files_touched",
+      "representation_line": 192
+    },
+    {
+      "kind": "Assign",
+      "line_start": 237,
+      "line_end": 237,
+      "column": 4,
+      "owner": "_files_touched",
+      "representation_line": 196
+    },
+    {
+      "kind": "Assign",
+      "line_start": 238,
+      "line_end": 238,
+      "column": 4,
+      "owner": "_files_touched",
+      "representation_line": 196
+    },
+    {
+      "kind": "Return",
+      "line_start": 239,
+      "line_end": 239,
+      "column": 4,
+      "owner": "_files_touched",
+      "representation_line": 197
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 242,
+      "line_end": 247,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 201
+    },
+    {
+      "kind": "Expr",
+      "line_start": 243,
+      "line_end": 243,
+      "column": 4,
+      "owner": "_resolves",
+      "representation_line": 207
+    },
+    {
+      "kind": "If",
+      "line_start": 244,
+      "line_end": 245,
+      "column": 4,
+      "owner": "_resolves",
+      "representation_line": 208
+    },
+    {
+      "kind": "Return",
+      "line_start": 245,
+      "line_end": 245,
+      "column": 8,
+      "owner": "_resolves",
+      "representation_line": 210
+    },
+    {
+      "kind": "Assign",
+      "line_start": 246,
+      "line_end": 246,
+      "column": 4,
+      "owner": "_resolves",
+      "representation_line": 214
+    },
+    {
+      "kind": "Return",
+      "line_start": 247,
+      "line_end": 247,
+      "column": 4,
+      "owner": "_resolves",
+      "representation_line": 215
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 250,
+      "line_end": 258,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 219
+    },
+    {
+      "kind": "Expr",
+      "line_start": 251,
+      "line_end": 251,
+      "column": 4,
+      "owner": "_base_meta",
+      "representation_line": 225
+    },
+    {
+      "kind": "Return",
+      "line_start": 252,
+      "line_end": 258,
+      "column": 4,
+      "owner": "_base_meta",
+      "representation_line": 226
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 261,
+      "line_end": 274,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 230
+    },
+    {
+      "kind": "Expr",
+      "line_start": 262,
+      "line_end": 262,
+      "column": 4,
+      "owner": "_post_meta",
+      "representation_line": 236
+    },
+    {
+      "kind": "Assign",
+      "line_start": 263,
+      "line_end": 263,
+      "column": 4,
+      "owner": "_post_meta",
+      "representation_line": 236
+    },
+    {
+      "kind": "Assign",
+      "line_start": 264,
+      "line_end": 268,
+      "column": 4,
+      "owner": "_post_meta",
+      "representation_line": 236
+    },
+    {
+      "kind": "If",
+      "line_start": 269,
+      "line_end": 270,
+      "column": 4,
+      "owner": "_post_meta",
+      "representation_line": 237
+    },
+    {
+      "kind": "Assign",
+      "line_start": 270,
+      "line_end": 270,
+      "column": 8,
+      "owner": "_post_meta",
+      "representation_line": 240
+    },
+    {
+      "kind": "If",
+      "line_start": 271,
+      "line_end": 273,
+      "column": 4,
+      "owner": "_post_meta",
+      "representation_line": 242
+    },
+    {
+      "kind": "Assign",
+      "line_start": 272,
+      "line_end": 272,
+      "column": 8,
+      "owner": "_post_meta",
+      "representation_line": 245
+    },
+    {
+      "kind": "Assign",
+      "line_start": 273,
+      "line_end": 273,
+      "column": 8,
+      "owner": "_post_meta",
+      "representation_line": 245
+    },
+    {
+      "kind": "Return",
+      "line_start": 274,
+      "line_end": 274,
+      "column": 4,
+      "owner": "_post_meta",
+      "representation_line": 247
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 277,
+      "line_end": 286,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 251
+    },
+    {
+      "kind": "Expr",
+      "line_start": 278,
+      "line_end": 278,
+      "column": 4,
+      "owner": "_trace_policy",
+      "representation_line": 257
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 279,
+      "line_end": 279,
+      "column": 4,
+      "owner": "_trace_policy",
+      "representation_line": 257
+    },
+    {
+      "kind": "If",
+      "line_start": 281,
+      "line_end": 283,
+      "column": 4,
+      "owner": "_trace_policy",
+      "representation_line": 258
+    },
+    {
+      "kind": "Expr",
+      "line_start": 282,
+      "line_end": 282,
+      "column": 8,
+      "owner": "_trace_policy",
+      "representation_line": 261
+    },
+    {
+      "kind": "Return",
+      "line_start": 283,
+      "line_end": 283,
+      "column": 8,
+      "owner": "_trace_policy",
+      "representation_line": 262
+    },
+    {
+      "kind": "Expr",
+      "line_start": 284,
+      "line_end": 286,
+      "column": 4,
+      "owner": "_trace_policy",
+      "representation_line": 266
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 289,
+      "line_end": 302,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 269
+    },
+    {
+      "kind": "Expr",
+      "line_start": 291,
+      "line_end": 291,
+      "column": 4,
+      "owner": "_denied",
+      "representation_line": 275
+    },
+    {
+      "kind": "Assign",
+      "line_start": 292,
+      "line_end": 292,
+      "column": 4,
+      "owner": "_denied",
+      "representation_line": 275
+    },
+    {
+      "kind": "Expr",
+      "line_start": 293,
+      "line_end": 294,
+      "column": 4,
+      "owner": "_denied",
+      "representation_line": 275
+    },
+    {
+      "kind": "Return",
+      "line_start": 295,
+      "line_end": 302,
+      "column": 4,
+      "owner": "_denied",
+      "representation_line": 276
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 305,
+      "line_end": 316,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 280
+    },
+    {
+      "kind": "Expr",
+      "line_start": 306,
+      "line_end": 306,
+      "column": 4,
+      "owner": "_snapshot_targets",
+      "representation_line": 286
+    },
+    {
+      "kind": "Assign",
+      "line_start": 307,
+      "line_end": 307,
+      "column": 4,
+      "owner": "_snapshot_targets",
+      "representation_line": 286
+    },
+    {
+      "kind": "Expr",
+      "line_start": 309,
+      "line_end": 309,
+      "column": 4,
+      "owner": "_snapshot_targets",
+      "representation_line": 286
+    },
+    {
+      "kind": "If",
+      "line_start": 310,
+      "line_end": 311,
+      "column": 4,
+      "owner": "_snapshot_targets",
+      "representation_line": 287
+    },
+    {
+      "kind": "Return",
+      "line_start": 311,
+      "line_end": 311,
+      "column": 8,
+      "owner": "_snapshot_targets",
+      "representation_line": 289
+    },
+    {
+      "kind": "Assign",
+      "line_start": 312,
+      "line_end": 312,
+      "column": 4,
+      "owner": "_snapshot_targets",
+      "representation_line": 293
+    },
+    {
+      "kind": "Assign",
+      "line_start": 313,
+      "line_end": 314,
+      "column": 4,
+      "owner": "_snapshot_targets",
+      "representation_line": 293
+    },
+    {
+      "kind": "Return",
+      "line_start": 315,
+      "line_end": 316,
+      "column": 4,
+      "owner": "_snapshot_targets",
+      "representation_line": 294
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 319,
+      "line_end": 324,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 298
+    },
+    {
+      "kind": "Expr",
+      "line_start": 320,
+      "line_end": 320,
+      "column": 4,
+      "owner": "_call_engine",
+      "representation_line": 304
+    },
+    {
+      "kind": "If",
+      "line_start": 321,
+      "line_end": 323,
+      "column": 4,
+      "owner": "_call_engine",
+      "representation_line": 305
+    },
+    {
+      "kind": "Return",
+      "line_start": 322,
+      "line_end": 323,
+      "column": 8,
+      "owner": "_call_engine",
+      "representation_line": 307
+    },
+    {
+      "kind": "Return",
+      "line_start": 324,
+      "line_end": 324,
+      "column": 4,
+      "owner": "_call_engine",
+      "representation_line": 310
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 327,
+      "line_end": 339,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 314
+    },
+    {
+      "kind": "Expr",
+      "line_start": 330,
+      "line_end": 330,
+      "column": 4,
+      "owner": "_provenance",
+      "representation_line": 320
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 331,
+      "line_end": 331,
+      "column": 4,
+      "owner": "_provenance",
+      "representation_line": 320
+    },
+    {
+      "kind": "Assign",
+      "line_start": 334,
+      "line_end": 334,
+      "column": 4,
+      "owner": "_provenance",
+      "representation_line": 320
+    },
+    {
+      "kind": "Assign",
+      "line_start": 335,
+      "line_end": 335,
+      "column": 4,
+      "owner": "_provenance",
+      "representation_line": 320
+    },
+    {
+      "kind": "Return",
+      "line_start": 336,
+      "line_end": 339,
+      "column": 4,
+      "owner": "_provenance",
+      "representation_line": 321
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 342,
+      "line_end": 351,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 325
+    },
+    {
+      "kind": "Expr",
+      "line_start": 343,
+      "line_end": 343,
+      "column": 4,
+      "owner": "engine_model",
+      "representation_line": 331
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 344,
+      "line_end": 344,
+      "column": 4,
+      "owner": "engine_model",
+      "representation_line": 331
+    },
+    {
+      "kind": "Try",
+      "line_start": 346,
+      "line_end": 349,
+      "column": 4,
+      "owner": "engine_model",
+      "representation_line": 332
+    },
+    {
+      "kind": "Assign",
+      "line_start": 347,
+      "line_end": 347,
+      "column": 8,
+      "owner": "engine_model",
+      "representation_line": 335
+    },
+    {
+      "kind": "Return",
+      "line_start": 349,
+      "line_end": 349,
+      "column": 8,
+      "owner": "engine_model",
+      "representation_line": 339
+    },
+    {
+      "kind": "Return",
+      "line_start": 351,
+      "line_end": 351,
+      "column": 4,
+      "owner": "engine_model",
+      "representation_line": 342
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 40,
+      "line_end": 49,
+      "column": 10,
+      "kind": "List",
+      "original_ast": "List(elts=[Constant(value='Amended'), Constant(value='EngineRequest'), Constant(value='GuardedCall'), Constant(value='apply_plugin'), Constant(value='call_with_guards'), Constant(value='checkpoint_record'), Constant(value='engine_model'), Constant(value='harness_amend')], ctx=Load())",
+      "rendered": "['Amended', 'EngineRequest', 'GuardedCall', 'apply_plugin', 'call_with_guards', 'checkpoint_record', 'engine_model', 'harness_amend']"
+    },
+    {
+      "line_start": 52,
+      "line_end": 52,
+      "column": 12,
+      "kind": "Constant",
+      "original_ast": "Constant(value='vvaharness.remediation_agent')",
+      "rendered": "'vvaharness.remediation_agent'"
+    },
+    {
+      "line_start": 55,
+      "line_end": 55,
+      "column": 1,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dataclass', ctx=Load()), args=[], keywords=[keyword(arg='frozen', value=Constant(value=True))])",
+      "rendered": "dataclass(frozen=True)"
+    },
+    {
+      "line_start": 63,
+      "line_end": 63,
+      "column": 20,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 64,
+      "line_end": 64,
+      "column": 22,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 5,
+      "kind": "Name",
+      "original_ast": "Name(id='property', ctx=Load())",
+      "rendered": "property"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 15,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Attribute(value=Name(id='self', ctx=Load()), attr='policy_ctx', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), Call(func=Name(id='getattr', ctx=Load()), args=[Attribute(value=Name(id='self', ctx=Load()), attr='policy_ctx', ctx=Load()), Constant(value='enabled'), Constant(value=False)], keywords=[])])",
+      "rendered": "self.policy_ctx is not None and getattr(self.policy_ctx, 'enabled', False)"
+    },
+    {
+      "line_start": 72,
+      "line_end": 72,
+      "column": 1,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dataclass', ctx=Load()), args=[], keywords=[keyword(arg='frozen', value=Constant(value=True))])",
+      "rendered": "dataclass(frozen=True)"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 38,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='field', ctx=Load()), args=[], keywords=[keyword(arg='default_factory', value=Name(id='dict', ctx=Load()))])",
+      "rendered": "field(default_factory=dict)"
+    },
+    {
+      "line_start": 78,
+      "line_end": 78,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 79,
+      "line_end": 79,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='field', ctx=Load()), args=[], keywords=[keyword(arg='default_factory', value=Name(id='dict', ctx=Load()))])",
+      "rendered": "field(default_factory=dict)"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 31,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='Spend', ctx=Load()), args=[], keywords=[])",
+      "rendered": "Spend()"
+    },
+    {
+      "line_start": 83,
+      "line_end": 83,
+      "column": 38,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[], ctx=Load())",
+      "rendered": "()"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 1,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dataclass', ctx=Load()), args=[], keywords=[keyword(arg='frozen', value=Constant(value=True))])",
+      "rendered": "dataclass(frozen=True)"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 38,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[], ctx=Load())",
+      "rendered": "()"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='field', ctx=Load()), args=[], keywords=[keyword(arg='default_factory', value=Name(id='dict', ctx=Load()))])",
+      "rendered": "field(default_factory=dict)"
+    },
+    {
+      "line_start": 99,
+      "line_end": 99,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='datetime', ctx=Load()), attr='now', ctx=Load()), args=[Name(id='UTC', ctx=Load())], keywords=[])",
+      "rendered": "datetime.now(UTC)"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='TOKENS', ctx=Load()), attr='spend', ctx=Load()), args=[], keywords=[])",
+      "rendered": "TOKENS.spend()"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_base_meta', ctx=Load()), args=[Name(id='request', ctx=Load()), Name(id='started', ctx=Load())], keywords=[])",
+      "rendered": "_base_meta(request, started)"
+    },
+    {
+      "line_start": 102,
+      "line_end": 102,
+      "column": 10,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Attribute(value=Name(id='request', ctx=Load()), attr='enforce', ctx=Load()), body=Call(func=Attribute(value=Name(id='_policy', ctx=Load()), attr='pre_decision', ctx=Load()), args=[Attribute(value=Name(id='request', ctx=Load()), attr='policy_ctx', ctx=Load()), Attribute(value=Name(id='request', ctx=Load()), attr='target', ctx=Load())], keywords=[]), orelse=Constant(value=None))",
+      "rendered": "_policy.pre_decision(request.policy_ctx, request.target) if request.enforce else None"
+    },
+    {
+      "line_start": 103,
+      "line_end": 103,
+      "column": 7,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='request', ctx=Load()), attr='verbose', ctx=Load())",
+      "rendered": "request.verbose"
+    },
+    {
+      "line_start": 104,
+      "line_end": 104,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_trace_policy', ctx=Load()), args=[Name(id='request', ctx=Load()), Name(id='pre', ctx=Load())], keywords=[])",
+      "rendered": "_trace_policy(request, pre)"
+    },
+    {
+      "line_start": 105,
+      "line_end": 105,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='pre', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), UnaryOp(op=Not(), operand=Attribute(value=Name(id='pre', ctx=Load()), attr='allowed', ctx=Load()))])",
+      "rendered": "pre is not None and (not pre.allowed)"
+    },
+    {
+      "line_start": 106,
+      "line_end": 106,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_denied', ctx=Load()), args=[Name(id='request', ctx=Load()), Name(id='pre', ctx=Load()), Name(id='meta', ctx=Load()), Name(id='started', ctx=Load()), Name(id='spend_before', ctx=Load())], keywords=[])",
+      "rendered": "_denied(request, pre, meta, started, spend_before)"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='artifacts', ctx=Load()), attr='changed_files_whole_tree', ctx=Load()), args=[Attribute(value=Name(id='request', ctx=Load()), attr='repo', ctx=Load())], keywords=[])",
+      "rendered": "artifacts.changed_files_whole_tree(request.repo)"
+    },
+    {
+      "line_start": 110,
+      "line_end": 110,
+      "column": 24,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='artifacts', ctx=Load()), attr='snapshot_files', ctx=Load()), args=[Attribute(value=Name(id='request', ctx=Load()), attr='repo', ctx=Load()), Name(id='pre_call_dirty', ctx=Load())], keywords=[])",
+      "rendered": "artifacts.snapshot_files(request.repo, pre_call_dirty)"
+    },
+    {
+      "line_start": 111,
+      "line_end": 111,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='artifacts', ctx=Load()), attr='snapshot_files', ctx=Load()), args=[Attribute(value=Name(id='request', ctx=Load()), attr='repo', ctx=Load()), Call(func=Name(id='_snapshot_targets', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "artifacts.snapshot_files(request.repo, _snapshot_targets(request))"
+    },
+    {
+      "line_start": 113,
+      "line_end": 113,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_call_engine', ctx=Load()), args=[Name(id='fn', ctx=Load()), Name(id='request', ctx=Load()), Name(id='pre', ctx=Load())], keywords=[])",
+      "rendered": "_call_engine(fn, request, pre)"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 115,
+      "line_end": 116,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_engine_failed', ctx=Load()), args=[Name(id='request', ctx=Load()), Name(id='exc', ctx=Load()), Name(id='pre_call_dirty', ctx=Load()), Name(id='pre_call_snapshot', ctx=Load()), Name(id='snapshot', ctx=Load()), Name(id='pre', ctx=Load()), Name(id='meta', ctx=Load()), Name(id='started', ctx=Load()), Name(id='spend_before', ctx=Load())], keywords=[])",
+      "rendered": "_engine_failed(request, exc, pre_call_dirty, pre_call_snapshot, snapshot, pre, meta, started, spend_before)"
+    },
+    {
+      "line_start": 117,
+      "line_end": 120,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='GuardedCall', ctx=Load()), args=[], keywords=[keyword(arg='verdict', value=Call(func=Attribute(value=Name(id='_pr', ctx=Load()), attr='_coerce_verdict', ctx=Load()), args=[Name(id='raw', ctx=Load()), Attribute(value=Name(id='request', ctx=Load()), attr='target', ctx=Load())], keywords=[])), keyword(arg='snapshot', value=Name(id='snapshot', ctx=Load())), keyword(arg='pre', value=Name(id='pre', ctx=Load())), keyword(arg='meta', value=Name(id='meta', ctx=Load())), keyword(arg='started', value=Name(id='started', ctx=Load())), keyword(arg='spend_before', value=Name(id='spend_before', ctx=Load())), keyword(arg='pre_call_dirty', value=Call(func=Name(id='tuple', ctx=Load()), args=[Name(id='pre_call_dirty', ctx=Load())], keywords=[]))])",
+      "rendered": "GuardedCall(verdict=_pr._coerce_verdict(raw, request.target), snapshot=snapshot, pre=pre, meta=meta, started=started, spend_before=spend_before, pre_call_dirty=tuple(pre_call_dirty))"
+    },
+    {
+      "line_start": 128,
+      "line_end": 128,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='artifacts', ctx=Load()), attr='changed_files_whole_tree', ctx=Load()), args=[Attribute(value=Name(id='request', ctx=Load()), attr='repo', ctx=Load())], keywords=[])",
+      "rendered": "artifacts.changed_files_whole_tree(request.repo)"
+    },
+    {
+      "line_start": 129,
+      "line_end": 129,
+      "column": 20,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='f', ctx=Load()), generators=[comprehension(target=Name(id='f', ctx=Store()), iter=Name(id='now_dirty', ctx=Load()), ifs=[Compare(left=Name(id='f', ctx=Load()), ops=[NotIn()], comparators=[Call(func=Name(id='set', ctx=Load()), args=[Name(id='pre_call_dirty', ctx=Load())], keywords=[])])], is_async=0)])",
+      "rendered": "[f for f in now_dirty if f not in set(pre_call_dirty)]"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 26,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='artifacts', ctx=Load()), attr='changed_since_snapshot', ctx=Load()), args=[Attribute(value=Name(id='request', ctx=Load()), attr='repo', ctx=Load()), Name(id='pre_call_snapshot', ctx=Load())], keywords=[])",
+      "rendered": "artifacts.changed_since_snapshot(request.repo, pre_call_snapshot)"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='list', ctx=Load()), args=[Call(func=Attribute(value=Name(id='dict', ctx=Load()), attr='fromkeys', ctx=Load()), args=[List(elts=[Starred(value=Name(id='changed_during_call', ctx=Load()), ctx=Load()), Starred(value=Name(id='new_untracked', ctx=Load()), ctx=Load())], ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "list(dict.fromkeys([*changed_during_call, *new_untracked]))"
+    },
+    {
+      "line_start": 132,
+      "line_end": 133,
+      "column": 16,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='to_revert', ctx=Load()), body=Call(func=Attribute(value=Name(id='_policy', ctx=Load()), attr='revert_files', ctx=Load()), args=[Attribute(value=Name(id='request', ctx=Load()), attr='repo', ctx=Load()), Name(id='to_revert', ctx=Load()), Name(id='pre_call_snapshot', ctx=Load())], keywords=[]), orelse=List(elts=[], ctx=Load()))",
+      "rendered": "_policy.revert_files(request.repo, to_revert, pre_call_snapshot) if to_revert else []"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 13,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='exc', ctx=Load()), Constant(value='stderr'), Constant(value=None)], keywords=[]), Call(func=Name(id='str', ctx=Load()), args=[Name(id='exc', ctx=Load())], keywords=[])])",
+      "rendered": "getattr(exc, 'stderr', None) or str(exc)"
+    },
+    {
+      "line_start": 135,
+      "line_end": 137,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='    [guard] engine call failed for finding '), FormattedValue(value=Attribute(value=Attribute(value=Name(id='request', ctx=Load()), attr='target', ctx=Load()), attr='index', ctx=Load()), conversion=-1), Constant(value=' ('), FormattedValue(value=Attribute(value=Call(func=Name(id='type', ctx=Load()), args=[Name(id='exc', ctx=Load())], keywords=[]), attr='__name__', ctx=Load()), conversion=-1), Constant(value=': '), FormattedValue(value=Name(id='detail', ctx=Load()), conversion=-1), Constant(value='); reverted '), FormattedValue(value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='reverted', ctx=Load())], keywords=[]), conversion=-1), Constant(value=' in-flight edit(s)')])], keywords=[])",
+      "rendered": "console.write(source_template_136_8)"
+    },
+    {
+      "line_start": 138,
+      "line_end": 140,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='RemediationVerdict', ctx=Load()), args=[], keywords=[keyword(arg='finding_index', value=Attribute(value=Attribute(value=Name(id='request', ctx=Load()), attr='target', ctx=Load()), attr='index', ctx=Load())), keyword(arg='verdict', value=Constant(value='Not Fixed')), keyword(arg='gates', value=Call(func=Name(id='Gates', ctx=Load()), args=[], keywords=[])), keyword(arg='changes', value=List(elts=[], ctx=Load())), keyword(arg='summary', value=JoinedStr(values=[Constant(value='remediation session failed: '), FormattedValue(value=Attribute(value=Call(func=Name(id='type', ctx=Load()), args=[Name(id='exc', ctx=Load())], keywords=[]), attr='__name__', ctx=Load()), conversion=-1), Constant(value=': '), FormattedValue(value=Name(id='exc', ctx=Load()), conversion=-1)]))])",
+      "rendered": "RemediationVerdict(finding_index=request.target.index, verdict='Not Fixed', gates=Gates(), changes=[], summary=source_template_140_28)"
+    },
+    {
+      "line_start": 142,
+      "line_end": 143,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='GuardedCall', ctx=Load()), args=[], keywords=[keyword(arg='verdict', value=Name(id='verdict', ctx=Load())), keyword(arg='snapshot', value=Name(id='snapshot', ctx=Load())), keyword(arg='pre', value=Name(id='pre', ctx=Load())), keyword(arg='meta', value=Name(id='meta', ctx=Load())), keyword(arg='started', value=Name(id='started', ctx=Load())), keyword(arg='spend_before', value=Name(id='spend_before', ctx=Load()))])",
+      "rendered": "GuardedCall(verdict=verdict, snapshot=snapshot, pre=pre, meta=meta, started=started, spend_before=spend_before)"
+    },
+    {
+      "line_start": 152,
+      "line_end": 152,
+      "column": 32,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[], ctx=Load())",
+      "rendered": "()"
+    },
+    {
+      "line_start": 153,
+      "line_end": 153,
+      "column": 17,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 154,
+      "line_end": 154,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='pre', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "pre is not None"
+    },
+    {
+      "line_start": 155,
+      "line_end": 156,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_policy', ctx=Load()), attr='enforce_post', ctx=Load()), args=[Attribute(value=Name(id='request', ctx=Load()), attr='policy_ctx', ctx=Load()), Attribute(value=Name(id='request', ctx=Load()), attr='target', ctx=Load()), Name(id='remediation', ctx=Load()), Name(id='pre', ctx=Load())], keywords=[keyword(arg='repo', value=Attribute(value=Name(id='request', ctx=Load()), attr='repo', ctx=Load())), keyword(arg='before_snapshot', value=Name(id='snapshot', ctx=Load()))])",
+      "rendered": "_policy.enforce_post(request.policy_ctx, request.target, remediation, pre, repo=request.repo, before_snapshot=snapshot)"
+    },
+    {
+      "line_start": 157,
+      "line_end": 157,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='tuple', ctx=Load()), args=[Attribute(value=Name(id='post', ctx=Load()), attr='reverted', ctx=Load())], keywords=[])",
+      "rendered": "tuple(post.reverted)"
+    },
+    {
+      "line_start": 158,
+      "line_end": 158,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_post_meta', ctx=Load()), args=[Name(id='pre', ctx=Load()), Name(id='post', ctx=Load())], keywords=[])",
+      "rendered": "_post_meta(pre, post)"
+    },
+    {
+      "line_start": 159,
+      "line_end": 160,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='artifacts', ctx=Load()), attr='derive_diff', ctx=Load()), args=[Attribute(value=Name(id='request', ctx=Load()), attr='repo', ctx=Load()), Name(id='snapshot', ctx=Load()), ListComp(elt=Attribute(value=Name(id='c', ctx=Load()), attr='file', ctx=Load()), generators=[comprehension(target=Name(id='c', ctx=Store()), iter=Attribute(value=Name(id='remediation', ctx=Load()), attr='changes', ctx=Load()), ifs=[Attribute(value=Name(id='c', ctx=Load()), attr='file', ctx=Load())], is_async=0)])], keywords=[])",
+      "rendered": "artifacts.derive_diff(request.repo, snapshot, [c.file for c in remediation.changes if c.file])"
+    },
+    {
+      "line_start": 161,
+      "line_end": 162,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='to_evidence', ctx=Load()), args=[Name(id='remediation', ctx=Load())], keywords=[keyword(arg='provenance', value=Call(func=Name(id='_provenance', ctx=Load()), args=[Name(id='request', ctx=Load())], keywords=[keyword(arg='denied', value=Name(id='denied', ctx=Load())), keyword(arg='started', value=Name(id='started', ctx=Load())), keyword(arg='spend_before', value=Name(id='spend_before', ctx=Load()))]))])",
+      "rendered": "to_evidence(remediation, provenance=_provenance(request, denied=denied, started=started, spend_before=spend_before))"
+    },
+    {
+      "line_start": 164,
+      "line_end": 166,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='finalize', ctx=Load()), args=[Name(id='evidence', ctx=Load())], keywords=[keyword(arg='mode', value=Attribute(value=Name(id='request', ctx=Load()), attr='mode', ctx=Load())), keyword(arg='diff', value=Name(id='diff', ctx=Load())), keyword(arg='files_touched', value=Call(func=Name(id='_files_touched', ctx=Load()), args=[Attribute(value=Name(id='request', ctx=Load()), attr='repo', ctx=Load()), Name(id='evidence', ctx=Load()), Name(id='snapshot', ctx=Load()), Name(id='pre_call_dirty', ctx=Load())], keywords=[]))])",
+      "rendered": "finalize(evidence, mode=request.mode, diff=diff, files_touched=_files_touched(request.repo, evidence, snapshot, pre_call_dirty))"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_reconcile_post_meta', ctx=Load()), args=[Name(id='meta', ctx=Load()), Name(id='contract', ctx=Load())], keywords=[])",
+      "rendered": "_reconcile_post_meta(meta, contract)"
+    },
+    {
+      "line_start": 168,
+      "line_end": 168,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='Amended', ctx=Load()), args=[], keywords=[keyword(arg='remediation', value=Name(id='contract', ctx=Load())), keyword(arg='reverted_paths', value=Name(id='reverted', ctx=Load())), keyword(arg='meta', value=Name(id='meta', ctx=Load()))])",
+      "rendered": "Amended(remediation=contract, reverted_paths=reverted, meta=meta)"
+    },
+    {
+      "line_start": 174,
+      "line_end": 174,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Compare(left=Call(func=Attribute(value=Name(id='meta', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='policy_action')], keywords=[]), ops=[NotEq()], comparators=[Constant(value='patch')]), Call(func=Attribute(value=Name(id='meta', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='policy_reverted')], keywords=[])])",
+      "rendered": "meta.get('policy_action') != 'patch' or meta.get('policy_reverted')"
+    },
+    {
+      "line_start": 175,
+      "line_end": 175,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='meta', ctx=Load())",
+      "rendered": "meta"
+    },
+    {
+      "line_start": 176,
+      "line_end": 177,
+      "column": 16,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='remediation', ctx=Load()), attr='kind', ctx=Load()), ops=[In()], comparators=[Tuple(elts=[Attribute(value=Name(id='RemediationKind', ctx=Load()), attr='NO_ACTION', ctx=Load()), Attribute(value=Name(id='RemediationKind', ctx=Load()), attr='ALREADY_RESOLVED', ctx=Load())], ctx=Load())])",
+      "rendered": "remediation.kind in (RemediationKind.NO_ACTION, RemediationKind.ALREADY_RESOLVED)"
+    },
+    {
+      "line_start": 178,
+      "line_end": 178,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Attribute(value=Name(id='remediation', ctx=Load()), attr='diff', ctx=Load()), UnaryOp(op=Not(), operand=Name(id='no_action', ctx=Load()))])",
+      "rendered": "remediation.diff and (not no_action)"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='meta', ctx=Load())",
+      "rendered": "meta"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 13,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=UnaryOp(op=Not(), operand=Attribute(value=Name(id='remediation', ctx=Load()), attr='diff', ctx=Load())), body=Constant(value='no_diff_captured'), orelse=Constant(value='remediation_not_applied'))",
+      "rendered": "'no_diff_captured' if not remediation.diff else 'remediation_not_applied'"
+    },
+    {
+      "line_start": 181,
+      "line_end": 185,
+      "column": 17,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[None, Constant(value='policy_reason'), Constant(value='final_verdict')], values=[Name(id='meta', ctx=Load()), Name(id='reason', ctx=Load()), Constant(value='REJECT')])",
+      "rendered": "{**meta, 'policy_reason': reason, 'final_verdict': 'REJECT'}"
+    },
+    {
+      "line_start": 186,
+      "line_end": 186,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Attribute(value=Name(id='meta', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='policy_reason')], keywords=[]), ops=[NotEq()], comparators=[Name(id='reason', ctx=Load())])",
+      "rendered": "meta.get('policy_reason') != reason"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 42,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='meta', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='policy_reason'), Constant(value='')], keywords=[])",
+      "rendered": "meta.get('policy_reason', '')"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='reconciled', ctx=Load())",
+      "rendered": "reconciled"
+    },
+    {
+      "line_start": 197,
+      "line_end": 198,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='EngineRequest', ctx=Load()), args=[], keywords=[keyword(arg='target', value=Name(id='target', ctx=Load())), keyword(arg='repo', value=Call(func=Name(id='Path', ctx=Load()), args=[Name(id='repo', ctx=Load())], keywords=[])), keyword(arg='mode', value=Name(id='mode', ctx=Load())), keyword(arg='cfg', value=Name(id='cfg', ctx=Load())), keyword(arg='verbose', value=Name(id='verbose', ctx=Load())), keyword(arg='policy_ctx', value=Name(id='policy_ctx', ctx=Load()))])",
+      "rendered": "EngineRequest(target=target, repo=Path(repo), mode=mode, cfg=cfg, verbose=verbose, policy_ctx=policy_ctx)"
+    },
+    {
+      "line_start": 199,
+      "line_end": 199,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='call_with_guards', ctx=Load()), args=[Attribute(value=Name(id='_pr', ctx=Load()), attr='_invoke', ctx=Load()), Name(id='request', ctx=Load())], keywords=[])",
+      "rendered": "call_with_guards(_pr._invoke, request)"
+    },
+    {
+      "line_start": 200,
+      "line_end": 203,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='harness_amend', ctx=Load()), args=[Attribute(value=Name(id='guarded', ctx=Load()), attr='verdict', ctx=Load()), Attribute(value=Name(id='guarded', ctx=Load()), attr='snapshot', ctx=Load())], keywords=[keyword(arg='request', value=Name(id='request', ctx=Load())), keyword(arg='pre', value=Attribute(value=Name(id='guarded', ctx=Load()), attr='pre', ctx=Load())), keyword(arg='denied', value=Attribute(value=Name(id='guarded', ctx=Load()), attr='denied', ctx=Load())), keyword(arg='started', value=Attribute(value=Name(id='guarded', ctx=Load()), attr='started', ctx=Load())), keyword(arg='spend_before', value=Attribute(value=Name(id='guarded', ctx=Load()), attr='spend_before', ctx=Load())), keyword(arg='pre_call_dirty', value=Attribute(value=Name(id='guarded', ctx=Load()), attr='pre_call_dirty', ctx=Load()))])",
+      "rendered": "harness_amend(guarded.verdict, guarded.snapshot, request=request, pre=guarded.pre, denied=guarded.denied, started=guarded.started, spend_before=guarded.spend_before, pre_call_dirty=guarded.pre_call_dirty)"
+    },
+    {
+      "line_start": 204,
+      "line_end": 206,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='artifacts', ctx=Load()), attr='write_case', ctx=Load()), args=[Name(id='out_dir', ctx=Load()), Attribute(value=Name(id='guarded', ctx=Load()), attr='verdict', ctx=Load()), Attribute(value=Name(id='amended', ctx=Load()), attr='remediation', ctx=Load())], keywords=[keyword(arg='meta', value=Dict(keys=[None, None], values=[Attribute(value=Name(id='guarded', ctx=Load()), attr='meta', ctx=Load()), Attribute(value=Name(id='amended', ctx=Load()), attr='meta', ctx=Load())])), keyword(arg='target', value=Name(id='target', ctx=Load())), keyword(arg='reverted_paths', value=Attribute(value=Name(id='amended', ctx=Load()), attr='reverted_paths', ctx=Load()))])",
+      "rendered": "artifacts.write_case(out_dir, guarded.verdict, amended.remediation, meta={**guarded.meta, **amended.meta}, target=target, reverted_paths=amended.reverted_paths)"
+    },
+    {
+      "line_start": 207,
+      "line_end": 207,
+      "column": 11,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='amended', ctx=Load()), attr='remediation', ctx=Load())",
+      "rendered": "amended.remediation"
+    },
+    {
+      "line_start": 213,
+      "line_end": 213,
+      "column": 18,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='remediation', ctx=Load()), attr='disposition', ctx=Load())",
+      "rendered": "remediation.disposition"
+    },
+    {
+      "line_start": 214,
+      "line_end": 220,
+      "column": 11,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='finding_index'), Constant(value='artifact_dir'), Constant(value='kind'), Constant(value='disposition'), Constant(value='diff_captured')], values=[Attribute(value=Name(id='target', ctx=Load()), attr='index', ctx=Load()), Call(func=Name(id='str', ctx=Load()), args=[Name(id='out_dir', ctx=Load())], keywords=[]), Attribute(value=Attribute(value=Name(id='remediation', ctx=Load()), attr='kind', ctx=Load()), attr='value', ctx=Load()), IfExp(test=Compare(left=Name(id='disposition', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), body=Attribute(value=Name(id='disposition', ctx=Load()), attr='value', ctx=Load()), orelse=Constant(value=None)), Call(func=Name(id='bool', ctx=Load()), args=[Attribute(value=Name(id='remediation', ctx=Load()), attr='diff', ctx=Load())], keywords=[])])",
+      "rendered": "{'finding_index': target.index, 'artifact_dir': str(out_dir), 'kind': remediation.kind.value, 'disposition': disposition.value if disposition is not None else None, 'diff_captured': bool(remediation.diff)}"
+    },
+    {
+      "line_start": 227,
+      "line_end": 227,
+      "column": 13,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='artifacts', ctx=Load()), attr='changed_files_whole_tree', ctx=Load()), args=[Name(id='repo', ctx=Load())], keywords=[])",
+      "rendered": "artifacts.changed_files_whole_tree(repo)"
+    },
+    {
+      "line_start": 228,
+      "line_end": 228,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='proven', ctx=Load())",
+      "rendered": "proven"
+    },
+    {
+      "line_start": 231,
+      "line_end": 231,
+      "column": 19,
+      "kind": "SetComp",
+      "original_ast": "SetComp(elt=Call(func=Name(id='_norm_path', ctx=Load()), args=[Name(id='f', ctx=Load())], keywords=[]), generators=[comprehension(target=Name(id='f', ctx=Store()), iter=Name(id='pre_call_dirty', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "{_norm_path(f) for f in pre_call_dirty}"
+    },
+    {
+      "line_start": 232,
+      "line_end": 233,
+      "column": 29,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='snapshot', ctx=Load()), body=SetComp(elt=Call(func=Name(id='_norm_path', ctx=Load()), args=[Name(id='f', ctx=Load())], keywords=[]), generators=[comprehension(target=Name(id='f', ctx=Store()), iter=Call(func=Attribute(value=Name(id='artifacts', ctx=Load()), attr='changed_since_snapshot', ctx=Load()), args=[Name(id='repo', ctx=Load()), Name(id='snapshot', ctx=Load())], keywords=[]), ifs=[], is_async=0)]), orelse=Call(func=Name(id='set', ctx=Load()), args=[], keywords=[]))",
+      "rendered": "{_norm_path(f) for f in artifacts.changed_since_snapshot(repo, snapshot)} if snapshot else set()"
+    },
+    {
+      "line_start": 234,
+      "line_end": 235,
+      "column": 17,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='f', ctx=Load()), generators=[comprehension(target=Name(id='f', ctx=Store()), iter=Name(id='proven', ctx=Load()), ifs=[BoolOp(op=Or(), values=[Compare(left=Call(func=Name(id='_norm_path', ctx=Load()), args=[Name(id='f', ctx=Load())], keywords=[]), ops=[NotIn()], comparators=[Name(id='pre_norm', ctx=Load())]), Compare(left=Call(func=Name(id='_norm_path', ctx=Load()), args=[Name(id='f', ctx=Load())], keywords=[]), ops=[In()], comparators=[Name(id='changed_this_case', ctx=Load())])])], is_async=0)])",
+      "rendered": "[f for f in proven if _norm_path(f) not in pre_norm or _norm_path(f) in changed_this_case]"
+    },
+    {
+      "line_start": 236,
+      "line_end": 236,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='tuple', ctx=Load()), args=[Name(id='proven', ctx=Load())], keywords=[])",
+      "rendered": "tuple(proven)"
+    },
+    {
+      "line_start": 237,
+      "line_end": 237,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='artifacts', ctx=Load()), attr='changed_since_snapshot', ctx=Load()), args=[Name(id='repo', ctx=Load()), Name(id='snapshot', ctx=Load())], keywords=[])",
+      "rendered": "artifacts.changed_since_snapshot(repo, snapshot)"
+    },
+    {
+      "line_start": 238,
+      "line_end": 238,
+      "column": 14,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Attribute(value=Name(id='c', ctx=Load()), attr='file', ctx=Load()), generators=[comprehension(target=Name(id='c', ctx=Store()), iter=Attribute(value=Name(id='evidence', ctx=Load()), attr='changes', ctx=Load()), ifs=[Call(func=Name(id='_resolves', ctx=Load()), args=[Name(id='repo', ctx=Load()), Attribute(value=Name(id='c', ctx=Load()), attr='file', ctx=Load())], keywords=[])], is_async=0)])",
+      "rendered": "[c.file for c in evidence.changes if _resolves(repo, c.file)]"
+    },
+    {
+      "line_start": 239,
+      "line_end": 239,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='tuple', ctx=Load()), args=[Call(func=Attribute(value=Name(id='dict', ctx=Load()), attr='fromkeys', ctx=Load()), args=[List(elts=[Starred(value=Name(id='from_snapshot', ctx=Load()), ctx=Load()), Starred(value=Name(id='claimed', ctx=Load()), ctx=Load())], ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "tuple(dict.fromkeys([*from_snapshot, *claimed]))"
+    },
+    {
+      "line_start": 244,
+      "line_end": 244,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Name(id='ref', ctx=Load()))",
+      "rendered": "not ref"
+    },
+    {
+      "line_start": 245,
+      "line_end": 245,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=False)",
+      "rendered": "False"
+    },
+    {
+      "line_start": 246,
+      "line_end": 246,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='artifacts', ctx=Load()), attr='_safe_repo_path', ctx=Load()), args=[Name(id='repo', ctx=Load()), Name(id='ref', ctx=Load())], keywords=[])",
+      "rendered": "artifacts._safe_repo_path(repo, ref)"
+    },
+    {
+      "line_start": 247,
+      "line_end": 247,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='resolved', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), Call(func=Attribute(value=Name(id='resolved', ctx=Load()), attr='is_file', ctx=Load()), args=[], keywords=[])])",
+      "rendered": "resolved is not None and resolved.is_file()"
+    },
+    {
+      "line_start": 252,
+      "line_end": 258,
+      "column": 11,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='severity'), Constant(value='title'), Constant(value='file'), Constant(value='mode'), Constant(value='generated')], values=[Attribute(value=Attribute(value=Name(id='request', ctx=Load()), attr='target', ctx=Load()), attr='severity', ctx=Load()), Attribute(value=Attribute(value=Name(id='request', ctx=Load()), attr='target', ctx=Load()), attr='title', ctx=Load()), Attribute(value=Attribute(value=Name(id='request', ctx=Load()), attr='target', ctx=Load()), attr='file', ctx=Load()), Attribute(value=Name(id='request', ctx=Load()), attr='mode', ctx=Load()), Call(func=Attribute(value=Name(id='started', ctx=Load()), attr='isoformat', ctx=Load()), args=[], keywords=[])])",
+      "rendered": "{'severity': request.target.severity, 'title': request.target.title, 'file': request.target.file, 'mode': request.mode, 'generated': started.isoformat()}"
+    },
+    {
+      "line_start": 263,
+      "line_end": 263,
+      "column": 13,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Attribute(value=Name(id='post', ctx=Load()), attr='reason', ctx=Load()), Attribute(value=Attribute(value=Name(id='pre', ctx=Load()), attr='decision', ctx=Load()), attr='reason', ctx=Load())])",
+      "rendered": "post.reason or pre.decision.reason"
+    },
+    {
+      "line_start": 264,
+      "line_end": 268,
+      "column": 11,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='policy_action'), Constant(value='policy_reason'), Constant(value='final_verdict')], values=[Attribute(value=Attribute(value=Attribute(value=Name(id='pre', ctx=Load()), attr='decision', ctx=Load()), attr='action', ctx=Load()), attr='value', ctx=Load()), Name(id='reason', ctx=Load()), Attribute(value=Name(id='post', ctx=Load()), attr='final_verdict', ctx=Load())])",
+      "rendered": "{'policy_action': pre.decision.action.value, 'policy_reason': reason, 'final_verdict': post.final_verdict}"
+    },
+    {
+      "line_start": 269,
+      "line_end": 269,
+      "column": 7,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='post', ctx=Load()), attr='reason', ctx=Load())",
+      "rendered": "post.reason"
+    },
+    {
+      "line_start": 270,
+      "line_end": 270,
+      "column": 36,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Attribute(value=Name(id='pre', ctx=Load()), attr='decision', ctx=Load()), attr='reason', ctx=Load())",
+      "rendered": "pre.decision.reason"
+    },
+    {
+      "line_start": 271,
+      "line_end": 271,
+      "column": 7,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='post', ctx=Load()), attr='reverted', ctx=Load())",
+      "rendered": "post.reverted"
+    },
+    {
+      "line_start": 272,
+      "line_end": 272,
+      "column": 34,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='post', ctx=Load()), attr='reverted', ctx=Load())",
+      "rendered": "post.reverted"
+    },
+    {
+      "line_start": 273,
+      "line_end": 273,
+      "column": 39,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='post', ctx=Load()), attr='matched_globs', ctx=Load())",
+      "rendered": "post.matched_globs"
+    },
+    {
+      "line_start": 274,
+      "line_end": 274,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='meta', ctx=Load())",
+      "rendered": "meta"
+    },
+    {
+      "line_start": 281,
+      "line_end": 281,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='pre', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "pre is not None"
+    },
+    {
+      "line_start": 282,
+      "line_end": 282,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_pr', ctx=Load()), attr='_dump_policy', ctx=Load()), args=[Attribute(value=Name(id='request', ctx=Load()), attr='target', ctx=Load()), Name(id='pre', ctx=Load())], keywords=[])",
+      "rendered": "_pr._dump_policy(request.target, pre)"
+    },
+    {
+      "line_start": 284,
+      "line_end": 286,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='    [policy] enforcement disabled (step_remediate.enforce_policy=false) — no policy gate or playbook strategy injected for finding '), FormattedValue(value=Attribute(value=Attribute(value=Name(id='request', ctx=Load()), attr='target', ctx=Load()), attr='index', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "console.write(source_template_284_18)"
+    },
+    {
+      "line_start": 292,
+      "line_end": 292,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_policy', ctx=Load()), attr='guidance_verdict', ctx=Load()), args=[Attribute(value=Name(id='request', ctx=Load()), attr='policy_ctx', ctx=Load()), Attribute(value=Name(id='request', ctx=Load()), attr='target', ctx=Load()), Name(id='pre', ctx=Load())], keywords=[])",
+      "rendered": "_policy.guidance_verdict(request.policy_ctx, request.target, pre)"
+    },
+    {
+      "line_start": 293,
+      "line_end": 294,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='    [policy] pre-gate guidance-only for finding '), FormattedValue(value=Attribute(value=Attribute(value=Name(id='request', ctx=Load()), attr='target', ctx=Load()), attr='index', ctx=Load()), conversion=-1), Constant(value=' ('), FormattedValue(value=Attribute(value=Attribute(value=Name(id='pre', ctx=Load()), attr='decision', ctx=Load()), attr='reason', ctx=Load()), conversion=-1), Constant(value=') — agent skipped')])], keywords=[])",
+      "rendered": "console.write(source_template_293_18)"
+    },
+    {
+      "line_start": 295,
+      "line_end": 302,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='GuardedCall', ctx=Load()), args=[], keywords=[keyword(arg='verdict', value=Name(id='verdict', ctx=Load())), keyword(arg='meta', value=Dict(keys=[None, Constant(value='policy_action'), Constant(value='policy_reason'), Constant(value='final_verdict')], values=[Name(id='meta', ctx=Load()), Attribute(value=Attribute(value=Attribute(value=Name(id='pre', ctx=Load()), attr='decision', ctx=Load()), attr='action', ctx=Load()), attr='value', ctx=Load()), Attribute(value=Attribute(value=Name(id='pre', ctx=Load()), attr='decision', ctx=Load()), attr='reason', ctx=Load()), Constant(value='REJECT')])), keyword(arg='denied', value=Constant(value=True)), keyword(arg='started', value=Name(id='started', ctx=Load())), keyword(arg='spend_before', value=Name(id='spend_before', ctx=Load()))])",
+      "rendered": "GuardedCall(verdict=verdict, meta={**meta, 'policy_action': pre.decision.action.value, 'policy_reason': pre.decision.reason, 'final_verdict': 'REJECT'}, denied=True, started=started, spend_before=spend_before)"
+    },
+    {
+      "line_start": 307,
+      "line_end": 307,
+      "column": 14,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Attribute(value=Attribute(value=Name(id='request', ctx=Load()), attr='target', ctx=Load()), attr='file', ctx=Load()), body=List(elts=[Attribute(value=Attribute(value=Name(id='request', ctx=Load()), attr='target', ctx=Load()), attr='file', ctx=Load())], ctx=Load()), orelse=List(elts=[], ctx=Load()))",
+      "rendered": "[request.target.file] if request.target.file else []"
+    },
+    {
+      "line_start": 309,
+      "line_end": 309,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='targets', ctx=Load()), attr='extend', ctx=Load()), args=[Call(func=Attribute(value=Name(id='_policy', ctx=Load()), attr='workflow_snapshot_paths', ctx=Load()), args=[Attribute(value=Name(id='request', ctx=Load()), attr='repo', ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "targets.extend(_policy.workflow_snapshot_paths(request.repo))"
+    },
+    {
+      "line_start": 310,
+      "line_end": 310,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Attribute(value=Name(id='request', ctx=Load()), attr='enforce', ctx=Load()))",
+      "rendered": "not request.enforce"
+    },
+    {
+      "line_start": 311,
+      "line_end": 311,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='targets', ctx=Load())",
+      "rendered": "targets"
+    },
+    {
+      "line_start": 312,
+      "line_end": 312,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='getattr', ctx=Load()), args=[Attribute(value=Name(id='request', ctx=Load()), attr='policy_ctx', ctx=Load()), Constant(value='gate'), Constant(value=None)], keywords=[])",
+      "rendered": "getattr(request.policy_ctx, 'gate', None)"
+    },
+    {
+      "line_start": 313,
+      "line_end": 314,
+      "column": 16,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='gate', ctx=Load()), body=List(elts=[Starred(value=Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='gate', ctx=Load()), Constant(value='forbid_patch_paths'), List(elts=[], ctx=Load())], keywords=[]), ctx=Load()), Starred(value=Call(func=Name(id='getattr', ctx=Load()), args=[Name(id='gate', ctx=Load()), Constant(value='deny_paths'), List(elts=[], ctx=Load())], keywords=[]), ctx=Load())], ctx=Load()), orelse=List(elts=[], ctx=Load()))",
+      "rendered": "[*getattr(gate, 'forbid_patch_paths', []), *getattr(gate, 'deny_paths', [])] if gate else []"
+    },
+    {
+      "line_start": 315,
+      "line_end": 316,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='list', ctx=Load()), args=[Call(func=Attribute(value=Name(id='dict', ctx=Load()), attr='fromkeys', ctx=Load()), args=[List(elts=[Starred(value=Name(id='targets', ctx=Load()), ctx=Load()), Starred(value=Call(func=Attribute(value=Name(id='_policy', ctx=Load()), attr='worktree_forbidden_matches', ctx=Load()), args=[Attribute(value=Name(id='request', ctx=Load()), attr='repo', ctx=Load()), Name(id='patterns', ctx=Load())], keywords=[]), ctx=Load())], ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "list(dict.fromkeys([*targets, *_policy.worktree_forbidden_matches(request.repo, patterns)]))"
+    },
+    {
+      "line_start": 321,
+      "line_end": 321,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='pre', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "pre is not None"
+    },
+    {
+      "line_start": 322,
+      "line_end": 323,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='fn', ctx=Load()), args=[Attribute(value=Name(id='request', ctx=Load()), attr='target', ctx=Load()), Attribute(value=Name(id='request', ctx=Load()), attr='cfg', ctx=Load()), Attribute(value=Name(id='request', ctx=Load()), attr='repo', ctx=Load()), Attribute(value=Name(id='request', ctx=Load()), attr='mode', ctx=Load()), Attribute(value=Name(id='request', ctx=Load()), attr='verbose', ctx=Load())], keywords=[keyword(arg='pre', value=Name(id='pre', ctx=Load())), keyword(arg='ctx', value=Attribute(value=Name(id='request', ctx=Load()), attr='policy_ctx', ctx=Load()))])",
+      "rendered": "fn(request.target, request.cfg, request.repo, request.mode, request.verbose, pre=pre, ctx=request.policy_ctx)"
+    },
+    {
+      "line_start": 324,
+      "line_end": 324,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='fn', ctx=Load()), args=[Attribute(value=Name(id='request', ctx=Load()), attr='target', ctx=Load()), Attribute(value=Name(id='request', ctx=Load()), attr='cfg', ctx=Load()), Attribute(value=Name(id='request', ctx=Load()), attr='repo', ctx=Load()), Attribute(value=Name(id='request', ctx=Load()), attr='mode', ctx=Load()), Attribute(value=Name(id='request', ctx=Load()), attr='verbose', ctx=Load())], keywords=[])",
+      "rendered": "fn(request.target, request.cfg, request.repo, request.mode, request.verbose)"
+    },
+    {
+      "line_start": 334,
+      "line_end": 334,
+      "column": 21,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='denied', ctx=Load()), body=Tuple(elts=[Constant(value=''), Constant(value='')], ctx=Load()), orelse=Call(func=Name(id='engine_model', ctx=Load()), args=[Attribute(value=Name(id='request', ctx=Load()), attr='cfg', ctx=Load())], keywords=[]))",
+      "rendered": "('', '') if denied else engine_model(request.cfg)"
+    },
+    {
+      "line_start": 335,
+      "line_end": 335,
+      "column": 17,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Name(id='denied', ctx=Load()), body=Tuple(elts=[Constant(value=0.0), Constant(value=0)], ctx=Load()), orelse=Call(func=Name(id='reported_between', ctx=Load()), args=[Name(id='spend_before', ctx=Load()), Call(func=Attribute(value=Name(id='TOKENS', ctx=Load()), attr='spend', ctx=Load()), args=[], keywords=[])], keywords=[]))",
+      "rendered": "(0.0, 0) if denied else reported_between(spend_before, TOKENS.spend())"
+    },
+    {
+      "line_start": 336,
+      "line_end": 339,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='Provenance', ctx=Load()), args=[], keywords=[keyword(arg='engine', value=Name(id='ENGINE_ID', ctx=Load())), keyword(arg='engine_version', value=Name(id='__version__', ctx=Load())), keyword(arg='model', value=Name(id='model', ctx=Load())), keyword(arg='backend', value=Name(id='backend', ctx=Load())), keyword(arg='started', value=Name(id='started', ctx=Load())), keyword(arg='ended', value=IfExp(test=Name(id='started', ctx=Load()), body=Call(func=Attribute(value=Name(id='datetime', ctx=Load()), attr='now', ctx=Load()), args=[Name(id='UTC', ctx=Load())], keywords=[]), orelse=Constant(value=None))), keyword(arg='usd', value=Name(id='usd', ctx=Load())), keyword(arg='turns', value=Name(id='turns', ctx=Load()))])",
+      "rendered": "Provenance(engine=ENGINE_ID, engine_version=__version__, model=model, backend=backend, started=started, ended=datetime.now(UTC) if started else None, usd=usd, turns=turns)"
+    },
+    {
+      "line_start": 347,
+      "line_end": 347,
+      "column": 22,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='resolve_model', ctx=Load()), args=[Attribute(value=Attribute(value=Name(id='cfg', ctx=Load()), attr='models', ctx=Load()), attr='remediate', ctx=Load())], keywords=[])",
+      "rendered": "resolve_model(cfg.models.remediate)"
+    },
+    {
+      "line_start": 348,
+      "line_end": 348,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='Exception', ctx=Load())",
+      "rendered": "Exception"
+    },
+    {
+      "line_start": 349,
+      "line_end": 349,
+      "column": 15,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Constant(value=''), Constant(value='')], ctx=Load())",
+      "rendered": "('', '')"
+    },
+    {
+      "line_start": 351,
+      "line_end": 351,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Call(func=Name(id='str', ctx=Load()), args=[Name(id='mid', ctx=Load())], keywords=[]), JoinedStr(values=[FormattedValue(value=Name(id='LLM_REGISTRY', ctx=Load()), conversion=-1), Constant(value=':'), FormattedValue(value=Name(id='via', ctx=Load()), conversion=-1)])], ctx=Load())",
+      "rendered": "(str(mid), source_template_351_21)"
+    }
+  ],
+  "calls": [
+    {
+      "line": 55,
+      "end_line": 55,
+      "callee": "dataclass",
+      "enclosing": "EngineRequest",
+      "expression": "dataclass(frozen=True)"
+    },
+    {
+      "line": 72,
+      "end_line": 72,
+      "callee": "dataclass",
+      "enclosing": "GuardedCall",
+      "expression": "dataclass(frozen=True)"
+    },
+    {
+      "line": 86,
+      "end_line": 86,
+      "callee": "dataclass",
+      "enclosing": "Amended",
+      "expression": "dataclass(frozen=True)"
+    },
+    {
+      "line": 77,
+      "end_line": 77,
+      "callee": "field",
+      "enclosing": "GuardedCall",
+      "expression": "field(default_factory=dict)"
+    },
+    {
+      "line": 79,
+      "end_line": 79,
+      "callee": "field",
+      "enclosing": "GuardedCall",
+      "expression": "field(default_factory=dict)"
+    },
+    {
+      "line": 82,
+      "end_line": 82,
+      "callee": "Spend",
+      "enclosing": "GuardedCall",
+      "expression": "Spend()"
+    },
+    {
+      "line": 92,
+      "end_line": 92,
+      "callee": "field",
+      "enclosing": "Amended",
+      "expression": "field(default_factory=dict)"
+    },
+    {
+      "line": 99,
+      "end_line": 99,
+      "callee": "datetime.now",
+      "enclosing": "call_with_guards",
+      "expression": "datetime.now(UTC)"
+    },
+    {
+      "line": 100,
+      "end_line": 100,
+      "callee": "TOKENS.spend",
+      "enclosing": "call_with_guards",
+      "expression": "TOKENS.spend()"
+    },
+    {
+      "line": 101,
+      "end_line": 101,
+      "callee": "_base_meta",
+      "enclosing": "call_with_guards",
+      "expression": "_base_meta(request, started)"
+    },
+    {
+      "line": 109,
+      "end_line": 109,
+      "callee": "artifacts.changed_files_whole_tree",
+      "enclosing": "call_with_guards",
+      "expression": "artifacts.changed_files_whole_tree(request.repo)"
+    },
+    {
+      "line": 110,
+      "end_line": 110,
+      "callee": "artifacts.snapshot_files",
+      "enclosing": "call_with_guards",
+      "expression": "artifacts.snapshot_files(request.repo, pre_call_dirty)"
+    },
+    {
+      "line": 111,
+      "end_line": 111,
+      "callee": "artifacts.snapshot_files",
+      "enclosing": "call_with_guards",
+      "expression": "artifacts.snapshot_files(request.repo, _snapshot_targets(request))"
+    },
+    {
+      "line": 117,
+      "end_line": 120,
+      "callee": "GuardedCall",
+      "enclosing": "call_with_guards",
+      "expression": "GuardedCall(verdict=_pr._coerce_verdict(raw, request.target),\n                       snapshot=snapshot, pre=pre, meta=meta, started=started,\n                       spend_before=spend_before,\n                       pre_call_dirty=tuple(pre_call_dirty))"
+    },
+    {
+      "line": 128,
+      "end_line": 128,
+      "callee": "artifacts.changed_files_whole_tree",
+      "enclosing": "_engine_failed",
+      "expression": "artifacts.changed_files_whole_tree(request.repo)"
+    },
+    {
+      "line": 130,
+      "end_line": 130,
+      "callee": "artifacts.changed_since_snapshot",
+      "enclosing": "_engine_failed",
+      "expression": "artifacts.changed_since_snapshot(request.repo, pre_call_snapshot)"
+    },
+    {
+      "line": 131,
+      "end_line": 131,
+      "callee": "list",
+      "enclosing": "_engine_failed",
+      "expression": "list(dict.fromkeys([*changed_during_call, *new_untracked]))"
+    },
+    {
+      "line": 135,
+      "end_line": 137,
+      "callee": "console.write",
+      "enclosing": "_engine_failed",
+      "expression": "console.write(\n        f\"    [guard] engine call failed for finding {request.target.index} \"\n        f\"({type(exc).__name__}: {detail}); reverted {len(reverted)} in-flight edit(s)\")"
+    },
+    {
+      "line": 138,
+      "end_line": 140,
+      "callee": "RemediationVerdict",
+      "enclosing": "_engine_failed",
+      "expression": "RemediationVerdict(\n        finding_index=request.target.index, verdict=\"Not Fixed\", gates=Gates(),\n        changes=[], summary=f\"remediation session failed: {type(exc).__name__}: {exc}\")"
+    },
+    {
+      "line": 142,
+      "end_line": 143,
+      "callee": "GuardedCall",
+      "enclosing": "_engine_failed",
+      "expression": "GuardedCall(verdict=verdict, snapshot=snapshot, pre=pre, meta=meta,\n                       started=started, spend_before=spend_before)"
+    },
+    {
+      "line": 149,
+      "end_line": 149,
+      "callee": "Spend",
+      "enclosing": "harness_amend",
+      "expression": "Spend()"
+    },
+    {
+      "line": 159,
+      "end_line": 160,
+      "callee": "artifacts.derive_diff",
+      "enclosing": "harness_amend",
+      "expression": "artifacts.derive_diff(request.repo, snapshot,\n                                 [c.file for c in remediation.changes if c.file])"
+    },
+    {
+      "line": 161,
+      "end_line": 162,
+      "callee": "to_evidence",
+      "enclosing": "harness_amend",
+      "expression": "to_evidence(remediation, provenance=_provenance(\n        request, denied=denied, started=started, spend_before=spend_before))"
+    },
+    {
+      "line": 164,
+      "end_line": 166,
+      "callee": "finalize",
+      "enclosing": "harness_amend",
+      "expression": "finalize(evidence, mode=request.mode, diff=diff,\n                        files_touched=_files_touched(request.repo, evidence, snapshot,\n                                                     pre_call_dirty))"
+    },
+    {
+      "line": 167,
+      "end_line": 167,
+      "callee": "_reconcile_post_meta",
+      "enclosing": "harness_amend",
+      "expression": "_reconcile_post_meta(meta, contract)"
+    },
+    {
+      "line": 168,
+      "end_line": 168,
+      "callee": "Amended",
+      "enclosing": "harness_amend",
+      "expression": "Amended(remediation=contract, reverted_paths=reverted, meta=meta)"
+    },
+    {
+      "line": 197,
+      "end_line": 198,
+      "callee": "EngineRequest",
+      "enclosing": "apply_plugin",
+      "expression": "EngineRequest(target=target, repo=Path(repo), mode=mode, cfg=cfg,\n                            verbose=verbose, policy_ctx=policy_ctx)"
+    },
+    {
+      "line": 199,
+      "end_line": 199,
+      "callee": "call_with_guards",
+      "enclosing": "apply_plugin",
+      "expression": "call_with_guards(_pr._invoke, request)"
+    },
+    {
+      "line": 200,
+      "end_line": 203,
+      "callee": "harness_amend",
+      "enclosing": "apply_plugin",
+      "expression": "harness_amend(guarded.verdict, guarded.snapshot,\n                            request=request, pre=guarded.pre, denied=guarded.denied,\n                            started=guarded.started, spend_before=guarded.spend_before,\n                            pre_call_dirty=guarded.pre_call_dirty)"
+    },
+    {
+      "line": 204,
+      "end_line": 206,
+      "callee": "artifacts.write_case",
+      "enclosing": "apply_plugin",
+      "expression": "artifacts.write_case(out_dir, guarded.verdict, amended.remediation,\n                         meta={**guarded.meta, **amended.meta}, target=target,\n                         reverted_paths=amended.reverted_paths)"
+    },
+    {
+      "line": 227,
+      "end_line": 227,
+      "callee": "artifacts.changed_files_whole_tree",
+      "enclosing": "_files_touched",
+      "expression": "artifacts.changed_files_whole_tree(repo)"
+    },
+    {
+      "line": 237,
+      "end_line": 237,
+      "callee": "artifacts.changed_since_snapshot",
+      "enclosing": "_files_touched",
+      "expression": "artifacts.changed_since_snapshot(repo, snapshot)"
+    },
+    {
+      "line": 239,
+      "end_line": 239,
+      "callee": "tuple",
+      "enclosing": "_files_touched",
+      "expression": "tuple(dict.fromkeys([*from_snapshot, *claimed]))"
+    },
+    {
+      "line": 246,
+      "end_line": 246,
+      "callee": "artifacts._safe_repo_path",
+      "enclosing": "_resolves",
+      "expression": "artifacts._safe_repo_path(repo, ref)"
+    },
+    {
+      "line": 284,
+      "end_line": 286,
+      "callee": "console.write",
+      "enclosing": "_trace_policy",
+      "expression": "console.write(f\"    [policy] enforcement disabled \"\n                  f\"(step_remediate.enforce_policy=false) — no policy gate or \"\n                  f\"playbook strategy injected for finding {request.target.index}\")"
+    },
+    {
+      "line": 292,
+      "end_line": 292,
+      "callee": "_policy.guidance_verdict",
+      "enclosing": "_denied",
+      "expression": "_policy.guidance_verdict(request.policy_ctx, request.target, pre)"
+    },
+    {
+      "line": 293,
+      "end_line": 294,
+      "callee": "console.write",
+      "enclosing": "_denied",
+      "expression": "console.write(f\"    [policy] pre-gate guidance-only for finding \"\n                  f\"{request.target.index} ({pre.decision.reason}) — agent skipped\")"
+    },
+    {
+      "line": 295,
+      "end_line": 302,
+      "callee": "GuardedCall",
+      "enclosing": "_denied",
+      "expression": "GuardedCall(\n        verdict=verdict,\n        meta={**meta, \"policy_action\": pre.decision.action.value,\n              \"policy_reason\": pre.decision.reason, \"final_verdict\": \"REJECT\"},\n        denied=True,\n        started=started,\n        spend_before=spend_before,\n    )"
+    },
+    {
+      "line": 309,
+      "end_line": 309,
+      "callee": "targets.extend",
+      "enclosing": "_snapshot_targets",
+      "expression": "targets.extend(_policy.workflow_snapshot_paths(request.repo))"
+    },
+    {
+      "line": 312,
+      "end_line": 312,
+      "callee": "getattr",
+      "enclosing": "_snapshot_targets",
+      "expression": "getattr(request.policy_ctx, \"gate\", None)"
+    },
+    {
+      "line": 315,
+      "end_line": 316,
+      "callee": "list",
+      "enclosing": "_snapshot_targets",
+      "expression": "list(dict.fromkeys(\n        [*targets, *_policy.worktree_forbidden_matches(request.repo, patterns)]))"
+    },
+    {
+      "line": 324,
+      "end_line": 324,
+      "callee": "fn",
+      "enclosing": "_call_engine",
+      "expression": "fn(request.target, request.cfg, request.repo, request.mode, request.verbose)"
+    },
+    {
+      "line": 329,
+      "end_line": 329,
+      "callee": "Spend",
+      "enclosing": "_provenance",
+      "expression": "Spend()"
+    },
+    {
+      "line": 336,
+      "end_line": 339,
+      "callee": "Provenance",
+      "enclosing": "_provenance",
+      "expression": "Provenance(engine=ENGINE_ID, engine_version=__version__,\n                      model=model, backend=backend, started=started,\n                      ended=datetime.now(UTC) if started else None,\n                      usd=usd, turns=turns)"
+    },
+    {
+      "line": 102,
+      "end_line": 102,
+      "callee": "_policy.pre_decision",
+      "enclosing": "call_with_guards",
+      "expression": "_policy.pre_decision(request.policy_ctx, request.target)"
+    },
+    {
+      "line": 104,
+      "end_line": 104,
+      "callee": "_trace_policy",
+      "enclosing": "call_with_guards",
+      "expression": "_trace_policy(request, pre)"
+    },
+    {
+      "line": 106,
+      "end_line": 106,
+      "callee": "_denied",
+      "enclosing": "call_with_guards",
+      "expression": "_denied(request, pre, meta, started, spend_before)"
+    },
+    {
+      "line": 111,
+      "end_line": 111,
+      "callee": "_snapshot_targets",
+      "enclosing": "call_with_guards",
+      "expression": "_snapshot_targets(request)"
+    },
+    {
+      "line": 113,
+      "end_line": 113,
+      "callee": "_call_engine",
+      "enclosing": "call_with_guards",
+      "expression": "_call_engine(fn, request, pre)"
+    },
+    {
+      "line": 131,
+      "end_line": 131,
+      "callee": "dict.fromkeys",
+      "enclosing": "_engine_failed",
+      "expression": "dict.fromkeys([*changed_during_call, *new_untracked])"
+    },
+    {
+      "line": 132,
+      "end_line": 132,
+      "callee": "_policy.revert_files",
+      "enclosing": "_engine_failed",
+      "expression": "_policy.revert_files(request.repo, to_revert, pre_call_snapshot)"
+    },
+    {
+      "line": 134,
+      "end_line": 134,
+      "callee": "getattr",
+      "enclosing": "_engine_failed",
+      "expression": "getattr(exc, \"stderr\", None)"
+    },
+    {
+      "line": 134,
+      "end_line": 134,
+      "callee": "str",
+      "enclosing": "_engine_failed",
+      "expression": "str(exc)"
+    },
+    {
+      "line": 155,
+      "end_line": 156,
+      "callee": "_policy.enforce_post",
+      "enclosing": "harness_amend",
+      "expression": "_policy.enforce_post(request.policy_ctx, request.target, remediation, pre,\n                                    repo=request.repo, before_snapshot=snapshot)"
+    },
+    {
+      "line": 157,
+      "end_line": 157,
+      "callee": "tuple",
+      "enclosing": "harness_amend",
+      "expression": "tuple(post.reverted)"
+    },
+    {
+      "line": 158,
+      "end_line": 158,
+      "callee": "_post_meta",
+      "enclosing": "harness_amend",
+      "expression": "_post_meta(pre, post)"
+    },
+    {
+      "line": 174,
+      "end_line": 174,
+      "callee": "meta.get",
+      "enclosing": "_reconcile_post_meta",
+      "expression": "meta.get(\"policy_reverted\")"
+    },
+    {
+      "line": 186,
+      "end_line": 186,
+      "callee": "meta.get",
+      "enclosing": "_reconcile_post_meta",
+      "expression": "meta.get(\"policy_reason\")"
+    },
+    {
+      "line": 187,
+      "end_line": 187,
+      "callee": "meta.get",
+      "enclosing": "_reconcile_post_meta",
+      "expression": "meta.get(\"policy_reason\", \"\")"
+    },
+    {
+      "line": 216,
+      "end_line": 216,
+      "callee": "str",
+      "enclosing": "checkpoint_record",
+      "expression": "str(out_dir)"
+    },
+    {
+      "line": 219,
+      "end_line": 219,
+      "callee": "bool",
+      "enclosing": "checkpoint_record",
+      "expression": "bool(remediation.diff)"
+    },
+    {
+      "line": 236,
+      "end_line": 236,
+      "callee": "tuple",
+      "enclosing": "_files_touched",
+      "expression": "tuple(proven)"
+    },
+    {
+      "line": 239,
+      "end_line": 239,
+      "callee": "dict.fromkeys",
+      "enclosing": "_files_touched",
+      "expression": "dict.fromkeys([*from_snapshot, *claimed])"
+    },
+    {
+      "line": 247,
+      "end_line": 247,
+      "callee": "resolved.is_file",
+      "enclosing": "_resolves",
+      "expression": "resolved.is_file()"
+    },
+    {
+      "line": 257,
+      "end_line": 257,
+      "callee": "started.isoformat",
+      "enclosing": "_base_meta",
+      "expression": "started.isoformat()"
+    },
+    {
+      "line": 282,
+      "end_line": 282,
+      "callee": "_pr._dump_policy",
+      "enclosing": "_trace_policy",
+      "expression": "_pr._dump_policy(request.target, pre)"
+    },
+    {
+      "line": 309,
+      "end_line": 309,
+      "callee": "_policy.workflow_snapshot_paths",
+      "enclosing": "_snapshot_targets",
+      "expression": "_policy.workflow_snapshot_paths(request.repo)"
+    },
+    {
+      "line": 315,
+      "end_line": 316,
+      "callee": "dict.fromkeys",
+      "enclosing": "_snapshot_targets",
+      "expression": "dict.fromkeys(\n        [*targets, *_policy.worktree_forbidden_matches(request.repo, patterns)])"
+    },
+    {
+      "line": 322,
+      "end_line": 323,
+      "callee": "fn",
+      "enclosing": "_call_engine",
+      "expression": "fn(request.target, request.cfg, request.repo, request.mode,\n                  request.verbose, pre=pre, ctx=request.policy_ctx)"
+    },
+    {
+      "line": 334,
+      "end_line": 334,
+      "callee": "engine_model",
+      "enclosing": "_provenance",
+      "expression": "engine_model(request.cfg)"
+    },
+    {
+      "line": 335,
+      "end_line": 335,
+      "callee": "reported_between",
+      "enclosing": "_provenance",
+      "expression": "reported_between(spend_before, TOKENS.spend())"
+    },
+    {
+      "line": 347,
+      "end_line": 347,
+      "callee": "resolve_model",
+      "enclosing": "engine_model",
+      "expression": "resolve_model(cfg.models.remediate)"
+    },
+    {
+      "line": 351,
+      "end_line": 351,
+      "callee": "str",
+      "enclosing": "engine_model",
+      "expression": "str(mid)"
+    },
+    {
+      "line": 69,
+      "end_line": 69,
+      "callee": "getattr",
+      "enclosing": "EngineRequest.enforce",
+      "expression": "getattr(self.policy_ctx, \"enabled\", False)"
+    },
+    {
+      "line": 115,
+      "end_line": 116,
+      "callee": "_engine_failed",
+      "enclosing": "call_with_guards",
+      "expression": "_engine_failed(request, exc, pre_call_dirty, pre_call_snapshot,\n                              snapshot, pre, meta, started, spend_before)"
+    },
+    {
+      "line": 117,
+      "end_line": 117,
+      "callee": "_pr._coerce_verdict",
+      "enclosing": "call_with_guards",
+      "expression": "_pr._coerce_verdict(raw, request.target)"
+    },
+    {
+      "line": 120,
+      "end_line": 120,
+      "callee": "tuple",
+      "enclosing": "call_with_guards",
+      "expression": "tuple(pre_call_dirty)"
+    },
+    {
+      "line": 139,
+      "end_line": 139,
+      "callee": "Gates",
+      "enclosing": "_engine_failed",
+      "expression": "Gates()"
+    },
+    {
+      "line": 161,
+      "end_line": 162,
+      "callee": "_provenance",
+      "enclosing": "harness_amend",
+      "expression": "_provenance(\n        request, denied=denied, started=started, spend_before=spend_before)"
+    },
+    {
+      "line": 165,
+      "end_line": 166,
+      "callee": "_files_touched",
+      "enclosing": "harness_amend",
+      "expression": "_files_touched(request.repo, evidence, snapshot,\n                                                     pre_call_dirty)"
+    },
+    {
+      "line": 174,
+      "end_line": 174,
+      "callee": "meta.get",
+      "enclosing": "_reconcile_post_meta",
+      "expression": "meta.get(\"policy_action\")"
+    },
+    {
+      "line": 197,
+      "end_line": 197,
+      "callee": "Path",
+      "enclosing": "apply_plugin",
+      "expression": "Path(repo)"
+    },
+    {
+      "line": 231,
+      "end_line": 231,
+      "callee": "_norm_path",
+      "enclosing": "_files_touched",
+      "expression": "_norm_path(f)"
+    },
+    {
+      "line": 233,
+      "end_line": 233,
+      "callee": "set",
+      "enclosing": "_files_touched",
+      "expression": "set()"
+    },
+    {
+      "line": 238,
+      "end_line": 238,
+      "callee": "_resolves",
+      "enclosing": "_files_touched",
+      "expression": "_resolves(repo, c.file)"
+    },
+    {
+      "line": 335,
+      "end_line": 335,
+      "callee": "TOKENS.spend",
+      "enclosing": "_provenance",
+      "expression": "TOKENS.spend()"
+    },
+    {
+      "line": 129,
+      "end_line": 129,
+      "callee": "set",
+      "enclosing": "_engine_failed",
+      "expression": "set(pre_call_dirty)"
+    },
+    {
+      "line": 137,
+      "end_line": 137,
+      "callee": "len",
+      "enclosing": "_engine_failed",
+      "expression": "len(reverted)"
+    },
+    {
+      "line": 232,
+      "end_line": 232,
+      "callee": "_norm_path",
+      "enclosing": "_files_touched",
+      "expression": "_norm_path(f)"
+    },
+    {
+      "line": 313,
+      "end_line": 313,
+      "callee": "getattr",
+      "enclosing": "_snapshot_targets",
+      "expression": "getattr(gate, \"forbid_patch_paths\", [])"
+    },
+    {
+      "line": 314,
+      "end_line": 314,
+      "callee": "getattr",
+      "enclosing": "_snapshot_targets",
+      "expression": "getattr(gate, \"deny_paths\", [])"
+    },
+    {
+      "line": 338,
+      "end_line": 338,
+      "callee": "datetime.now",
+      "enclosing": "_provenance",
+      "expression": "datetime.now(UTC)"
+    },
+    {
+      "line": 137,
+      "end_line": 137,
+      "callee": "type",
+      "enclosing": "_engine_failed",
+      "expression": "type(exc)"
+    },
+    {
+      "line": 232,
+      "end_line": 232,
+      "callee": "artifacts.changed_since_snapshot",
+      "enclosing": "_files_touched",
+      "expression": "artifacts.changed_since_snapshot(repo, snapshot)"
+    },
+    {
+      "line": 316,
+      "end_line": 316,
+      "callee": "_policy.worktree_forbidden_matches",
+      "enclosing": "_snapshot_targets",
+      "expression": "_policy.worktree_forbidden_matches(request.repo, patterns)"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "type",
+      "enclosing": "_engine_failed",
+      "expression": "type(exc)"
+    },
+    {
+      "line": 235,
+      "end_line": 235,
+      "callee": "_norm_path",
+      "enclosing": "_files_touched",
+      "expression": "_norm_path(f)"
+    },
+    {
+      "line": 235,
+      "end_line": 235,
+      "callee": "_norm_path",
+      "enclosing": "_files_touched",
+      "expression": "_norm_path(f)"
+    }
+  ],
+  "imports": [
+    {
+      "line": 16,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 18,
+      "source_expression": "from collections.abc import Callable",
+      "targets": [
+        "collections.abc",
+        "collections.abc.Callable"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "from dataclasses import dataclass, field",
+      "targets": [
+        "dataclasses",
+        "dataclasses.dataclass",
+        "dataclasses.field"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "from datetime import UTC, datetime",
+      "targets": [
+        "datetime",
+        "datetime.UTC",
+        "datetime.datetime"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 21,
+      "source_expression": "from pathlib import Path",
+      "targets": [
+        "pathlib",
+        "pathlib.Path"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "from typing import Any",
+      "targets": [
+        "typing",
+        "typing.Any"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 24,
+      "source_expression": "from vvaharness.models import LLM_REGISTRY, Provenance, Remediation, RemediationEvidence, RemediationKind, finalize",
+      "targets": [
+        "vvaharness.models",
+        "vvaharness.models.LLM_REGISTRY",
+        "vvaharness.models.Provenance",
+        "vvaharness.models.Remediation",
+        "vvaharness.models.RemediationEvidence",
+        "vvaharness.models.RemediationKind",
+        "vvaharness.models.finalize"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 32,
+      "source_expression": "from vvaharness.remediation_agent import artifacts",
+      "targets": [
+        "vvaharness.remediation_agent",
+        "vvaharness.remediation_agent.artifacts"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/__init__.py",
+        "vvaharness/remediation_agent/artifacts/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 33,
+      "source_expression": "from vvaharness.remediation_agent import policy as _policy",
+      "targets": [
+        "vvaharness.remediation_agent",
+        "vvaharness.remediation_agent.policy"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/__init__.py",
+        "vvaharness/remediation_agent/policy/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 34,
+      "source_expression": "from vvaharness.remediation_agent.artifacts.diff import _norm_path",
+      "targets": [
+        "vvaharness.remediation_agent.artifacts.diff",
+        "vvaharness.remediation_agent.artifacts.diff._norm_path"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/artifacts/diff/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 35,
+      "source_expression": "from vvaharness.remediation_agent.models import Gates, RemediationVerdict, to_evidence",
+      "targets": [
+        "vvaharness.remediation_agent.models",
+        "vvaharness.remediation_agent.models.Gates",
+        "vvaharness.remediation_agent.models.RemediationVerdict",
+        "vvaharness.remediation_agent.models.to_evidence"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 36,
+      "source_expression": "from vvaharness.remediation_agent.target import RemediationTarget",
+      "targets": [
+        "vvaharness.remediation_agent.target",
+        "vvaharness.remediation_agent.target.RemediationTarget"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/target.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 37,
+      "source_expression": "from vvaharness.util import console",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.console"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/console.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 38,
+      "source_expression": "from vvaharness.util.tokens import TOKENS, Spend, reported_between",
+      "targets": [
+        "vvaharness.util.tokens",
+        "vvaharness.util.tokens.TOKENS",
+        "vvaharness.util.tokens.Spend",
+        "vvaharness.util.tokens.reported_between"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/tokens.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 97,
+      "source_expression": "from vvaharness.remediation_agent import plugin_runner as _pr",
+      "targets": [
+        "vvaharness.remediation_agent",
+        "vvaharness.remediation_agent.plugin_runner"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/__init__.py",
+        "vvaharness/remediation_agent/plugin_runner/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 195,
+      "source_expression": "from vvaharness.remediation_agent import plugin_runner as _pr",
+      "targets": [
+        "vvaharness.remediation_agent",
+        "vvaharness.remediation_agent.plugin_runner"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/__init__.py",
+        "vvaharness/remediation_agent/plugin_runner/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 279,
+      "source_expression": "from vvaharness.remediation_agent import plugin_runner as _pr",
+      "targets": [
+        "vvaharness.remediation_agent",
+        "vvaharness.remediation_agent.plugin_runner"
+      ],
+      "local_source_paths": [
+        "vvaharness/remediation_agent/__init__.py",
+        "vvaharness/remediation_agent/plugin_runner/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 331,
+      "source_expression": "from vvaharness import __version__",
+      "targets": [
+        "vvaharness",
+        "vvaharness.__version__"
+      ],
+      "local_source_paths": [
+        "vvaharness/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 344,
+      "source_expression": "from vvaharness.backends.llm.registry import resolve as resolve_model",
+      "targets": [
+        "vvaharness.backends.llm.registry",
+        "vvaharness.backends.llm.registry.resolve"
+      ],
+      "local_source_paths": [
+        "vvaharness/backends/llm/registry.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

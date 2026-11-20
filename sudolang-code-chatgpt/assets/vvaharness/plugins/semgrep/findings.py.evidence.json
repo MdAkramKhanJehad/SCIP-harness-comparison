@@ -1,0 +1,2760 @@
+{
+  "source": "vvaharness/plugins/semgrep/findings.py",
+  "sha256": "1541b00f38075a264f00e823cdf9b07a47bda1dc07293c6dd2deceb13676227b",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Turning `semgrep --json` output into vvaharness Findings, so S5 onward can run on them.\"\"\"\nfrom __future__ import annotations\n\nimport json\nimport re\nfrom pathlib import Path, PurePosixPath\n\nfrom vvaharness.models import Finding, VulnClass\nfrom vvaharness.report.cwe import cwe_name\nfrom vvaharness.util import logs\nfrom vvaharness.util.counters import COUNTERS\nfrom vvaharness.util.events import Event\n\nlog = logs.get_logger(__name__)\n\nMAX_FINDINGS = 2_000\nMAX_JSON_BYTES = 64 * 1024 * 1024\n_MAX_SNIPPET_CHARS = 2_000\n_MAX_TITLE_CHARS = 200\n_MAX_LABEL_CHARS = 120\n\n_CWE_RE = re.compile(r\"CWE-(\\d{1,5})\")\n\n#: CWE to the 12-member VulnClass enum. Anything unmapped becomes `other` rather than being\n#: dropped, because a finding vvaharness cannot classify is still a finding it must carry.\n_CWE_TO_CLASS: dict[int, VulnClass] = {\n    77: VulnClass.INJECTION, 78: VulnClass.INJECTION, 79: VulnClass.INJECTION,\n    89: VulnClass.INJECTION, 90: VulnClass.INJECTION, 91: VulnClass.INJECTION,\n    94: VulnClass.INJECTION, 95: VulnClass.INJECTION, 611: VulnClass.INJECTION,\n    643: VulnClass.INJECTION, 917: VulnClass.INJECTION,\n    502: VulnClass.DESERIALIZATION,\n    190: VulnClass.INT_OVERFLOW, 191: VulnClass.INT_OVERFLOW,\n    362: VulnClass.RACE, 367: VulnClass.RACE,\n    134: VulnClass.FMT_STRING,\n    416: VulnClass.UAF,\n    121: VulnClass.STACK_OVERFLOW,\n    122: VulnClass.HEAP_OVERFLOW, 787: VulnClass.HEAP_OVERFLOW,\n    843: VulnClass.TYPE_CONFUSION,\n    200: VulnClass.INFO_LEAK, 209: VulnClass.INFO_LEAK, 532: VulnClass.INFO_LEAK,\n    22: VulnClass.LOGIC, 287: VulnClass.LOGIC, 306: VulnClass.LOGIC,\n    352: VulnClass.LOGIC, 862: VulnClass.LOGIC, 863: VulnClass.LOGIC,\n    # Widened so common Semgrep CWEs map to a class instead of folding to OTHER.\n    # Only added where the CWE *is* the class; a CWE the 12-member enum genuinely cannot\n    # express keeps OTHER and carries vuln_class_label.\n    88: VulnClass.INJECTION, 117: VulnClass.INJECTION, 470: VulnClass.INJECTION,\n    943: VulnClass.INJECTION, 1336: VulnClass.INJECTION,\n    704: VulnClass.TYPE_CONFUSION,\n    215: VulnClass.INFO_LEAK, 311: VulnClass.INFO_LEAK, 312: VulnClass.INFO_LEAK,\n    313: VulnClass.INFO_LEAK, 315: VulnClass.INFO_LEAK, 319: VulnClass.INFO_LEAK,\n    359: VulnClass.INFO_LEAK, 497: VulnClass.INFO_LEAK, 522: VulnClass.INFO_LEAK,\n    614: VulnClass.INFO_LEAK, 798: VulnClass.INFO_LEAK,\n}\n\n_SEVERITY = {\"ERROR\": \"high\", \"WARNING\": \"medium\", \"INFO\": \"low\"}\n\n\nclass SemgrepFindingsError(ValueError):\n    \"\"\"Raised when Semgrep JSON cannot be read as a finding set.\"\"\"\n\n\ndef _posix(value: str) -> PurePosixPath:\n    \"\"\"*value* as a POSIX pure path, so a Windows separator keys the same as a POSIX one.\"\"\"\n    return PurePosixPath(value.replace(\"\\\\\", \"/\"))\n\n\ndef _under(base: PurePosixPath, candidate: PurePosixPath) -> str:\n    \"\"\"*candidate* as a path relative to *base*, or empty when it does not sit under it.\"\"\"\n    return str(candidate.relative_to(base)) if candidate.is_relative_to(base) else \"\"\n\n\ndef relative_path(path: str, root: str) -> str:\n    \"\"\"A Semgrep path as vvaharness keys findings: repo-relative, POSIX, no leading ``./``.\"\"\"\n    candidate = _posix(path)\n    if not root or not candidate.is_absolute():\n        return str(candidate) if str(candidate) not in (\".\", \"\") else path\n    base = _posix(str(Path(root).resolve()))\n    under = _under(base, candidate) or _under(base, _posix(str(Path(path).resolve())))\n    if under:\n        return under\n    COUNTERS.bump(\"semgrep_path_outside_repo\")\n    log.warning(Event.SEMGREP_PATH_NOT_RELATIVE, path=str(candidate), repo_root=str(base),\n                detail=\"this finding keeps an absolute path, so S5 drops it as a file that is \"\n                       \"not in the repo inventory\")\n    return str(candidate)\n\n\ndef _cwe_ids(metadata: dict) -> list[str]:\n    \"\"\"Every ``CWE-n`` mentioned in a rule's cwe metadata, in first-seen order.\"\"\"\n    raw = metadata.get(\"cwe\") or []\n    values = [raw] if isinstance(raw, str) else [v for v in raw if isinstance(v, str)]\n    seen: dict[str, None] = {}\n    for value in values:\n        for match in _CWE_RE.finditer(value):\n            seen.setdefault(f\"CWE-{int(match.group(1))}\", None)\n    return list(seen)\n\n\ndef _vuln_class(cwes: list[str]) -> VulnClass:\n    \"\"\"The first mapped CWE's class, else ``other``; never raises on an unknown CWE.\"\"\"\n    for cwe in cwes:\n        mapped = _CWE_TO_CLASS.get(int(cwe.removeprefix(\"CWE-\")))\n        if mapped is not None:\n            return mapped\n    return VulnClass.OTHER\n\n\ndef _label(metadata: dict, cwes: list[str]) -> str:\n    \"\"\"The caller's own wording for a class VulnClass cannot express; s8 reads it for coverage.\"\"\"\n    raw = metadata.get(\"vulnerability_class\") or []\n    values = [raw] if isinstance(raw, str) else [v for v in raw if isinstance(v, str)]\n    authored = next((v.strip() for v in values if v.strip()), \"\")\n    return authored or next((cwe_name(c) for c in cwes if cwe_name(c)), \"\")\n\n\ndef _finding(result: dict, root: str) -> Finding | None:\n    \"\"\"One Semgrep result as a Finding, or None when it carries no usable location.\"\"\"\n    raw_path = result.get(\"path\")\n    start = (result.get(\"start\") or {}).get(\"line\")\n    if not isinstance(raw_path, str) or not isinstance(start, int):\n        return None\n    path = relative_path(raw_path, root)\n    extra = result.get(\"extra\") or {}\n    metadata = extra.get(\"metadata\") or {}\n    cwes = _cwe_ids(metadata)\n    vuln_class = _vuln_class(cwes)\n    rule_id = str(result.get(\"check_id\") or \"semgrep\")\n    message = str(extra.get(\"message\") or rule_id)\n    optional = {\n        \"line_end\": (result.get(\"end\") or {}).get(\"line\"),\n        \"cwe\": cwes[0] if cwes else None,\n        \"severity\": _SEVERITY.get(str(extra.get(\"severity\", \"\")).upper()),\n        \"code_snippet\": str(extra.get(\"lines\") or \"\")[:_MAX_SNIPPET_CHARS] or None,\n        \"vuln_class_label\": (_label(metadata, cwes)[:_MAX_LABEL_CHARS]\n                             if vuln_class is VulnClass.OTHER else None),\n    }\n    return Finding(\n        title=message.strip().splitlines()[0][:_MAX_TITLE_CHARS] or rule_id,\n        file=path,\n        line_start=start,\n        vuln_class=vuln_class,\n        description=message,\n        origin=f\"semgrep:{rule_id}\",\n        **{k: v for k, v in optional.items() if v is not None},\n    )\n\n\ndef findings_from_semgrep(payload: Path | str | dict, *,\n                         repo: Path | str | None = None) -> list[Finding]:\n    \"\"\"Findings from a ``semgrep --json`` document, given as a path or an already-parsed dict.\"\"\"\n    # Pass repo= whenever semgrep was given an absolute target: it then reports absolute paths,\n    # vvaharness keys findings on repo-relative ones, and every unresolvable file is DROPPED by S5.\n    document = payload if isinstance(payload, dict) else read_semgrep_json(Path(payload))\n    root = \"\" if repo is None else str(repo)\n    results = document.get(\"results\")\n    if not isinstance(results, list):\n        raise SemgrepFindingsError(\"semgrep JSON has no 'results' list\")\n    if len(results) > MAX_FINDINGS:\n        raise SemgrepFindingsError(f\"{len(results)} results exceeds MAX_FINDINGS={MAX_FINDINGS}\")\n    return [f for r in results if isinstance(r, dict) and (f := _finding(r, root)) is not None]\n\n\ndef read_semgrep_json(path: Path) -> dict:\n    \"\"\"A bounded JSON read, so an oversized or malformed report fails before parsing costs.\"\"\"\n    try:\n        if path.stat().st_size > MAX_JSON_BYTES:\n            raise SemgrepFindingsError(f\"{path} exceeds MAX_JSON_BYTES={MAX_JSON_BYTES}\")\n        document = json.loads(path.read_text(encoding=\"utf-8\"))\n    except (OSError, json.JSONDecodeError) as exc:\n        raise SemgrepFindingsError(f\"cannot read semgrep JSON at {path}: {exc}\") from exc\n    if not isinstance(document, dict):\n        raise SemgrepFindingsError(f\"semgrep JSON at {path} is not an object\")\n    return document\n\n\n__all__ = [\n    \"MAX_FINDINGS\",\n    \"MAX_JSON_BYTES\",\n    \"SemgrepFindingsError\",\n    \"findings_from_semgrep\",\n    \"read_semgrep_json\",\n    \"relative_path\",\n]\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/plugins/semgrep/findings.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "Turning `semgrep --json` output into vvaharness Findings, so S5 onward can run on them.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_72_4": {
+      "source": "vvaharness/plugins/semgrep/findings.py",
+      "line_start": 72,
+      "line_end": 72,
+      "value": "Raised when Semgrep JSON cannot be read as a finding set.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_76_4": {
+      "source": "vvaharness/plugins/semgrep/findings.py",
+      "line_start": 76,
+      "line_end": 76,
+      "value": "*value* as a POSIX pure path, so a Windows separator keys the same as a POSIX one.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_81_4": {
+      "source": "vvaharness/plugins/semgrep/findings.py",
+      "line_start": 81,
+      "line_end": 81,
+      "value": "*candidate* as a path relative to *base*, or empty when it does not sit under it.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_86_4": {
+      "source": "vvaharness/plugins/semgrep/findings.py",
+      "line_start": 86,
+      "line_end": 86,
+      "value": "A Semgrep path as vvaharness keys findings: repo-relative, POSIX, no leading ``./``.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_102_4": {
+      "source": "vvaharness/plugins/semgrep/findings.py",
+      "line_start": 102,
+      "line_end": 102,
+      "value": "Every ``CWE-n`` mentioned in a rule's cwe metadata, in first-seen order.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_108_28": {
+      "source": "vvaharness/plugins/semgrep/findings.py",
+      "line_start": 108,
+      "line_end": 108,
+      "source_expression": "f\"CWE-{int(match.group(1))}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_113_4": {
+      "source": "vvaharness/plugins/semgrep/findings.py",
+      "line_start": 113,
+      "line_end": 113,
+      "value": "The first mapped CWE's class, else ``other``; never raises on an unknown CWE.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_122_4": {
+      "source": "vvaharness/plugins/semgrep/findings.py",
+      "line_start": 122,
+      "line_end": 122,
+      "value": "The caller's own wording for a class VulnClass cannot express; s8 reads it for coverage.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_130_4": {
+      "source": "vvaharness/plugins/semgrep/findings.py",
+      "line_start": 130,
+      "line_end": 130,
+      "value": "One Semgrep result as a Finding, or None when it carries no usable location.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_156_15": {
+      "source": "vvaharness/plugins/semgrep/findings.py",
+      "line_start": 156,
+      "line_end": 156,
+      "source_expression": "f\"semgrep:{rule_id}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_163_4": {
+      "source": "vvaharness/plugins/semgrep/findings.py",
+      "line_start": 163,
+      "line_end": 163,
+      "value": "Findings from a ``semgrep --json`` document, given as a path or an already-parsed dict.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_172_35": {
+      "source": "vvaharness/plugins/semgrep/findings.py",
+      "line_start": 172,
+      "line_end": 172,
+      "source_expression": "f\"{len(results)} results exceeds MAX_FINDINGS={MAX_FINDINGS}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_177_4": {
+      "source": "vvaharness/plugins/semgrep/findings.py",
+      "line_start": 177,
+      "line_end": 177,
+      "value": "A bounded JSON read, so an oversized or malformed report fails before parsing costs.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_180_39": {
+      "source": "vvaharness/plugins/semgrep/findings.py",
+      "line_start": 180,
+      "line_end": 180,
+      "source_expression": "f\"{path} exceeds MAX_JSON_BYTES={MAX_JSON_BYTES}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_183_35": {
+      "source": "vvaharness/plugins/semgrep/findings.py",
+      "line_start": 183,
+      "line_end": 183,
+      "source_expression": "f\"cannot read semgrep JSON at {path}: {exc}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_185_35": {
+      "source": "vvaharness/plugins/semgrep/findings.py",
+      "line_start": 185,
+      "line_end": 185,
+      "source_expression": "f\"semgrep JSON at {path} is not an object\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "Turning `semgrep --json` output into vvaharness Findings, so S5 onward can run on them.",
+      "context": "literal"
+    },
+    {
+      "line_start": 36,
+      "line_end": 36,
+      "column": 21,
+      "value": "CWE-(\\d{1,5})",
+      "context": "literal"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 13,
+      "value": "ERROR",
+      "context": "literal"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 30,
+      "value": "WARNING",
+      "context": "literal"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 51,
+      "value": "INFO",
+      "context": "literal"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 22,
+      "value": "high",
+      "context": "literal"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 41,
+      "value": "medium",
+      "context": "literal"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 59,
+      "value": "low",
+      "context": "literal"
+    },
+    {
+      "line_start": 72,
+      "line_end": 72,
+      "column": 4,
+      "value": "Raised when Semgrep JSON cannot be read as a finding set.",
+      "context": "literal"
+    },
+    {
+      "line_start": 76,
+      "line_end": 76,
+      "column": 4,
+      "value": "*value* as a POSIX pure path, so a Windows separator keys the same as a POSIX one.",
+      "context": "literal"
+    },
+    {
+      "line_start": 81,
+      "line_end": 81,
+      "column": 4,
+      "value": "*candidate* as a path relative to *base*, or empty when it does not sit under it.",
+      "context": "literal"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 4,
+      "value": "A Semgrep path as vvaharness keys findings: repo-relative, POSIX, no leading ``./``.",
+      "context": "literal"
+    },
+    {
+      "line_start": 102,
+      "line_end": 102,
+      "column": 4,
+      "value": "Every ``CWE-n`` mentioned in a rule's cwe metadata, in first-seen order.",
+      "context": "literal"
+    },
+    {
+      "line_start": 113,
+      "line_end": 113,
+      "column": 4,
+      "value": "The first mapped CWE's class, else ``other``; never raises on an unknown CWE.",
+      "context": "literal"
+    },
+    {
+      "line_start": 122,
+      "line_end": 122,
+      "column": 4,
+      "value": "The caller's own wording for a class VulnClass cannot express; s8 reads it for coverage.",
+      "context": "literal"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 4,
+      "value": "One Semgrep result as a Finding, or None when it carries no usable location.",
+      "context": "literal"
+    },
+    {
+      "line_start": 163,
+      "line_end": 163,
+      "column": 4,
+      "value": "Findings from a ``semgrep --json`` document, given as a path or an already-parsed dict.",
+      "context": "literal"
+    },
+    {
+      "line_start": 177,
+      "line_end": 177,
+      "column": 4,
+      "value": "A bounded JSON read, so an oversized or malformed report fails before parsing costs.",
+      "context": "literal"
+    },
+    {
+      "line_start": 190,
+      "line_end": 190,
+      "column": 4,
+      "value": "MAX_FINDINGS",
+      "context": "literal"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 4,
+      "value": "MAX_JSON_BYTES",
+      "context": "literal"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 4,
+      "value": "SemgrepFindingsError",
+      "context": "literal"
+    },
+    {
+      "line_start": 193,
+      "line_end": 193,
+      "column": 4,
+      "value": "findings_from_semgrep",
+      "context": "literal"
+    },
+    {
+      "line_start": 194,
+      "line_end": 194,
+      "column": 4,
+      "value": "read_semgrep_json",
+      "context": "literal"
+    },
+    {
+      "line_start": 195,
+      "line_end": 195,
+      "column": 4,
+      "value": "relative_path",
+      "context": "literal"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 83,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 18,
+      "value": "semgrep_path_outside_repo",
+      "context": "literal"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 62,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 26,
+      "value": "path",
+      "context": "literal"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 44,
+      "value": "line",
+      "context": "literal"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 8,
+      "value": "line_end",
+      "context": "literal"
+    },
+    {
+      "line_start": 144,
+      "line_end": 144,
+      "column": 8,
+      "value": "cwe",
+      "context": "literal"
+    },
+    {
+      "line_start": 145,
+      "line_end": 145,
+      "column": 8,
+      "value": "severity",
+      "context": "literal"
+    },
+    {
+      "line_start": 146,
+      "line_end": 146,
+      "column": 8,
+      "value": "code_snippet",
+      "context": "literal"
+    },
+    {
+      "line_start": 147,
+      "line_end": 147,
+      "column": 8,
+      "value": "vuln_class_label",
+      "context": "literal"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 11,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 168,
+      "line_end": 168,
+      "column": 27,
+      "value": "results",
+      "context": "literal"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 39,
+      "value": "\\",
+      "context": "literal"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 45,
+      "value": "/",
+      "context": "literal"
+    },
+    {
+      "line_start": 96,
+      "line_end": 97,
+      "column": 23,
+      "value": "this finding keeps an absolute path, so S5 drops it as a file that is not in the repo inventory",
+      "context": "literal"
+    },
+    {
+      "line_start": 103,
+      "line_end": 103,
+      "column": 23,
+      "value": "cwe",
+      "context": "literal"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 23,
+      "value": "vulnerability_class",
+      "context": "literal"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 72,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 23,
+      "value": "extra",
+      "context": "literal"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 25,
+      "value": "metadata",
+      "context": "literal"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 44,
+      "value": "semgrep",
+      "context": "literal"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 50,
+      "value": "line",
+      "context": "literal"
+    },
+    {
+      "line_start": 170,
+      "line_end": 170,
+      "column": 35,
+      "value": "semgrep JSON has no 'results' list",
+      "context": "literal"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 29,
+      "value": "check_id",
+      "context": "literal"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 28,
+      "value": "message",
+      "context": "literal"
+    },
+    {
+      "line_start": 156,
+      "line_end": 156,
+      "column": 17,
+      "value": "semgrep:",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 172,
+      "line_end": 172,
+      "column": 51,
+      "value": " results exceeds MAX_FINDINGS=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 185,
+      "line_end": 185,
+      "column": 37,
+      "value": "semgrep JSON at ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 185,
+      "line_end": 185,
+      "column": 59,
+      "value": " is not an object",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 89,
+      "line_end": 89,
+      "column": 56,
+      "value": ".",
+      "context": "literal"
+    },
+    {
+      "line_start": 89,
+      "line_end": 89,
+      "column": 61,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 108,
+      "line_end": 108,
+      "column": 30,
+      "value": "CWE-",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 56,
+      "value": "CWE-",
+      "context": "literal"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 24,
+      "value": "start",
+      "context": "literal"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 47,
+      "value": " exceeds MAX_JSON_BYTES=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 54,
+      "value": "utf-8",
+      "context": "literal"
+    },
+    {
+      "line_start": 183,
+      "line_end": 183,
+      "column": 37,
+      "value": "cannot read semgrep JSON at ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 183,
+      "line_end": 183,
+      "column": 71,
+      "value": ": ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 32,
+      "value": "end",
+      "context": "literal"
+    },
+    {
+      "line_start": 146,
+      "line_end": 146,
+      "column": 50,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 145,
+      "line_end": 145,
+      "column": 48,
+      "value": "severity",
+      "context": "literal"
+    },
+    {
+      "line_start": 145,
+      "line_end": 145,
+      "column": 60,
+      "value": "",
+      "context": "literal"
+    },
+    {
+      "line_start": 146,
+      "line_end": 146,
+      "column": 38,
+      "value": "lines",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 38,
+      "text": "#: CWE to the 12-member VulnClass enum. Anything unmapped becomes `other` rather than being"
+    },
+    {
+      "line": 39,
+      "text": "#: dropped, because a finding vvaharness cannot classify is still a finding it must carry."
+    },
+    {
+      "line": 56,
+      "text": "# Widened so common Semgrep CWEs map to a class instead of folding to OTHER."
+    },
+    {
+      "line": 57,
+      "text": "# Only added where the CWE *is* the class; a CWE the 12-member enum genuinely cannot"
+    },
+    {
+      "line": 58,
+      "text": "# express keeps OTHER and carries vuln_class_label."
+    },
+    {
+      "line": 164,
+      "text": "# Pass repo= whenever semgrep was given an absolute target: it then reports absolute paths,"
+    },
+    {
+      "line": 165,
+      "text": "# vvaharness keys findings on repo-relative ones, and every unresolvable file is DROPPED by S5."
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 16,
+      "line_end": 16,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 18,
+      "line_end": 18,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "Import",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 23,
+      "line_end": 23,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 26,
+      "line_end": 26,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "Assign",
+      "line_start": 28,
+      "line_end": 28,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 30,
+      "line_end": 30,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 31,
+      "line_end": 31,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 32,
+      "line_end": 32,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 33,
+      "line_end": 33,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 34,
+      "line_end": 34,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "Assign",
+      "line_start": 36,
+      "line_end": 36,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 40,
+      "line_end": 66,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "Assign",
+      "line_start": 68,
+      "line_end": 68,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 8
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 71,
+      "line_end": 72,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 9
+    },
+    {
+      "kind": "Expr",
+      "line_start": 72,
+      "line_end": 72,
+      "column": 4,
+      "owner": "SemgrepFindingsError",
+      "representation_line": 14
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 75,
+      "line_end": 77,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 16
+    },
+    {
+      "kind": "Expr",
+      "line_start": 76,
+      "line_end": 76,
+      "column": 4,
+      "owner": "_posix",
+      "representation_line": 22
+    },
+    {
+      "kind": "Return",
+      "line_start": 77,
+      "line_end": 77,
+      "column": 4,
+      "owner": "_posix",
+      "representation_line": 23
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 80,
+      "line_end": 82,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 27
+    },
+    {
+      "kind": "Expr",
+      "line_start": 81,
+      "line_end": 81,
+      "column": 4,
+      "owner": "_under",
+      "representation_line": 33
+    },
+    {
+      "kind": "Return",
+      "line_start": 82,
+      "line_end": 82,
+      "column": 4,
+      "owner": "_under",
+      "representation_line": 34
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 85,
+      "line_end": 98,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 38
+    },
+    {
+      "kind": "Expr",
+      "line_start": 86,
+      "line_end": 86,
+      "column": 4,
+      "owner": "relative_path",
+      "representation_line": 44
+    },
+    {
+      "kind": "Assign",
+      "line_start": 87,
+      "line_end": 87,
+      "column": 4,
+      "owner": "relative_path",
+      "representation_line": 44
+    },
+    {
+      "kind": "If",
+      "line_start": 88,
+      "line_end": 89,
+      "column": 4,
+      "owner": "relative_path",
+      "representation_line": 45
+    },
+    {
+      "kind": "Return",
+      "line_start": 89,
+      "line_end": 89,
+      "column": 8,
+      "owner": "relative_path",
+      "representation_line": 47
+    },
+    {
+      "kind": "Assign",
+      "line_start": 90,
+      "line_end": 90,
+      "column": 4,
+      "owner": "relative_path",
+      "representation_line": 51
+    },
+    {
+      "kind": "Assign",
+      "line_start": 91,
+      "line_end": 91,
+      "column": 4,
+      "owner": "relative_path",
+      "representation_line": 51
+    },
+    {
+      "kind": "If",
+      "line_start": 92,
+      "line_end": 93,
+      "column": 4,
+      "owner": "relative_path",
+      "representation_line": 52
+    },
+    {
+      "kind": "Return",
+      "line_start": 93,
+      "line_end": 93,
+      "column": 8,
+      "owner": "relative_path",
+      "representation_line": 54
+    },
+    {
+      "kind": "Expr",
+      "line_start": 94,
+      "line_end": 94,
+      "column": 4,
+      "owner": "relative_path",
+      "representation_line": 58
+    },
+    {
+      "kind": "Expr",
+      "line_start": 95,
+      "line_end": 97,
+      "column": 4,
+      "owner": "relative_path",
+      "representation_line": 58
+    },
+    {
+      "kind": "Return",
+      "line_start": 98,
+      "line_end": 98,
+      "column": 4,
+      "owner": "relative_path",
+      "representation_line": 59
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 101,
+      "line_end": 109,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 63
+    },
+    {
+      "kind": "Expr",
+      "line_start": 102,
+      "line_end": 102,
+      "column": 4,
+      "owner": "_cwe_ids",
+      "representation_line": 69
+    },
+    {
+      "kind": "Assign",
+      "line_start": 103,
+      "line_end": 103,
+      "column": 4,
+      "owner": "_cwe_ids",
+      "representation_line": 69
+    },
+    {
+      "kind": "Assign",
+      "line_start": 104,
+      "line_end": 104,
+      "column": 4,
+      "owner": "_cwe_ids",
+      "representation_line": 69
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 105,
+      "line_end": 105,
+      "column": 4,
+      "owner": "_cwe_ids",
+      "representation_line": 69
+    },
+    {
+      "kind": "For",
+      "line_start": 106,
+      "line_end": 108,
+      "column": 4,
+      "owner": "_cwe_ids",
+      "representation_line": 70
+    },
+    {
+      "kind": "For",
+      "line_start": 107,
+      "line_end": 108,
+      "column": 8,
+      "owner": "_cwe_ids",
+      "representation_line": 72
+    },
+    {
+      "kind": "Expr",
+      "line_start": 108,
+      "line_end": 108,
+      "column": 12,
+      "owner": "_cwe_ids",
+      "representation_line": 75
+    },
+    {
+      "kind": "Return",
+      "line_start": 109,
+      "line_end": 109,
+      "column": 4,
+      "owner": "_cwe_ids",
+      "representation_line": 78
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 112,
+      "line_end": 118,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 82
+    },
+    {
+      "kind": "Expr",
+      "line_start": 113,
+      "line_end": 113,
+      "column": 4,
+      "owner": "_vuln_class",
+      "representation_line": 88
+    },
+    {
+      "kind": "For",
+      "line_start": 114,
+      "line_end": 117,
+      "column": 4,
+      "owner": "_vuln_class",
+      "representation_line": 89
+    },
+    {
+      "kind": "Assign",
+      "line_start": 115,
+      "line_end": 115,
+      "column": 8,
+      "owner": "_vuln_class",
+      "representation_line": 92
+    },
+    {
+      "kind": "If",
+      "line_start": 116,
+      "line_end": 117,
+      "column": 8,
+      "owner": "_vuln_class",
+      "representation_line": 93
+    },
+    {
+      "kind": "Return",
+      "line_start": 117,
+      "line_end": 117,
+      "column": 12,
+      "owner": "_vuln_class",
+      "representation_line": 95
+    },
+    {
+      "kind": "Return",
+      "line_start": 118,
+      "line_end": 118,
+      "column": 4,
+      "owner": "_vuln_class",
+      "representation_line": 99
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 121,
+      "line_end": 126,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 103
+    },
+    {
+      "kind": "Expr",
+      "line_start": 122,
+      "line_end": 122,
+      "column": 4,
+      "owner": "_label",
+      "representation_line": 109
+    },
+    {
+      "kind": "Assign",
+      "line_start": 123,
+      "line_end": 123,
+      "column": 4,
+      "owner": "_label",
+      "representation_line": 109
+    },
+    {
+      "kind": "Assign",
+      "line_start": 124,
+      "line_end": 124,
+      "column": 4,
+      "owner": "_label",
+      "representation_line": 109
+    },
+    {
+      "kind": "Assign",
+      "line_start": 125,
+      "line_end": 125,
+      "column": 4,
+      "owner": "_label",
+      "representation_line": 109
+    },
+    {
+      "kind": "Return",
+      "line_start": 126,
+      "line_end": 126,
+      "column": 4,
+      "owner": "_label",
+      "representation_line": 110
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 129,
+      "line_end": 158,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 114
+    },
+    {
+      "kind": "Expr",
+      "line_start": 130,
+      "line_end": 130,
+      "column": 4,
+      "owner": "_finding",
+      "representation_line": 120
+    },
+    {
+      "kind": "Assign",
+      "line_start": 131,
+      "line_end": 131,
+      "column": 4,
+      "owner": "_finding",
+      "representation_line": 120
+    },
+    {
+      "kind": "Assign",
+      "line_start": 132,
+      "line_end": 132,
+      "column": 4,
+      "owner": "_finding",
+      "representation_line": 120
+    },
+    {
+      "kind": "If",
+      "line_start": 133,
+      "line_end": 134,
+      "column": 4,
+      "owner": "_finding",
+      "representation_line": 121
+    },
+    {
+      "kind": "Return",
+      "line_start": 134,
+      "line_end": 134,
+      "column": 8,
+      "owner": "_finding",
+      "representation_line": 123
+    },
+    {
+      "kind": "Assign",
+      "line_start": 135,
+      "line_end": 135,
+      "column": 4,
+      "owner": "_finding",
+      "representation_line": 127
+    },
+    {
+      "kind": "Assign",
+      "line_start": 136,
+      "line_end": 136,
+      "column": 4,
+      "owner": "_finding",
+      "representation_line": 127
+    },
+    {
+      "kind": "Assign",
+      "line_start": 137,
+      "line_end": 137,
+      "column": 4,
+      "owner": "_finding",
+      "representation_line": 127
+    },
+    {
+      "kind": "Assign",
+      "line_start": 138,
+      "line_end": 138,
+      "column": 4,
+      "owner": "_finding",
+      "representation_line": 127
+    },
+    {
+      "kind": "Assign",
+      "line_start": 139,
+      "line_end": 139,
+      "column": 4,
+      "owner": "_finding",
+      "representation_line": 127
+    },
+    {
+      "kind": "Assign",
+      "line_start": 140,
+      "line_end": 140,
+      "column": 4,
+      "owner": "_finding",
+      "representation_line": 129
+    },
+    {
+      "kind": "Assign",
+      "line_start": 141,
+      "line_end": 141,
+      "column": 4,
+      "owner": "_finding",
+      "representation_line": 129
+    },
+    {
+      "kind": "Assign",
+      "line_start": 142,
+      "line_end": 149,
+      "column": 4,
+      "owner": "_finding",
+      "representation_line": 129
+    },
+    {
+      "kind": "Return",
+      "line_start": 150,
+      "line_end": 158,
+      "column": 4,
+      "owner": "_finding",
+      "representation_line": 130
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 161,
+      "line_end": 173,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 134
+    },
+    {
+      "kind": "Expr",
+      "line_start": 163,
+      "line_end": 163,
+      "column": 4,
+      "owner": "findings_from_semgrep",
+      "representation_line": 140
+    },
+    {
+      "kind": "Assign",
+      "line_start": 166,
+      "line_end": 166,
+      "column": 4,
+      "owner": "findings_from_semgrep",
+      "representation_line": 140
+    },
+    {
+      "kind": "Assign",
+      "line_start": 167,
+      "line_end": 167,
+      "column": 4,
+      "owner": "findings_from_semgrep",
+      "representation_line": 140
+    },
+    {
+      "kind": "Assign",
+      "line_start": 168,
+      "line_end": 168,
+      "column": 4,
+      "owner": "findings_from_semgrep",
+      "representation_line": 140
+    },
+    {
+      "kind": "If",
+      "line_start": 169,
+      "line_end": 170,
+      "column": 4,
+      "owner": "findings_from_semgrep",
+      "representation_line": 141
+    },
+    {
+      "kind": "Raise",
+      "line_start": 170,
+      "line_end": 170,
+      "column": 8,
+      "owner": "findings_from_semgrep",
+      "representation_line": 143
+    },
+    {
+      "kind": "If",
+      "line_start": 171,
+      "line_end": 172,
+      "column": 4,
+      "owner": "findings_from_semgrep",
+      "representation_line": 146
+    },
+    {
+      "kind": "Raise",
+      "line_start": 172,
+      "line_end": 172,
+      "column": 8,
+      "owner": "findings_from_semgrep",
+      "representation_line": 148
+    },
+    {
+      "kind": "Return",
+      "line_start": 173,
+      "line_end": 173,
+      "column": 4,
+      "owner": "findings_from_semgrep",
+      "representation_line": 151
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 176,
+      "line_end": 186,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 155
+    },
+    {
+      "kind": "Expr",
+      "line_start": 177,
+      "line_end": 177,
+      "column": 4,
+      "owner": "read_semgrep_json",
+      "representation_line": 161
+    },
+    {
+      "kind": "Try",
+      "line_start": 178,
+      "line_end": 183,
+      "column": 4,
+      "owner": "read_semgrep_json",
+      "representation_line": 162
+    },
+    {
+      "kind": "If",
+      "line_start": 179,
+      "line_end": 180,
+      "column": 8,
+      "owner": "read_semgrep_json",
+      "representation_line": 164
+    },
+    {
+      "kind": "Raise",
+      "line_start": 180,
+      "line_end": 180,
+      "column": 12,
+      "owner": "read_semgrep_json",
+      "representation_line": 166
+    },
+    {
+      "kind": "Assign",
+      "line_start": 181,
+      "line_end": 181,
+      "column": 8,
+      "owner": "read_semgrep_json",
+      "representation_line": 170
+    },
+    {
+      "kind": "Raise",
+      "line_start": 183,
+      "line_end": 183,
+      "column": 8,
+      "owner": "read_semgrep_json",
+      "representation_line": 174
+    },
+    {
+      "kind": "If",
+      "line_start": 184,
+      "line_end": 185,
+      "column": 4,
+      "owner": "read_semgrep_json",
+      "representation_line": 177
+    },
+    {
+      "kind": "Raise",
+      "line_start": 185,
+      "line_end": 185,
+      "column": 8,
+      "owner": "read_semgrep_json",
+      "representation_line": 179
+    },
+    {
+      "kind": "Return",
+      "line_start": 186,
+      "line_end": 186,
+      "column": 4,
+      "owner": "read_semgrep_json",
+      "representation_line": 182
+    },
+    {
+      "kind": "Assign",
+      "line_start": 189,
+      "line_end": 196,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 187
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 28,
+      "line_end": 28,
+      "column": 6,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='logs', ctx=Load()), attr='get_logger', ctx=Load()), args=[Name(id='__name__', ctx=Load())], keywords=[])",
+      "rendered": "logs.get_logger(__name__)"
+    },
+    {
+      "line_start": 30,
+      "line_end": 30,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=2000)",
+      "rendered": "2000"
+    },
+    {
+      "line_start": 31,
+      "line_end": 31,
+      "column": 17,
+      "kind": "BinOp",
+      "original_ast": "BinOp(left=BinOp(left=Constant(value=64), op=Mult(), right=Constant(value=1024)), op=Mult(), right=Constant(value=1024))",
+      "rendered": "64 * 1024 * 1024"
+    },
+    {
+      "line_start": 32,
+      "line_end": 32,
+      "column": 21,
+      "kind": "Constant",
+      "original_ast": "Constant(value=2000)",
+      "rendered": "2000"
+    },
+    {
+      "line_start": 33,
+      "line_end": 33,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=200)",
+      "rendered": "200"
+    },
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 19,
+      "kind": "Constant",
+      "original_ast": "Constant(value=120)",
+      "rendered": "120"
+    },
+    {
+      "line_start": 36,
+      "line_end": 36,
+      "column": 10,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='re', ctx=Load()), attr='compile', ctx=Load()), args=[Constant(value='CWE-(\\\\d{1,5})')], keywords=[])",
+      "rendered": "re.compile('CWE-(\\\\d{1,5})')"
+    },
+    {
+      "line_start": 40,
+      "line_end": 66,
+      "column": 38,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value=77), Constant(value=78), Constant(value=79), Constant(value=89), Constant(value=90), Constant(value=91), Constant(value=94), Constant(value=95), Constant(value=611), Constant(value=643), Constant(value=917), Constant(value=502), Constant(value=190), Constant(value=191), Constant(value=362), Constant(value=367), Constant(value=134), Constant(value=416), Constant(value=121), Constant(value=122), Constant(value=787), Constant(value=843), Constant(value=200), Constant(value=209), Constant(value=532), Constant(value=22), Constant(value=287), Constant(value=306), Constant(value=352), Constant(value=862), Constant(value=863), Constant(value=88), Constant(value=117), Constant(value=470), Constant(value=943), Constant(value=1336), Constant(value=704), Constant(value=215), Constant(value=311), Constant(value=312), Constant(value=313), Constant(value=315), Constant(value=319), Constant(value=359), Constant(value=497), Constant(value=522), Constant(value=614), Constant(value=798)], values=[Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INJECTION', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INJECTION', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INJECTION', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INJECTION', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INJECTION', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INJECTION', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INJECTION', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INJECTION', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INJECTION', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INJECTION', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INJECTION', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='DESERIALIZATION', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INT_OVERFLOW', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INT_OVERFLOW', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='RACE', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='RACE', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='FMT_STRING', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='UAF', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='STACK_OVERFLOW', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='HEAP_OVERFLOW', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='HEAP_OVERFLOW', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='TYPE_CONFUSION', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INFO_LEAK', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INFO_LEAK', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INFO_LEAK', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='LOGIC', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='LOGIC', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='LOGIC', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='LOGIC', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='LOGIC', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='LOGIC', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INJECTION', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INJECTION', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INJECTION', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INJECTION', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INJECTION', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='TYPE_CONFUSION', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INFO_LEAK', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INFO_LEAK', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INFO_LEAK', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INFO_LEAK', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INFO_LEAK', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INFO_LEAK', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INFO_LEAK', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INFO_LEAK', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INFO_LEAK', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INFO_LEAK', ctx=Load()), Attribute(value=Name(id='VulnClass', ctx=Load()), attr='INFO_LEAK', ctx=Load())])",
+      "rendered": "{77: VulnClass.INJECTION, 78: VulnClass.INJECTION, 79: VulnClass.INJECTION, 89: VulnClass.INJECTION, 90: VulnClass.INJECTION, 91: VulnClass.INJECTION, 94: VulnClass.INJECTION, 95: VulnClass.INJECTION, 611: VulnClass.INJECTION, 643: VulnClass.INJECTION, 917: VulnClass.INJECTION, 502: VulnClass.DESERIALIZATION, 190: VulnClass.INT_OVERFLOW, 191: VulnClass.INT_OVERFLOW, 362: VulnClass.RACE, 367: VulnClass.RACE, 134: VulnClass.FMT_STRING, 416: VulnClass.UAF, 121: VulnClass.STACK_OVERFLOW, 122: VulnClass.HEAP_OVERFLOW, 787: VulnClass.HEAP_OVERFLOW, 843: VulnClass.TYPE_CONFUSION, 200: VulnClass.INFO_LEAK, 209: VulnClass.INFO_LEAK, 532: VulnClass.INFO_LEAK, 22: VulnClass.LOGIC, 287: VulnClass.LOGIC, 306: VulnClass.LOGIC, 352: VulnClass.LOGIC, 862: VulnClass.LOGIC, 863: VulnClass.LOGIC, 88: VulnClass.INJECTION, 117: VulnClass.INJECTION, 470: VulnClass.INJECTION, 943: VulnClass.INJECTION, 1336: VulnClass.INJECTION, 704: VulnClass.TYPE_CONFUSION, 215: VulnClass.INFO_LEAK, 311: VulnClass.INFO_LEAK, 312: VulnClass.INFO_LEAK, 313: VulnClass.INFO_LEAK, 315: VulnClass.INFO_LEAK, 319: VulnClass.INFO_LEAK, 359: VulnClass.INFO_LEAK, 497: VulnClass.INFO_LEAK, 522: VulnClass.INFO_LEAK, 614: VulnClass.INFO_LEAK, 798: VulnClass.INFO_LEAK}"
+    },
+    {
+      "line_start": 68,
+      "line_end": 68,
+      "column": 12,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='ERROR'), Constant(value='WARNING'), Constant(value='INFO')], values=[Constant(value='high'), Constant(value='medium'), Constant(value='low')])",
+      "rendered": "{'ERROR': 'high', 'WARNING': 'medium', 'INFO': 'low'}"
+    },
+    {
+      "line_start": 71,
+      "line_end": 71,
+      "column": 27,
+      "kind": "Name",
+      "original_ast": "Name(id='ValueError', ctx=Load())",
+      "rendered": "ValueError"
+    },
+    {
+      "line_start": 77,
+      "line_end": 77,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='PurePosixPath', ctx=Load()), args=[Call(func=Attribute(value=Name(id='value', ctx=Load()), attr='replace', ctx=Load()), args=[Constant(value='\\\\'), Constant(value='/')], keywords=[])], keywords=[])",
+      "rendered": "PurePosixPath(value.replace('\\\\', '/'))"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Attribute(value=Name(id='candidate', ctx=Load()), attr='is_relative_to', ctx=Load()), args=[Name(id='base', ctx=Load())], keywords=[]), body=Call(func=Name(id='str', ctx=Load()), args=[Call(func=Attribute(value=Name(id='candidate', ctx=Load()), attr='relative_to', ctx=Load()), args=[Name(id='base', ctx=Load())], keywords=[])], keywords=[]), orelse=Constant(value=''))",
+      "rendered": "str(candidate.relative_to(base)) if candidate.is_relative_to(base) else ''"
+    },
+    {
+      "line_start": 87,
+      "line_end": 87,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_posix', ctx=Load()), args=[Name(id='path', ctx=Load())], keywords=[])",
+      "rendered": "_posix(path)"
+    },
+    {
+      "line_start": 88,
+      "line_end": 88,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[UnaryOp(op=Not(), operand=Name(id='root', ctx=Load())), UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='candidate', ctx=Load()), attr='is_absolute', ctx=Load()), args=[], keywords=[]))])",
+      "rendered": "not root or not candidate.is_absolute()"
+    },
+    {
+      "line_start": 89,
+      "line_end": 89,
+      "column": 15,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=Call(func=Name(id='str', ctx=Load()), args=[Name(id='candidate', ctx=Load())], keywords=[]), ops=[NotIn()], comparators=[Tuple(elts=[Constant(value='.'), Constant(value='')], ctx=Load())]), body=Call(func=Name(id='str', ctx=Load()), args=[Name(id='candidate', ctx=Load())], keywords=[]), orelse=Name(id='path', ctx=Load()))",
+      "rendered": "str(candidate) if str(candidate) not in ('.', '') else path"
+    },
+    {
+      "line_start": 90,
+      "line_end": 90,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_posix', ctx=Load()), args=[Call(func=Name(id='str', ctx=Load()), args=[Call(func=Attribute(value=Call(func=Name(id='Path', ctx=Load()), args=[Name(id='root', ctx=Load())], keywords=[]), attr='resolve', ctx=Load()), args=[], keywords=[])], keywords=[])], keywords=[])",
+      "rendered": "_posix(str(Path(root).resolve()))"
+    },
+    {
+      "line_start": 91,
+      "line_end": 91,
+      "column": 12,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Name(id='_under', ctx=Load()), args=[Name(id='base', ctx=Load()), Name(id='candidate', ctx=Load())], keywords=[]), Call(func=Name(id='_under', ctx=Load()), args=[Name(id='base', ctx=Load()), Call(func=Name(id='_posix', ctx=Load()), args=[Call(func=Name(id='str', ctx=Load()), args=[Call(func=Attribute(value=Call(func=Name(id='Path', ctx=Load()), args=[Name(id='path', ctx=Load())], keywords=[]), attr='resolve', ctx=Load()), args=[], keywords=[])], keywords=[])], keywords=[])], keywords=[])])",
+      "rendered": "_under(base, candidate) or _under(base, _posix(str(Path(path).resolve())))"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='under', ctx=Load())",
+      "rendered": "under"
+    },
+    {
+      "line_start": 93,
+      "line_end": 93,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='under', ctx=Load())",
+      "rendered": "under"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='COUNTERS', ctx=Load()), attr='bump', ctx=Load()), args=[Constant(value='semgrep_path_outside_repo')], keywords=[])",
+      "rendered": "COUNTERS.bump('semgrep_path_outside_repo')"
+    },
+    {
+      "line_start": 95,
+      "line_end": 97,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='log', ctx=Load()), attr='warning', ctx=Load()), args=[Attribute(value=Name(id='Event', ctx=Load()), attr='SEMGREP_PATH_NOT_RELATIVE', ctx=Load())], keywords=[keyword(arg='path', value=Call(func=Name(id='str', ctx=Load()), args=[Name(id='candidate', ctx=Load())], keywords=[])), keyword(arg='repo_root', value=Call(func=Name(id='str', ctx=Load()), args=[Name(id='base', ctx=Load())], keywords=[])), keyword(arg='detail', value=Constant(value='this finding keeps an absolute path, so S5 drops it as a file that is not in the repo inventory'))])",
+      "rendered": "log.warning(Event.SEMGREP_PATH_NOT_RELATIVE, path=str(candidate), repo_root=str(base), detail='this finding keeps an absolute path, so S5 drops it as a file that is not in the repo inventory')"
+    },
+    {
+      "line_start": 98,
+      "line_end": 98,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='str', ctx=Load()), args=[Name(id='candidate', ctx=Load())], keywords=[])",
+      "rendered": "str(candidate)"
+    },
+    {
+      "line_start": 103,
+      "line_end": 103,
+      "column": 10,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='metadata', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='cwe')], keywords=[]), List(elts=[], ctx=Load())])",
+      "rendered": "metadata.get('cwe') or []"
+    },
+    {
+      "line_start": 104,
+      "line_end": 104,
+      "column": 13,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='raw', ctx=Load()), Name(id='str', ctx=Load())], keywords=[]), body=List(elts=[Name(id='raw', ctx=Load())], ctx=Load()), orelse=ListComp(elt=Name(id='v', ctx=Load()), generators=[comprehension(target=Name(id='v', ctx=Store()), iter=Name(id='raw', ctx=Load()), ifs=[Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='v', ctx=Load()), Name(id='str', ctx=Load())], keywords=[])], is_async=0)]))",
+      "rendered": "[raw] if isinstance(raw, str) else [v for v in raw if isinstance(v, str)]"
+    },
+    {
+      "line_start": 105,
+      "line_end": 105,
+      "column": 28,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[], values=[])",
+      "rendered": "{}"
+    },
+    {
+      "line_start": 106,
+      "line_end": 106,
+      "column": 17,
+      "kind": "Name",
+      "original_ast": "Name(id='values', ctx=Load())",
+      "rendered": "values"
+    },
+    {
+      "line_start": 107,
+      "line_end": 107,
+      "column": 21,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_CWE_RE', ctx=Load()), attr='finditer', ctx=Load()), args=[Name(id='value', ctx=Load())], keywords=[])",
+      "rendered": "_CWE_RE.finditer(value)"
+    },
+    {
+      "line_start": 108,
+      "line_end": 108,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='seen', ctx=Load()), attr='setdefault', ctx=Load()), args=[JoinedStr(values=[Constant(value='CWE-'), FormattedValue(value=Call(func=Name(id='int', ctx=Load()), args=[Call(func=Attribute(value=Name(id='match', ctx=Load()), attr='group', ctx=Load()), args=[Constant(value=1)], keywords=[])], keywords=[]), conversion=-1)]), Constant(value=None)], keywords=[])",
+      "rendered": "seen.setdefault(source_template_108_28, None)"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='list', ctx=Load()), args=[Name(id='seen', ctx=Load())], keywords=[])",
+      "rendered": "list(seen)"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='cwes', ctx=Load())",
+      "rendered": "cwes"
+    },
+    {
+      "line_start": 115,
+      "line_end": 115,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='_CWE_TO_CLASS', ctx=Load()), attr='get', ctx=Load()), args=[Call(func=Name(id='int', ctx=Load()), args=[Call(func=Attribute(value=Name(id='cwe', ctx=Load()), attr='removeprefix', ctx=Load()), args=[Constant(value='CWE-')], keywords=[])], keywords=[])], keywords=[])",
+      "rendered": "_CWE_TO_CLASS.get(int(cwe.removeprefix('CWE-')))"
+    },
+    {
+      "line_start": 116,
+      "line_end": 116,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='mapped', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "mapped is not None"
+    },
+    {
+      "line_start": 117,
+      "line_end": 117,
+      "column": 19,
+      "kind": "Name",
+      "original_ast": "Name(id='mapped', ctx=Load())",
+      "rendered": "mapped"
+    },
+    {
+      "line_start": 118,
+      "line_end": 118,
+      "column": 11,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='VulnClass', ctx=Load()), attr='OTHER', ctx=Load())",
+      "rendered": "VulnClass.OTHER"
+    },
+    {
+      "line_start": 123,
+      "line_end": 123,
+      "column": 10,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='metadata', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='vulnerability_class')], keywords=[]), List(elts=[], ctx=Load())])",
+      "rendered": "metadata.get('vulnerability_class') or []"
+    },
+    {
+      "line_start": 124,
+      "line_end": 124,
+      "column": 13,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='raw', ctx=Load()), Name(id='str', ctx=Load())], keywords=[]), body=List(elts=[Name(id='raw', ctx=Load())], ctx=Load()), orelse=ListComp(elt=Name(id='v', ctx=Load()), generators=[comprehension(target=Name(id='v', ctx=Store()), iter=Name(id='raw', ctx=Load()), ifs=[Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='v', ctx=Load()), Name(id='str', ctx=Load())], keywords=[])], is_async=0)]))",
+      "rendered": "[raw] if isinstance(raw, str) else [v for v in raw if isinstance(v, str)]"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='next', ctx=Load()), args=[GeneratorExp(elt=Call(func=Attribute(value=Name(id='v', ctx=Load()), attr='strip', ctx=Load()), args=[], keywords=[]), generators=[comprehension(target=Name(id='v', ctx=Store()), iter=Name(id='values', ctx=Load()), ifs=[Call(func=Attribute(value=Name(id='v', ctx=Load()), attr='strip', ctx=Load()), args=[], keywords=[])], is_async=0)]), Constant(value='')], keywords=[])",
+      "rendered": "next((v.strip() for v in values if v.strip()), '')"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Name(id='authored', ctx=Load()), Call(func=Name(id='next', ctx=Load()), args=[GeneratorExp(elt=Call(func=Name(id='cwe_name', ctx=Load()), args=[Name(id='c', ctx=Load())], keywords=[]), generators=[comprehension(target=Name(id='c', ctx=Store()), iter=Name(id='cwes', ctx=Load()), ifs=[Call(func=Name(id='cwe_name', ctx=Load()), args=[Name(id='c', ctx=Load())], keywords=[])], is_async=0)]), Constant(value='')], keywords=[])])",
+      "rendered": "authored or next((cwe_name(c) for c in cwes if cwe_name(c)), '')"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='result', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='path')], keywords=[])",
+      "rendered": "result.get('path')"
+    },
+    {
+      "line_start": 132,
+      "line_end": 132,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='result', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='start')], keywords=[]), Dict(keys=[], values=[])]), attr='get', ctx=Load()), args=[Constant(value='line')], keywords=[])",
+      "rendered": "(result.get('start') or {}).get('line')"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[UnaryOp(op=Not(), operand=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='raw_path', ctx=Load()), Name(id='str', ctx=Load())], keywords=[])), UnaryOp(op=Not(), operand=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='start', ctx=Load()), Name(id='int', ctx=Load())], keywords=[]))])",
+      "rendered": "not isinstance(raw_path, str) or not isinstance(start, int)"
+    },
+    {
+      "line_start": 134,
+      "line_end": 134,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 135,
+      "line_end": 135,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='relative_path', ctx=Load()), args=[Name(id='raw_path', ctx=Load()), Name(id='root', ctx=Load())], keywords=[])",
+      "rendered": "relative_path(raw_path, root)"
+    },
+    {
+      "line_start": 136,
+      "line_end": 136,
+      "column": 12,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='result', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='extra')], keywords=[]), Dict(keys=[], values=[])])",
+      "rendered": "result.get('extra') or {}"
+    },
+    {
+      "line_start": 137,
+      "line_end": 137,
+      "column": 15,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='extra', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='metadata')], keywords=[]), Dict(keys=[], values=[])])",
+      "rendered": "extra.get('metadata') or {}"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_cwe_ids', ctx=Load()), args=[Name(id='metadata', ctx=Load())], keywords=[])",
+      "rendered": "_cwe_ids(metadata)"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 17,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_vuln_class', ctx=Load()), args=[Name(id='cwes', ctx=Load())], keywords=[])",
+      "rendered": "_vuln_class(cwes)"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='str', ctx=Load()), args=[BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='result', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='check_id')], keywords=[]), Constant(value='semgrep')])], keywords=[])",
+      "rendered": "str(result.get('check_id') or 'semgrep')"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='str', ctx=Load()), args=[BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='extra', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='message')], keywords=[]), Name(id='rule_id', ctx=Load())])], keywords=[])",
+      "rendered": "str(extra.get('message') or rule_id)"
+    },
+    {
+      "line_start": 142,
+      "line_end": 149,
+      "column": 15,
+      "kind": "Dict",
+      "original_ast": "Dict(keys=[Constant(value='line_end'), Constant(value='cwe'), Constant(value='severity'), Constant(value='code_snippet'), Constant(value='vuln_class_label')], values=[Call(func=Attribute(value=BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='result', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='end')], keywords=[]), Dict(keys=[], values=[])]), attr='get', ctx=Load()), args=[Constant(value='line')], keywords=[]), IfExp(test=Name(id='cwes', ctx=Load()), body=Subscript(value=Name(id='cwes', ctx=Load()), slice=Constant(value=0), ctx=Load()), orelse=Constant(value=None)), Call(func=Attribute(value=Name(id='_SEVERITY', ctx=Load()), attr='get', ctx=Load()), args=[Call(func=Attribute(value=Call(func=Name(id='str', ctx=Load()), args=[Call(func=Attribute(value=Name(id='extra', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='severity'), Constant(value='')], keywords=[])], keywords=[]), attr='upper', ctx=Load()), args=[], keywords=[])], keywords=[]), BoolOp(op=Or(), values=[Subscript(value=Call(func=Name(id='str', ctx=Load()), args=[BoolOp(op=Or(), values=[Call(func=Attribute(value=Name(id='extra', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='lines')], keywords=[]), Constant(value='')])], keywords=[]), slice=Slice(upper=Name(id='_MAX_SNIPPET_CHARS', ctx=Load())), ctx=Load()), Constant(value=None)]), IfExp(test=Compare(left=Name(id='vuln_class', ctx=Load()), ops=[Is()], comparators=[Attribute(value=Name(id='VulnClass', ctx=Load()), attr='OTHER', ctx=Load())]), body=Subscript(value=Call(func=Name(id='_label', ctx=Load()), args=[Name(id='metadata', ctx=Load()), Name(id='cwes', ctx=Load())], keywords=[]), slice=Slice(upper=Name(id='_MAX_LABEL_CHARS', ctx=Load())), ctx=Load()), orelse=Constant(value=None))])",
+      "rendered": "{'line_end': (result.get('end') or {}).get('line'), 'cwe': cwes[0] if cwes else None, 'severity': _SEVERITY.get(str(extra.get('severity', '')).upper()), 'code_snippet': str(extra.get('lines') or '')[:_MAX_SNIPPET_CHARS] or None, 'vuln_class_label': _label(metadata, cwes)[:_MAX_LABEL_CHARS] if vuln_class is VulnClass.OTHER else None}"
+    },
+    {
+      "line_start": 150,
+      "line_end": 158,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='Finding', ctx=Load()), args=[], keywords=[keyword(arg='title', value=BoolOp(op=Or(), values=[Subscript(value=Subscript(value=Call(func=Attribute(value=Call(func=Attribute(value=Name(id='message', ctx=Load()), attr='strip', ctx=Load()), args=[], keywords=[]), attr='splitlines', ctx=Load()), args=[], keywords=[]), slice=Constant(value=0), ctx=Load()), slice=Slice(upper=Name(id='_MAX_TITLE_CHARS', ctx=Load())), ctx=Load()), Name(id='rule_id', ctx=Load())])), keyword(arg='file', value=Name(id='path', ctx=Load())), keyword(arg='line_start', value=Name(id='start', ctx=Load())), keyword(arg='vuln_class', value=Name(id='vuln_class', ctx=Load())), keyword(arg='description', value=Name(id='message', ctx=Load())), keyword(arg='origin', value=JoinedStr(values=[Constant(value='semgrep:'), FormattedValue(value=Name(id='rule_id', ctx=Load()), conversion=-1)])), keyword(value=DictComp(key=Name(id='k', ctx=Load()), value=Name(id='v', ctx=Load()), generators=[comprehension(target=Tuple(elts=[Name(id='k', ctx=Store()), Name(id='v', ctx=Store())], ctx=Store()), iter=Call(func=Attribute(value=Name(id='optional', ctx=Load()), attr='items', ctx=Load()), args=[], keywords=[]), ifs=[Compare(left=Name(id='v', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])], is_async=0)]))])",
+      "rendered": "Finding(title=message.strip().splitlines()[0][:_MAX_TITLE_CHARS] or rule_id, file=path, line_start=start, vuln_class=vuln_class, description=message, origin=source_template_156_15, **{k: v for k, v in optional.items() if v is not None})"
+    },
+    {
+      "line_start": 166,
+      "line_end": 166,
+      "column": 15,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='payload', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[]), body=Name(id='payload', ctx=Load()), orelse=Call(func=Name(id='read_semgrep_json', ctx=Load()), args=[Call(func=Name(id='Path', ctx=Load()), args=[Name(id='payload', ctx=Load())], keywords=[])], keywords=[]))",
+      "rendered": "payload if isinstance(payload, dict) else read_semgrep_json(Path(payload))"
+    },
+    {
+      "line_start": 167,
+      "line_end": 167,
+      "column": 11,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Compare(left=Name(id='repo', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)]), body=Constant(value=''), orelse=Call(func=Name(id='str', ctx=Load()), args=[Name(id='repo', ctx=Load())], keywords=[]))",
+      "rendered": "'' if repo is None else str(repo)"
+    },
+    {
+      "line_start": 168,
+      "line_end": 168,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='document', ctx=Load()), attr='get', ctx=Load()), args=[Constant(value='results')], keywords=[])",
+      "rendered": "document.get('results')"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='results', ctx=Load()), Name(id='list', ctx=Load())], keywords=[]))",
+      "rendered": "not isinstance(results, list)"
+    },
+    {
+      "line_start": 170,
+      "line_end": 170,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='SemgrepFindingsError', ctx=Load()), args=[Constant(value=\"semgrep JSON has no 'results' list\")], keywords=[])",
+      "rendered": "SemgrepFindingsError(\"semgrep JSON has no 'results' list\")"
+    },
+    {
+      "line_start": 171,
+      "line_end": 171,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='results', ctx=Load())], keywords=[]), ops=[Gt()], comparators=[Name(id='MAX_FINDINGS', ctx=Load())])",
+      "rendered": "len(results) > MAX_FINDINGS"
+    },
+    {
+      "line_start": 172,
+      "line_end": 172,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='SemgrepFindingsError', ctx=Load()), args=[JoinedStr(values=[FormattedValue(value=Call(func=Name(id='len', ctx=Load()), args=[Name(id='results', ctx=Load())], keywords=[]), conversion=-1), Constant(value=' results exceeds MAX_FINDINGS='), FormattedValue(value=Name(id='MAX_FINDINGS', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "SemgrepFindingsError(source_template_172_35)"
+    },
+    {
+      "line_start": 173,
+      "line_end": 173,
+      "column": 11,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='f', ctx=Load()), generators=[comprehension(target=Name(id='r', ctx=Store()), iter=Name(id='results', ctx=Load()), ifs=[BoolOp(op=And(), values=[Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='r', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[]), Compare(left=NamedExpr(target=Name(id='f', ctx=Store()), value=Call(func=Name(id='_finding', ctx=Load()), args=[Name(id='r', ctx=Load()), Name(id='root', ctx=Load())], keywords=[])), ops=[IsNot()], comparators=[Constant(value=None)])])], is_async=0)])",
+      "rendered": "[f for r in results if isinstance(r, dict) and (f := _finding(r, root)) is not None]"
+    },
+    {
+      "line_start": 179,
+      "line_end": 179,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Call(func=Attribute(value=Name(id='path', ctx=Load()), attr='stat', ctx=Load()), args=[], keywords=[]), attr='st_size', ctx=Load()), ops=[Gt()], comparators=[Name(id='MAX_JSON_BYTES', ctx=Load())])",
+      "rendered": "path.stat().st_size > MAX_JSON_BYTES"
+    },
+    {
+      "line_start": 180,
+      "line_end": 180,
+      "column": 18,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='SemgrepFindingsError', ctx=Load()), args=[JoinedStr(values=[FormattedValue(value=Name(id='path', ctx=Load()), conversion=-1), Constant(value=' exceeds MAX_JSON_BYTES='), FormattedValue(value=Name(id='MAX_JSON_BYTES', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "SemgrepFindingsError(source_template_180_39)"
+    },
+    {
+      "line_start": 181,
+      "line_end": 181,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='json', ctx=Load()), attr='loads', ctx=Load()), args=[Call(func=Attribute(value=Name(id='path', ctx=Load()), attr='read_text', ctx=Load()), args=[], keywords=[keyword(arg='encoding', value=Constant(value='utf-8'))])], keywords=[])",
+      "rendered": "json.loads(path.read_text(encoding='utf-8'))"
+    },
+    {
+      "line_start": 182,
+      "line_end": 182,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='OSError', ctx=Load()), Attribute(value=Name(id='json', ctx=Load()), attr='JSONDecodeError', ctx=Load())], ctx=Load())",
+      "rendered": "(OSError, json.JSONDecodeError)"
+    },
+    {
+      "line_start": 183,
+      "line_end": 183,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='SemgrepFindingsError', ctx=Load()), args=[JoinedStr(values=[Constant(value='cannot read semgrep JSON at '), FormattedValue(value=Name(id='path', ctx=Load()), conversion=-1), Constant(value=': '), FormattedValue(value=Name(id='exc', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "SemgrepFindingsError(source_template_183_35)"
+    },
+    {
+      "line_start": 183,
+      "line_end": 183,
+      "column": 86,
+      "kind": "Name",
+      "original_ast": "Name(id='exc', ctx=Load())",
+      "rendered": "exc"
+    },
+    {
+      "line_start": 184,
+      "line_end": 184,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Name(id='isinstance', ctx=Load()), args=[Name(id='document', ctx=Load()), Name(id='dict', ctx=Load())], keywords=[]))",
+      "rendered": "not isinstance(document, dict)"
+    },
+    {
+      "line_start": 185,
+      "line_end": 185,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='SemgrepFindingsError', ctx=Load()), args=[JoinedStr(values=[Constant(value='semgrep JSON at '), FormattedValue(value=Name(id='path', ctx=Load()), conversion=-1), Constant(value=' is not an object')])], keywords=[])",
+      "rendered": "SemgrepFindingsError(source_template_185_35)"
+    },
+    {
+      "line_start": 186,
+      "line_end": 186,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='document', ctx=Load())",
+      "rendered": "document"
+    },
+    {
+      "line_start": 189,
+      "line_end": 196,
+      "column": 10,
+      "kind": "List",
+      "original_ast": "List(elts=[Constant(value='MAX_FINDINGS'), Constant(value='MAX_JSON_BYTES'), Constant(value='SemgrepFindingsError'), Constant(value='findings_from_semgrep'), Constant(value='read_semgrep_json'), Constant(value='relative_path')], ctx=Load())",
+      "rendered": "['MAX_FINDINGS', 'MAX_JSON_BYTES', 'SemgrepFindingsError', 'findings_from_semgrep', 'read_semgrep_json', 'relative_path']"
+    }
+  ],
+  "calls": [
+    {
+      "line": 28,
+      "end_line": 28,
+      "callee": "logs.get_logger",
+      "enclosing": "module initialization",
+      "expression": "logs.get_logger(__name__)"
+    },
+    {
+      "line": 36,
+      "end_line": 36,
+      "callee": "re.compile",
+      "enclosing": "module initialization",
+      "expression": "re.compile(r\"CWE-(\\d{1,5})\")"
+    },
+    {
+      "line": 77,
+      "end_line": 77,
+      "callee": "PurePosixPath",
+      "enclosing": "_posix",
+      "expression": "PurePosixPath(value.replace(\"\\\\\", \"/\"))"
+    },
+    {
+      "line": 87,
+      "end_line": 87,
+      "callee": "_posix",
+      "enclosing": "relative_path",
+      "expression": "_posix(path)"
+    },
+    {
+      "line": 90,
+      "end_line": 90,
+      "callee": "_posix",
+      "enclosing": "relative_path",
+      "expression": "_posix(str(Path(root).resolve()))"
+    },
+    {
+      "line": 94,
+      "end_line": 94,
+      "callee": "COUNTERS.bump",
+      "enclosing": "relative_path",
+      "expression": "COUNTERS.bump(\"semgrep_path_outside_repo\")"
+    },
+    {
+      "line": 95,
+      "end_line": 97,
+      "callee": "log.warning",
+      "enclosing": "relative_path",
+      "expression": "log.warning(Event.SEMGREP_PATH_NOT_RELATIVE, path=str(candidate), repo_root=str(base),\n                detail=\"this finding keeps an absolute path, so S5 drops it as a file that is \"\n                       \"not in the repo inventory\")"
+    },
+    {
+      "line": 98,
+      "end_line": 98,
+      "callee": "str",
+      "enclosing": "relative_path",
+      "expression": "str(candidate)"
+    },
+    {
+      "line": 109,
+      "end_line": 109,
+      "callee": "list",
+      "enclosing": "_cwe_ids",
+      "expression": "list(seen)"
+    },
+    {
+      "line": 125,
+      "end_line": 125,
+      "callee": "next",
+      "enclosing": "_label",
+      "expression": "next((v.strip() for v in values if v.strip()), \"\")"
+    },
+    {
+      "line": 131,
+      "end_line": 131,
+      "callee": "result.get",
+      "enclosing": "_finding",
+      "expression": "result.get(\"path\")"
+    },
+    {
+      "line": 132,
+      "end_line": 132,
+      "callee": "(result.get('start') or {}).get",
+      "enclosing": "_finding",
+      "expression": "(result.get(\"start\") or {}).get(\"line\")"
+    },
+    {
+      "line": 135,
+      "end_line": 135,
+      "callee": "relative_path",
+      "enclosing": "_finding",
+      "expression": "relative_path(raw_path, root)"
+    },
+    {
+      "line": 138,
+      "end_line": 138,
+      "callee": "_cwe_ids",
+      "enclosing": "_finding",
+      "expression": "_cwe_ids(metadata)"
+    },
+    {
+      "line": 139,
+      "end_line": 139,
+      "callee": "_vuln_class",
+      "enclosing": "_finding",
+      "expression": "_vuln_class(cwes)"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "str",
+      "enclosing": "_finding",
+      "expression": "str(result.get(\"check_id\") or \"semgrep\")"
+    },
+    {
+      "line": 141,
+      "end_line": 141,
+      "callee": "str",
+      "enclosing": "_finding",
+      "expression": "str(extra.get(\"message\") or rule_id)"
+    },
+    {
+      "line": 150,
+      "end_line": 158,
+      "callee": "Finding",
+      "enclosing": "_finding",
+      "expression": "Finding(\n        title=message.strip().splitlines()[0][:_MAX_TITLE_CHARS] or rule_id,\n        file=path,\n        line_start=start,\n        vuln_class=vuln_class,\n        description=message,\n        origin=f\"semgrep:{rule_id}\",\n        **{k: v for k, v in optional.items() if v is not None},\n    )"
+    },
+    {
+      "line": 168,
+      "end_line": 168,
+      "callee": "document.get",
+      "enclosing": "findings_from_semgrep",
+      "expression": "document.get(\"results\")"
+    },
+    {
+      "line": 77,
+      "end_line": 77,
+      "callee": "value.replace",
+      "enclosing": "_posix",
+      "expression": "value.replace(\"\\\\\", \"/\")"
+    },
+    {
+      "line": 82,
+      "end_line": 82,
+      "callee": "candidate.is_relative_to",
+      "enclosing": "_under",
+      "expression": "candidate.is_relative_to(base)"
+    },
+    {
+      "line": 82,
+      "end_line": 82,
+      "callee": "str",
+      "enclosing": "_under",
+      "expression": "str(candidate.relative_to(base))"
+    },
+    {
+      "line": 90,
+      "end_line": 90,
+      "callee": "str",
+      "enclosing": "relative_path",
+      "expression": "str(Path(root).resolve())"
+    },
+    {
+      "line": 91,
+      "end_line": 91,
+      "callee": "_under",
+      "enclosing": "relative_path",
+      "expression": "_under(base, candidate)"
+    },
+    {
+      "line": 91,
+      "end_line": 91,
+      "callee": "_under",
+      "enclosing": "relative_path",
+      "expression": "_under(base, _posix(str(Path(path).resolve())))"
+    },
+    {
+      "line": 103,
+      "end_line": 103,
+      "callee": "metadata.get",
+      "enclosing": "_cwe_ids",
+      "expression": "metadata.get(\"cwe\")"
+    },
+    {
+      "line": 104,
+      "end_line": 104,
+      "callee": "isinstance",
+      "enclosing": "_cwe_ids",
+      "expression": "isinstance(raw, str)"
+    },
+    {
+      "line": 107,
+      "end_line": 107,
+      "callee": "_CWE_RE.finditer",
+      "enclosing": "_cwe_ids",
+      "expression": "_CWE_RE.finditer(value)"
+    },
+    {
+      "line": 115,
+      "end_line": 115,
+      "callee": "_CWE_TO_CLASS.get",
+      "enclosing": "_vuln_class",
+      "expression": "_CWE_TO_CLASS.get(int(cwe.removeprefix(\"CWE-\")))"
+    },
+    {
+      "line": 123,
+      "end_line": 123,
+      "callee": "metadata.get",
+      "enclosing": "_label",
+      "expression": "metadata.get(\"vulnerability_class\")"
+    },
+    {
+      "line": 124,
+      "end_line": 124,
+      "callee": "isinstance",
+      "enclosing": "_label",
+      "expression": "isinstance(raw, str)"
+    },
+    {
+      "line": 126,
+      "end_line": 126,
+      "callee": "next",
+      "enclosing": "_label",
+      "expression": "next((cwe_name(c) for c in cwes if cwe_name(c)), \"\")"
+    },
+    {
+      "line": 136,
+      "end_line": 136,
+      "callee": "result.get",
+      "enclosing": "_finding",
+      "expression": "result.get(\"extra\")"
+    },
+    {
+      "line": 137,
+      "end_line": 137,
+      "callee": "extra.get",
+      "enclosing": "_finding",
+      "expression": "extra.get(\"metadata\")"
+    },
+    {
+      "line": 143,
+      "end_line": 143,
+      "callee": "(result.get('end') or {}).get",
+      "enclosing": "_finding",
+      "expression": "(result.get(\"end\") or {}).get(\"line\")"
+    },
+    {
+      "line": 145,
+      "end_line": 145,
+      "callee": "_SEVERITY.get",
+      "enclosing": "_finding",
+      "expression": "_SEVERITY.get(str(extra.get(\"severity\", \"\")).upper())"
+    },
+    {
+      "line": 166,
+      "end_line": 166,
+      "callee": "isinstance",
+      "enclosing": "findings_from_semgrep",
+      "expression": "isinstance(payload, dict)"
+    },
+    {
+      "line": 166,
+      "end_line": 166,
+      "callee": "read_semgrep_json",
+      "enclosing": "findings_from_semgrep",
+      "expression": "read_semgrep_json(Path(payload))"
+    },
+    {
+      "line": 167,
+      "end_line": 167,
+      "callee": "str",
+      "enclosing": "findings_from_semgrep",
+      "expression": "str(repo)"
+    },
+    {
+      "line": 169,
+      "end_line": 169,
+      "callee": "isinstance",
+      "enclosing": "findings_from_semgrep",
+      "expression": "isinstance(results, list)"
+    },
+    {
+      "line": 170,
+      "end_line": 170,
+      "callee": "SemgrepFindingsError",
+      "enclosing": "findings_from_semgrep",
+      "expression": "SemgrepFindingsError(\"semgrep JSON has no 'results' list\")"
+    },
+    {
+      "line": 171,
+      "end_line": 171,
+      "callee": "len",
+      "enclosing": "findings_from_semgrep",
+      "expression": "len(results)"
+    },
+    {
+      "line": 172,
+      "end_line": 172,
+      "callee": "SemgrepFindingsError",
+      "enclosing": "findings_from_semgrep",
+      "expression": "SemgrepFindingsError(f\"{len(results)} results exceeds MAX_FINDINGS={MAX_FINDINGS}\")"
+    },
+    {
+      "line": 181,
+      "end_line": 181,
+      "callee": "json.loads",
+      "enclosing": "read_semgrep_json",
+      "expression": "json.loads(path.read_text(encoding=\"utf-8\"))"
+    },
+    {
+      "line": 184,
+      "end_line": 184,
+      "callee": "isinstance",
+      "enclosing": "read_semgrep_json",
+      "expression": "isinstance(document, dict)"
+    },
+    {
+      "line": 185,
+      "end_line": 185,
+      "callee": "SemgrepFindingsError",
+      "enclosing": "read_semgrep_json",
+      "expression": "SemgrepFindingsError(f\"semgrep JSON at {path} is not an object\")"
+    },
+    {
+      "line": 82,
+      "end_line": 82,
+      "callee": "candidate.relative_to",
+      "enclosing": "_under",
+      "expression": "candidate.relative_to(base)"
+    },
+    {
+      "line": 88,
+      "end_line": 88,
+      "callee": "candidate.is_absolute",
+      "enclosing": "relative_path",
+      "expression": "candidate.is_absolute()"
+    },
+    {
+      "line": 89,
+      "end_line": 89,
+      "callee": "str",
+      "enclosing": "relative_path",
+      "expression": "str(candidate)"
+    },
+    {
+      "line": 90,
+      "end_line": 90,
+      "callee": "Path(root).resolve",
+      "enclosing": "relative_path",
+      "expression": "Path(root).resolve()"
+    },
+    {
+      "line": 91,
+      "end_line": 91,
+      "callee": "_posix",
+      "enclosing": "relative_path",
+      "expression": "_posix(str(Path(path).resolve()))"
+    },
+    {
+      "line": 95,
+      "end_line": 95,
+      "callee": "str",
+      "enclosing": "relative_path",
+      "expression": "str(candidate)"
+    },
+    {
+      "line": 95,
+      "end_line": 95,
+      "callee": "str",
+      "enclosing": "relative_path",
+      "expression": "str(base)"
+    },
+    {
+      "line": 108,
+      "end_line": 108,
+      "callee": "seen.setdefault",
+      "enclosing": "_cwe_ids",
+      "expression": "seen.setdefault(f\"CWE-{int(match.group(1))}\", None)"
+    },
+    {
+      "line": 115,
+      "end_line": 115,
+      "callee": "int",
+      "enclosing": "_vuln_class",
+      "expression": "int(cwe.removeprefix(\"CWE-\"))"
+    },
+    {
+      "line": 125,
+      "end_line": 125,
+      "callee": "v.strip",
+      "enclosing": "_label",
+      "expression": "v.strip()"
+    },
+    {
+      "line": 133,
+      "end_line": 133,
+      "callee": "isinstance",
+      "enclosing": "_finding",
+      "expression": "isinstance(raw_path, str)"
+    },
+    {
+      "line": 133,
+      "end_line": 133,
+      "callee": "isinstance",
+      "enclosing": "_finding",
+      "expression": "isinstance(start, int)"
+    },
+    {
+      "line": 140,
+      "end_line": 140,
+      "callee": "result.get",
+      "enclosing": "_finding",
+      "expression": "result.get(\"check_id\")"
+    },
+    {
+      "line": 141,
+      "end_line": 141,
+      "callee": "extra.get",
+      "enclosing": "_finding",
+      "expression": "extra.get(\"message\")"
+    },
+    {
+      "line": 145,
+      "end_line": 145,
+      "callee": "str(extra.get('severity', '')).upper",
+      "enclosing": "_finding",
+      "expression": "str(extra.get(\"severity\", \"\")).upper()"
+    },
+    {
+      "line": 166,
+      "end_line": 166,
+      "callee": "Path",
+      "enclosing": "findings_from_semgrep",
+      "expression": "Path(payload)"
+    },
+    {
+      "line": 180,
+      "end_line": 180,
+      "callee": "SemgrepFindingsError",
+      "enclosing": "read_semgrep_json",
+      "expression": "SemgrepFindingsError(f\"{path} exceeds MAX_JSON_BYTES={MAX_JSON_BYTES}\")"
+    },
+    {
+      "line": 181,
+      "end_line": 181,
+      "callee": "path.read_text",
+      "enclosing": "read_semgrep_json",
+      "expression": "path.read_text(encoding=\"utf-8\")"
+    },
+    {
+      "line": 183,
+      "end_line": 183,
+      "callee": "SemgrepFindingsError",
+      "enclosing": "read_semgrep_json",
+      "expression": "SemgrepFindingsError(f\"cannot read semgrep JSON at {path}: {exc}\")"
+    },
+    {
+      "line": 89,
+      "end_line": 89,
+      "callee": "str",
+      "enclosing": "relative_path",
+      "expression": "str(candidate)"
+    },
+    {
+      "line": 91,
+      "end_line": 91,
+      "callee": "str",
+      "enclosing": "relative_path",
+      "expression": "str(Path(path).resolve())"
+    },
+    {
+      "line": 104,
+      "end_line": 104,
+      "callee": "isinstance",
+      "enclosing": "_cwe_ids",
+      "expression": "isinstance(v, str)"
+    },
+    {
+      "line": 115,
+      "end_line": 115,
+      "callee": "cwe.removeprefix",
+      "enclosing": "_vuln_class",
+      "expression": "cwe.removeprefix(\"CWE-\")"
+    },
+    {
+      "line": 124,
+      "end_line": 124,
+      "callee": "isinstance",
+      "enclosing": "_label",
+      "expression": "isinstance(v, str)"
+    },
+    {
+      "line": 125,
+      "end_line": 125,
+      "callee": "v.strip",
+      "enclosing": "_label",
+      "expression": "v.strip()"
+    },
+    {
+      "line": 126,
+      "end_line": 126,
+      "callee": "cwe_name",
+      "enclosing": "_label",
+      "expression": "cwe_name(c)"
+    },
+    {
+      "line": 132,
+      "end_line": 132,
+      "callee": "result.get",
+      "enclosing": "_finding",
+      "expression": "result.get(\"start\")"
+    },
+    {
+      "line": 146,
+      "end_line": 146,
+      "callee": "str",
+      "enclosing": "_finding",
+      "expression": "str(extra.get(\"lines\") or \"\")"
+    },
+    {
+      "line": 147,
+      "end_line": 147,
+      "callee": "_label",
+      "enclosing": "_finding",
+      "expression": "_label(metadata, cwes)"
+    },
+    {
+      "line": 173,
+      "end_line": 173,
+      "callee": "isinstance",
+      "enclosing": "findings_from_semgrep",
+      "expression": "isinstance(r, dict)"
+    },
+    {
+      "line": 179,
+      "end_line": 179,
+      "callee": "path.stat",
+      "enclosing": "read_semgrep_json",
+      "expression": "path.stat()"
+    },
+    {
+      "line": 90,
+      "end_line": 90,
+      "callee": "Path",
+      "enclosing": "relative_path",
+      "expression": "Path(root)"
+    },
+    {
+      "line": 91,
+      "end_line": 91,
+      "callee": "Path(path).resolve",
+      "enclosing": "relative_path",
+      "expression": "Path(path).resolve()"
+    },
+    {
+      "line": 126,
+      "end_line": 126,
+      "callee": "cwe_name",
+      "enclosing": "_label",
+      "expression": "cwe_name(c)"
+    },
+    {
+      "line": 143,
+      "end_line": 143,
+      "callee": "result.get",
+      "enclosing": "_finding",
+      "expression": "result.get(\"end\")"
+    },
+    {
+      "line": 145,
+      "end_line": 145,
+      "callee": "str",
+      "enclosing": "_finding",
+      "expression": "str(extra.get(\"severity\", \"\"))"
+    },
+    {
+      "line": 157,
+      "end_line": 157,
+      "callee": "optional.items",
+      "enclosing": "_finding",
+      "expression": "optional.items()"
+    },
+    {
+      "line": 172,
+      "end_line": 172,
+      "callee": "len",
+      "enclosing": "findings_from_semgrep",
+      "expression": "len(results)"
+    },
+    {
+      "line": 108,
+      "end_line": 108,
+      "callee": "int",
+      "enclosing": "_cwe_ids",
+      "expression": "int(match.group(1))"
+    },
+    {
+      "line": 145,
+      "end_line": 145,
+      "callee": "extra.get",
+      "enclosing": "_finding",
+      "expression": "extra.get(\"severity\", \"\")"
+    },
+    {
+      "line": 146,
+      "end_line": 146,
+      "callee": "extra.get",
+      "enclosing": "_finding",
+      "expression": "extra.get(\"lines\")"
+    },
+    {
+      "line": 151,
+      "end_line": 151,
+      "callee": "message.strip().splitlines",
+      "enclosing": "_finding",
+      "expression": "message.strip().splitlines()"
+    },
+    {
+      "line": 173,
+      "end_line": 173,
+      "callee": "_finding",
+      "enclosing": "findings_from_semgrep",
+      "expression": "_finding(r, root)"
+    },
+    {
+      "line": 91,
+      "end_line": 91,
+      "callee": "Path",
+      "enclosing": "relative_path",
+      "expression": "Path(path)"
+    },
+    {
+      "line": 108,
+      "end_line": 108,
+      "callee": "match.group",
+      "enclosing": "_cwe_ids",
+      "expression": "match.group(1)"
+    },
+    {
+      "line": 151,
+      "end_line": 151,
+      "callee": "message.strip",
+      "enclosing": "_finding",
+      "expression": "message.strip()"
+    }
+  ],
+  "imports": [
+    {
+      "line": 16,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 18,
+      "source_expression": "import json",
+      "targets": [
+        "json"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "import re",
+      "targets": [
+        "re"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "from pathlib import Path, PurePosixPath",
+      "targets": [
+        "pathlib",
+        "pathlib.Path",
+        "pathlib.PurePosixPath"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "from vvaharness.models import Finding, VulnClass",
+      "targets": [
+        "vvaharness.models",
+        "vvaharness.models.Finding",
+        "vvaharness.models.VulnClass"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 23,
+      "source_expression": "from vvaharness.report.cwe import cwe_name",
+      "targets": [
+        "vvaharness.report.cwe",
+        "vvaharness.report.cwe.cwe_name"
+      ],
+      "local_source_paths": [
+        "vvaharness/report/cwe.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 24,
+      "source_expression": "from vvaharness.util import logs",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.logs"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/logs.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 25,
+      "source_expression": "from vvaharness.util.counters import COUNTERS",
+      "targets": [
+        "vvaharness.util.counters",
+        "vvaharness.util.counters.COUNTERS"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/counters.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 26,
+      "source_expression": "from vvaharness.util.events import Event",
+      "targets": [
+        "vvaharness.util.events",
+        "vvaharness.util.events.Event"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/events.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}

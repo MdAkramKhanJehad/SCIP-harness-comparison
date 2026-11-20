@@ -1,0 +1,2161 @@
+{
+  "source": "vvaharness/validation/ingest/case_loader.py",
+  "sha256": "e270e994911633cb715ad842b953b9e0f31c17d089ed408ed6aa349a2a4a0c38",
+  "source_text": "# Copyright 2026 Visa, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Discover and load finding cases from a target repo, selecting by FindingCase.state (derived).\"\"\"\n\nfrom __future__ import annotations\n\nfrom dataclasses import dataclass\nfrom pathlib import Path\n\nfrom pydantic import ValidationError\n\nfrom vvaharness.models import CaseState, Disposition, FindingCase\nfrom vvaharness.orchestrator.artifacts import artifact_dir\nfrom vvaharness.util import console\nfrom vvaharness.validation.constants.artifacts import (\n    FINDING_CASE_FILENAME,\n    REMEDIATION_DIRNAME,\n    VALIDATABLE_STATES,\n)\nfrom vvaharness.validation.ingest.errors import IngestError\n\n__all__ = [\"LoadedCase\", \"all_case_ids\", \"discover_cases\", \"load_case\",\n           \"select_cases\"]\n\n# The states named in the refusal message; DECLINED is conditional, see _is_validatable.\n_VALIDATABLE = \", \".join(sorted(\n    [*(state.value for state in VALIDATABLE_STATES),\n     f\"{CaseState.DECLINED.value} (only when not-applicable)\"]))\n\n\n@dataclass(frozen=True)\nclass LoadedCase:\n    \"\"\"A parsed case and the path it came from, so its verdict lands back in the same file.\"\"\"\n\n    case: FindingCase\n    path: Path\n\n    @property\n    def case_id(self) -> str:\n        \"\"\"The case's stable identity.\"\"\"\n        return self.case.case_id\n\n\ndef discover_cases(repo: Path) -> list[Path]:\n    \"\"\"Return sorted case-file paths under the repo's remediation dir.\n\n    Refuses (via ``artifact_dir``) a ``security-remediation`` that is a symlink or not a\n    real directory, rather than following it outside the repo. A symlinked\n    ``finding_case.json``, or one whose ``<slug>`` parent directory is itself a symlink, is\n    silently excluded here rather than selected — the same escape ``artifact_dir`` already\n    refuses on the write side.\n    \"\"\"\n    rem_dir = artifact_dir(repo, REMEDIATION_DIRNAME)\n    if not rem_dir.is_dir():\n        return []\n    return sorted(\n        path for path in rem_dir.glob(f\"*/{FINDING_CASE_FILENAME}\")\n        if not path.is_symlink() and not path.parent.is_symlink()\n    )\n\n\ndef load_case(path: Path) -> LoadedCase:\n    \"\"\"Parse a single finding case from disk.\"\"\"\n    return LoadedCase(case=FindingCase.read(path), path=path)\n\n\ndef _load_case_safe(path: Path) -> LoadedCase | None:\n    \"\"\"Load a case, or None with a printed warning, so one bad case can't abort --all.\"\"\"\n    try:\n        return load_case(path)\n    except (OSError, ValueError, ValidationError) as exc:\n        console.write(\n            f\"validate: skipping finding '{path.parent.name}' — \"\n            f\"unreadable finding case ({path}): {exc}\"\n        )\n        return None\n\n\ndef all_case_ids(repo: Path) -> list[str] | None:\n    \"\"\"Every case id on disk, or None if the set can't be fully enumerated.\"\"\"\n    try:\n        return [load_case(path).case_id for path in discover_cases(repo)]\n    except (OSError, ValueError, ValidationError):\n        return None\n\n\ndef _all_cases(repo: Path) -> list[LoadedCase]:\n    \"\"\"Load every readable case under *repo* (any state).\"\"\"\n    return [c for path in discover_cases(repo) if (c := _load_case_safe(path)) is not None]\n\n\ndef _is_validatable(loaded: LoadedCase) -> bool:\n    \"\"\"True: validator can act; DECLINED/NOT_APPLICABLE too, not FALSE_POSITIVE/POLICY_DENIED.\"\"\"\n    case = loaded.case\n    if case.state in VALIDATABLE_STATES:\n        return True\n    return case.state is CaseState.DECLINED and _declined_for_review(case)\n\n\ndef _declined_for_review(case: FindingCase) -> bool:\n    \"\"\"True when the latest attempt declined for a reason a re-check could overturn.\"\"\"\n    latest = case.attempts[-1] if case.attempts else None\n    return (latest is not None\n            and latest.remediation.disposition is Disposition.NOT_APPLICABLE)\n\n\ndef _cvss_score(loaded: LoadedCase) -> float:\n    \"\"\"Return the finding's CVSS base score; 0.0 when absent, so it sorts last.\"\"\"\n    return loaded.case.finding.cvss_score or 0.0\n\n\ndef _top_by_cvss(cases: list[LoadedCase], limit: int) -> list[LoadedCase]:\n    \"\"\"Return the *limit* highest-CVSS cases; stable discovery order on ties.\"\"\"\n    return sorted(cases, key=_cvss_score, reverse=True)[:limit]\n\n\ndef _log_selection(cases: list[LoadedCase]) -> None:\n    \"\"\"Emit one stderr line per selected case so the ``--all`` route is never silent.\"\"\"\n    for loaded in cases:\n        console.write(\n            f\"validate: selected {loaded.case_id} (state={loaded.case.state.value})\"\n        )\n\n\ndef _capped(cases: list[LoadedCase], max_findings: int | None) -> list[LoadedCase]:\n    \"\"\"Trim *cases* to the top ``max_findings`` by CVSS, announcing the cap on stderr.\"\"\"\n    if max_findings is None or max_findings <= 0 or len(cases) <= max_findings:\n        return cases\n    total = len(cases)\n    console.write(\n        f\"validate: capping to top {max_findings} of {total} validatable findings by CVSS \"\n        f\"(use --all to validate every finding)\"\n    )\n    return _top_by_cvss(cases, max_findings)\n\n\ndef _filter_owned(\n    cases: list[LoadedCase], owned: set[tuple[str, Path]]\n) -> list[LoadedCase]:\n    \"\"\"Keep only cases this run's S10 (per the state store) actually produced.\n\n    ``owned`` is ``(finding_id, artifact_dir.resolve())`` pairs — see\n    ``vvaharness.remediation_agent.provenance.owned_cases``. Matching on both stops a\n    planted case that reuses a real id under a different slug directory. Applied BEFORE\n    the top-N CVSS cap, so a planted high-CVSS case cannot take a real case's slot.\n    \"\"\"\n    kept = []\n    for loaded in cases:\n        key = (loaded.case_id, loaded.path.parent.resolve())\n        if key in owned:\n            kept.append(loaded)\n        else:\n            console.write(\n                f\"skipping {loaded.path.parent}: no S10 record for this case in the \"\n                \"state store (not written by this machine's remediation)\"\n            )\n    return kept\n\n\ndef select_cases(\n    repo: Path,\n    case_ids: list[str] | None,\n    max_findings: int | None = None,\n    *,\n    owned: set[tuple[str, Path]] | None = None,\n) -> list[LoadedCase]:\n    \"\"\"Load validatable cases: case_ids selects exactly those, else top max_findings by CVSS.\n\n    ``owned`` (when given) is the provenance set from\n    ``vvaharness.remediation_agent.provenance.owned_cases`` — a case missing from it is\n    skipped before anything else, including an explicit ``case_ids`` selection.\n    \"\"\"\n    all_cases = _all_cases(repo)\n    if owned is not None:\n        all_cases = _filter_owned(all_cases, owned)\n    if case_ids is not None:\n        selected = _select_by_id(all_cases, case_ids)\n    else:\n        selected = _capped([c for c in all_cases if _is_validatable(c)], max_findings)\n    _log_selection(selected)\n    return selected\n\n\ndef _select_by_id(all_cases: list[LoadedCase], case_ids: list[str]) -> list[LoadedCase]:\n    \"\"\"Resolve explicit case ids, raising IngestError on a missing or non-validatable state.\"\"\"\n    by_id = {loaded.case_id: loaded for loaded in all_cases}\n    missing = [cid for cid in case_ids if cid not in by_id]\n    if missing:\n        raise IngestError(f\"requested finding ids not found: {', '.join(missing)}\")\n    not_validatable = [\n        f\"{cid} (state '{by_id[cid].case.state.value}')\"\n        for cid in case_ids\n        if not _is_validatable(by_id[cid])\n    ]\n    if not_validatable:\n        raise IngestError(\n            \"validation cannot run — these findings are not in a validatable state \"\n            f\"(need {_VALIDATABLE}): {', '.join(not_validatable)}\"\n        )\n    return [by_id[cid] for cid in case_ids]\n",
+  "literals": {
+    "source_literal_15_0": {
+      "source": "vvaharness/validation/ingest/case_loader.py",
+      "line_start": 15,
+      "line_end": 15,
+      "value": "Discover and load finding cases from a target repo, selecting by FindingCase.state (derived).",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_40_5": {
+      "source": "vvaharness/validation/ingest/case_loader.py",
+      "line_start": 40,
+      "line_end": 40,
+      "source_expression": "f\"{CaseState.DECLINED.value} (only when not-applicable)\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_45_4": {
+      "source": "vvaharness/validation/ingest/case_loader.py",
+      "line_start": 45,
+      "line_end": 45,
+      "value": "A parsed case and the path it came from, so its verdict lands back in the same file.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_52_8": {
+      "source": "vvaharness/validation/ingest/case_loader.py",
+      "line_start": 52,
+      "line_end": 52,
+      "value": "The case's stable identity.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_57_4": {
+      "source": "vvaharness/validation/ingest/case_loader.py",
+      "line_start": 57,
+      "line_end": 64,
+      "value": "Return sorted case-file paths under the repo's remediation dir.\n\n    Refuses (via ``artifact_dir``) a ``security-remediation`` that is a symlink or not a\n    real directory, rather than following it outside the repo. A symlinked\n    ``finding_case.json``, or one whose ``<slug>`` parent directory is itself a symlink, is\n    silently excluded here rather than selected — the same escape ``artifact_dir`` already\n    refuses on the write side.\n    ",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_69_38": {
+      "source": "vvaharness/validation/ingest/case_loader.py",
+      "line_start": 69,
+      "line_end": 69,
+      "source_expression": "f\"*/{FINDING_CASE_FILENAME}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_75_4": {
+      "source": "vvaharness/validation/ingest/case_loader.py",
+      "line_start": 75,
+      "line_end": 75,
+      "value": "Parse a single finding case from disk.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_80_4": {
+      "source": "vvaharness/validation/ingest/case_loader.py",
+      "line_start": 80,
+      "line_end": 80,
+      "value": "Load a case, or None with a printed warning, so one bad case can't abort --all.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_85_12": {
+      "source": "vvaharness/validation/ingest/case_loader.py",
+      "line_start": 85,
+      "line_end": 86,
+      "source_expression": "f\"validate: skipping finding '{path.parent.name}' — \"\n            f\"unreadable finding case ({path}): {exc}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_92_4": {
+      "source": "vvaharness/validation/ingest/case_loader.py",
+      "line_start": 92,
+      "line_end": 92,
+      "value": "Every case id on disk, or None if the set can't be fully enumerated.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_100_4": {
+      "source": "vvaharness/validation/ingest/case_loader.py",
+      "line_start": 100,
+      "line_end": 100,
+      "value": "Load every readable case under *repo* (any state).",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_105_4": {
+      "source": "vvaharness/validation/ingest/case_loader.py",
+      "line_start": 105,
+      "line_end": 105,
+      "value": "True: validator can act; DECLINED/NOT_APPLICABLE too, not FALSE_POSITIVE/POLICY_DENIED.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_113_4": {
+      "source": "vvaharness/validation/ingest/case_loader.py",
+      "line_start": 113,
+      "line_end": 113,
+      "value": "True when the latest attempt declined for a reason a re-check could overturn.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_120_4": {
+      "source": "vvaharness/validation/ingest/case_loader.py",
+      "line_start": 120,
+      "line_end": 120,
+      "value": "Return the finding's CVSS base score; 0.0 when absent, so it sorts last.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_125_4": {
+      "source": "vvaharness/validation/ingest/case_loader.py",
+      "line_start": 125,
+      "line_end": 125,
+      "value": "Return the *limit* highest-CVSS cases; stable discovery order on ties.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_130_4": {
+      "source": "vvaharness/validation/ingest/case_loader.py",
+      "line_start": 130,
+      "line_end": 130,
+      "value": "Emit one stderr line per selected case so the ``--all`` route is never silent.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_133_12": {
+      "source": "vvaharness/validation/ingest/case_loader.py",
+      "line_start": 133,
+      "line_end": 133,
+      "source_expression": "f\"validate: selected {loaded.case_id} (state={loaded.case.state.value})\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_138_4": {
+      "source": "vvaharness/validation/ingest/case_loader.py",
+      "line_start": 138,
+      "line_end": 138,
+      "value": "Trim *cases* to the top ``max_findings`` by CVSS, announcing the cap on stderr.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_143_8": {
+      "source": "vvaharness/validation/ingest/case_loader.py",
+      "line_start": 143,
+      "line_end": 144,
+      "source_expression": "f\"validate: capping to top {max_findings} of {total} validatable findings by CVSS \"\n        f\"(use --all to validate every finding)\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_152_4": {
+      "source": "vvaharness/validation/ingest/case_loader.py",
+      "line_start": 152,
+      "line_end": 158,
+      "value": "Keep only cases this run's S10 (per the state store) actually produced.\n\n    ``owned`` is ``(finding_id, artifact_dir.resolve())`` pairs — see\n    ``vvaharness.remediation_agent.provenance.owned_cases``. Matching on both stops a\n    planted case that reuses a real id under a different slug directory. Applied BEFORE\n    the top-N CVSS cap, so a planted high-CVSS case cannot take a real case's slot.\n    ",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_166_16": {
+      "source": "vvaharness/validation/ingest/case_loader.py",
+      "line_start": 166,
+      "line_end": 167,
+      "source_expression": "f\"skipping {loaded.path.parent}: no S10 record for this case in the \"\n                \"state store (not written by this machine's remediation)\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_literal_179_4": {
+      "source": "vvaharness/validation/ingest/case_loader.py",
+      "line_start": 179,
+      "line_end": 184,
+      "value": "Load validatable cases: case_ids selects exactly those, else top max_findings by CVSS.\n\n    ``owned`` (when given) is the provenance set from\n    ``vvaharness.remediation_agent.provenance.owned_cases`` — a case missing from it is\n    skipped before anything else, including an explicit ``case_ids`` selection.\n    ",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_literal_197_4": {
+      "source": "vvaharness/validation/ingest/case_loader.py",
+      "line_start": 197,
+      "line_end": 197,
+      "value": "Resolve explicit case ids, raising IngestError on a missing or non-validatable state.",
+      "meaning": "exact source string constant; inert unless passed to an executable API"
+    },
+    "source_template_201_26": {
+      "source": "vvaharness/validation/ingest/case_loader.py",
+      "line_start": 201,
+      "line_end": 201,
+      "source_expression": "f\"requested finding ids not found: {', '.join(missing)}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_203_8": {
+      "source": "vvaharness/validation/ingest/case_loader.py",
+      "line_start": 203,
+      "line_end": 203,
+      "source_expression": "f\"{cid} (state '{by_id[cid].case.state.value}')\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    },
+    "source_template_209_12": {
+      "source": "vvaharness/validation/ingest/case_loader.py",
+      "line_start": 209,
+      "line_end": 210,
+      "source_expression": "\"validation cannot run — these findings are not in a validatable state \"\n            f\"(need {_VALIDATABLE}): {', '.join(not_validatable)}\"",
+      "meaning": "evaluate this source f-string at its original call site; not a frozen output"
+    }
+  },
+  "strings": [
+    {
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "value": "Discover and load finding cases from a target repo, selecting by FindingCase.state (derived).",
+      "context": "literal"
+    },
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 11,
+      "value": "LoadedCase",
+      "context": "literal"
+    },
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 25,
+      "value": "all_case_ids",
+      "context": "literal"
+    },
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 41,
+      "value": "discover_cases",
+      "context": "literal"
+    },
+    {
+      "line_start": 34,
+      "line_end": 34,
+      "column": 59,
+      "value": "load_case",
+      "context": "literal"
+    },
+    {
+      "line_start": 35,
+      "line_end": 35,
+      "column": 11,
+      "value": "select_cases",
+      "context": "literal"
+    },
+    {
+      "line_start": 45,
+      "line_end": 45,
+      "column": 4,
+      "value": "A parsed case and the path it came from, so its verdict lands back in the same file.",
+      "context": "literal"
+    },
+    {
+      "line_start": 57,
+      "line_end": 64,
+      "column": 4,
+      "value": "Return sorted case-file paths under the repo's remediation dir.\n\n    Refuses (via ``artifact_dir``) a ``security-remediation`` that is a symlink or not a\n    real directory, rather than following it outside the repo. A symlinked\n    ``finding_case.json``, or one whose ``<slug>`` parent directory is itself a symlink, is\n    silently excluded here rather than selected — the same escape ``artifact_dir`` already\n    refuses on the write side.\n    ",
+      "context": "literal"
+    },
+    {
+      "line_start": 75,
+      "line_end": 75,
+      "column": 4,
+      "value": "Parse a single finding case from disk.",
+      "context": "literal"
+    },
+    {
+      "line_start": 80,
+      "line_end": 80,
+      "column": 4,
+      "value": "Load a case, or None with a printed warning, so one bad case can't abort --all.",
+      "context": "literal"
+    },
+    {
+      "line_start": 92,
+      "line_end": 92,
+      "column": 4,
+      "value": "Every case id on disk, or None if the set can't be fully enumerated.",
+      "context": "literal"
+    },
+    {
+      "line_start": 100,
+      "line_end": 100,
+      "column": 4,
+      "value": "Load every readable case under *repo* (any state).",
+      "context": "literal"
+    },
+    {
+      "line_start": 105,
+      "line_end": 105,
+      "column": 4,
+      "value": "True: validator can act; DECLINED/NOT_APPLICABLE too, not FALSE_POSITIVE/POLICY_DENIED.",
+      "context": "literal"
+    },
+    {
+      "line_start": 113,
+      "line_end": 113,
+      "column": 4,
+      "value": "True when the latest attempt declined for a reason a re-check could overturn.",
+      "context": "literal"
+    },
+    {
+      "line_start": 120,
+      "line_end": 120,
+      "column": 4,
+      "value": "Return the finding's CVSS base score; 0.0 when absent, so it sorts last.",
+      "context": "literal"
+    },
+    {
+      "line_start": 125,
+      "line_end": 125,
+      "column": 4,
+      "value": "Return the *limit* highest-CVSS cases; stable discovery order on ties.",
+      "context": "literal"
+    },
+    {
+      "line_start": 130,
+      "line_end": 130,
+      "column": 4,
+      "value": "Emit one stderr line per selected case so the ``--all`` route is never silent.",
+      "context": "literal"
+    },
+    {
+      "line_start": 138,
+      "line_end": 138,
+      "column": 4,
+      "value": "Trim *cases* to the top ``max_findings`` by CVSS, announcing the cap on stderr.",
+      "context": "literal"
+    },
+    {
+      "line_start": 152,
+      "line_end": 158,
+      "column": 4,
+      "value": "Keep only cases this run's S10 (per the state store) actually produced.\n\n    ``owned`` is ``(finding_id, artifact_dir.resolve())`` pairs — see\n    ``vvaharness.remediation_agent.provenance.owned_cases``. Matching on both stops a\n    planted case that reuses a real id under a different slug directory. Applied BEFORE\n    the top-N CVSS cap, so a planted high-CVSS case cannot take a real case's slot.\n    ",
+      "context": "literal"
+    },
+    {
+      "line_start": 179,
+      "line_end": 184,
+      "column": 4,
+      "value": "Load validatable cases: case_ids selects exactly those, else top max_findings by CVSS.\n\n    ``owned`` (when given) is the provenance set from\n    ``vvaharness.remediation_agent.provenance.owned_cases`` — a case missing from it is\n    skipped before anything else, including an explicit ``case_ids`` selection.\n    ",
+      "context": "literal"
+    },
+    {
+      "line_start": 197,
+      "line_end": 197,
+      "column": 4,
+      "value": "Resolve explicit case ids, raising IngestError on a missing or non-validatable state.",
+      "context": "literal"
+    },
+    {
+      "line_start": 38,
+      "line_end": 38,
+      "column": 15,
+      "value": ", ",
+      "context": "literal"
+    },
+    {
+      "line_start": 52,
+      "line_end": 52,
+      "column": 8,
+      "value": "The case's stable identity.",
+      "context": "literal"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 10,
+      "value": "validate: capping to top ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 143,
+      "line_end": 143,
+      "column": 49,
+      "value": " of ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 143,
+      "line_end": 144,
+      "column": 60,
+      "value": " validatable findings by CVSS (use --all to validate every finding)",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 203,
+      "line_end": 203,
+      "column": 15,
+      "value": " (state '",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 203,
+      "line_end": 203,
+      "column": 53,
+      "value": "')",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 40,
+      "line_end": 40,
+      "column": 33,
+      "value": " (only when not-applicable)",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 14,
+      "value": "validate: selected ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 49,
+      "value": " (state=",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 133,
+      "line_end": 133,
+      "column": 82,
+      "value": ")",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 201,
+      "line_end": 201,
+      "column": 28,
+      "value": "requested finding ids not found: ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 209,
+      "line_end": 210,
+      "column": 12,
+      "value": "validation cannot run — these findings are not in a validatable state (need ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 210,
+      "line_end": 210,
+      "column": 34,
+      "value": "): ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 85,
+      "line_end": 85,
+      "column": 14,
+      "value": "validate: skipping finding '",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 85,
+      "line_end": 86,
+      "column": 60,
+      "value": "' — unreadable finding case (",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 86,
+      "line_end": 86,
+      "column": 45,
+      "value": "): ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 166,
+      "line_end": 166,
+      "column": 18,
+      "value": "skipping ",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 166,
+      "line_end": 167,
+      "column": 47,
+      "value": ": no S10 record for this case in the state store (not written by this machine's remediation)",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 69,
+      "line_end": 69,
+      "column": 40,
+      "value": "*/",
+      "context": "f-string segment"
+    },
+    {
+      "line_start": 201,
+      "line_end": 201,
+      "column": 62,
+      "value": ", ",
+      "context": "literal"
+    },
+    {
+      "line_start": 210,
+      "line_end": 210,
+      "column": 38,
+      "value": ", ",
+      "context": "literal"
+    }
+  ],
+  "comments": [
+    {
+      "line": 1,
+      "text": "# Copyright 2026 Visa, Inc."
+    },
+    {
+      "line": 2,
+      "text": "#"
+    },
+    {
+      "line": 3,
+      "text": "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+    },
+    {
+      "line": 4,
+      "text": "# you may not use this file except in compliance with the License."
+    },
+    {
+      "line": 5,
+      "text": "# You may obtain a copy of the License at"
+    },
+    {
+      "line": 6,
+      "text": "#"
+    },
+    {
+      "line": 7,
+      "text": "#     http://www.apache.org/licenses/LICENSE-2.0"
+    },
+    {
+      "line": 8,
+      "text": "#"
+    },
+    {
+      "line": 9,
+      "text": "# Unless required by applicable law or agreed to in writing, software"
+    },
+    {
+      "line": 10,
+      "text": "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+    },
+    {
+      "line": 11,
+      "text": "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+    },
+    {
+      "line": 12,
+      "text": "# See the License for the specific language governing permissions and"
+    },
+    {
+      "line": 13,
+      "text": "# limitations under the License."
+    },
+    {
+      "line": 37,
+      "text": "# The states named in the refusal message; DECLINED is conditional, see _is_validatable."
+    }
+  ],
+  "statements": [
+    {
+      "kind": "Expr",
+      "line_start": 15,
+      "line_end": 15,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 17,
+      "line_end": 17,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 19,
+      "line_end": 19,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 20,
+      "line_end": 20,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 22,
+      "line_end": 22,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 2
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 24,
+      "line_end": 24,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 25,
+      "line_end": 25,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 26,
+      "line_end": 26,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 27,
+      "line_end": 31,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "ImportFrom",
+      "line_start": 32,
+      "line_end": 32,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 4
+    },
+    {
+      "kind": "Assign",
+      "line_start": 34,
+      "line_end": 35,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "Assign",
+      "line_start": 38,
+      "line_end": 40,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 6
+    },
+    {
+      "kind": "ClassDef",
+      "line_start": 44,
+      "line_end": 53,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 7
+    },
+    {
+      "kind": "Expr",
+      "line_start": 45,
+      "line_end": 45,
+      "column": 4,
+      "owner": "LoadedCase",
+      "representation_line": 15
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 47,
+      "line_end": 47,
+      "column": 4,
+      "owner": "LoadedCase",
+      "representation_line": 15
+    },
+    {
+      "kind": "AnnAssign",
+      "line_start": 48,
+      "line_end": 48,
+      "column": 4,
+      "owner": "LoadedCase",
+      "representation_line": 15
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 51,
+      "line_end": 53,
+      "column": 4,
+      "owner": "LoadedCase",
+      "representation_line": 16
+    },
+    {
+      "kind": "Expr",
+      "line_start": 52,
+      "line_end": 52,
+      "column": 8,
+      "owner": "LoadedCase.case_id",
+      "representation_line": 25
+    },
+    {
+      "kind": "Return",
+      "line_start": 53,
+      "line_end": 53,
+      "column": 8,
+      "owner": "LoadedCase.case_id",
+      "representation_line": 26
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 56,
+      "line_end": 71,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 33
+    },
+    {
+      "kind": "Expr",
+      "line_start": 57,
+      "line_end": 64,
+      "column": 4,
+      "owner": "discover_cases",
+      "representation_line": 39
+    },
+    {
+      "kind": "Assign",
+      "line_start": 65,
+      "line_end": 65,
+      "column": 4,
+      "owner": "discover_cases",
+      "representation_line": 39
+    },
+    {
+      "kind": "If",
+      "line_start": 66,
+      "line_end": 67,
+      "column": 4,
+      "owner": "discover_cases",
+      "representation_line": 40
+    },
+    {
+      "kind": "Return",
+      "line_start": 67,
+      "line_end": 67,
+      "column": 8,
+      "owner": "discover_cases",
+      "representation_line": 42
+    },
+    {
+      "kind": "Return",
+      "line_start": 68,
+      "line_end": 71,
+      "column": 4,
+      "owner": "discover_cases",
+      "representation_line": 45
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 74,
+      "line_end": 76,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 49
+    },
+    {
+      "kind": "Expr",
+      "line_start": 75,
+      "line_end": 75,
+      "column": 4,
+      "owner": "load_case",
+      "representation_line": 55
+    },
+    {
+      "kind": "Return",
+      "line_start": 76,
+      "line_end": 76,
+      "column": 4,
+      "owner": "load_case",
+      "representation_line": 56
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 79,
+      "line_end": 88,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 60
+    },
+    {
+      "kind": "Expr",
+      "line_start": 80,
+      "line_end": 80,
+      "column": 4,
+      "owner": "_load_case_safe",
+      "representation_line": 66
+    },
+    {
+      "kind": "Try",
+      "line_start": 81,
+      "line_end": 88,
+      "column": 4,
+      "owner": "_load_case_safe",
+      "representation_line": 67
+    },
+    {
+      "kind": "Return",
+      "line_start": 82,
+      "line_end": 82,
+      "column": 8,
+      "owner": "_load_case_safe",
+      "representation_line": 69
+    },
+    {
+      "kind": "Expr",
+      "line_start": 84,
+      "line_end": 87,
+      "column": 8,
+      "owner": "_load_case_safe",
+      "representation_line": 75
+    },
+    {
+      "kind": "Return",
+      "line_start": 88,
+      "line_end": 88,
+      "column": 8,
+      "owner": "_load_case_safe",
+      "representation_line": 76
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 91,
+      "line_end": 96,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 81
+    },
+    {
+      "kind": "Expr",
+      "line_start": 92,
+      "line_end": 92,
+      "column": 4,
+      "owner": "all_case_ids",
+      "representation_line": 87
+    },
+    {
+      "kind": "Try",
+      "line_start": 93,
+      "line_end": 96,
+      "column": 4,
+      "owner": "all_case_ids",
+      "representation_line": 88
+    },
+    {
+      "kind": "Return",
+      "line_start": 94,
+      "line_end": 94,
+      "column": 8,
+      "owner": "all_case_ids",
+      "representation_line": 90
+    },
+    {
+      "kind": "Return",
+      "line_start": 96,
+      "line_end": 96,
+      "column": 8,
+      "owner": "all_case_ids",
+      "representation_line": 95
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 99,
+      "line_end": 101,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 100
+    },
+    {
+      "kind": "Expr",
+      "line_start": 100,
+      "line_end": 100,
+      "column": 4,
+      "owner": "_all_cases",
+      "representation_line": 106
+    },
+    {
+      "kind": "Return",
+      "line_start": 101,
+      "line_end": 101,
+      "column": 4,
+      "owner": "_all_cases",
+      "representation_line": 107
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 104,
+      "line_end": 109,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 111
+    },
+    {
+      "kind": "Expr",
+      "line_start": 105,
+      "line_end": 105,
+      "column": 4,
+      "owner": "_is_validatable",
+      "representation_line": 117
+    },
+    {
+      "kind": "Assign",
+      "line_start": 106,
+      "line_end": 106,
+      "column": 4,
+      "owner": "_is_validatable",
+      "representation_line": 117
+    },
+    {
+      "kind": "If",
+      "line_start": 107,
+      "line_end": 108,
+      "column": 4,
+      "owner": "_is_validatable",
+      "representation_line": 118
+    },
+    {
+      "kind": "Return",
+      "line_start": 108,
+      "line_end": 108,
+      "column": 8,
+      "owner": "_is_validatable",
+      "representation_line": 120
+    },
+    {
+      "kind": "Return",
+      "line_start": 109,
+      "line_end": 109,
+      "column": 4,
+      "owner": "_is_validatable",
+      "representation_line": 123
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 112,
+      "line_end": 116,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 127
+    },
+    {
+      "kind": "Expr",
+      "line_start": 113,
+      "line_end": 113,
+      "column": 4,
+      "owner": "_declined_for_review",
+      "representation_line": 133
+    },
+    {
+      "kind": "Assign",
+      "line_start": 114,
+      "line_end": 114,
+      "column": 4,
+      "owner": "_declined_for_review",
+      "representation_line": 133
+    },
+    {
+      "kind": "Return",
+      "line_start": 115,
+      "line_end": 116,
+      "column": 4,
+      "owner": "_declined_for_review",
+      "representation_line": 134
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 119,
+      "line_end": 121,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 138
+    },
+    {
+      "kind": "Expr",
+      "line_start": 120,
+      "line_end": 120,
+      "column": 4,
+      "owner": "_cvss_score",
+      "representation_line": 144
+    },
+    {
+      "kind": "Return",
+      "line_start": 121,
+      "line_end": 121,
+      "column": 4,
+      "owner": "_cvss_score",
+      "representation_line": 145
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 124,
+      "line_end": 126,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 149
+    },
+    {
+      "kind": "Expr",
+      "line_start": 125,
+      "line_end": 125,
+      "column": 4,
+      "owner": "_top_by_cvss",
+      "representation_line": 155
+    },
+    {
+      "kind": "Return",
+      "line_start": 126,
+      "line_end": 126,
+      "column": 4,
+      "owner": "_top_by_cvss",
+      "representation_line": 156
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 129,
+      "line_end": 134,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 160
+    },
+    {
+      "kind": "Expr",
+      "line_start": 130,
+      "line_end": 130,
+      "column": 4,
+      "owner": "_log_selection",
+      "representation_line": 166
+    },
+    {
+      "kind": "For",
+      "line_start": 131,
+      "line_end": 134,
+      "column": 4,
+      "owner": "_log_selection",
+      "representation_line": 167
+    },
+    {
+      "kind": "Expr",
+      "line_start": 132,
+      "line_end": 134,
+      "column": 8,
+      "owner": "_log_selection",
+      "representation_line": 170
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 137,
+      "line_end": 146,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 174
+    },
+    {
+      "kind": "Expr",
+      "line_start": 138,
+      "line_end": 138,
+      "column": 4,
+      "owner": "_capped",
+      "representation_line": 180
+    },
+    {
+      "kind": "If",
+      "line_start": 139,
+      "line_end": 140,
+      "column": 4,
+      "owner": "_capped",
+      "representation_line": 181
+    },
+    {
+      "kind": "Return",
+      "line_start": 140,
+      "line_end": 140,
+      "column": 8,
+      "owner": "_capped",
+      "representation_line": 183
+    },
+    {
+      "kind": "Assign",
+      "line_start": 141,
+      "line_end": 141,
+      "column": 4,
+      "owner": "_capped",
+      "representation_line": 187
+    },
+    {
+      "kind": "Expr",
+      "line_start": 142,
+      "line_end": 145,
+      "column": 4,
+      "owner": "_capped",
+      "representation_line": 187
+    },
+    {
+      "kind": "Return",
+      "line_start": 146,
+      "line_end": 146,
+      "column": 4,
+      "owner": "_capped",
+      "representation_line": 188
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 149,
+      "line_end": 169,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 192
+    },
+    {
+      "kind": "Expr",
+      "line_start": 152,
+      "line_end": 158,
+      "column": 4,
+      "owner": "_filter_owned",
+      "representation_line": 198
+    },
+    {
+      "kind": "Assign",
+      "line_start": 159,
+      "line_end": 159,
+      "column": 4,
+      "owner": "_filter_owned",
+      "representation_line": 198
+    },
+    {
+      "kind": "For",
+      "line_start": 160,
+      "line_end": 168,
+      "column": 4,
+      "owner": "_filter_owned",
+      "representation_line": 199
+    },
+    {
+      "kind": "Assign",
+      "line_start": 161,
+      "line_end": 161,
+      "column": 8,
+      "owner": "_filter_owned",
+      "representation_line": 202
+    },
+    {
+      "kind": "If",
+      "line_start": 162,
+      "line_end": 168,
+      "column": 8,
+      "owner": "_filter_owned",
+      "representation_line": 203
+    },
+    {
+      "kind": "Expr",
+      "line_start": 163,
+      "line_end": 163,
+      "column": 12,
+      "owner": "_filter_owned",
+      "representation_line": 206
+    },
+    {
+      "kind": "Expr",
+      "line_start": 165,
+      "line_end": 168,
+      "column": 12,
+      "owner": "_filter_owned",
+      "representation_line": 210
+    },
+    {
+      "kind": "Return",
+      "line_start": 169,
+      "line_end": 169,
+      "column": 4,
+      "owner": "_filter_owned",
+      "representation_line": 213
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 172,
+      "line_end": 193,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 217
+    },
+    {
+      "kind": "Expr",
+      "line_start": 179,
+      "line_end": 184,
+      "column": 4,
+      "owner": "select_cases",
+      "representation_line": 223
+    },
+    {
+      "kind": "Assign",
+      "line_start": 185,
+      "line_end": 185,
+      "column": 4,
+      "owner": "select_cases",
+      "representation_line": 223
+    },
+    {
+      "kind": "If",
+      "line_start": 186,
+      "line_end": 187,
+      "column": 4,
+      "owner": "select_cases",
+      "representation_line": 224
+    },
+    {
+      "kind": "Assign",
+      "line_start": 187,
+      "line_end": 187,
+      "column": 8,
+      "owner": "select_cases",
+      "representation_line": 227
+    },
+    {
+      "kind": "If",
+      "line_start": 188,
+      "line_end": 191,
+      "column": 4,
+      "owner": "select_cases",
+      "representation_line": 229
+    },
+    {
+      "kind": "Assign",
+      "line_start": 189,
+      "line_end": 189,
+      "column": 8,
+      "owner": "select_cases",
+      "representation_line": 232
+    },
+    {
+      "kind": "Assign",
+      "line_start": 191,
+      "line_end": 191,
+      "column": 8,
+      "owner": "select_cases",
+      "representation_line": 236
+    },
+    {
+      "kind": "Expr",
+      "line_start": 192,
+      "line_end": 192,
+      "column": 4,
+      "owner": "select_cases",
+      "representation_line": 239
+    },
+    {
+      "kind": "Return",
+      "line_start": 193,
+      "line_end": 193,
+      "column": 4,
+      "owner": "select_cases",
+      "representation_line": 240
+    },
+    {
+      "kind": "FunctionDef",
+      "line_start": 196,
+      "line_end": 212,
+      "column": 0,
+      "owner": "module initialization",
+      "representation_line": 244
+    },
+    {
+      "kind": "Expr",
+      "line_start": 197,
+      "line_end": 197,
+      "column": 4,
+      "owner": "_select_by_id",
+      "representation_line": 250
+    },
+    {
+      "kind": "Assign",
+      "line_start": 198,
+      "line_end": 198,
+      "column": 4,
+      "owner": "_select_by_id",
+      "representation_line": 250
+    },
+    {
+      "kind": "Assign",
+      "line_start": 199,
+      "line_end": 199,
+      "column": 4,
+      "owner": "_select_by_id",
+      "representation_line": 250
+    },
+    {
+      "kind": "If",
+      "line_start": 200,
+      "line_end": 201,
+      "column": 4,
+      "owner": "_select_by_id",
+      "representation_line": 251
+    },
+    {
+      "kind": "Raise",
+      "line_start": 201,
+      "line_end": 201,
+      "column": 8,
+      "owner": "_select_by_id",
+      "representation_line": 253
+    },
+    {
+      "kind": "Assign",
+      "line_start": 202,
+      "line_end": 206,
+      "column": 4,
+      "owner": "_select_by_id",
+      "representation_line": 257
+    },
+    {
+      "kind": "If",
+      "line_start": 207,
+      "line_end": 211,
+      "column": 4,
+      "owner": "_select_by_id",
+      "representation_line": 258
+    },
+    {
+      "kind": "Raise",
+      "line_start": 208,
+      "line_end": 211,
+      "column": 8,
+      "owner": "_select_by_id",
+      "representation_line": 260
+    },
+    {
+      "kind": "Return",
+      "line_start": 212,
+      "line_end": 212,
+      "column": 4,
+      "owner": "_select_by_id",
+      "representation_line": 263
+    }
+  ],
+  "expressions": [
+    {
+      "line_start": 34,
+      "line_end": 35,
+      "column": 10,
+      "kind": "List",
+      "original_ast": "List(elts=[Constant(value='LoadedCase'), Constant(value='all_case_ids'), Constant(value='discover_cases'), Constant(value='load_case'), Constant(value='select_cases')], ctx=Load())",
+      "rendered": "['LoadedCase', 'all_case_ids', 'discover_cases', 'load_case', 'select_cases']"
+    },
+    {
+      "line_start": 38,
+      "line_end": 40,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Constant(value=', '), attr='join', ctx=Load()), args=[Call(func=Name(id='sorted', ctx=Load()), args=[List(elts=[Starred(value=GeneratorExp(elt=Attribute(value=Name(id='state', ctx=Load()), attr='value', ctx=Load()), generators=[comprehension(target=Name(id='state', ctx=Store()), iter=Name(id='VALIDATABLE_STATES', ctx=Load()), ifs=[], is_async=0)]), ctx=Load()), JoinedStr(values=[FormattedValue(value=Attribute(value=Attribute(value=Name(id='CaseState', ctx=Load()), attr='DECLINED', ctx=Load()), attr='value', ctx=Load()), conversion=-1), Constant(value=' (only when not-applicable)')])], ctx=Load())], keywords=[])], keywords=[])",
+      "rendered": "', '.join(sorted([*(state.value for state in VALIDATABLE_STATES), source_template_40_5]))"
+    },
+    {
+      "line_start": 43,
+      "line_end": 43,
+      "column": 1,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='dataclass', ctx=Load()), args=[], keywords=[keyword(arg='frozen', value=Constant(value=True))])",
+      "rendered": "dataclass(frozen=True)"
+    },
+    {
+      "line_start": 50,
+      "line_end": 50,
+      "column": 5,
+      "kind": "Name",
+      "original_ast": "Name(id='property', ctx=Load())",
+      "rendered": "property"
+    },
+    {
+      "line_start": 53,
+      "line_end": 53,
+      "column": 15,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Attribute(value=Name(id='self', ctx=Load()), attr='case', ctx=Load()), attr='case_id', ctx=Load())",
+      "rendered": "self.case.case_id"
+    },
+    {
+      "line_start": 65,
+      "line_end": 65,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='artifact_dir', ctx=Load()), args=[Name(id='repo', ctx=Load()), Name(id='REMEDIATION_DIRNAME', ctx=Load())], keywords=[])",
+      "rendered": "artifact_dir(repo, REMEDIATION_DIRNAME)"
+    },
+    {
+      "line_start": 66,
+      "line_end": 66,
+      "column": 7,
+      "kind": "UnaryOp",
+      "original_ast": "UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='rem_dir', ctx=Load()), attr='is_dir', ctx=Load()), args=[], keywords=[]))",
+      "rendered": "not rem_dir.is_dir()"
+    },
+    {
+      "line_start": 67,
+      "line_end": 67,
+      "column": 15,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 68,
+      "line_end": 71,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='sorted', ctx=Load()), args=[GeneratorExp(elt=Name(id='path', ctx=Load()), generators=[comprehension(target=Name(id='path', ctx=Store()), iter=Call(func=Attribute(value=Name(id='rem_dir', ctx=Load()), attr='glob', ctx=Load()), args=[JoinedStr(values=[Constant(value='*/'), FormattedValue(value=Name(id='FINDING_CASE_FILENAME', ctx=Load()), conversion=-1)])], keywords=[]), ifs=[BoolOp(op=And(), values=[UnaryOp(op=Not(), operand=Call(func=Attribute(value=Name(id='path', ctx=Load()), attr='is_symlink', ctx=Load()), args=[], keywords=[])), UnaryOp(op=Not(), operand=Call(func=Attribute(value=Attribute(value=Name(id='path', ctx=Load()), attr='parent', ctx=Load()), attr='is_symlink', ctx=Load()), args=[], keywords=[]))])], is_async=0)])], keywords=[])",
+      "rendered": "sorted((path for path in rem_dir.glob(source_template_69_38) if not path.is_symlink() and (not path.parent.is_symlink())))"
+    },
+    {
+      "line_start": 76,
+      "line_end": 76,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='LoadedCase', ctx=Load()), args=[], keywords=[keyword(arg='case', value=Call(func=Attribute(value=Name(id='FindingCase', ctx=Load()), attr='read', ctx=Load()), args=[Name(id='path', ctx=Load())], keywords=[])), keyword(arg='path', value=Name(id='path', ctx=Load()))])",
+      "rendered": "LoadedCase(case=FindingCase.read(path), path=path)"
+    },
+    {
+      "line_start": 82,
+      "line_end": 82,
+      "column": 15,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='load_case', ctx=Load()), args=[Name(id='path', ctx=Load())], keywords=[])",
+      "rendered": "load_case(path)"
+    },
+    {
+      "line_start": 83,
+      "line_end": 83,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='OSError', ctx=Load()), Name(id='ValueError', ctx=Load()), Name(id='ValidationError', ctx=Load())], ctx=Load())",
+      "rendered": "(OSError, ValueError, ValidationError)"
+    },
+    {
+      "line_start": 84,
+      "line_end": 87,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value=\"validate: skipping finding '\"), FormattedValue(value=Attribute(value=Attribute(value=Name(id='path', ctx=Load()), attr='parent', ctx=Load()), attr='name', ctx=Load()), conversion=-1), Constant(value=\"' — unreadable finding case (\"), FormattedValue(value=Name(id='path', ctx=Load()), conversion=-1), Constant(value='): '), FormattedValue(value=Name(id='exc', ctx=Load()), conversion=-1)])], keywords=[])",
+      "rendered": "console.write(source_template_85_12)"
+    },
+    {
+      "line_start": 88,
+      "line_end": 88,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 94,
+      "line_end": 94,
+      "column": 15,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Attribute(value=Call(func=Name(id='load_case', ctx=Load()), args=[Name(id='path', ctx=Load())], keywords=[]), attr='case_id', ctx=Load()), generators=[comprehension(target=Name(id='path', ctx=Store()), iter=Call(func=Name(id='discover_cases', ctx=Load()), args=[Name(id='repo', ctx=Load())], keywords=[]), ifs=[], is_async=0)])",
+      "rendered": "[load_case(path).case_id for path in discover_cases(repo)]"
+    },
+    {
+      "line_start": 95,
+      "line_end": 95,
+      "column": 11,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Name(id='OSError', ctx=Load()), Name(id='ValueError', ctx=Load()), Name(id='ValidationError', ctx=Load())], ctx=Load())",
+      "rendered": "(OSError, ValueError, ValidationError)"
+    },
+    {
+      "line_start": 96,
+      "line_end": 96,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=None)",
+      "rendered": "None"
+    },
+    {
+      "line_start": 101,
+      "line_end": 101,
+      "column": 11,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='c', ctx=Load()), generators=[comprehension(target=Name(id='path', ctx=Store()), iter=Call(func=Name(id='discover_cases', ctx=Load()), args=[Name(id='repo', ctx=Load())], keywords=[]), ifs=[Compare(left=NamedExpr(target=Name(id='c', ctx=Store()), value=Call(func=Name(id='_load_case_safe', ctx=Load()), args=[Name(id='path', ctx=Load())], keywords=[])), ops=[IsNot()], comparators=[Constant(value=None)])], is_async=0)])",
+      "rendered": "[c for path in discover_cases(repo) if (c := _load_case_safe(path)) is not None]"
+    },
+    {
+      "line_start": 106,
+      "line_end": 106,
+      "column": 11,
+      "kind": "Attribute",
+      "original_ast": "Attribute(value=Name(id='loaded', ctx=Load()), attr='case', ctx=Load())",
+      "rendered": "loaded.case"
+    },
+    {
+      "line_start": 107,
+      "line_end": 107,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Attribute(value=Name(id='case', ctx=Load()), attr='state', ctx=Load()), ops=[In()], comparators=[Name(id='VALIDATABLE_STATES', ctx=Load())])",
+      "rendered": "case.state in VALIDATABLE_STATES"
+    },
+    {
+      "line_start": 108,
+      "line_end": 108,
+      "column": 15,
+      "kind": "Constant",
+      "original_ast": "Constant(value=True)",
+      "rendered": "True"
+    },
+    {
+      "line_start": 109,
+      "line_end": 109,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Attribute(value=Name(id='case', ctx=Load()), attr='state', ctx=Load()), ops=[Is()], comparators=[Attribute(value=Name(id='CaseState', ctx=Load()), attr='DECLINED', ctx=Load())]), Call(func=Name(id='_declined_for_review', ctx=Load()), args=[Name(id='case', ctx=Load())], keywords=[])])",
+      "rendered": "case.state is CaseState.DECLINED and _declined_for_review(case)"
+    },
+    {
+      "line_start": 114,
+      "line_end": 114,
+      "column": 13,
+      "kind": "IfExp",
+      "original_ast": "IfExp(test=Attribute(value=Name(id='case', ctx=Load()), attr='attempts', ctx=Load()), body=Subscript(value=Attribute(value=Name(id='case', ctx=Load()), attr='attempts', ctx=Load()), slice=UnaryOp(op=USub(), operand=Constant(value=1)), ctx=Load()), orelse=Constant(value=None))",
+      "rendered": "case.attempts[-1] if case.attempts else None"
+    },
+    {
+      "line_start": 115,
+      "line_end": 116,
+      "column": 12,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=And(), values=[Compare(left=Name(id='latest', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)]), Compare(left=Attribute(value=Attribute(value=Name(id='latest', ctx=Load()), attr='remediation', ctx=Load()), attr='disposition', ctx=Load()), ops=[Is()], comparators=[Attribute(value=Name(id='Disposition', ctx=Load()), attr='NOT_APPLICABLE', ctx=Load())])])",
+      "rendered": "latest is not None and latest.remediation.disposition is Disposition.NOT_APPLICABLE"
+    },
+    {
+      "line_start": 121,
+      "line_end": 121,
+      "column": 11,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Attribute(value=Attribute(value=Attribute(value=Name(id='loaded', ctx=Load()), attr='case', ctx=Load()), attr='finding', ctx=Load()), attr='cvss_score', ctx=Load()), Constant(value=0.0)])",
+      "rendered": "loaded.case.finding.cvss_score or 0.0"
+    },
+    {
+      "line_start": 126,
+      "line_end": 126,
+      "column": 11,
+      "kind": "Subscript",
+      "original_ast": "Subscript(value=Call(func=Name(id='sorted', ctx=Load()), args=[Name(id='cases', ctx=Load())], keywords=[keyword(arg='key', value=Name(id='_cvss_score', ctx=Load())), keyword(arg='reverse', value=Constant(value=True))]), slice=Slice(upper=Name(id='limit', ctx=Load())), ctx=Load())",
+      "rendered": "sorted(cases, key=_cvss_score, reverse=True)[:limit]"
+    },
+    {
+      "line_start": 131,
+      "line_end": 131,
+      "column": 18,
+      "kind": "Name",
+      "original_ast": "Name(id='cases', ctx=Load())",
+      "rendered": "cases"
+    },
+    {
+      "line_start": 132,
+      "line_end": 134,
+      "column": 8,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='validate: selected '), FormattedValue(value=Attribute(value=Name(id='loaded', ctx=Load()), attr='case_id', ctx=Load()), conversion=-1), Constant(value=' (state='), FormattedValue(value=Attribute(value=Attribute(value=Attribute(value=Name(id='loaded', ctx=Load()), attr='case', ctx=Load()), attr='state', ctx=Load()), attr='value', ctx=Load()), conversion=-1), Constant(value=')')])], keywords=[])",
+      "rendered": "console.write(source_template_133_12)"
+    },
+    {
+      "line_start": 139,
+      "line_end": 139,
+      "column": 7,
+      "kind": "BoolOp",
+      "original_ast": "BoolOp(op=Or(), values=[Compare(left=Name(id='max_findings', ctx=Load()), ops=[Is()], comparators=[Constant(value=None)]), Compare(left=Name(id='max_findings', ctx=Load()), ops=[LtE()], comparators=[Constant(value=0)]), Compare(left=Call(func=Name(id='len', ctx=Load()), args=[Name(id='cases', ctx=Load())], keywords=[]), ops=[LtE()], comparators=[Name(id='max_findings', ctx=Load())])])",
+      "rendered": "max_findings is None or max_findings <= 0 or len(cases) <= max_findings"
+    },
+    {
+      "line_start": 140,
+      "line_end": 140,
+      "column": 15,
+      "kind": "Name",
+      "original_ast": "Name(id='cases', ctx=Load())",
+      "rendered": "cases"
+    },
+    {
+      "line_start": 141,
+      "line_end": 141,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='len', ctx=Load()), args=[Name(id='cases', ctx=Load())], keywords=[])",
+      "rendered": "len(cases)"
+    },
+    {
+      "line_start": 142,
+      "line_end": 145,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='validate: capping to top '), FormattedValue(value=Name(id='max_findings', ctx=Load()), conversion=-1), Constant(value=' of '), FormattedValue(value=Name(id='total', ctx=Load()), conversion=-1), Constant(value=' validatable findings by CVSS (use --all to validate every finding)')])], keywords=[])",
+      "rendered": "console.write(source_template_143_8)"
+    },
+    {
+      "line_start": 146,
+      "line_end": 146,
+      "column": 11,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_top_by_cvss', ctx=Load()), args=[Name(id='cases', ctx=Load()), Name(id='max_findings', ctx=Load())], keywords=[])",
+      "rendered": "_top_by_cvss(cases, max_findings)"
+    },
+    {
+      "line_start": 159,
+      "line_end": 159,
+      "column": 11,
+      "kind": "List",
+      "original_ast": "List(elts=[], ctx=Load())",
+      "rendered": "[]"
+    },
+    {
+      "line_start": 160,
+      "line_end": 160,
+      "column": 18,
+      "kind": "Name",
+      "original_ast": "Name(id='cases', ctx=Load())",
+      "rendered": "cases"
+    },
+    {
+      "line_start": 161,
+      "line_end": 161,
+      "column": 14,
+      "kind": "Tuple",
+      "original_ast": "Tuple(elts=[Attribute(value=Name(id='loaded', ctx=Load()), attr='case_id', ctx=Load()), Call(func=Attribute(value=Attribute(value=Attribute(value=Name(id='loaded', ctx=Load()), attr='path', ctx=Load()), attr='parent', ctx=Load()), attr='resolve', ctx=Load()), args=[], keywords=[])], ctx=Load())",
+      "rendered": "(loaded.case_id, loaded.path.parent.resolve())"
+    },
+    {
+      "line_start": 162,
+      "line_end": 162,
+      "column": 11,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='key', ctx=Load()), ops=[In()], comparators=[Name(id='owned', ctx=Load())])",
+      "rendered": "key in owned"
+    },
+    {
+      "line_start": 163,
+      "line_end": 163,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='kept', ctx=Load()), attr='append', ctx=Load()), args=[Name(id='loaded', ctx=Load())], keywords=[])",
+      "rendered": "kept.append(loaded)"
+    },
+    {
+      "line_start": 165,
+      "line_end": 168,
+      "column": 12,
+      "kind": "Call",
+      "original_ast": "Call(func=Attribute(value=Name(id='console', ctx=Load()), attr='write', ctx=Load()), args=[JoinedStr(values=[Constant(value='skipping '), FormattedValue(value=Attribute(value=Attribute(value=Name(id='loaded', ctx=Load()), attr='path', ctx=Load()), attr='parent', ctx=Load()), conversion=-1), Constant(value=\": no S10 record for this case in the state store (not written by this machine's remediation)\")])], keywords=[])",
+      "rendered": "console.write(source_template_166_16)"
+    },
+    {
+      "line_start": 169,
+      "line_end": 169,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='kept', ctx=Load())",
+      "rendered": "kept"
+    },
+    {
+      "line_start": 185,
+      "line_end": 185,
+      "column": 16,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_all_cases', ctx=Load()), args=[Name(id='repo', ctx=Load())], keywords=[])",
+      "rendered": "_all_cases(repo)"
+    },
+    {
+      "line_start": 186,
+      "line_end": 186,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='owned', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "owned is not None"
+    },
+    {
+      "line_start": 187,
+      "line_end": 187,
+      "column": 20,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_filter_owned', ctx=Load()), args=[Name(id='all_cases', ctx=Load()), Name(id='owned', ctx=Load())], keywords=[])",
+      "rendered": "_filter_owned(all_cases, owned)"
+    },
+    {
+      "line_start": 188,
+      "line_end": 188,
+      "column": 7,
+      "kind": "Compare",
+      "original_ast": "Compare(left=Name(id='case_ids', ctx=Load()), ops=[IsNot()], comparators=[Constant(value=None)])",
+      "rendered": "case_ids is not None"
+    },
+    {
+      "line_start": 189,
+      "line_end": 189,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_select_by_id', ctx=Load()), args=[Name(id='all_cases', ctx=Load()), Name(id='case_ids', ctx=Load())], keywords=[])",
+      "rendered": "_select_by_id(all_cases, case_ids)"
+    },
+    {
+      "line_start": 191,
+      "line_end": 191,
+      "column": 19,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_capped', ctx=Load()), args=[ListComp(elt=Name(id='c', ctx=Load()), generators=[comprehension(target=Name(id='c', ctx=Store()), iter=Name(id='all_cases', ctx=Load()), ifs=[Call(func=Name(id='_is_validatable', ctx=Load()), args=[Name(id='c', ctx=Load())], keywords=[])], is_async=0)]), Name(id='max_findings', ctx=Load())], keywords=[])",
+      "rendered": "_capped([c for c in all_cases if _is_validatable(c)], max_findings)"
+    },
+    {
+      "line_start": 192,
+      "line_end": 192,
+      "column": 4,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='_log_selection', ctx=Load()), args=[Name(id='selected', ctx=Load())], keywords=[])",
+      "rendered": "_log_selection(selected)"
+    },
+    {
+      "line_start": 193,
+      "line_end": 193,
+      "column": 11,
+      "kind": "Name",
+      "original_ast": "Name(id='selected', ctx=Load())",
+      "rendered": "selected"
+    },
+    {
+      "line_start": 198,
+      "line_end": 198,
+      "column": 12,
+      "kind": "DictComp",
+      "original_ast": "DictComp(key=Attribute(value=Name(id='loaded', ctx=Load()), attr='case_id', ctx=Load()), value=Name(id='loaded', ctx=Load()), generators=[comprehension(target=Name(id='loaded', ctx=Store()), iter=Name(id='all_cases', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "{loaded.case_id: loaded for loaded in all_cases}"
+    },
+    {
+      "line_start": 199,
+      "line_end": 199,
+      "column": 14,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Name(id='cid', ctx=Load()), generators=[comprehension(target=Name(id='cid', ctx=Store()), iter=Name(id='case_ids', ctx=Load()), ifs=[Compare(left=Name(id='cid', ctx=Load()), ops=[NotIn()], comparators=[Name(id='by_id', ctx=Load())])], is_async=0)])",
+      "rendered": "[cid for cid in case_ids if cid not in by_id]"
+    },
+    {
+      "line_start": 200,
+      "line_end": 200,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='missing', ctx=Load())",
+      "rendered": "missing"
+    },
+    {
+      "line_start": 201,
+      "line_end": 201,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='IngestError', ctx=Load()), args=[JoinedStr(values=[Constant(value='requested finding ids not found: '), FormattedValue(value=Call(func=Attribute(value=Constant(value=', '), attr='join', ctx=Load()), args=[Name(id='missing', ctx=Load())], keywords=[]), conversion=-1)])], keywords=[])",
+      "rendered": "IngestError(source_template_201_26)"
+    },
+    {
+      "line_start": 202,
+      "line_end": 206,
+      "column": 22,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=JoinedStr(values=[FormattedValue(value=Name(id='cid', ctx=Load()), conversion=-1), Constant(value=\" (state '\"), FormattedValue(value=Attribute(value=Attribute(value=Attribute(value=Subscript(value=Name(id='by_id', ctx=Load()), slice=Name(id='cid', ctx=Load()), ctx=Load()), attr='case', ctx=Load()), attr='state', ctx=Load()), attr='value', ctx=Load()), conversion=-1), Constant(value=\"')\")]), generators=[comprehension(target=Name(id='cid', ctx=Store()), iter=Name(id='case_ids', ctx=Load()), ifs=[UnaryOp(op=Not(), operand=Call(func=Name(id='_is_validatable', ctx=Load()), args=[Subscript(value=Name(id='by_id', ctx=Load()), slice=Name(id='cid', ctx=Load()), ctx=Load())], keywords=[]))], is_async=0)])",
+      "rendered": "[source_template_203_8 for cid in case_ids if not _is_validatable(by_id[cid])]"
+    },
+    {
+      "line_start": 207,
+      "line_end": 207,
+      "column": 7,
+      "kind": "Name",
+      "original_ast": "Name(id='not_validatable', ctx=Load())",
+      "rendered": "not_validatable"
+    },
+    {
+      "line_start": 208,
+      "line_end": 211,
+      "column": 14,
+      "kind": "Call",
+      "original_ast": "Call(func=Name(id='IngestError', ctx=Load()), args=[JoinedStr(values=[Constant(value='validation cannot run — these findings are not in a validatable state (need '), FormattedValue(value=Name(id='_VALIDATABLE', ctx=Load()), conversion=-1), Constant(value='): '), FormattedValue(value=Call(func=Attribute(value=Constant(value=', '), attr='join', ctx=Load()), args=[Name(id='not_validatable', ctx=Load())], keywords=[]), conversion=-1)])], keywords=[])",
+      "rendered": "IngestError(source_template_209_12)"
+    },
+    {
+      "line_start": 212,
+      "line_end": 212,
+      "column": 11,
+      "kind": "ListComp",
+      "original_ast": "ListComp(elt=Subscript(value=Name(id='by_id', ctx=Load()), slice=Name(id='cid', ctx=Load()), ctx=Load()), generators=[comprehension(target=Name(id='cid', ctx=Store()), iter=Name(id='case_ids', ctx=Load()), ifs=[], is_async=0)])",
+      "rendered": "[by_id[cid] for cid in case_ids]"
+    }
+  ],
+  "calls": [
+    {
+      "line": 38,
+      "end_line": 40,
+      "callee": "', '.join",
+      "enclosing": "module initialization",
+      "expression": "\", \".join(sorted(\n    [*(state.value for state in VALIDATABLE_STATES),\n     f\"{CaseState.DECLINED.value} (only when not-applicable)\"]))"
+    },
+    {
+      "line": 43,
+      "end_line": 43,
+      "callee": "dataclass",
+      "enclosing": "LoadedCase",
+      "expression": "dataclass(frozen=True)"
+    },
+    {
+      "line": 38,
+      "end_line": 40,
+      "callee": "sorted",
+      "enclosing": "module initialization",
+      "expression": "sorted(\n    [*(state.value for state in VALIDATABLE_STATES),\n     f\"{CaseState.DECLINED.value} (only when not-applicable)\"])"
+    },
+    {
+      "line": 65,
+      "end_line": 65,
+      "callee": "artifact_dir",
+      "enclosing": "discover_cases",
+      "expression": "artifact_dir(repo, REMEDIATION_DIRNAME)"
+    },
+    {
+      "line": 68,
+      "end_line": 71,
+      "callee": "sorted",
+      "enclosing": "discover_cases",
+      "expression": "sorted(\n        path for path in rem_dir.glob(f\"*/{FINDING_CASE_FILENAME}\")\n        if not path.is_symlink() and not path.parent.is_symlink()\n    )"
+    },
+    {
+      "line": 76,
+      "end_line": 76,
+      "callee": "LoadedCase",
+      "enclosing": "load_case",
+      "expression": "LoadedCase(case=FindingCase.read(path), path=path)"
+    },
+    {
+      "line": 141,
+      "end_line": 141,
+      "callee": "len",
+      "enclosing": "_capped",
+      "expression": "len(cases)"
+    },
+    {
+      "line": 142,
+      "end_line": 145,
+      "callee": "console.write",
+      "enclosing": "_capped",
+      "expression": "console.write(\n        f\"validate: capping to top {max_findings} of {total} validatable findings by CVSS \"\n        f\"(use --all to validate every finding)\"\n    )"
+    },
+    {
+      "line": 146,
+      "end_line": 146,
+      "callee": "_top_by_cvss",
+      "enclosing": "_capped",
+      "expression": "_top_by_cvss(cases, max_findings)"
+    },
+    {
+      "line": 185,
+      "end_line": 185,
+      "callee": "_all_cases",
+      "enclosing": "select_cases",
+      "expression": "_all_cases(repo)"
+    },
+    {
+      "line": 192,
+      "end_line": 192,
+      "callee": "_log_selection",
+      "enclosing": "select_cases",
+      "expression": "_log_selection(selected)"
+    },
+    {
+      "line": 66,
+      "end_line": 66,
+      "callee": "rem_dir.is_dir",
+      "enclosing": "discover_cases",
+      "expression": "rem_dir.is_dir()"
+    },
+    {
+      "line": 82,
+      "end_line": 82,
+      "callee": "load_case",
+      "enclosing": "_load_case_safe",
+      "expression": "load_case(path)"
+    },
+    {
+      "line": 109,
+      "end_line": 109,
+      "callee": "_declined_for_review",
+      "enclosing": "_is_validatable",
+      "expression": "_declined_for_review(case)"
+    },
+    {
+      "line": 126,
+      "end_line": 126,
+      "callee": "sorted",
+      "enclosing": "_top_by_cvss",
+      "expression": "sorted(cases, key=_cvss_score, reverse=True)"
+    },
+    {
+      "line": 132,
+      "end_line": 134,
+      "callee": "console.write",
+      "enclosing": "_log_selection",
+      "expression": "console.write(\n            f\"validate: selected {loaded.case_id} (state={loaded.case.state.value})\"\n        )"
+    },
+    {
+      "line": 187,
+      "end_line": 187,
+      "callee": "_filter_owned",
+      "enclosing": "select_cases",
+      "expression": "_filter_owned(all_cases, owned)"
+    },
+    {
+      "line": 189,
+      "end_line": 189,
+      "callee": "_select_by_id",
+      "enclosing": "select_cases",
+      "expression": "_select_by_id(all_cases, case_ids)"
+    },
+    {
+      "line": 191,
+      "end_line": 191,
+      "callee": "_capped",
+      "enclosing": "select_cases",
+      "expression": "_capped([c for c in all_cases if _is_validatable(c)], max_findings)"
+    },
+    {
+      "line": 201,
+      "end_line": 201,
+      "callee": "IngestError",
+      "enclosing": "_select_by_id",
+      "expression": "IngestError(f\"requested finding ids not found: {', '.join(missing)}\")"
+    },
+    {
+      "line": 208,
+      "end_line": 211,
+      "callee": "IngestError",
+      "enclosing": "_select_by_id",
+      "expression": "IngestError(\n            \"validation cannot run — these findings are not in a validatable state \"\n            f\"(need {_VALIDATABLE}): {', '.join(not_validatable)}\"\n        )"
+    },
+    {
+      "line": 76,
+      "end_line": 76,
+      "callee": "FindingCase.read",
+      "enclosing": "load_case",
+      "expression": "FindingCase.read(path)"
+    },
+    {
+      "line": 84,
+      "end_line": 87,
+      "callee": "console.write",
+      "enclosing": "_load_case_safe",
+      "expression": "console.write(\n            f\"validate: skipping finding '{path.parent.name}' — \"\n            f\"unreadable finding case ({path}): {exc}\"\n        )"
+    },
+    {
+      "line": 101,
+      "end_line": 101,
+      "callee": "discover_cases",
+      "enclosing": "_all_cases",
+      "expression": "discover_cases(repo)"
+    },
+    {
+      "line": 139,
+      "end_line": 139,
+      "callee": "len",
+      "enclosing": "_capped",
+      "expression": "len(cases)"
+    },
+    {
+      "line": 161,
+      "end_line": 161,
+      "callee": "loaded.path.parent.resolve",
+      "enclosing": "_filter_owned",
+      "expression": "loaded.path.parent.resolve()"
+    },
+    {
+      "line": 163,
+      "end_line": 163,
+      "callee": "kept.append",
+      "enclosing": "_filter_owned",
+      "expression": "kept.append(loaded)"
+    },
+    {
+      "line": 165,
+      "end_line": 168,
+      "callee": "console.write",
+      "enclosing": "_filter_owned",
+      "expression": "console.write(\n                f\"skipping {loaded.path.parent}: no S10 record for this case in the \"\n                \"state store (not written by this machine's remediation)\"\n            )"
+    },
+    {
+      "line": 69,
+      "end_line": 69,
+      "callee": "rem_dir.glob",
+      "enclosing": "discover_cases",
+      "expression": "rem_dir.glob(f\"*/{FINDING_CASE_FILENAME}\")"
+    },
+    {
+      "line": 94,
+      "end_line": 94,
+      "callee": "load_case",
+      "enclosing": "all_case_ids",
+      "expression": "load_case(path)"
+    },
+    {
+      "line": 94,
+      "end_line": 94,
+      "callee": "discover_cases",
+      "enclosing": "all_case_ids",
+      "expression": "discover_cases(repo)"
+    },
+    {
+      "line": 205,
+      "end_line": 205,
+      "callee": "_is_validatable",
+      "enclosing": "_select_by_id",
+      "expression": "_is_validatable(by_id[cid])"
+    },
+    {
+      "line": 101,
+      "end_line": 101,
+      "callee": "_load_case_safe",
+      "enclosing": "_all_cases",
+      "expression": "_load_case_safe(path)"
+    },
+    {
+      "line": 191,
+      "end_line": 191,
+      "callee": "_is_validatable",
+      "enclosing": "select_cases",
+      "expression": "_is_validatable(c)"
+    },
+    {
+      "line": 201,
+      "end_line": 201,
+      "callee": "', '.join",
+      "enclosing": "_select_by_id",
+      "expression": "', '.join(missing)"
+    },
+    {
+      "line": 210,
+      "end_line": 210,
+      "callee": "', '.join",
+      "enclosing": "_select_by_id",
+      "expression": "', '.join(not_validatable)"
+    },
+    {
+      "line": 70,
+      "end_line": 70,
+      "callee": "path.is_symlink",
+      "enclosing": "discover_cases",
+      "expression": "path.is_symlink()"
+    },
+    {
+      "line": 70,
+      "end_line": 70,
+      "callee": "path.parent.is_symlink",
+      "enclosing": "discover_cases",
+      "expression": "path.parent.is_symlink()"
+    }
+  ],
+  "imports": [
+    {
+      "line": 17,
+      "source_expression": "from __future__ import annotations",
+      "targets": [
+        "__future__",
+        "__future__.annotations"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 19,
+      "source_expression": "from dataclasses import dataclass",
+      "targets": [
+        "dataclasses",
+        "dataclasses.dataclass"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 20,
+      "source_expression": "from pathlib import Path",
+      "targets": [
+        "pathlib",
+        "pathlib.Path"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 22,
+      "source_expression": "from pydantic import ValidationError",
+      "targets": [
+        "pydantic",
+        "pydantic.ValidationError"
+      ],
+      "local_source_paths": [],
+      "boundary": "external/standard-library import; see dependency_boundaries.md"
+    },
+    {
+      "line": 24,
+      "source_expression": "from vvaharness.models import CaseState, Disposition, FindingCase",
+      "targets": [
+        "vvaharness.models",
+        "vvaharness.models.CaseState",
+        "vvaharness.models.Disposition",
+        "vvaharness.models.FindingCase"
+      ],
+      "local_source_paths": [
+        "vvaharness/models/__init__.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 25,
+      "source_expression": "from vvaharness.orchestrator.artifacts import artifact_dir",
+      "targets": [
+        "vvaharness.orchestrator.artifacts",
+        "vvaharness.orchestrator.artifacts.artifact_dir"
+      ],
+      "local_source_paths": [
+        "vvaharness/orchestrator/artifacts.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 26,
+      "source_expression": "from vvaharness.util import console",
+      "targets": [
+        "vvaharness.util",
+        "vvaharness.util.console"
+      ],
+      "local_source_paths": [
+        "vvaharness/util/__init__.py",
+        "vvaharness/util/console.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 27,
+      "source_expression": "from vvaharness.validation.constants.artifacts import FINDING_CASE_FILENAME, REMEDIATION_DIRNAME, VALIDATABLE_STATES",
+      "targets": [
+        "vvaharness.validation.constants.artifacts",
+        "vvaharness.validation.constants.artifacts.FINDING_CASE_FILENAME",
+        "vvaharness.validation.constants.artifacts.REMEDIATION_DIRNAME",
+        "vvaharness.validation.constants.artifacts.VALIDATABLE_STATES"
+      ],
+      "local_source_paths": [
+        "vvaharness/validation/constants/artifacts.py"
+      ],
+      "boundary": "local definition linked"
+    },
+    {
+      "line": 32,
+      "source_expression": "from vvaharness.validation.ingest.errors import IngestError",
+      "targets": [
+        "vvaharness.validation.ingest.errors",
+        "vvaharness.validation.ingest.errors.IngestError"
+      ],
+      "local_source_paths": [
+        "vvaharness/validation/ingest/errors.py"
+      ],
+      "boundary": "local definition linked"
+    }
+  ]
+}
